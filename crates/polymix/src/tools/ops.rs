@@ -488,7 +488,7 @@ impl OpSpec for RemeshSpec {
     type Params = RemeshUi;
     const NAME: &'static str = "Remesh";
     fn keys(p: &mut Self::Params, i: &egui::InputState) -> bool {
-        let before = p.clone();
+        let before = *p;
         if plain(i, egui::Key::D) {
             p.density = (p.density + 10.0).min(100.0);
         }
@@ -626,7 +626,7 @@ impl OpSpec for ReduceSpec {
     type Params = ReduceUi;
     const NAME: &'static str = "Reduce";
     fn keys(p: &mut Self::Params, i: &egui::InputState) -> bool {
-        let before = p.clone();
+        let before = *p;
         // D / F: keep 10 % more / less.
         if plain(i, egui::Key::D) || plain(i, egui::Key::F) {
             let step = if plain(i, egui::Key::D) { 10.0 } else { -10.0 };
