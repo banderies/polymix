@@ -209,8 +209,11 @@ pub trait Tool {
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {
         None
     }
-    /// Keyboard shortcuts while the tool is active.
-    fn keys(&mut self, _input: &egui::InputState, _cx: &mut ToolCx) {}
+    /// Keyboard shortcuts while the tool is active. Return true if a key was used (the app
+    /// then skips its own shortcuts for it).
+    fn keys(&mut self, _input: &egui::InputState, _cx: &mut ToolCx) -> bool {
+        false
+    }
     /// Mouse wheel over the viewport, when the navigation mode routes it to tools (brush
     /// tools resize their brush). Return true if used; otherwise the view zooms.
     fn wheel(&mut self, _delta: f32, _cx: &mut ToolCx) -> bool {

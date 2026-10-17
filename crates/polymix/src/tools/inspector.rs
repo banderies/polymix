@@ -306,10 +306,12 @@ impl Tool for InspectorTool {
         }
     }
 
-    fn keys(&mut self, i: &egui::InputState, cx: &mut ToolCx) {
+    fn keys(&mut self, i: &egui::InputState, cx: &mut ToolCx) -> bool {
         if i.key_pressed(egui::Key::Q) && self.job.is_none() {
             self.auto_repair(cx);
+            return true;
         }
+        false
     }
 
     fn script(&mut self, cmd: &str, cx: &mut ToolCx) {

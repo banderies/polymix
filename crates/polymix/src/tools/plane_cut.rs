@@ -295,10 +295,12 @@ impl Tool for PlaneCutTool {
         false
     }
 
-    fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) {
+    fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
         if i.key_pressed(egui::Key::Q) {
             self.cut_type = if self.cut_type == CutType::Discard { CutType::Slice } else { CutType::Discard };
+            return true;
         }
+        false
     }
 
     fn busy(&self) -> Option<(String, f32)> {

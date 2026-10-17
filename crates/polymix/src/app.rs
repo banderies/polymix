@@ -940,9 +940,11 @@ impl PolymixApp {
                     ("Sculpt: right-drag", "Brush strength"),
                     ("Select: E / I / G / O / < >", "Connected / Invert / Groups / Optimize / Shrink-Grow"),
                     ("Select: X, F, D, Cmd+D", "Discard, Erase & Fill, Extrude, Offset"),
-                    ("Select: R, Shift+R, B", "Remesh, Reduce, Smooth"),
-                    ("Enter / Esc", "Accept / Cancel tool"),
-                    ("Cmd+Z / Shift+Cmd+Z", "Undo / Redo"),
+                    ("Select: R, Shift+R, Cmd+F (or B), Y, Cmd+B", "Remesh, Reduce, Smooth, Separate, Bridge"),
+                    ("Remesh / Reduce: D / F, T, G", "Density ±10, adaptive, preserve groups"),
+                    ("Enter or A / Esc", "Accept / Cancel tool"),
+                    ("Cmd+Z / Shift+Cmd+Z (Cmd+Y) / Alt+← Alt+→", "Undo / Redo"),
+                    ("Cmd+Shift+O", "Object browser"),
                 ]) {
                     ui.label(RichText::new(k).monospace());
                     ui.label(v);
@@ -1542,12 +1544,19 @@ impl PolymixApp {
         }
         let i = ctx.input(|i| i.clone());
         let cmd = i.modifiers.command;
-        if i.key_pressed(Key::Z) && cmd && !i.modifiers.shift {
+        // Undo / redo: Cmd+Z, Shift+Cmd+Z / Cmd+Y, Alt+Left / Alt+Right. Alt+Shift+arrows
+        // ("skip tool changes" in Meshmixer) behave the same: tools add no history entries
+        // of their own.
+        if (i.key_pressed(Key::Z) && cmd && !i.modifiers.shift) || (i.key_pressed(Key::ArrowLeft) && i.modifiers.alt) {
             self.undo(ctx);
             return;
         }
-        if (i.key_pressed(Key::Z) && cmd && i.modifiers.shift) || (i.key_pressed(Key::Y) && cmd) {
+        if (i.key_pressed(Key::Z) && cmd && i.modifiers.shift) || (i.key_pressed(Key::Y) && cmd) || (i.key_pressed(Key::ArrowRight) && i.modifiers.alt) {
             self.redo(ctx);
+            return;
+        }
+        if i.key_pressed(Key::O) && cmd && i.modifiers.shift {
+            self.show_objects = !self.show_objects;
             return;
         }
         if i.key_pressed(Key::O) && cmd {
@@ -1575,7 +1584,9 @@ impl PolymixApp {
             self.hotbox = if self.hotbox.is_some() { None } else { i.pointer.hover_pos().or(Some(vp.rect.center())) };
             return;
         }
-        if i.key_pressed(Key::Enter) {
+        // Accept: Enter, or A (Meshmixer); Sculpt will use A for attract (ROADMAP M8.3).
+        let accept_a = i.key_pressed(Key::A) && !cmd && !i.modifiers.shift && !i.modifiers.alt && self.tools.last().is_some_and(|t| t.name() != "Sculpt");
+        if i.key_pressed(Key::Enter) || accept_a {
             if let Some(mut t) = self.tools.pop() {
                 let mut cx = self.tool_cx(ctx, vp);
                 // Enter never accepts while the tool is still computing its result.
@@ -1590,7 +1601,7 @@ impl PolymixApp {
         // Tool-specific keys take precedence.
         if let Some(mut t) = self.tools.pop() {
             let mut cx = self.tool_cx(ctx, vp);
-            t.keys(&i, &mut cx);
+            let used = t.keys(&i, &mut cx);
             let req = t.take_request();
             let is_select = t.name() == "Select";
             self.tools.push(t);
@@ -1598,13 +1609,17 @@ impl PolymixApp {
                 self.tools.push(r);
                 return;
             }
+            if used {
+                return;
+            }
             if is_select {
                 // The select tool consumes most letter keys.
                 if i.key_pressed(Key::W) {
                     self.view.wireframe = !self.view.wireframe;
                 }
-                if i.key_pressed(Key::F) && cmd {
-                    self.camera.focus(&self.scene.bounds());
+                if i.key_pressed(Key::Y) && i.modifiers.shift && self.accept_tools_for_command(ctx, vp) {
+                    commands::separate_shells(&mut self.cmd_cx());
+                    self.scene_changed(ctx, vp);
                 }
                 return;
             }

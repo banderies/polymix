@@ -59,10 +59,10 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 
 | Meshmixer | Polymix | Notes |
 |---|---|---|
-| Undo / Redo (⌘Z, ⇧⌘Z, Ctrl+Y, Alt+←/→) | 🟡 | ⌘Z, ⇧⌘Z, ⌘Y ✅; Alt+arrows ❌ |
-| Undo/Redo (Skip Tools) Alt+Shift+←/→ | ❌ | |
+| Undo / Redo (⌘Z, ⇧⌘Z, Ctrl+Y, Alt+←/→) | ✅ | |
+| Undo/Redo (Skip Tools) Alt+Shift+←/→ | ✅ | Same as undo/redo: Polymix tools add no history entries of their own |
 | Discard Undo History | ❌ | |
-| Accept (Enter **or A**) / Cancel (Esc) | 🟡 | Enter/Esc ✅; `A` ❌ |
+| Accept (Enter **or A**) / Cancel (Esc) | ✅ | |
 | Switching tools accepts the current tool | ✅ | Hotkey, palette, menu; only Esc/Cancel discards |
 | Set as Target / Clear Target (target surface) | ❌ | Used by Attract/Align to Target, "Project to target" options |
 | Copy | ❌ | |
@@ -81,7 +81,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Transparent Target | ❌ | |
 | Show Wireframe | ✅ | W |
 | Show Boundaries | ✅ | |
-| Show Objects Browser (Ctrl+Shift+O) | 🟡 | View menu toggle ✅; hotkey ❌ |
+| Show Objects Browser (Ctrl+Shift+O) | ✅ | |
 | — | ✅ | Polymix extras: Sharp edges (crease-angle shading), face group colours, Y/Z up, standard views, statistics |
 
 ### Navigation (hotkeys.pdf page 1)
@@ -151,17 +151,17 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Extrude (D) | ✅ | |
 | Edit: Extract (Shift+D) — offset copy into a new object | ❌ | |
 | Edit: Offset (Ctrl+D) | 🟡 | Distance ✅; Soft Transition, Connected ❌ |
-| Edit: Remesh (R) / Reduce (Shift+R) on the selection | ✅ | Hotkeys inside them (D/F density ±10, T adaptive, G groups) ❌ |
+| Edit: Remesh (R) / Reduce (Shift+R) on the selection | ✅ | In-tool D/F density ±10, T adaptive (Remesh), G preserve groups |
 | Edit: Bridge (two selected regions) | 🟡 | Polymix bridges two boundary loops |
 | Edit: Join (along boundary edges) | ❌ |  |
 | Edit: Weld Boundaries | ❌ |  |
 | Edit: Tube Handle | ❌ | Connect two selected regions with a tube |
 | Edit: Align To Target / Attract To Target | ❌ | Needs target surface |
-| Edit: Separate (Y) / Duplicate selection | 🟡 | Commands ✅; `Y` hotkey ❌ |
-| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | ❌ | |
+| Edit: Separate (Y) / Duplicate selection | ✅ | |
+| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | 🟡 | ⌘B ✅; J and P with their tools |
 | Edit: Fit Primitive | ❌ | |
 | Edit: Grow Hair | ⚪ ❌ | |
-| **Deform** menu: Smooth (⌘F) | 🟡 | Tool ✅; Meshmixer opens it with ⌘F, Polymix with `B` (Meshmixer's `B` is Smooth Boundary) |
+| **Deform** menu: Smooth (⌘F) | ✅ | `B` also smooths until Smooth Boundary lands (M2.1) |
 | Deform: Smooth Boundary ("Smooth Loop", B) | ❌ | |
 | Deform: Soft Transform (Shift+T) / Transform selection (T) | ❌ | Polymix Transform is whole-object only |
 | Deform: Warp | ❌ | |

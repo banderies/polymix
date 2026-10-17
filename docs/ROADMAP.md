@@ -30,10 +30,11 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       navigation mode), RMB-drag expand/contract of the selection. Wheel (Meshmixer nav) or
       Shift+wheel (Fusion 360 nav); right-drag grows/shrinks by surface distance in Select and
       sets strength in Sculpt.
-- [ ] **M1.4 Hotkeys.** `A` accept; Alt+←/→ undo/redo; Alt+Shift+←/→ undo/redo skipping tool
+- [x] **M1.4 Hotkeys.** `A` accept; Alt+←/→ undo/redo; Alt+Shift+←/→ undo/redo skipping tool
       changes; ⌘⇧O object browser; selection: `B` Smooth Boundary, ⌘F Smooth, `Y` Separate,
       `J` Join, `P` Fit Primitive, ⌘B Bridge (bound as the tools land); Remesh/Reduce in-tool
-      D/F density ±10, T adaptive, G preserve groups.
+      D/F density ±10, T adaptive, G preserve groups. Done except `B` → Smooth Boundary (M2.1),
+      `J` (M3.2) and `P` (M4.6).
 - [ ] **M1.5 View commands.** Recenter at cursor, Previous/Next view, Show grid.
 
 ## M2 — Selection

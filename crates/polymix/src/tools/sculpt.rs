@@ -266,12 +266,15 @@ impl Tool for SculptTool {
         }
     }
 
-    fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) {
+    fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
         if i.key_pressed(egui::Key::OpenBracket) {
             step_brush_size(&mut self.size_pct, false);
+            return true;
         }
         if i.key_pressed(egui::Key::CloseBracket) {
             step_brush_size(&mut self.size_pct, true);
+            return true;
         }
+        false
     }
 }

@@ -34,6 +34,16 @@ pub trait OpSpec: Send + 'static {
     fn defaults(info: &OpInfo) -> Self::Params;
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo);
     fn run(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput>;
+    /// In-tool hotkeys (Meshmixer: D/F density ±10, T adaptive, G groups). Return true if
+    /// the parameters changed.
+    fn keys(_p: &mut Self::Params, _i: &egui::InputState) -> bool {
+        false
+    }
+}
+
+/// Plain (unmodified) key press.
+fn plain(i: &egui::InputState, k: egui::Key) -> bool {
+    i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt && !i.modifiers.shift
 }
 
 pub struct OpTool<S: OpSpec> {
@@ -166,6 +176,14 @@ impl<S: OpSpec> OpTool<S> {
 impl<S: OpSpec> Tool for OpTool<S> {
     fn name(&self) -> &'static str {
         S::NAME
+    }
+
+    fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
+        if S::keys(&mut self.params, i) {
+            self.changed_at = Some(Instant::now());
+            return true;
+        }
+        false
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
@@ -469,6 +487,25 @@ pub struct RemeshSpec;
 impl OpSpec for RemeshSpec {
     type Params = RemeshUi;
     const NAME: &'static str = "Remesh";
+    fn keys(p: &mut Self::Params, i: &egui::InputState) -> bool {
+        let before = p.clone();
+        if plain(i, egui::Key::D) {
+            p.density = (p.density + 10.0).min(100.0);
+        }
+        if plain(i, egui::Key::F) {
+            p.density = (p.density - 10.0).max(0.0);
+        }
+        if (plain(i, egui::Key::D) || plain(i, egui::Key::F)) && p.mode == RemeshMode::TargetEdgeLength {
+            p.mode = RemeshMode::RelativeDensity;
+        }
+        if plain(i, egui::Key::T) {
+            p.mode = if p.mode == RemeshMode::AdaptiveDensity { RemeshMode::RelativeDensity } else { RemeshMode::AdaptiveDensity };
+        }
+        if plain(i, egui::Key::G) {
+            p.preserve_groups = !p.preserve_groups;
+        }
+        *p != before
+    }
     fn defaults(info: &OpInfo) -> Self::Params {
         let base = match info.selection {
             Some(sel) => mm_remesh::edge_length_stats_in(info.mesh, sel).mean,
@@ -588,6 +625,19 @@ pub struct ReduceSpec;
 impl OpSpec for ReduceSpec {
     type Params = ReduceUi;
     const NAME: &'static str = "Reduce";
+    fn keys(p: &mut Self::Params, i: &egui::InputState) -> bool {
+        let before = p.clone();
+        // D / F: keep 10 % more / less.
+        if plain(i, egui::Key::D) || plain(i, egui::Key::F) {
+            let step = if plain(i, egui::Key::D) { 10.0 } else { -10.0 };
+            p.goal = ReduceGoal::Percentage;
+            p.percentage = (p.percentage + step).clamp(1.0, 99.0);
+        }
+        if plain(i, egui::Key::G) {
+            p.preserve_groups = !p.preserve_groups;
+        }
+        *p != before
+    }
     fn defaults(info: &OpInfo) -> Self::Params {
         let n = info.selection.map(|s| s.len()).unwrap_or(info.mesh.triangle_count());
         ReduceUi {
@@ -980,6 +1030,39 @@ mod tests {
         let hole: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t) - DVec3::new(1.2, 0.0, 4.0)).length() < 0.5).collect();
         m.remove_triangles(hole);
         m
+    }
+
+    /// Input state with one key press.
+    fn key_input(key: egui::Key) -> egui::InputState {
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }],
+            ..Default::default()
+        };
+        let mut state = egui::InputState::default();
+        state = state.begin_pass(raw, false, 1.0, egui::InputOptions::default());
+        state
+    }
+
+    #[test]
+    fn remesh_and_reduce_hotkeys() {
+        let m = mm_core::primitives::icosphere(1.0, 2);
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let mut p = RemeshSpec::defaults(&info);
+        let d0 = p.density;
+        assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::D)));
+        assert_eq!(p.density, d0 + 10.0);
+        assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::F)));
+        assert_eq!(p.density, d0);
+        assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::T)));
+        assert_eq!(p.mode, RemeshMode::AdaptiveDensity);
+        let g = p.preserve_groups;
+        assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::G)));
+        assert_eq!(p.preserve_groups, !g);
+        assert!(!RemeshSpec::keys(&mut p, &key_input(egui::Key::K)));
+        let mut r = ReduceSpec::defaults(&info);
+        let k0 = r.percentage;
+        assert!(ReduceSpec::keys(&mut r, &key_input(egui::Key::F)));
+        assert_eq!(r.percentage, k0 - 10.0);
     }
 
     fn run_spec<S: OpSpec>(mesh: &Mesh, sel: Option<&[u32]>) -> anyhow::Result<OpOutput> {

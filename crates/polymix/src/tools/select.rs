@@ -499,7 +499,7 @@ impl Tool for SelectTool {
         }
     }
 
-    fn keys(&mut self, i: &egui::InputState, cx: &mut ToolCx) {
+    fn keys(&mut self, i: &egui::InputState, cx: &mut ToolCx) -> bool {
         use egui::Key;
         let cmd = i.modifiers.command;
         let shift = i.modifiers.shift;
@@ -544,8 +544,18 @@ impl Tool for SelectTool {
         } else if i.key_pressed(Key::R) && !cmd {
             self.request = Some(Box::new(ops::RemeshTool::new(cx)));
         } else if i.key_pressed(Key::B) && !cmd {
+            // Meshmixer's B is Smooth Boundary (ROADMAP M2.1); until then B smooths too.
             self.request = Some(Box::new(ops::SmoothTool::new(cx)));
+        } else if i.key_pressed(Key::F) && cmd {
+            self.request = Some(Box::new(ops::SmoothTool::new(cx)));
+        } else if i.key_pressed(Key::B) && cmd {
+            self.request = Some(Box::new(ops::BridgeTool::new(cx)));
+        } else if i.key_pressed(Key::Y) && !cmd && !shift {
+            run(&mut |x| commands::separate_selection(x, false));
+        } else {
+            return false;
         }
+        true
     }
 
     fn cancel(&mut self, cx: &mut ToolCx) -> bool {
