@@ -5,6 +5,7 @@ use crate::commands::{self, CmdCx};
 use crate::jobs::Job;
 use crate::navigation::{NavAction, NavMode};
 use crate::renderer::{self, ColorVertex, GpuMesh, ObjectStyle, SceneRenderer};
+use crate::spacemouse::{self, SpaceMouse};
 use crate::scene::{History, ObjectId, Scene};
 use crate::tools::{self, Overlay, PointerInput, Tool, ToolCx, ToolOutcome, Viewport};
 use crate::ui_util;
@@ -107,6 +108,10 @@ pub struct PolymixApp {
     /// Last pointer position seen over the viewport (for releases outside it).
     last_pointer: Option<egui::Pos2>,
     show_help: bool,
+    /// 3D mouse (3Dconnexion) input and its settings window.
+    space: SpaceMouse,
+    space_cfg: spacemouse::Settings,
+    show_space_window: bool,
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
     hotbox: Option<egui::Pos2>,
     show_objects: bool,
@@ -150,6 +155,9 @@ impl PolymixApp {
             nav_drag: None,
             last_pointer: None,
             show_help: false,
+            space: SpaceMouse::start(&cc.egui_ctx),
+            space_cfg: spacemouse::Settings::default(),
+            show_space_window: false,
             hotbox: None,
             show_objects: true,
             last_export_dir: None,
@@ -172,6 +180,9 @@ impl PolymixApp {
             app.view.group_colors = flag("group_colors", false);
             app.view.sharp_edges = flag("sharp_edges", true);
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
+            if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
+                app.space_cfg = cfg;
+            }
             app.view.crease_deg = st.get_string("crease_deg").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CREASE_DEG);
             app.show_objects = flag("show_objects", true);
             app.camera.orthographic = flag("orthographic", false);
@@ -522,6 +533,10 @@ impl PolymixApp {
                         ui.selectable_value(&mut self.view.nav_mode, m, m.label());
                     }
                 });
+                if ui.button("3D mouse…").on_hover_text("3Dconnexion SpaceMouse settings").clicked() {
+                    ui.close();
+                    self.show_space_window = true;
+                }
                 ui.separator();
                 ui.label("Up axis");
                 ui.horizontal(|ui| {
@@ -930,6 +945,94 @@ impl PolymixApp {
                 }
             });
         });
+    }
+
+    /// Apply 3D mouse motion and buttons.
+    fn space_mouse(&mut self, ctx: &egui::Context, vp: Viewport) {
+        let (motion, pressed) = self.space.poll();
+        if !self.space_cfg.enabled {
+            return;
+        }
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
+        if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64) {
+            // Keep animating while the cap is deflected.
+            ctx.request_repaint();
+        }
+        use std::f64::consts::FRAC_PI_2;
+        for b in pressed {
+            match spacemouse::button_action(b) {
+                Some(spacemouse::ButtonAction::Menu) => {
+                    self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) };
+                }
+                Some(spacemouse::ButtonAction::Fit) => self.camera.focus(&self.scene.bounds()),
+                Some(spacemouse::ButtonAction::Top) => self.camera.set_view(0.0, FRAC_PI_2),
+                Some(spacemouse::ButtonAction::Right) => self.camera.set_view(FRAC_PI_2, 0.0),
+                Some(spacemouse::ButtonAction::Front) => self.camera.set_view(0.0, 0.0),
+                None => {}
+            }
+        }
+    }
+
+    fn space_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_space_window;
+        egui::Window::new("3D mouse").open(&mut open).resizable(false).show(ctx, |ui| {
+            match &self.space.status {
+                spacemouse::Status::Ready { device: Some((vendor, product)) } => {
+                    ui.label(format!("Connected · device {vendor:04x}:{product:04x}"));
+                }
+                spacemouse::Status::Ready { device: None } => {
+                    ui.label("3Dconnexion driver ready · no device connected");
+                }
+                spacemouse::Status::DriverMissing => {
+                    ui.label("3Dconnexion driver (3DxWare) not installed.");
+                }
+                spacemouse::Status::Unsupported => {
+                    ui.label("3D mice are not supported on this platform yet.");
+                }
+                spacemouse::Status::Failed(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 120, 90), format!("Could not connect: {e}"));
+                }
+            }
+            let c = &mut self.space_cfg;
+            ui.checkbox(&mut c.enabled, "Enabled");
+            ui.small("Object mode: move the cap the way you want the model to move.");
+            egui::Grid::new("space_speeds").num_columns(2).show(ui, |ui| {
+                for (label, v) in [("Speed", &mut c.speed), ("Pan", &mut c.pan_speed), ("Zoom", &mut c.zoom_speed), ("Rotate", &mut c.rotate_speed)] {
+                    ui.label(label);
+                    ui.add(egui::Slider::new(v, 0.1..=4.0).logarithmic(true));
+                    ui.end_row();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut c.lock_rotation, "Lock rotation");
+                ui.checkbox(&mut c.lock_translation, "Lock pan/zoom");
+            });
+            ui_util::section(ui, "Invert");
+            ui.horizontal_wrapped(|ui| {
+                for (i, name) in spacemouse::Settings::AXIS_NAMES.iter().enumerate() {
+                    ui.checkbox(&mut c.invert[i], *name);
+                }
+            });
+            ui_util::section(ui, "Live input");
+            let (axis, buttons) = self.space.raw();
+            let m = spacemouse::to_view(axis);
+            egui::Grid::new("space_live").num_columns(2).show(ui, |ui| {
+                for (name, v) in spacemouse::Settings::AXIS_NAMES.iter().zip(m.t.iter().chain(m.r.iter())) {
+                    ui.label(*name);
+                    ui.add(egui::ProgressBar::new((v * 0.5 + 0.5).clamp(0.0, 1.0)).desired_width(160.0).text(format!("{v:+.2}")));
+                    ui.end_row();
+                }
+                ui.label("Buttons");
+                ui.monospace(if buttons == 0 { "–".to_string() } else { (0..32).filter(|b| buttons & (1 << b) != 0).map(|b| b.to_string()).collect::<Vec<_>>().join(" ") });
+                ui.end_row();
+            });
+            ui.small("Buttons: Menu = Hotbox, Fit = focus, Top / Right / Front = views.");
+        });
+        if open {
+            // Keep the live readout moving.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        self.show_space_window = open;
     }
 
     // ------------------------------------------------------------------
@@ -1489,6 +1592,7 @@ impl eframe::App for PolymixApp {
         st.set_string("group_colors", b(self.view.group_colors));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
+        st.set_string("spacemouse", self.space_cfg.to_pref());
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));
         st.set_string("orthographic", b(self.camera.orthographic));
@@ -1514,6 +1618,7 @@ impl eframe::App for PolymixApp {
         // during panel drawing use the previous frame's value.
         let vp_prev = Viewport { rect: ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::NULL.with("vp_rect"))).unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))) };
 
+        self.space_mouse(&ctx, vp_prev);
         if let Some(to) = self.pending_switch.clone() {
             self.switch_to(to, &ctx, vp_prev);
             ctx.request_repaint();
@@ -1570,6 +1675,7 @@ impl eframe::App for PolymixApp {
         }
         self.handle_keys(&ctx, vp_prev);
         self.help_window(&ctx);
+        self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);
     }

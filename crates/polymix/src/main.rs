@@ -8,6 +8,7 @@ mod jobs;
 mod navigation;
 mod renderer;
 mod scene;
+mod spacemouse;
 mod tools;
 mod ui_util;
 
@@ -16,6 +17,10 @@ mod pipeline_tests;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    if std::env::args().any(|a| a == "--probe-3dmouse") {
+        probe_3d_mouse();
+        return Ok(());
+    }
     let files: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -59,4 +64,44 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         });
     }
     cfg
+}
+
+/// `polymix --probe-3dmouse`: connect to the 3D mouse driver without opening a window, then
+/// record up to six gestures (cap motions separated by letting go) and report the dominant
+/// raw axis of each, to check the axis mapping on a given device.
+fn probe_3d_mouse() {
+    let mut sm = spacemouse::SpaceMouse::start_with(&egui::Context::default(), true);
+    println!("3D mouse: {:?}", sm.status);
+    println!("Within 40 s, make these six moves, letting go between them:");
+    println!("  1 push right   2 pull up   3 pull toward you");
+    println!("  4 tilt the top away from you   5 twist clockwise   6 tilt the top to the right");
+    let names = ["pan x", "pan y", "zoom", "tilt", "spin", "roll"];
+    let start = std::time::Instant::now();
+    let mut gesture: Option<[f32; 6]> = None;
+    let mut buttons_seen = Vec::new();
+    let mut n = 0;
+    while start.elapsed() < std::time::Duration::from_secs(40) && n < 6 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (m, pressed) = sm.poll();
+        buttons_seen.extend(pressed);
+        let v: Vec<f32> = m.t.iter().chain(m.r.iter()).copied().collect();
+        if m.is_zero() {
+            if let Some(peak) = gesture.take() {
+                n += 1;
+                let (i, p) = peak.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap();
+                println!("gesture {n}: {} {:+.2}   (all: {})", names[i], p, peak.iter().map(|x| format!("{x:+.2}")).collect::<Vec<_>>().join(" "));
+            }
+        } else {
+            let g = gesture.get_or_insert([0.0; 6]);
+            for k in 0..6 {
+                if v[k].abs() > g[k].abs() {
+                    g[k] = v[k];
+                }
+            }
+        }
+    }
+    if !buttons_seen.is_empty() {
+        println!("buttons pressed: {buttons_seen:?}");
+    }
+    println!("expected: 1 pan x +, 2 pan y +, 3 zoom +, 4 tilt -, 5 spin -, 6 roll -");
 }

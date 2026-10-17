@@ -20,10 +20,12 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       the user's Meshmixer setting, default) / *Meshmixer* (RMB or Alt+LMB tumble, Alt+MMB /
       Shift+RMB / Alt+Shift+LMB pan, Alt+RMB and Alt+⌘+LMB zoom). View → Navigation; mapping per
       Meshmixer's hotkeys.pdf (live check pending: Meshmixer was closed).
-- [ ] **M1.2 3D mouse (3Dconnexion SpaceMouse).** 6-DoF camera navigation (pan/zoom/tumble
+- [x] **M1.2 3D mouse (3Dconnexion SpaceMouse).** 6-DoF camera navigation (pan/zoom/tumble
       around the view's axes, matching the free-rotation setting), device buttons (Fit, views),
       sensitivity and axis-invert settings; macOS first via the 3Dconnexion driver, with a
-      device abstraction for Windows/Linux later.
+      device abstraction for Windows/Linux later. Done on macOS (View → 3D mouse…,
+      `polymix --probe-3dmouse` checks the axis mapping on a device); Windows (3DxWare) and
+      Linux (spacenavd) backends still to add.
 - [ ] **M1.3 Brush size on the mouse wheel** in Select/Sculpt where Meshmixer does it (per
       navigation mode), RMB-drag expand/contract of the selection.
 - [ ] **M1.4 Hotkeys.** `A` accept; Alt+←/→ undo/redo; Alt+Shift+←/→ undo/redo skipping tool

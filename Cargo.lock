@@ -1989,6 +1989,7 @@ dependencies = [
  "egui",
  "env_logger",
  "glam",
+ "libloading",
  "log",
  "mm-core",
  "mm-edit",

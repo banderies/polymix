@@ -26,3 +26,7 @@ rfd = "0.17"
 log = "0.4"
 env_logger = "0.11"
 png = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 3D mouse: the 3Dconnexion driver framework is loaded at run time.
+libloading = "0.8"

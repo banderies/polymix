@@ -95,6 +95,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Wheel zooms (outside brush tools) | ✅ | Zooms toward the cursor |
 | "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ✅ | View → Navigation; default, as in your Meshmixer |
 | ViewCube / SteeringWheels | ⚪ ❌ | Autodesk components; Polymix has an axis gizmo |
+| 3D mouse (3Dconnexion) | ✅ | Polymix addition: View → 3D mouse… (macOS) |
 
 ### Hotbox (Space) — hotkeys.pdf page 5
 

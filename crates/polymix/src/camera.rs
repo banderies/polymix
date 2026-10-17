@@ -185,6 +185,21 @@ impl Camera {
         self.distance = r / (self.fov_y * 0.5).sin() * 1.1;
     }
 
+    /// Turn the model by (`rx`, `ry`, `rz`) radians about the view's axes (x right, y up,
+    /// z toward the viewer), as a 3D mouse does in object mode. The turntable mode keeps the
+    /// horizon level: spin is about the world up axis and roll is ignored.
+    pub fn rotate_view(&mut self, rx: f64, ry: f64, rz: f64) {
+        // The camera turns opposite to the model.
+        self.orient = if self.free_orbit {
+            self.orient * DQuat::from_scaled_axis(DVec3::new(-rx, -ry, -rz))
+        } else {
+            let upright = (self.orient * DVec3::Y).y >= 0.0;
+            let spin = DQuat::from_rotation_y(if upright { -ry } else { ry });
+            spin * self.orient * DQuat::from_rotation_x(-rx)
+        }
+        .normalize();
+    }
+
     /// Snap to the nearest axis-aligned view (view direction and screen-up both along axes).
     pub fn snap_to_axis(&mut self) {
         let back = nearest_axis(self.orient * DVec3::Z, None);
