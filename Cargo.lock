@@ -1366,6 +1366,7 @@ dependencies = [
  "anyhow",
  "glam",
  "mm-core",
+ "mm-repair",
  "mm-solid",
  "rayon",
  "robust",
