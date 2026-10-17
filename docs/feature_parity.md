@@ -46,6 +46,11 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Export SVG | ⚪ ❌ | |
 | Print / Send to printer | ⚪ ❌ | |
 | Preferences (Alt+T / ⌘,) | 🟡 | View options persist; no Preferences window |
+| Pref: Flip Z-Y axis on import/export (on in your install) | ❌ | Polymix has a Z-up *view* but does not convert file axes |
+| Pref: Mesh Normal Mode Vertex / Face / Group normals | 🟡 | Smooth (+ sharp edges) and flat ✅; group normals ❌ |
+| Pref: Mesh Color Mode Group / Vertex / Constant | 🟡 | Group and constant ✅; vertex ❌ |
+| Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | 🟡 | Export active object or all visible; OBJ groups ✅ |
+| Pref: Import dialogs (append/replace, scale models) | ❌ | |
 | Autosave + crash recovery | ❌ | |
 
 ### Actions menu
@@ -86,7 +91,7 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Zoom: Alt+RMB (Maya) | ❌ | Polymix: wheel/pinch and Alt+⌘+LMB |
 | Zoom: Alt+Ctrl/⌘+LMB (pen-friendly) | ✅ | |
 | Wheel zooms (outside brush tools) | ✅ | Zooms toward the cursor |
-| "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ❌ | Preference |
+| "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ❌ | **This is the mode your Meshmixer uses** (Preferences → Navigation Mode) |
 | ViewCube / SteeringWheels | ⚪ ❌ | Autodesk components; Polymix has an axis gizmo |
 
 ### Hotbox (Space) — hotkeys.pdf page 5
@@ -149,10 +154,11 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Edit: Weld Boundaries | ❌ |  |
 | Edit: Tube Handle | ❌ | Connect two selected regions with a tube |
 | Edit: Align To Target / Attract To Target | ❌ | Needs target surface |
-| Edit: Separate / Duplicate selection | ✅ | |
+| Edit: Separate (Y) / Duplicate selection | 🟡 | Commands ✅; `Y` hotkey ❌ |
+| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | ❌ | |
 | Edit: Fit Primitive | ❌ | |
 | Edit: Grow Hair | ⚪ ❌ | |
-| **Deform** menu: Smooth | ✅ | `B` opens Smooth in Polymix; in Meshmixer `B` is Smooth Loop |
+| **Deform** menu: Smooth (⌘F) | 🟡 | Tool ✅; Meshmixer opens it with ⌘F, Polymix with `B` (Meshmixer's `B` is Smooth Boundary) |
 | Deform: Smooth Boundary ("Smooth Loop", B) | ❌ | |
 | Deform: Soft Transform (Shift+T) / Transform selection (T) | ❌ | Polymix Transform is whole-object only |
 | Deform: Warp | ❌ | |
@@ -236,6 +242,8 @@ free/turntable camera toggle.
 
 ## Suggested next steps for the vessel workflow
 
+0. Navigation preference with a **Fusion 360 mode** (MMB pan, Shift+MMB tumble, wheel zoom) —
+   your Meshmixer is set to it.
 1. Mouse wheel = brush size in Select/Sculpt (zoom with Alt+RMB / Alt+⌘+LMB), `A` to accept.
 2. Smooth Boundary ("Smooth Loop", `B` with a selection) and Erase & Fill options (smoothness,
    border rings).
