@@ -129,8 +129,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Paint Mode: sphere brush, Shift deselect | ✅ | Brush keeps its size on the model |
 | Brush types: SphereDisc, Unwrap (geodesic) | ❌ | |
-| **Mouse wheel resizes the brush** (also `[` `]`) | 🟡 | `[` `]` ✅; wheel still zooms ❌ |
-| RMB-drag expands / contracts the selection | ❌ | hotkeys.pdf "Expand: RMB"; must coexist with RMB tumble |
+| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Wheel in Meshmixer navigation, Shift+wheel in Fusion 360 navigation |
+| RMB-drag expands / contracts the selection | ✅ | With a selection; geodesic distance (other expand modes: ROADMAP M2.5) |
 | Laser Lasso (curve from background; closed = inside, open = smaller side, through the model) | ✅ | |
 | Lasso Mode (multi-curve loop drawn *on the surface*, rotate between curves) | ❌ | |
 | Double-click: connected part | ✅ | |
@@ -177,7 +177,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ❌ | |
 | Brushes: PaintVertex, SmoothColor | ⚪ ❌ | |
 | Dynamic refinement while sculpting (Refinement, Adaptivity; R, T) | ❌ | |
-| Size / Strength | ✅ | Size is a % of the model; wheel ❌ |
+| Size / Strength | ✅ | Size is a % of the model; wheel size, right-drag strength |
 | Spacing, Flow, Lazyness, AlignToStroke, Falloff curve, Stencils, brush textures | ❌ | |
 | Primary / Secondary (Shift) / Invert (Ctrl/⌘) | 🟡 | Invert ✅ for Inflate; Secondary brush ❌ |
 | Toggles: Symmetry (Shift+S), Hold boundary (B), Preserve groups (G), Attract (A) | 🟡 | Hold boundary checkbox ✅ (no hotkey) |

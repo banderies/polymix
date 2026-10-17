@@ -26,8 +26,10 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       device abstraction for Windows/Linux later. Done on macOS (View → 3D mouse…,
       `polymix --probe-3dmouse` checks the axis mapping on a device); Windows (3DxWare) and
       Linux (spacenavd) backends still to add.
-- [ ] **M1.3 Brush size on the mouse wheel** in Select/Sculpt where Meshmixer does it (per
-      navigation mode), RMB-drag expand/contract of the selection.
+- [x] **M1.3 Brush size on the mouse wheel** in Select/Sculpt where Meshmixer does it (per
+      navigation mode), RMB-drag expand/contract of the selection. Wheel (Meshmixer nav) or
+      Shift+wheel (Fusion 360 nav); right-drag grows/shrinks by surface distance in Select and
+      sets strength in Sculpt.
 - [ ] **M1.4 Hotkeys.** `A` accept; Alt+←/→ undo/redo; Alt+Shift+←/→ undo/redo skipping tool
       changes; ⌘⇧O object browser; selection: `B` Smooth Boundary, ⌘F Smooth, `Y` Separate,
       `J` Join, `P` Fit Primitive, ⌘B Bridge (bound as the tools land); Remesh/Reduce in-tool

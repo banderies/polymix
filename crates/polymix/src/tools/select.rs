@@ -34,8 +34,61 @@ pub struct SelectTool {
     hover_brush: Option<(DVec3, f64)>,
     /// Selection before the latest click, so a double-click can undo its two brush dabs.
     before_click: Option<(ObjectId, TriSelection, f64)>,
+    /// Right-drag expand/contract in progress.
+    expand: Option<ExpandSession>,
     /// Sub-tool requested from the panel (opened by the app).
     pub request: Option<Box<dyn Tool>>,
+}
+
+/// Right-drag grow/shrink (Meshmixer's "Expand Mode: Geodesic Distance"): drag right to grow
+/// the selection by a surface distance, left to shrink it.
+struct ExpandSession {
+    object: ObjectId,
+    original: TriSelection,
+    /// Per triangle: surface distance from the selection border (max over its vertices).
+    dist: Vec<f32>,
+    /// World length per screen point at the press position.
+    scale: f64,
+}
+
+impl ExpandSession {
+    fn new(mesh: &Mesh, object: ObjectId, original: TriSelection, scale: f64) -> Self {
+        // Border vertices: on edges between selected and unselected triangles.
+        let mut sources = Vec::new();
+        let mut mark = vec![false; mesh.max_vid()];
+        for t in original.iter() {
+            for e in mesh.tri_edges(t) {
+                let o = mesh.edge_other_triangle(e, t);
+                if o != mm_core::INVALID && !original.contains(o) {
+                    for v in mesh.edge_vertices(e) {
+                        if !std::mem::replace(&mut mark[v as usize], true) {
+                            sources.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        let vd = crate::centerline::geodesic_distance(mesh, &sources);
+        let mut dist = vec![f32::INFINITY; mesh.max_tid()];
+        for t in mesh.triangle_ids() {
+            dist[t as usize] = mesh.triangle(t).iter().map(|&v| vd[v as usize]).fold(0.0, f64::max) as f32;
+        }
+        Self { object, original, dist, scale }
+    }
+
+    /// Selection for a signed surface distance `d` (positive grows).
+    fn apply(&self, mesh: &Mesh, d: f64, out: &mut TriSelection) {
+        *out = self.original.clone();
+        let d = d as f32;
+        for t in mesh.triangle_ids() {
+            let within = self.dist[t as usize] <= d.abs();
+            if d > 0.0 && within {
+                out.insert(t);
+            } else if d < 0.0 && within {
+                out.remove(t);
+            }
+        }
+    }
 }
 
 struct Stroke {
@@ -54,6 +107,7 @@ impl Default for SelectTool {
             curve: None,
             hover_brush: None,
             before_click: None,
+            expand: None,
             request: None,
         }
     }
@@ -246,10 +300,10 @@ impl Tool for SelectTool {
         let (n_sel, n_tri) = cx.scene.active().map(|o| (o.selection.len(), o.mesh.triangle_count())).unwrap_or((0, 0));
         ui.label(format!("{} / {} triangles selected", ui_util::format_count(n_sel), ui_util::format_count(n_tri)));
         ui.small(match self.mode {
-            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect",
+            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation)",
             SelectMode::Lasso => "Draw a closed loop to select inside, or an open curve across the model to select the smaller side · Shift: deselect",
         });
-        ui.small("Double-click: hole border (on an open edge) or connected part · S: clear");
+        ui.small("Double-click: hole border (on an open edge) or connected part · Right-drag: grow / shrink · S: clear");
 
         ui_util::section(ui, "Selection");
         ui.horizontal_wrapped(|ui| {
@@ -378,6 +432,48 @@ impl Tool for SelectTool {
         };
     }
 
+    fn wheel(&mut self, delta: f32, _cx: &mut ToolCx) -> bool {
+        if self.mode != SelectMode::Brush {
+            return false;
+        }
+        self.size_pct = (self.size_pct * (delta * 0.004).exp()).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        true
+    }
+
+    fn claims_secondary_drag(&self, scene: &Scene) -> bool {
+        scene.active().is_some_and(|o| !o.selection.is_empty())
+    }
+
+    fn secondary_drag(&mut self, phase: DragPhase, pos: egui::Pos2, total: egui::Vec2, cx: &mut ToolCx) {
+        match phase {
+            DragPhase::Start => {
+                let Some(id) = cx.scene.active else { return };
+                let at = cx.pick(pos, Some(id)).map(|(_, h)| h.point).unwrap_or(cx.camera.target);
+                let scale = cx.world_per_point(at);
+                cx.snapshot("Expand selection");
+                let o = cx.scene.get_mut(id).unwrap();
+                let mesh = o.mesh.clone();
+                o.selection.sync(&mesh);
+                self.expand = Some(ExpandSession::new(&mesh, id, o.selection.clone(), scale));
+            }
+            DragPhase::Move | DragPhase::End => {
+                let Some(session) = &self.expand else { return };
+                let Some(o) = cx.scene.get_mut(session.object) else {
+                    self.expand = None;
+                    return;
+                };
+                let mesh = o.mesh.clone();
+                let d = total.x as f64 * session.scale;
+                session.apply(&mesh, d, &mut o.selection);
+                o.touch_selection();
+                *cx.status = format!("{} by {:.3} · {} triangles selected", if d >= 0.0 { "Grow" } else { "Shrink" }, d.abs(), o.selection.len());
+                if phase == DragPhase::End {
+                    self.expand = None;
+                }
+            }
+        }
+    }
+
     fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
         if let Some((c, r)) = self.hover_brush {
             ov.brush = Some((c.as_vec3(), r as f32));
@@ -504,6 +600,33 @@ mod tests {
         // A triangle away from both rims has no ring.
         let mid = m.triangle_ids().find(|&t| m.triangle(t).iter().all(|&v| m.vertex(v).z > 0.5 && m.vertex(v).z < 1.5)).unwrap();
         assert!(hole_ring(&m, mid).is_empty());
+    }
+
+    #[test]
+    fn right_drag_grows_and_shrinks_by_surface_distance() {
+        let m = primitives::plane_grid(10.0, 10.0, 20, 20);
+        // Select the triangles within 2 units of the centre.
+        let mut sel = TriSelection::new(&m);
+        for t in m.triangle_ids() {
+            if m.tri_centroid(t).length() < 2.0 {
+                sel.insert(t);
+            }
+        }
+        let n0 = sel.len();
+        let session = ExpandSession::new(&m, 0, sel.clone(), 1.0);
+        let mut out = TriSelection::new(&m);
+        session.apply(&m, 0.0, &mut out);
+        assert_eq!(out.len(), n0);
+        session.apply(&m, 1.0, &mut out);
+        let grown = out.len();
+        assert!(grown > n0);
+        session.apply(&m, 2.0, &mut out);
+        assert!(out.len() > grown, "a longer drag grows further");
+        // Growth follows distance: nothing beyond ~2 + 2 units from the centre.
+        assert!(out.iter().all(|t| m.tri_centroid(t).length() < 4.6));
+        session.apply(&m, -0.8, &mut out);
+        assert!(out.len() < n0 && !out.is_empty());
+        assert!(out.iter().all(|t| sel.contains(t)), "shrinking only removes");
     }
 
     #[test]

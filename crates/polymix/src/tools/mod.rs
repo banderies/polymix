@@ -183,6 +183,13 @@ pub struct PointerInput {
     pub command: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragPhase {
+    Start,
+    Move,
+    End,
+}
+
 pub enum ToolOutcome {
     Continue,
     Close,
@@ -204,6 +211,18 @@ pub trait Tool {
     }
     /// Keyboard shortcuts while the tool is active.
     fn keys(&mut self, _input: &egui::InputState, _cx: &mut ToolCx) {}
+    /// Mouse wheel over the viewport, when the navigation mode routes it to tools (brush
+    /// tools resize their brush). Return true if used; otherwise the view zooms.
+    fn wheel(&mut self, _delta: f32, _cx: &mut ToolCx) -> bool {
+        false
+    }
+    /// Whether a right-button drag starting now belongs to the tool instead of navigation
+    /// (Meshmixer: right-drag expands the selection / sets brush strength).
+    fn claims_secondary_drag(&self, _scene: &Scene) -> bool {
+        false
+    }
+    /// A right-button drag owned by the tool; `total` is the pointer offset since the press.
+    fn secondary_drag(&mut self, _phase: DragPhase, _pos: egui::Pos2, _total: egui::Vec2, _cx: &mut ToolCx) {}
     /// Esc pressed. Return true to close the tool.
     fn cancel(&mut self, _cx: &mut ToolCx) -> bool {
         true

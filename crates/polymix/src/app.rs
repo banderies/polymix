@@ -7,7 +7,7 @@ use crate::navigation::{NavAction, NavMode};
 use crate::renderer::{self, ColorVertex, GpuMesh, ObjectStyle, SceneRenderer};
 use crate::spacemouse::{self, SpaceMouse};
 use crate::scene::{History, ObjectId, Scene};
-use crate::tools::{self, Overlay, PointerInput, Tool, ToolCx, ToolOutcome, Viewport};
+use crate::tools::{self, DragPhase, Overlay, PointerInput, Tool, ToolCx, ToolOutcome, Viewport};
 use crate::ui_util;
 use eframe::egui_wgpu;
 use egui::{Color32, Key, PointerButton, RichText};
@@ -105,6 +105,8 @@ pub struct PolymixApp {
     import_job: Option<Job<ImportResult>>,
     export_job: Option<Job<String>>,
     nav_drag: Option<PointerButton>,
+    /// Right-button drag owned by the active tool: press position.
+    tool_rmb: Option<egui::Pos2>,
     /// Last pointer position seen over the viewport (for releases outside it).
     last_pointer: Option<egui::Pos2>,
     show_help: bool,
@@ -153,6 +155,7 @@ impl PolymixApp {
             import_job: None,
             export_job: None,
             nav_drag: None,
+            tool_rmb: None,
             last_pointer: None,
             show_help: false,
             space: SpaceMouse::start(&cc.egui_ctx),
@@ -932,7 +935,9 @@ impl PolymixApp {
                     ("Shift+Y", "Separate shells"),
                     ("Select: drag / Shift+drag", "Paint selection / deselect"),
                     ("Select: double-click", "Select connected part"),
-                    ("Select: [ ]", "Brush size"),
+                    ("Select / Sculpt: [ ], wheel (Meshmixer nav) or Shift+wheel (Fusion 360 nav)", "Brush size"),
+                    ("Select: right-drag (with a selection)", "Grow / shrink the selection"),
+                    ("Sculpt: right-drag", "Brush strength"),
                     ("Select: E / I / G / O / < >", "Connected / Invert / Groups / Optimize / Shrink-Grow"),
                     ("Select: X, F, D, Cmd+D", "Discard, Erase & Fill, Extrude, Offset"),
                     ("Select: R, Shift+R, B", "Remesh, Reduce, Smooth"),
@@ -945,6 +950,26 @@ impl PolymixApp {
                 }
             });
         });
+    }
+
+    /// Send a right-drag to the active tool.
+    fn tool_secondary(&mut self, ctx: &egui::Context, vp: Viewport, phase: DragPhase, pos: egui::Pos2, total: egui::Vec2) {
+        if let Some(mut t) = self.tools.pop() {
+            let mut cx = self.tool_cx(ctx, vp);
+            t.secondary_drag(phase, pos, total, &mut cx);
+            self.tools.push(t);
+        }
+    }
+
+    /// Offer the wheel to the active tool; true if it used it.
+    fn tool_wheel(&mut self, ctx: &egui::Context, vp: Viewport, delta: f32) -> bool {
+        let Some(mut t) = self.tools.pop() else { return false };
+        let used = {
+            let mut cx = self.tool_cx(ctx, vp);
+            t.wheel(delta, &mut cx)
+        };
+        self.tools.push(t);
+        used
     }
 
     /// Apply 3D mouse motion and buttons.
@@ -1053,10 +1078,30 @@ impl PolymixApp {
         let in_rect = hover.map(|p| rect.contains(p)).unwrap_or(false) && (response.hovered() || response.dragged());
         let nav = self.view.nav_mode;
         let primary_nav = nav.starts_navigation(PointerButton::Primary, mods);
+        // Tools may own right-drags (selection expand, brush strength); Alt keeps navigation.
+        let tool_claims_rmb = !mods.alt && !mods.shift && self.tools.last().is_some_and(|t| t.claims_secondary_drag(&self.scene));
+        if response.drag_started_by(PointerButton::Secondary) && tool_claims_rmb {
+            if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
+                self.tool_rmb = Some(p);
+                self.tool_secondary(&ctx, vp, DragPhase::Start, p, egui::Vec2::ZERO);
+            }
+        }
         for btn in [PointerButton::Secondary, PointerButton::Middle, PointerButton::Primary] {
+            if self.tool_rmb.is_some() && btn == PointerButton::Secondary {
+                continue;
+            }
             if response.drag_started_by(btn) && nav.starts_navigation(btn, mods) {
                 self.nav_drag = Some(btn);
                 break;
+            }
+        }
+        if let Some(start) = self.tool_rmb {
+            let pos = hover.unwrap_or(start);
+            let down = ctx.input(|i| i.pointer.button_down(PointerButton::Secondary));
+            let phase = if down { DragPhase::Move } else { DragPhase::End };
+            self.tool_secondary(&ctx, vp, phase, pos, pos - start);
+            if !down {
+                self.tool_rmb = None;
             }
         }
         let nav_active = self.nav_drag.is_some();
@@ -1075,9 +1120,21 @@ impl PolymixApp {
             }
         }
         if in_rect {
+            // Shift+wheel arrives as horizontal scroll from a mouse wheel on macOS.
+            let wheel = if scroll.y != 0.0 { scroll.y } else { scroll.x };
+            // Brush tools take the wheel for their size: the plain wheel in Meshmixer
+            // navigation, Shift+wheel in Fusion 360 navigation (where the wheel zooms).
+            let to_tool = match nav {
+                NavMode::Meshmixer => !mods.shift && !mods.command,
+                NavMode::Fusion360 => mods.shift,
+            };
+            let mut scroll_y = scroll.y;
+            if wheel != 0.0 && to_tool && self.tool_wheel(&ctx, vp, wheel) {
+                scroll_y = 0.0;
+            }
             let mut factor = 1.0f64;
-            if scroll.y != 0.0 {
-                factor *= (-scroll.y as f64 * 0.0025).exp();
+            if scroll_y != 0.0 {
+                factor *= (-scroll_y as f64 * 0.0025).exp();
             }
             if zoom_delta != 1.0 {
                 factor /= zoom_delta as f64;

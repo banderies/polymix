@@ -36,6 +36,8 @@ pub struct SculptTool {
     hover: Option<(DVec3, f64)>,
     /// Keep open-boundary vertices fixed.
     hold_boundary: bool,
+    /// Strength when a right-drag (strength adjust) started.
+    strength_drag: Option<f64>,
 }
 
 struct SculptStroke {
@@ -49,7 +51,7 @@ struct SculptStroke {
 
 impl SculptTool {
     pub fn new(_cx: &mut ToolCx) -> Self {
-        Self { brush: Brush::RobustSmooth, size_pct: 4.0, strength: 0.5, stroke: None, armed: false, hover: None, hold_boundary: true }
+        Self { brush: Brush::RobustSmooth, size_pct: 4.0, strength: 0.5, stroke: None, armed: false, hover: None, hold_boundary: true, strength_drag: None }
     }
 }
 
@@ -164,7 +166,7 @@ impl Tool for SculptTool {
             ui.add(egui::Slider::new(&mut self.strength, 0.01..=1.0));
         });
         ui.checkbox(&mut self.hold_boundary, "Hold open boundaries");
-        ui.small("Drag on the surface. Cmd/Ctrl inverts Inflate. [ ] change size.");
+        ui.small("Drag on the surface. Cmd/Ctrl inverts Inflate. Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation). Right-drag: strength.");
         ui.add_space(8.0);
         if ui.button("Done").clicked() {
             return ToolOutcome::Close;
@@ -242,6 +244,25 @@ impl Tool for SculptTool {
     fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
         if let Some((c, r)) = self.hover {
             ov.brush = Some((c.as_vec3(), r as f32));
+        }
+    }
+
+    fn wheel(&mut self, delta: f32, _cx: &mut ToolCx) -> bool {
+        self.size_pct = (self.size_pct * (delta * 0.004).exp()).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        true
+    }
+
+    fn claims_secondary_drag(&self, _scene: &Scene) -> bool {
+        true
+    }
+
+    fn secondary_drag(&mut self, phase: DragPhase, _pos: egui::Pos2, total: egui::Vec2, cx: &mut ToolCx) {
+        // Horizontal right-drag sets the strength, as in Meshmixer.
+        let s0 = *self.strength_drag.get_or_insert(self.strength);
+        self.strength = (s0 + total.x as f64 * 0.003).clamp(0.01, 1.0);
+        *cx.status = format!("Strength {:.2}", self.strength);
+        if phase == DragPhase::End {
+            self.strength_drag = None;
         }
     }
 
