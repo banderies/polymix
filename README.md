@@ -76,7 +76,7 @@ Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |
 | Switching tools | Opening another tool (hotkey, palette, menu) accepts the current one, as in Meshmixer; only `Esc` / Cancel discards |
-| With a selection | `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `Cmd+F` smooth, `B` smooth boundary, `Y` separate, `Cmd+B` bridge, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, `S` clear selection |
+| With a selection | `T` transform the selected faces, `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `Cmd+F` smooth, `B` smooth boundary, `Y` separate, `Cmd+B` bridge, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, `S` clear selection |
 | Select tool | Drag on the model: paint · Drag from the background: lasso (closed loop selects inside) or laser cut (open curve selects the smaller side, through the model) · Double-click a triangle at an open edge: select the ring around that hole (then `F` to erase & fill it cleanly) · Double-click elsewhere: connected part · Shift: deselect |
 
 Shading: *View → Sharp edges* (on by default) keeps hard corners on CAD parts crisp: edges
@@ -89,7 +89,7 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 |---|---|
 | Select | Sphere brush (fixed size on the model), lasso and laser lasso (through or visible only), hole-border ring, grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
 | Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag |
-| Edit | Transform (gizmo + numeric, centre, drop to ground, principal axes), Plane Cut, Mirror, Make Solid, Remesh, Reduce, Smooth, Offset / Hollow, Boolean (union/difference/intersection), Bridge, Separate Shells, Combine, Duplicate, Flip normals |
+| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Plane Cut, Mirror, Make Solid, Remesh, Reduce, Smooth, Offset / Hollow, Boolean (union/difference/intersection; exact or volumetric), Bridge, Separate Shells, Combine, Duplicate, Flip normals |
 | Vessel | Trim branch, Flow extensions, Cap open ends, Measure diameter, Centerline, Boundary patches / CFD export, Check for CFD |
 | Analysis | Inspector, Measure, Units / Dimensions, Check for CFD, Deviation |
 

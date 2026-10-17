@@ -15,8 +15,31 @@ pub enum Space {
 /// Rotation snapping step while "Enable Snapping" is on.
 const SNAP_ANGLE_DEG: f64 = 15.0;
 
+/// Face Transform (T with a selection): only the selected faces move.
+struct FaceRegion {
+    tris: Vec<u32>,
+    /// One pivot for all selected pieces; otherwise each connected piece turns and scales
+    /// about its own centre.
+    shared_frame: bool,
+    /// The selection's border vertices stay put (the region stretches instead of the
+    /// faces around it).
+    fixed_boundary: bool,
+    /// Moving vertices per piece, with the piece's pivot.
+    groups: Vec<(Vec<u32>, DVec3)>,
+}
+
+/// Frame with Z along the area-weighted normal of `tris`.
+fn region_frame(m: &Mesh, tris: &[u32]) -> DQuat {
+    let n = tris.iter().map(|&t| m.tri_cross(t)).sum::<DVec3>();
+    let n = if n.length_squared() > 0.0 { n.normalize() } else { DVec3::Z };
+    let (u, _) = mm_core::geom::orthonormal_basis(n);
+    let u = u.normalize();
+    DQuat::from_mat3(&DMat3::from_cols(u, n.cross(u), n)).normalize()
+}
+
 pub struct TransformTool {
     object: Option<ObjectId>,
+    region: Option<FaceRegion>,
     /// The object's mesh when the tool opened (to detect changes from elsewhere).
     original: std::sync::Arc<Mesh>,
     /// Mesh the parameters below apply to: the original, or the result baked when the
@@ -93,10 +116,14 @@ fn nice_step(x: f64) -> f64 {
 
 /// Extents of `m` along the unit axes `axes`, and the centre of that box.
 fn extents_along(m: &Mesh, axes: [DVec3; 3]) -> (DVec3, DVec3) {
+    extents_of(m.vertex_ids().map(|v| m.vertex(v)), axes)
+}
+
+/// Extents of `points` along the unit axes `axes`, and the centre of that box.
+fn extents_of(points: impl Iterator<Item = DVec3>, axes: [DVec3; 3]) -> (DVec3, DVec3) {
     let mut lo = DVec3::splat(f64::INFINITY);
     let mut hi = DVec3::splat(f64::NEG_INFINITY);
-    for v in m.vertex_ids() {
-        let p = m.vertex(v);
+    for p in points {
         let q = DVec3::new(p.dot(axes[0]), p.dot(axes[1]), p.dot(axes[2]));
         lo = lo.min(q);
         hi = hi.max(q);
@@ -116,6 +143,7 @@ impl TransformTool {
         };
         let mut t = Self {
             object,
+            region: None,
             original: source.clone(),
             source,
             frame,
@@ -139,6 +167,67 @@ impl TransformTool {
         t
     }
 
+    /// Face Transform: move only the active object's selected faces.
+    pub fn new_faces(cx: &mut ToolCx) -> Self {
+        let mut t = Self::new(cx);
+        let tris: Vec<u32> = cx.scene.active().map(|o| o.selection.iter().collect()).unwrap_or_default();
+        if !tris.is_empty() {
+            t.frame = region_frame(&t.source, &tris);
+            t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new() });
+            t.update_region();
+        }
+        t
+    }
+
+    /// Recompute the moving vertices and pivots of a face region (after its options change
+    /// or the source is baked).
+    fn update_region(&mut self) {
+        let f = self.scale_frame();
+        let axes = AXES.map(|a| f * a);
+        let m = &*self.source;
+        let Some(r) = self.region.as_mut() else { return };
+        let selected: std::collections::HashSet<u32> = r.tris.iter().copied().collect();
+        let pieces: Vec<Vec<u32>> = if r.shared_frame {
+            vec![r.tris.clone()]
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for &t in &r.tris {
+                if !seen.insert(t) {
+                    continue;
+                }
+                let mut piece = vec![t];
+                let mut stack = vec![t];
+                while let Some(x) = stack.pop() {
+                    for n in m.tri_neighbors(x) {
+                        if n != mm_core::INVALID && selected.contains(&n) && seen.insert(n) {
+                            piece.push(n);
+                            stack.push(n);
+                        }
+                    }
+                }
+                out.push(piece);
+            }
+            out
+        };
+        let fixed = r.fixed_boundary;
+        r.groups = pieces
+            .into_iter()
+            .map(|piece| {
+                let mut verts: Vec<u32> = piece.iter().flat_map(|&t| m.triangle(t)).collect();
+                verts.sort_unstable();
+                verts.dedup();
+                if fixed {
+                    verts.retain(|&v| m.vertex_triangles(v).iter().all(|t| selected.contains(t)));
+                }
+                let pivot = extents_of(verts.iter().map(|&v| m.vertex(v)), axes).1;
+                (verts, pivot)
+            })
+            .collect();
+        self.pivot = extents_of(r.groups.iter().flat_map(|g| g.0.iter()).map(|&v| m.vertex(v)), axes).1;
+        self.dirty = true;
+    }
+
     /// Axes the scale applies along, in the source's coordinates.
     fn scale_frame(&self) -> DQuat {
         match self.space {
@@ -156,6 +245,10 @@ impl TransformTool {
     }
 
     fn reset_pivot(&mut self) {
+        if self.region.is_some() {
+            self.update_region();
+            return;
+        }
         let f = self.scale_frame();
         self.pivot = extents_along(&self.source, AXES.map(|a| f * a)).1;
     }
@@ -176,13 +269,25 @@ impl TransformTool {
     }
 
     fn rebuild(&mut self) {
-        let m = self.matrix();
         let mut mesh = (*self.source).clone();
-        mesh.transform(|p| m.transform_point3(p));
-        if m.determinant() < 0.0 {
-            mesh.reverse_orientation();
+        if let Some(r) = &self.region {
+            let lin = self.linear();
+            for (verts, pivot) in &r.groups {
+                let pivot = if r.shared_frame { self.pivot } else { *pivot };
+                for &v in verts {
+                    mesh.set_vertex(v, pivot + self.translate + lin * (self.source.vertex(v) - pivot));
+                }
+            }
+            let moving = r.groups.iter().flat_map(|g| g.0.iter()).map(|&v| mesh.vertex(v));
+            self.sizes = extents_of(moving, self.axes()).0;
+        } else {
+            let m = self.matrix();
+            mesh.transform(|p| m.transform_point3(p));
+            if m.determinant() < 0.0 {
+                mesh.reverse_orientation();
+            }
+            self.sizes = extents_along(&mesh, self.axes()).0;
         }
-        self.sizes = extents_along(&mesh, self.axes()).0;
         self.preview = Some(mesh);
         self.dirty = false;
     }
@@ -221,12 +326,15 @@ impl TransformTool {
         if self.dirty || self.preview.is_none() {
             self.rebuild();
         }
-        cx.history.push("Transform", cx.scene);
+        cx.history.push(self.name(), cx.scene);
         let frame = (self.rotation * self.frame).normalize();
+        let whole = self.region.is_none();
         if let (Some(o), Some(m)) = (cx.scene.get_mut(id), self.preview.take()) {
             let sel = o.selection.clone();
             o.mesh = std::sync::Arc::new(m);
-            o.frame = frame;
+            if whole {
+                o.frame = frame;
+            }
             o.selection = sel;
             o.touch_selection();
         }
@@ -372,11 +480,15 @@ impl TransformTool {
 
 impl Tool for TransformTool {
     fn name(&self) -> &'static str {
-        "Transform"
+        if self.region.is_some() {
+            "Face Transform"
+        } else {
+            "Transform"
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
-        ui_util::section(ui, "Transform");
+        ui_util::section(ui, self.name());
         if self.object.is_none() {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
@@ -404,6 +516,17 @@ impl Tool for TransformTool {
             self.reset_pivot();
             self.rebuild();
         }
+        if let Some(r) = &mut self.region {
+            let mut region_changed = false;
+            ui.horizontal(|ui| {
+                region_changed |= ui.checkbox(&mut r.shared_frame, "Shared frame").on_hover_text("Off: each selected piece turns and scales about its own centre").changed();
+                region_changed |= ui.checkbox(&mut r.fixed_boundary, "Fixed boundary").on_hover_text("Keep the selection's border in place").changed();
+            });
+            if region_changed {
+                self.update_region();
+                self.rebuild();
+            }
+        }
         let f = self.scale_frame();
         let step = (self.source.bounds().diagonal() * 0.002).max(1e-4);
         ui.label("Translate");
@@ -420,7 +543,9 @@ impl Tool for TransformTool {
         ui.label("Rotate (degrees, XYZ)");
         let local_rot = f.inverse() * self.rotation * f;
         let (rx, ry, rz) = local_rot.to_euler(EulerRot::XYZ);
-        let mut deg = [rx.to_degrees() + 0.0, ry.to_degrees() + 0.0, rz.to_degrees() + 0.0];
+        // Round-off would show as "-0".
+        let tidy = |r: f64| if r.abs() < 1e-9 { 0.0 } else { r.to_degrees() };
+        let mut deg = [tidy(rx), tidy(ry), tidy(rz)];
         let mut rot_changed = false;
         ui.horizontal(|ui| {
             for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
@@ -472,8 +597,18 @@ impl Tool for TransformTool {
             ui.checkbox(&mut self.absolute, "Absolute coords/sizes").on_hover_text("Snap the resulting position and size to the grid, not the change");
         }
         ui.add_space(4.0);
+        let whole = self.region.is_none();
         ui.horizontal_wrapped(|ui| {
             let b = self.source.bounds();
+            if !whole {
+                if ui.button("Reset").clicked() {
+                    self.translate = DVec3::ZERO;
+                    self.rotation = DQuat::IDENTITY;
+                    self.scale = DVec3::ONE;
+                    changed = true;
+                }
+                return;
+            }
             if ui.button("Center at origin").on_hover_text("Move the pivot (box centre) to the origin").clicked() {
                 self.translate = -self.pivot;
                 changed = true;
@@ -689,6 +824,7 @@ mod tests {
         let source = std::sync::Arc::new(m);
         let mut t = TransformTool {
             object: Some(1),
+            region: None,
             original: source.clone(),
             source,
             frame,
@@ -763,5 +899,85 @@ mod tests {
         t.absolute = true;
         assert!((t.snapped_size(2.3, 2.1) - 2.5).abs() < 1e-12);
         assert!((t.snapped_size(0.1, 2.0) - 0.1).abs() < 1e-12, "never snaps to zero");
+    }
+}
+
+#[cfg(test)]
+mod face_tests {
+    use super::*;
+    use mm_core::primitives;
+
+    fn face_tool(m: Mesh, tris: Vec<u32>) -> TransformTool {
+        let source = std::sync::Arc::new(m);
+        let mut t = TransformTool {
+            object: Some(1),
+            region: None,
+            original: source.clone(),
+            frame: region_frame(&source, &tris),
+            source,
+            space: Space::Local,
+            preview: None,
+            translate: DVec3::ZERO,
+            rotation: DQuat::IDENTITY,
+            scale: DVec3::ONE,
+            uniform: false,
+            snap: false,
+            absolute: false,
+            snap_step: 0.5,
+            pivot: DVec3::ZERO,
+            sizes: DVec3::ZERO,
+            dirty: true,
+            drag: None,
+            hover: None,
+        };
+        t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new() });
+        t.update_region();
+        t.rebuild();
+        t
+    }
+
+    #[test]
+    fn pull_selection_along_its_normal() {
+        let m = primitives::plane_grid(4.0, 4.0, 8, 8);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).truncate().length() < 1.0).collect();
+        let selected: std::collections::HashSet<u32> = sel.iter().flat_map(|&t| m.triangle(t)).collect();
+        for fixed in [false, true] {
+            let mut t = face_tool(m.clone(), sel.clone());
+            t.region.as_mut().unwrap().fixed_boundary = fixed;
+            t.update_region();
+            // Local Z is the selection's normal.
+            assert!((t.frame * DVec3::Z - DVec3::Z).length() < 1e-9);
+            t.translate = t.frame * DVec3::Z * 0.5;
+            t.rebuild();
+            let out = t.preview.as_ref().unwrap();
+            for v in m.vertex_ids() {
+                let z = out.vertex(v).z;
+                let border = m.vertex_triangles(v).iter().any(|t| !sel.contains(t));
+                let expect = if selected.contains(&v) && !(fixed && border) { 0.5 } else { 0.0 };
+                assert!((z - expect).abs() < 1e-12, "fixed {fixed}: vertex {v} at {z}, want {expect}");
+            }
+        }
+    }
+
+    #[test]
+    fn separate_frames_scale_each_piece_in_place() {
+        let m = primitives::plane_grid(6.0, 2.0, 12, 4);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).x.abs() > 1.5).collect();
+        let centre = |out: &Mesh, left: bool| {
+            let pts: Vec<DVec3> = sel.iter().filter(|&&t| (m.tri_centroid(t).x < 0.0) == left).map(|&t| out.tri_centroid(t)).collect();
+            pts.iter().sum::<DVec3>() / pts.len() as f64
+        };
+        let mut shared = face_tool(m.clone(), sel.clone());
+        shared.scale = DVec3::splat(0.5);
+        shared.rebuild();
+        let mut apart = face_tool(m.clone(), sel.clone());
+        apart.region.as_mut().unwrap().shared_frame = false;
+        apart.update_region();
+        apart.scale = DVec3::splat(0.5);
+        apart.rebuild();
+        let before = centre(&m, true);
+        // Shared: the left piece moves toward the common centre; separate: it stays.
+        assert!(centre(shared.preview.as_ref().unwrap(), true).x > before.x + 0.5);
+        assert!((centre(apart.preview.as_ref().unwrap(), true) - before).length() < 1e-9);
     }
 }

@@ -931,6 +931,9 @@ impl Tool for SelectTool {
             self.request = Some(Box::new(ops::JoinTool::new(cx)));
         } else if i.key_pressed(Key::Y) && !cmd && !shift {
             run(&mut |x| commands::separate_selection(x, false));
+        } else if i.key_pressed(Key::T) && !cmd && !shift && cx.scene.active().is_some_and(|o| !o.selection.is_empty()) {
+            // T with a selection transforms just the selected faces.
+            self.request = Some(Box::new(super::transform::TransformTool::new_faces(cx)));
         } else {
             return false;
         }

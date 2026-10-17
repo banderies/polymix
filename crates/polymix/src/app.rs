@@ -61,6 +61,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "select" => Box::new(tools::select::SelectTool::default()),
         "inspector" => Box::new(tools::inspector::InspectorTool::new(cx)),
         "transform" => Box::new(tools::transform::TransformTool::new(cx)),
+        "facetransform" => Box::new(tools::transform::TransformTool::new_faces(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),

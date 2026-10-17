@@ -163,7 +163,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Grow Hair | ⚪ ❌ | |
 | **Deform** menu: Smooth (⌘F) | ✅ | |
 | Deform: Smooth Boundary ("Smooth Loop", B) | ✅ | Meshmixer's parameters and defaults; remesher smooths the border curve |
-| Deform: Soft Transform (Shift+T) / Transform selection (T) | ❌ | Polymix Transform is whole-object only |
+| Deform: Transform selection (T) | ✅ | Face Transform: T in Select with a selection; frame along the selection normal; Shared Frame, Fixed Boundary |
+| Deform: Soft Transform (Shift+T) | ❌ | |
 | Deform: Warp | ❌ | |
 | **Convert To**: Open Part / Solid Part / Stamp | ⚪ ❌ | |
 
