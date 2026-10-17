@@ -142,8 +142,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Symmetry plane (Set / Reset) | ❌ | |
 | Magic wand | ❌ | |
 | **Modify Selection** menu: Select All, Expand/Contract Ring, Optimize Boundary, Invert, Invert (Connected), Expand to Connected, Expand to Groups | ✅ | Ctrl+A, < >, O, I, Shift+I, E, G |
-| Modify: Expand to Same Groups (non-connected) | ❌ | |
-| Modify: Select Visible | ❌ | |
+| Modify: Expand to Same Groups (non-connected) | ✅ | "Same groups"; `G` now expands through connected faces only, as in Meshmixer |
+| Modify: Select Visible | ✅ | |
 | **Edit** menu: Discard (X) | ✅ | |
 | Edit: Erase & Fill (F) | ✅ | Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth, Scale, Bulge, Create New Groups (Meshmixer's defaults) |
 | Edit: Flip Normals | ✅ | |

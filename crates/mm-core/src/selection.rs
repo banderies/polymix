@@ -179,6 +179,23 @@ impl TriSelection {
     }
 
     /// Expand to whole face groups touched by the selection.
+    /// Grow through edge-connected triangles that share the group of the triangle they are
+    /// reached from (Meshmixer "Expand to Groups").
+    pub fn expand_to_connected_groups(&mut self, m: &Mesh) {
+        let mut stack: Vec<u32> = self.iter().collect();
+        while let Some(t) = stack.pop() {
+            let g = m.tri_group(t);
+            for n in m.tri_neighbors(t) {
+                if n != INVALID && !self.contains(n) && m.tri_group(n) == g {
+                    self.insert(n);
+                    stack.push(n);
+                }
+            }
+        }
+    }
+
+    /// Add every triangle whose group occurs in the selection, connected or not
+    /// (Meshmixer "Expand to Same Groups").
     pub fn expand_to_groups(&mut self, m: &Mesh) {
         let mut groups: Vec<i32> = self.iter().map(|t| m.tri_group(t)).collect();
         groups.sort_unstable();
@@ -253,6 +270,28 @@ impl TriSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connected_vs_same_group_expansion() {
+        // Two separate patches of group 1 on a grid; start from one triangle of the first.
+        let mut m = crate::primitives::plane_grid(10.0, 2.0, 20, 4);
+        let ids: Vec<u32> = m.triangle_ids().collect();
+        for &t in &ids {
+            let x = m.tri_centroid(t).x;
+            if (-4.0..-2.0).contains(&x) || (2.0..4.0).contains(&x) {
+                m.set_tri_group(t, 1);
+            }
+        }
+        let seed = ids.iter().copied().find(|&t| (-4.0..-2.0).contains(&m.tri_centroid(t).x)).unwrap();
+        let mut a = TriSelection::new(&m);
+        a.insert(seed);
+        a.expand_to_connected_groups(&m);
+        assert!(a.iter().all(|t| m.tri_centroid(t).x < 0.0 && m.tri_group(t) == 1));
+        let mut b = TriSelection::new(&m);
+        b.insert(seed);
+        b.expand_to_groups(&m);
+        assert_eq!(b.len(), 2 * a.len());
+    }
     use crate::primitives;
 
     #[test]

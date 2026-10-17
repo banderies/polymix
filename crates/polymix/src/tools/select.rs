@@ -120,6 +120,33 @@ fn to_dvec(p: egui::Pos2) -> DVec2 {
     DVec2::new(p.x as f64, p.y as f64)
 }
 
+/// Is triangle `t` facing the camera and not hidden behind other surface?
+#[derive(Clone, Copy)]
+struct ViewTest {
+    eye: DVec3,
+    fwd: DVec3,
+    ortho: bool,
+}
+
+impl ViewTest {
+    fn new(camera: &crate::camera::Camera) -> Self {
+        Self { eye: camera.eye(), fwd: camera.forward(), ortho: camera.orthographic }
+    }
+
+    fn visible(&self, mesh: &Mesh, bvh: &mm_core::Bvh, t: u32) -> bool {
+        let c = mesh.tri_centroid(t);
+        let to_eye = if self.ortho { -self.fwd } else { (self.eye - c).normalize() };
+        if mesh.tri_normal(t).dot(to_eye) <= 0.0 {
+            return false;
+        }
+        // Occlusion: cast from the centroid toward the eye.
+        let origin = c + to_eye * 1e-6 * (1.0 + c.length());
+        let ray = Ray::new(origin, to_eye);
+        let max_t = if self.ortho { f64::INFINITY } else { self.eye.distance(c) };
+        bvh.raycast_filtered(mesh, &ray, max_t, |x| x != t).is_none()
+    }
+}
+
 impl SelectTool {
     fn paint_at(&mut self, cx: &mut ToolCx, pos: egui::Pos2) {
         let Some(stroke) = &mut self.stroke else { return };
@@ -169,9 +196,7 @@ impl SelectTool {
         let Some(id) = cx.scene.active.filter(|id| cx.scene.get(*id).is_some()) else { return };
         let vp = cx.vp;
         let view_proj = cx.camera.view_proj(vp.aspect());
-        let eye = cx.camera.eye();
-        let ortho = cx.camera.orthographic;
-        let fwd = cx.camera.forward();
+        let view = ViewTest::new(cx.camera);
         let through = self.through;
         cx.snapshot(if curve.closed { "Lasso select" } else { "Laser select" });
         let o = cx.scene.get_mut(id).unwrap();
@@ -203,21 +228,7 @@ impl SelectTool {
             .par_iter()
             .filter(|&&(_, inside)| inside == pick_inside)
             .map(|&(t, _)| t)
-            .filter(|&t| {
-                if through {
-                    return true;
-                }
-                let c = mesh.tri_centroid(t);
-                let to_eye = if ortho { -fwd } else { (eye - c).normalize() };
-                if mesh.tri_normal(t).dot(to_eye) <= 0.0 {
-                    return false;
-                }
-                // Occlusion: cast from the centroid toward the eye.
-                let origin = c + to_eye * 1e-6 * (1.0 + c.length());
-                let ray = Ray::new(origin, to_eye);
-                let max_t = if ortho { f64::INFINITY } else { eye.distance(c) };
-                bvh.raycast_filtered(&mesh, &ray, max_t, |x| x != t).is_none()
-            })
+            .filter(|&t| through || view.visible(&mesh, &bvh, t))
             .collect();
         o.selection.sync(&mesh);
         for t in hits {
@@ -226,6 +237,38 @@ impl SelectTool {
             } else {
                 o.selection.insert(t);
             }
+        }
+        o.touch_selection();
+        *cx.status = format!("{} triangles selected", o.selection.len());
+    }
+
+    /// Add every triangle of the active object that is visible in the current view
+    /// (Meshmixer: Modify > Select Visible).
+    fn select_visible(&mut self, cx: &mut ToolCx) {
+        let Some(id) = cx.scene.active.filter(|id| cx.scene.get(*id).is_some()) else { return };
+        let view_proj = cx.camera.view_proj(cx.vp.aspect());
+        let view = ViewTest::new(cx.camera);
+        cx.snapshot("Select visible");
+        let o = cx.scene.get_mut(id).unwrap();
+        let bvh = o.bvh();
+        let mesh = o.mesh.clone();
+        let hits: Vec<u32> = mesh
+            .triangle_ids()
+            .collect::<Vec<_>>()
+            .par_iter()
+            .copied()
+            .filter(|&t| {
+                let clip = view_proj * mesh.tri_centroid(t).extend(1.0);
+                if clip.w <= 0.0 {
+                    return false;
+                }
+                let ndc = clip.truncate() / clip.w;
+                ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && view.visible(&mesh, &bvh, t)
+            })
+            .collect();
+        o.selection.sync(&mesh);
+        for t in hits {
+            o.selection.insert(t);
         }
         o.touch_selection();
         *cx.status = format!("{} triangles selected", o.selection.len());
@@ -319,8 +362,12 @@ impl Tool for SelectTool {
             sc(ui, "Shrink", "<", SelectCmd::Contract, self);
             sc(ui, "Connected", "E", SelectCmd::Connected, self);
             sc(ui, "Invert connected", "Shift+I", SelectCmd::InvertConnected, self);
-            sc(ui, "To groups", "G", SelectCmd::ExpandToGroups, self);
+            sc(ui, "To groups", "G: connected faces of the same groups", SelectCmd::ExpandToGroups, self);
+            sc(ui, "Same groups", "All faces of the selected groups", SelectCmd::ExpandToSameGroups, self);
             sc(ui, "Optimize boundary", "O", SelectCmd::OptimizeBoundary, self);
+            if ui.button("Visible").on_hover_text("Select every face visible in the view").clicked() {
+                self.select_visible(cx);
+            }
         });
 
         let has_sel = n_sel > 0;
@@ -599,6 +646,20 @@ pub fn hole_ring(mesh: &Mesh, t: u32) -> Vec<u32> {
 mod tests {
     use super::*;
     use mm_core::primitives;
+
+    #[test]
+    fn view_test_sees_the_front_half() {
+        let m = primitives::icosphere(1.0, 3);
+        let bvh = mm_core::Bvh::build(&m);
+        let mut cam = crate::camera::Camera::default();
+        cam.focus(&m.bounds());
+        let view = ViewTest::new(&cam);
+        let n = m.triangle_ids().filter(|&t| view.visible(&m, &bvh, t)).count();
+        let frac = n as f64 / m.triangle_count() as f64;
+        assert!((0.3..0.5).contains(&frac), "visible fraction {frac}");
+        // Visible triangles face the eye.
+        assert!(m.triangle_ids().filter(|&t| view.visible(&m, &bvh, t)).all(|t| m.tri_normal(t).dot(cam.eye() - m.tri_centroid(t)) > 0.0));
+    }
 
     #[test]
     fn hole_ring_surrounds_the_hole() {

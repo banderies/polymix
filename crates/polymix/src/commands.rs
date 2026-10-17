@@ -33,7 +33,10 @@ pub enum SelectCmd {
     Contract,
     Connected,
     InvertConnected,
+    /// Connected triangles of the same groups (G).
     ExpandToGroups,
+    /// Every triangle of the selected groups, connected or not.
+    ExpandToSameGroups,
     OptimizeBoundary,
 }
 
@@ -64,7 +67,8 @@ pub fn selection_command(cx: &mut CmdCx, cmd: SelectCmd) {
                 }
             }
         }
-        SelectCmd::ExpandToGroups => sel.expand_to_groups(&m),
+        SelectCmd::ExpandToGroups => sel.expand_to_connected_groups(&m),
+        SelectCmd::ExpandToSameGroups => sel.expand_to_groups(&m),
         SelectCmd::OptimizeBoundary => sel.optimize_boundary(&m, 8),
     }
     o.touch_selection();
