@@ -288,6 +288,14 @@ impl TriSelection {
     }
 }
 
+/// Magic wand: the faces edge-connected to `seed` whose normals are within `max_angle`
+/// (radians) of the seed's normal, not crossing creases sharper than `crease_cos`.
+pub fn magic_wand(m: &Mesh, seed: u32, max_angle: f64, crease_cos: Option<f64>) -> Vec<u32> {
+    let n0 = m.tri_normal(seed);
+    let c = max_angle.cos();
+    flood_across(m, seed, |t| m.tri_normal(t).dot(n0) >= c, crease_cos)
+}
+
 /// One brush stamp for [`TriSelection::paint_brush`].
 #[derive(Clone, Copy, Debug)]
 pub struct BrushStamp {
@@ -478,6 +486,20 @@ mod tests {
                 assert!(free.iter().any(|t| m.tri_normal(t).z < 0.5), "without a limit it spills over");
             }
         }
+    }
+
+    #[test]
+    fn magic_wand_regions() {
+        let cube = primitives::cube(2.0, 4);
+        let top = cube.triangle_ids().find(|&t| cube.tri_normal(t).z > 0.99).unwrap();
+        let face = magic_wand(&cube, top, 20f64.to_radians(), None);
+        assert_eq!(face.len(), 32);
+        assert!(face.iter().all(|&t| cube.tri_normal(t).z > 0.99));
+        let sphere = primitives::icosphere(1.0, 4);
+        let pole = sphere.triangle_ids().max_by(|&a, &b| sphere.tri_centroid(a).z.total_cmp(&sphere.tri_centroid(b).z)).unwrap();
+        let cap = magic_wand(&sphere, pole, 30f64.to_radians(), None);
+        assert!(cap.iter().all(|&t| sphere.tri_centroid(t).z > 30f64.to_radians().cos() - 0.05));
+        assert!(cap.len() > 50);
     }
 
     #[test]

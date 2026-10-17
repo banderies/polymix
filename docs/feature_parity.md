@@ -140,7 +140,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Allow Back Faces | ✅ | Brush filter; the lasso has "selects through the model" |
 | Restrict To Exterior Faces | ✅ | Winding-number test: skips faces buried inside other parts |
 | Symmetry plane (Set / Reset) | 🟡 | Mirror across the object's centre on X/Y/Z; free plane placement ❌ |
-| Magic wand | ❌ | |
+| Magic wand | ✅ | Select → Wand: connected faces within an angle of the clicked face's normal |
 | **Modify Selection** menu: Select All, Expand/Contract Ring, Optimize Boundary, Invert, Invert (Connected), Expand to Connected, Expand to Groups | ✅ | Ctrl+A, < >, O, I, Shift+I, E, G |
 | Modify: Expand to Same Groups (non-connected) | ✅ | "Same groups"; `G` now expands through connected faces only, as in Meshmixer |
 | Modify: Select Visible | ✅ | |

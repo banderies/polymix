@@ -55,7 +55,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       Constant / Axis, EndType Offset / Flat, Soft Transition, Connected, Preserve Boundary /
       Groups, Accuracy, Regularity). Offset's Connected / Accuracy / Preserve Groups wait for a
       live check of their meaning in Meshmixer.
-- [ ] **M2.8 Magic wand** selection.
+- [x] **M2.8 Magic wand** selection (Select → Wand: click a face, angle threshold).
 
 ## M3 — Repair and topology
 

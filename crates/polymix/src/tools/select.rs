@@ -20,6 +20,8 @@ use rayon::prelude::*;
 pub enum SelectMode {
     Brush,
     Lasso,
+    /// Click a face to select the connected faces facing (nearly) the same way.
+    Wand,
 }
 
 pub struct SelectTool {
@@ -41,6 +43,8 @@ pub struct SelectTool {
     pub expand_mode: ExpandMode,
     /// Brush spread and geodesic growth stop at edges sharper than this (degrees; 0 = off).
     pub crease_deg: f32,
+    /// Magic wand: maximum angle (degrees) between a face's normal and the clicked face's.
+    pub wand_deg: f32,
     exterior: Option<ExteriorCache>,
     stroke: Option<Stroke>,
     /// Screen curve being drawn (lasso or laser).
@@ -182,6 +186,7 @@ impl Default for SelectTool {
             symmetry: None,
             expand_mode: ExpandMode::Geodesic,
             crease_deg: 0.0,
+            wand_deg: 20.0,
             exterior: None,
             stroke: None,
             curve: None,
@@ -388,6 +393,23 @@ impl SelectTool {
         *cx.status = format!("{} triangles selected", o.selection.len());
     }
 
+    fn wand(&mut self, cx: &mut ToolCx, id: ObjectId, seed: u32, deselect: bool) {
+        cx.snapshot("Magic wand");
+        let crease = self.crease_cos();
+        let Some(o) = cx.scene.get_mut(id) else { return };
+        let mesh = o.mesh.clone();
+        o.selection.sync(&mesh);
+        for t in mm_core::selection::magic_wand(&mesh, seed, (self.wand_deg as f64).to_radians(), crease) {
+            if deselect {
+                o.selection.remove(t);
+            } else {
+                o.selection.insert(t);
+            }
+        }
+        o.touch_selection();
+        *cx.status = format!("{} triangles selected", o.selection.len());
+    }
+
     /// Add a finished surface curve; close the loop when it ends near the first curve's start.
     fn finish_surface_curve(&mut self, cx: &mut ToolCx, pts: SurfaceCurve, deselect: bool) {
         let Some(id) = cx.scene.active else { return };
@@ -510,6 +532,7 @@ impl Tool for SelectTool {
             "sphere" => self.brush_shape = mm_core::BrushShape::Sphere,
             "disc" => self.brush_shape = mm_core::BrushShape::SphereDisc,
             "unwrap" => self.brush_shape = mm_core::BrushShape::Unwrap,
+            "wand" => self.mode = SelectMode::Wand,
             _ => {}
         }
     }
@@ -523,6 +546,7 @@ impl Tool for SelectTool {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.mode, SelectMode::Brush, "Brush");
             ui.selectable_value(&mut self.mode, SelectMode::Lasso, "Lasso");
+            ui.selectable_value(&mut self.mode, SelectMode::Wand, "Wand").on_hover_text("Magic wand: click a face to select the connected faces facing the same way");
         });
         match self.mode {
             SelectMode::Brush => {
@@ -570,6 +594,10 @@ impl Tool for SelectTool {
                 ui.add(egui::Slider::new(&mut self.crease_deg, 0.0..=180.0).suffix("°").text("Crease angle threshold"))
                     .on_hover_text("The brush and right-drag growth stop at edges sharper than this (0 = off)");
             }
+            SelectMode::Wand => {
+                ui.add(egui::Slider::new(&mut self.wand_deg, 1.0..=90.0).suffix("°").text("Angle threshold"))
+                    .on_hover_text("Faces whose normal differs from the clicked face's by less than this are selected");
+            }
             SelectMode::Lasso => {
                 let curves = self.surface.as_ref().map(|(_, c)| c.len()).unwrap_or(0);
                 ui.horizontal(|ui| {
@@ -590,6 +618,7 @@ impl Tool for SelectTool {
         ui.small(match self.mode {
             SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation)",
             SelectMode::Lasso => "Draw curves on the surface, turning the view between them; end near the start (or press Enter) to select the enclosed faces · A drag from the background is the laser lasso · Shift: deselect",
+            SelectMode::Wand => "Click a face to select the connected faces facing the same way (within the angle) · Shift: deselect · A drag from the background is the laser lasso",
         });
         ui.small("Double-click: hole border (on an open edge) or connected part · Right-drag: grow / shrink · S: clear");
 
@@ -698,6 +727,11 @@ impl Tool for SelectTool {
                     cx.scene.active = Some(id);
                     cx.snapshot("Brush select");
                     self.stroke = Some(Stroke { object: id, deselect, last: None });
+                }
+                // Magic wand: one click selects a region.
+                (SelectMode::Wand, Some((id, h))) => {
+                    cx.scene.active = Some(id);
+                    self.wand(cx, id, h.tid, deselect);
                 }
                 // Lasso mode on the model: a curve on the surface (part of a multi-curve loop).
                 (SelectMode::Lasso, Some((id, h))) => {
