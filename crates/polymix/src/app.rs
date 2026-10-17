@@ -64,6 +64,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "facetransform" => Box::new(tools::transform::TransformTool::new_faces(cx)),
         "softtransform" => Box::new(tools::transform::TransformTool::new_soft(cx)),
         "warp" => Box::new(tools::warp::WarpTool::new(cx)),
+        "align" => Box::new(tools::align::AlignTool::new(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
@@ -651,6 +652,9 @@ impl PolymixApp {
                     let cx = self.tool_cx(&ctx, vp);
                     if ui.button("Transform  (T)").clicked() {
                         open = Some("transform");
+                    }
+                    if ui.button("Align").on_hover_text("Put a picked face on the ground / world origin or against another object").clicked() {
+                        open = Some("align");
                     }
                     if ui.button("Plane Cut").clicked() {
                         open = Some("planecut");

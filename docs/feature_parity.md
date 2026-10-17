@@ -190,7 +190,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Mirror | ✅ | Weld at the plane |
 | Duplicate | ✅ | |
 | Transform (T) | ✅ | Gizmo (move / rotate / per-axis + uniform scale), Local Frame (default; objects remember their frame) / World Frame, Translate / Rotate / Scale / Size X/Y/Z, Uniform Scaling, snapping (step; 15° rotations) with Absolute Coords/Sizes, center, drop to ground |
-| Align (N) — align surfaces/axes to world | 🟡 | Principal-axes alignment only |
+| Align (N) — align surfaces/axes to world | ✅ | Source Center / Base / Surface Point / Surface Scribble (left-click); Destination World Origin X/Y/Z-up, Ground Plane, or a surface (shift-click); Translate Only / Translate and Rotate; Flip. Principal-axes alignment in Transform |
 | Create Pivot | ⚪ ❌ | |
 | Plane Cut | ✅ | Cut/Slice; No / Minimal / Fixed / Remeshed Fill (Remeshed also remeshes a band across the cut edge); Slice Groups; plus a vessel cross-section mode |
 | Combine | ✅ | |
