@@ -73,10 +73,10 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | Recenter View | ✅ | F / Focus |
-| Recenter At Cursor | ❌ | Pivot the camera on the surface point under the cursor |
-| Previous View / Next View | ❌ | |
+| Recenter At Cursor | ✅ | Alt+click, or View menu |
+| Previous View / Next View | ✅ | ⌘[ / ⌘] |
 | Orthographic View | ✅ | |
-| Show Grid | ❌ | |
+| Show Grid | ✅ | Floor grid under the scene |
 | Show Printer Bed | ⛔ | |
 | Transparent Target | ❌ | |
 | Show Wireframe | ✅ | W |

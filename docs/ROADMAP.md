@@ -35,7 +35,8 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       `J` Join, `P` Fit Primitive, ⌘B Bridge (bound as the tools land); Remesh/Reduce in-tool
       D/F density ±10, T adaptive, G preserve groups. Done except `B` → Smooth Boundary (M2.1),
       `J` (M3.2) and `P` (M4.6).
-- [ ] **M1.5 View commands.** Recenter at cursor, Previous/Next view, Show grid.
+- [x] **M1.5 View commands.** Recenter at cursor (Alt+click / View menu), Previous/Next view (⌘[ ⌘]),
+      Show grid.
 
 ## M2 — Selection
 

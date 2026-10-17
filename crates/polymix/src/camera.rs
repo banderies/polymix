@@ -45,7 +45,89 @@ impl Default for Camera {
     }
 }
 
+/// A saved view (for Previous / Next view).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewState {
+    pub target: DVec3,
+    pub distance: f64,
+    pub orient: DQuat,
+}
+
+impl ViewState {
+    /// Whether two views differ enough to keep both in the history.
+    pub fn differs(&self, o: &ViewState, scene_radius: f64) -> bool {
+        self.target.distance(o.target) > scene_radius * 1e-3
+            || (self.distance / o.distance.max(1e-12) - 1.0).abs() > 1e-3
+            || self.orient.angle_between(o.orient) > 1e-3
+    }
+}
+
+/// Back / forward history of views.
+#[derive(Default)]
+pub struct ViewHistory {
+    states: Vec<ViewState>,
+    /// Index of the current view when browsing the history; `None` = live (past the end).
+    pos: Option<usize>,
+}
+
+impl ViewHistory {
+    const MAX: usize = 50;
+
+    /// Remember `current` before the view changes (navigation start, focus, standard views…).
+    pub fn record(&mut self, current: ViewState, scene_radius: f64) {
+        if let Some(p) = self.pos.take() {
+            self.states.truncate(p + 1);
+        }
+        if self.states.last().is_none_or(|l| l.differs(&current, scene_radius)) {
+            self.states.push(current);
+            if self.states.len() > Self::MAX {
+                self.states.remove(0);
+            }
+        }
+    }
+
+    pub fn back(&mut self, current: ViewState, scene_radius: f64) -> Option<ViewState> {
+        let p = match self.pos {
+            Some(p) => p.checked_sub(1)?,
+            None => {
+                // Keep the live view so Next can return to it.
+                self.record(current, scene_radius);
+                self.states.len().checked_sub(2)?
+            }
+        };
+        self.pos = Some(p);
+        Some(self.states[p])
+    }
+
+    pub fn forward(&mut self) -> Option<ViewState> {
+        let p = self.pos? + 1;
+        if p >= self.states.len() {
+            return None;
+        }
+        self.pos = Some(p);
+        Some(self.states[p])
+    }
+
+    pub fn can_back(&self) -> bool {
+        self.pos.map_or(!self.states.is_empty(), |p| p > 0)
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.pos.is_some_and(|p| p + 1 < self.states.len())
+    }
+}
+
 impl Camera {
+    pub fn view_state(&self) -> ViewState {
+        ViewState { target: self.target, distance: self.distance, orient: self.orient }
+    }
+
+    pub fn set_view_state(&mut self, v: ViewState) {
+        self.target = v.target;
+        self.distance = v.distance;
+        self.orient = v.orient;
+    }
+
     pub fn world_up(&self) -> DVec3 {
         match self.up_axis {
             UpAxis::Y => DVec3::Y,
@@ -290,6 +372,29 @@ mod tests {
             assert!(c.view().is_finite());
             assert!(orthonormal(&c));
         }
+    }
+
+    #[test]
+    fn view_history_back_and_forward() {
+        let mut c = Camera::default();
+        let mut h = ViewHistory::default();
+        let v0 = c.view_state();
+        h.record(c.view_state(), 1.0);
+        c.tumble(50.0, 0.0);
+        let v1 = c.view_state();
+        h.record(c.view_state(), 1.0);
+        c.tumble(0.0, 50.0);
+        let v2 = c.view_state();
+        assert_eq!(h.back(c.view_state(), 1.0), Some(v1));
+        assert_eq!(h.back(v1, 1.0), Some(v0));
+        assert_eq!(h.back(v0, 1.0), None);
+        assert_eq!(h.forward(), Some(v1));
+        assert_eq!(h.forward(), Some(v2));
+        assert_eq!(h.forward(), None);
+        // A new change drops the forward history.
+        h.back(v2, 1.0);
+        h.record(v1, 1.0);
+        assert!(!h.can_forward());
     }
 
     #[test]

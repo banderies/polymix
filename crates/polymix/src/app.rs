@@ -1,6 +1,6 @@
 //! Application shell: layout, viewport navigation, tool dispatch, file IO.
 
-use crate::camera::{Camera, UpAxis};
+use crate::camera::{Camera, UpAxis, ViewHistory};
 use crate::commands::{self, CmdCx};
 use crate::jobs::Job;
 use crate::navigation::{NavAction, NavMode};
@@ -35,11 +35,12 @@ pub struct ViewOptions {
     pub crease_deg: f32,
     /// Mouse navigation scheme (Meshmixer's Preferences → Navigation Mode).
     pub nav_mode: NavMode,
+    pub show_grid: bool,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360 }
+        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false }
     }
 }
 
@@ -107,6 +108,12 @@ pub struct PolymixApp {
     nav_drag: Option<PointerButton>,
     /// Right-button drag owned by the active tool: press position.
     tool_rmb: Option<egui::Pos2>,
+    /// Previous / Next view.
+    view_history: ViewHistory,
+    /// Camera target glide (from, to, start time) for Recenter at Cursor.
+    view_anim: Option<(glam::DVec3, glam::DVec3, f64)>,
+    last_wheel: f64,
+    space_moving: bool,
     /// Last pointer position seen over the viewport (for releases outside it).
     last_pointer: Option<egui::Pos2>,
     show_help: bool,
@@ -156,6 +163,10 @@ impl PolymixApp {
             export_job: None,
             nav_drag: None,
             tool_rmb: None,
+            view_history: ViewHistory::default(),
+            view_anim: None,
+            last_wheel: 0.0,
+            space_moving: false,
             last_pointer: None,
             show_help: false,
             space: SpaceMouse::start(&cc.egui_ctx),
@@ -181,6 +192,7 @@ impl PolymixApp {
             app.view.flat = flag("flat", false);
             app.view.boundaries = flag("boundaries", true);
             app.view.group_colors = flag("group_colors", false);
+            app.view.show_grid = flag("grid", false);
             app.view.sharp_edges = flag("sharp_edges", true);
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
             if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
@@ -549,8 +561,23 @@ impl PolymixApp {
                 ui.separator();
                 if ui.button("Focus on scene  (F)").clicked() {
                     ui.close();
-                    self.camera.focus(&self.scene.bounds());
+                    self.focus_scene();
                 }
+                if ui.button("Recenter at cursor  (Alt+click)").on_hover_text("Pivot the view on the surface point last under the mouse").clicked() {
+                    ui.close();
+                    if let Some(p) = self.last_pointer {
+                        self.recenter_at(p, self.vp_prev(&ctx), ctx.input(|i| i.time));
+                    }
+                }
+                if ui.add_enabled(self.view_history.can_back(), egui::Button::new("Previous view   ⌘[")).clicked() {
+                    ui.close();
+                    self.previous_view();
+                }
+                if ui.add_enabled(self.view_history.can_forward(), egui::Button::new("Next view   ⌘]")).clicked() {
+                    ui.close();
+                    self.next_view();
+                }
+                ui.checkbox(&mut self.view.show_grid, "Show grid");
                 ui.menu_button("Standard views", |ui| {
                     use std::f64::consts::{FRAC_PI_2, PI};
                     for (name, yaw, pitch) in [
@@ -563,7 +590,7 @@ impl PolymixApp {
                     ] {
                         if ui.button(name).clicked() {
                             ui.close();
-                            self.camera.set_view(yaw, pitch);
+                            self.standard_view(yaw, pitch);
                         }
                     }
                 });
@@ -881,10 +908,11 @@ impl PolymixApp {
                 ui.horizontal(|ui| {
                     ui.toggle_value(&mut self.camera.free_orbit, "Free").on_hover_text("Free rotation (trackball) instead of a turntable");
                     if ui.button("Snap").on_hover_text("Snap to nearest axis view").clicked() {
+                        self.remember_view();
                         self.camera.snap_to_axis();
                     }
                     if ui.button("Focus").clicked() {
-                        self.camera.focus(&self.scene.bounds());
+                        self.focus_scene();
                     }
                     ui.toggle_value(&mut self.camera.orthographic, "Ortho");
                     ui.selectable_value(&mut self.camera.up_axis, UpAxis::Y, "Y-up");
@@ -954,6 +982,44 @@ impl PolymixApp {
         });
     }
 
+    /// Remember the current view before it changes (for Previous view).
+    fn remember_view(&mut self) {
+        self.view_history.record(self.camera.view_state(), self.camera.scene_radius);
+    }
+
+    fn focus_scene(&mut self) {
+        self.remember_view();
+        self.camera.focus(&self.scene.bounds());
+    }
+
+    fn standard_view(&mut self, yaw: f64, pitch: f64) {
+        self.remember_view();
+        self.camera.set_view(yaw, pitch);
+    }
+
+    fn previous_view(&mut self) {
+        if let Some(v) = self.view_history.back(self.camera.view_state(), self.camera.scene_radius) {
+            self.view_anim = None;
+            self.camera.set_view_state(v);
+        }
+    }
+
+    fn next_view(&mut self) {
+        if let Some(v) = self.view_history.forward() {
+            self.view_anim = None;
+            self.camera.set_view_state(v);
+        }
+    }
+
+    /// Glide the view's pivot to the surface point under `p` (Meshmixer: Recenter At Cursor).
+    fn recenter_at(&mut self, p: egui::Pos2, vp: Viewport, now: f64) {
+        let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
+        if let Some((_, h)) = tools::pick_ray(&mut self.scene, &ray, None) {
+            self.remember_view();
+            self.view_anim = Some((self.camera.target, h.point, now));
+        }
+    }
+
     /// Send a right-drag to the active tool.
     fn tool_secondary(&mut self, ctx: &egui::Context, vp: Viewport, phase: DragPhase, pos: egui::Pos2, total: egui::Vec2) {
         if let Some(mut t) = self.tools.pop() {
@@ -981,6 +1047,11 @@ impl PolymixApp {
             return;
         }
         let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
+        let moving = !motion.is_zero();
+        if moving && !self.space_moving {
+            self.remember_view();
+        }
+        self.space_moving = moving;
         if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64) {
             // Keep animating while the cap is deflected.
             ctx.request_repaint();
@@ -991,10 +1062,10 @@ impl PolymixApp {
                 Some(spacemouse::ButtonAction::Menu) => {
                     self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) };
                 }
-                Some(spacemouse::ButtonAction::Fit) => self.camera.focus(&self.scene.bounds()),
-                Some(spacemouse::ButtonAction::Top) => self.camera.set_view(0.0, FRAC_PI_2),
-                Some(spacemouse::ButtonAction::Right) => self.camera.set_view(FRAC_PI_2, 0.0),
-                Some(spacemouse::ButtonAction::Front) => self.camera.set_view(0.0, 0.0),
+                Some(spacemouse::ButtonAction::Fit) => self.focus_scene(),
+                Some(spacemouse::ButtonAction::Top) => self.standard_view(0.0, FRAC_PI_2),
+                Some(spacemouse::ButtonAction::Right) => self.standard_view(FRAC_PI_2, 0.0),
+                Some(spacemouse::ButtonAction::Front) => self.standard_view(0.0, 0.0),
                 None => {}
             }
         }
@@ -1094,6 +1165,7 @@ impl PolymixApp {
             }
             if response.drag_started_by(btn) && nav.starts_navigation(btn, mods) {
                 self.nav_drag = Some(btn);
+                self.remember_view();
                 break;
             }
         }
@@ -1142,6 +1214,11 @@ impl PolymixApp {
                 factor /= zoom_delta as f64;
             }
             if factor != 1.0 {
+                let now = ctx.input(|i| i.time);
+                if now - self.last_wheel > 0.6 {
+                    self.remember_view();
+                }
+                self.last_wheel = now;
                 let pivot = hover.and_then(|p| {
                     let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
                     tools::pick_ray(&mut self.scene, &ray, None).map(|(_, h)| h.point)
@@ -1150,6 +1227,22 @@ impl PolymixApp {
                     Some(p) => self.camera.zoom_towards(factor, p),
                     None => self.camera.zoom(factor),
                 }
+            }
+        }
+        // Alt+click (no drag) on the model: pivot the view there.
+        if response.clicked_by(PointerButton::Primary) && mods.alt {
+            if let Some(p) = hover {
+                self.recenter_at(p, vp, ctx.input(|i| i.time));
+            }
+        }
+        if let Some((from, to, t0)) = self.view_anim {
+            let t = ((ctx.input(|i| i.time) - t0) / 0.25).clamp(0.0, 1.0);
+            let e = t * t * (3.0 - 2.0 * t);
+            self.camera.target = from.lerp(to, e);
+            if t >= 1.0 {
+                self.view_anim = None;
+            } else {
+                ctx.request_repaint();
             }
         }
         let b = self.scene.bounds();
@@ -1227,6 +1320,9 @@ impl PolymixApp {
                 }
                 lines.extend_from_slice(&cached.1);
             }
+        }
+        if self.view.show_grid {
+            lines.extend(grid_lines(&self.camera, &self.scene.bounds()));
         }
         lines.extend(overlay.lines.iter().copied());
 
@@ -1440,6 +1536,7 @@ impl PolymixApp {
             "open" => self.start_import(vec![PathBuf::from(arg)], ctx),
             "wire" => self.view.wireframe = !self.view.wireframe,
             "flat" => self.view.flat = !self.view.flat,
+            "grid" => self.view.show_grid = !self.view.show_grid,
             "crease" => match arg.parse() {
                 Ok(d) => (self.view.sharp_edges, self.view.crease_deg) = (true, d),
                 Err(_) => self.view.sharp_edges = false,
@@ -1555,6 +1652,14 @@ impl PolymixApp {
             self.redo(ctx);
             return;
         }
+        if i.key_pressed(Key::OpenBracket) && cmd {
+            self.previous_view();
+            return;
+        }
+        if i.key_pressed(Key::CloseBracket) && cmd {
+            self.next_view();
+            return;
+        }
         if i.key_pressed(Key::O) && cmd && i.modifiers.shift {
             self.show_objects = !self.show_objects;
             return;
@@ -1628,7 +1733,7 @@ impl PolymixApp {
             self.view.wireframe = !self.view.wireframe;
         }
         if i.key_pressed(Key::F) && !cmd {
-            self.camera.focus(&self.scene.bounds());
+            self.focus_scene();
         }
         if self.scene.active().is_some() && !cmd {
             // Tool hotkeys work from inside other tools too: the open tool is accepted first.
@@ -1662,6 +1767,7 @@ impl eframe::App for PolymixApp {
         st.set_string("flat", b(self.view.flat));
         st.set_string("boundaries", b(self.view.boundaries));
         st.set_string("group_colors", b(self.view.group_colors));
+        st.set_string("grid", b(self.view.show_grid));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
         st.set_string("spacemouse", self.space_cfg.to_pref());
@@ -1762,4 +1868,40 @@ fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::Result<()
     let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
     w.write_image_data(&bytes)?;
     Ok(())
+}
+
+/// Floor grid under the scene, perpendicular to the up axis, with "nice" spacing (1, 2 or 5
+/// times a power of ten) and every fifth line brighter.
+fn grid_lines(camera: &Camera, b: &mm_core::Aabb) -> Vec<ColorVertex> {
+    if b.is_empty() {
+        return Vec::new();
+    }
+    let up = camera.world_up();
+    let size = b.diagonal().max(1e-6);
+    let raw = size / 20.0;
+    let pow = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0].into_iter().map(|m| m * pow).find(|s| *s >= raw).unwrap_or(10.0 * pow);
+    // In-plane axes and the floor height (just below the scene).
+    let (u, v) = if up == glam::DVec3::Z { (glam::DVec3::X, glam::DVec3::Y) } else { (glam::DVec3::X, glam::DVec3::Z) };
+    let floor = b.min.dot(up) - size * 1e-3;
+    let c = b.center();
+    let half = (size * 0.75 / step).ceil() * step;
+    let (cu, cv) = ((c.dot(u) / step).round() * step, (c.dot(v) / step).round() * step);
+    let n = (half / step).round() as i64;
+    let minor = Vec4::new(0.6, 0.6, 0.62, 0.22);
+    let major = Vec4::new(0.7, 0.7, 0.72, 0.45);
+    let mut out = Vec::with_capacity((4 * (2 * n + 1)) as usize);
+    for k in -n..=n {
+        let col = if (k + ((cu / step).round() as i64)).rem_euclid(5) == 0 { major } else { minor };
+        let a = up * floor + u * (cu + k as f64 * step) + v * (cv - half);
+        let z = up * floor + u * (cu + k as f64 * step) + v * (cv + half);
+        out.push(ColorVertex::new(a.as_vec3(), col));
+        out.push(ColorVertex::new(z.as_vec3(), col));
+        let col = if (k + ((cv / step).round() as i64)).rem_euclid(5) == 0 { major } else { minor };
+        let a = up * floor + v * (cv + k as f64 * step) + u * (cu - half);
+        let z = up * floor + v * (cv + k as f64 * step) + u * (cu + half);
+        out.push(ColorVertex::new(a.as_vec3(), col));
+        out.push(ColorVertex::new(z.as_vec3(), col));
+    }
+    out
 }
