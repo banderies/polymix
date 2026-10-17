@@ -82,7 +82,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       Align To Target, Attract To Target, "Project to Target" options.
 - [x] **M4.6 Fit Primitive** (Square, Rectangle, Cylinder, Spheres, Disc, Linear Sweep, Convex
       Hull, Height Field).
-- [ ] **M4.7 Add Tube** (spline tube between points; vessel bypass/repair).
+- [x] **M4.7 Add Tube** (spline tube between points; vessel bypass/repair).
 
 ## M5 — Analysis and measurement
 

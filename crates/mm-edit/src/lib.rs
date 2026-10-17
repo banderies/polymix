@@ -33,6 +33,7 @@ pub mod smooth;
 pub mod soft;
 pub mod target;
 pub mod transform;
+pub mod tube;
 pub mod vessel;
 
 pub use boolean::{mesh_boolean, BooleanOp, BooleanResult};
@@ -53,6 +54,7 @@ pub use region::{discard, duplicate, flip_normals, separate};
 pub use smooth::smooth_boundary;
 pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion};
 pub use target::{attract_to_target, icp_align, project_to_target, AttractParams, IcpParams, IcpResult};
+pub use tube::{add_tube, tube_mesh, tube_path, TubeEnd, TubeParams, TubePath};
 pub use transform::{align_to_principal_axes, center_on_origin, drop_to_ground, transform_mesh};
 pub use vessel::{estimate_vessel_cross_section, suggest_cut_plane, VesselCrossSection};
 

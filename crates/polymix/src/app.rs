@@ -70,6 +70,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "attracttotarget" => Box::new(tools::ops::AttractToTargetTool::new(cx)),
         "aligntotarget" => Box::new(tools::ops::AlignToTargetTool::new(cx)),
         "fitprimitive" => Box::new(tools::ops::FitPrimitiveTool::new(cx)),
+        "addtube" => Box::new(tools::add_tube::AddTubeTool::new(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
@@ -707,6 +708,9 @@ impl PolymixApp {
                     }
                     if ui.button("Bridge boundaries").clicked() {
                         open = Some("bridge");
+                    }
+                    if ui.button("Add Tube").on_hover_text("A tube between two points on the surface (bypass, channel, handle)").clicked() {
+                        open = Some("addtube");
                     }
                     if ui.button("Close Cracks").on_hover_text("Zip open boundaries that lie on top of each other").clicked() {
                         open = Some("closecracks");

@@ -201,7 +201,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Hollow | ✅ | Hollow wall ✅; escape holes ⛔ (printing) |
 | Make Pattern | ⚪ ❌ | |
 | Separate Shells (Shift+Y) | ✅ | |
-| Add Tube | ❌ | Possibly useful for vessel bypass/repair |
+| Add Tube | ✅ | Line / Spline (Inside, Outside), AutoRoute Minimal / Smooth (elastic band keeping the collision radius); Combine Boolean (union outside, difference inside) / Append / New Object; Direction Any / Face Normal; radius, end radius, tangent, length scale, solve steps; drag ends to move |
 | Unwrap / UV layout / SetUV | ⚪ ❌ | |
 | Generate / Filter / Split Complex, Convex Decomposition | ⚪ ❌ | |
 | Make Slices | ⛔ | |
