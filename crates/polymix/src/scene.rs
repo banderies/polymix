@@ -37,6 +37,9 @@ pub struct SceneObject {
     pub scalars: Option<(u64, Arc<Vec<f32>>)>,
     /// Optional names for face groups (CFD boundary patches: wall, inlet, outlet_1, …).
     pub group_names: std::collections::HashMap<i32, String>,
+    /// Orientation of the object's local frame: the rotations applied by Transform so far
+    /// (Transform's "Local Frame" axes).
+    pub frame: glam::DQuat,
     bvh: Option<Arc<Bvh>>,
 }
 
@@ -55,6 +58,7 @@ impl SceneObject {
             moved_vertices: Vec::new(),
             moved_from: 0,
             scalars: None,
+            frame: glam::DQuat::IDENTITY,
             bvh: None,
         }
     }

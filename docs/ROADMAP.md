@@ -74,7 +74,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 ## M4 — Transform, deformation and targets
 
-- [ ] **M4.1 Transform parity**: World / Local frame, snapping, absolute coords/sizes.
+- [x] **M4.1 Transform parity**: World / Local frame, snapping, absolute coords/sizes.
 - [ ] **M4.2 Transform selection** (Face Transform, T with a selection).
 - [ ] **M4.3 Soft Transform** (Shift+T) and **Warp**.
 - [ ] **M4.4 Align** (source/destination picking: base point, surface, world origin/axes).

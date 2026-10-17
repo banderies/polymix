@@ -2,17 +2,42 @@
 
 use super::*;
 use crate::ui_util;
-use glam::{DMat4, DQuat, EulerRot};
+use glam::{DMat3, DMat4, DQuat, EulerRot};
+
+/// Axes the Transform tool works in (Meshmixer's "Coordinate Space").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Space {
+    World,
+    /// The object's own frame: the axes turn with the rotations applied to it.
+    Local,
+}
+
+/// Rotation snapping step while "Enable Snapping" is on.
+const SNAP_ANGLE_DEG: f64 = 15.0;
 
 pub struct TransformTool {
     object: Option<ObjectId>,
+    /// The object's mesh when the tool opened (to detect changes from elsewhere).
+    original: std::sync::Arc<Mesh>,
+    /// Mesh the parameters below apply to: the original, or the result baked when the
+    /// coordinate space was switched.
     source: std::sync::Arc<Mesh>,
+    /// Orientation of the source's local frame.
+    frame: DQuat,
+    space: Space,
     preview: Option<Mesh>,
     translate: DVec3,
     rotation: DQuat,
+    /// Scale along the scale axes (the frame's axes in Local, world axes in World).
     scale: DVec3,
     uniform: bool,
+    snap: bool,
+    /// Snap the resulting coordinates / sizes to the grid instead of the change.
+    absolute: bool,
+    snap_step: f64,
     pivot: DVec3,
+    /// Current size along each gizmo axis.
+    sizes: DVec3,
     dirty: bool,
     drag: Option<GizmoDrag>,
     hover: Option<Handle>,
@@ -22,7 +47,8 @@ pub struct TransformTool {
 enum Handle {
     Move(usize),
     Rotate(usize),
-    Scale,
+    Scale(usize),
+    UniformScale,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -32,6 +58,7 @@ struct GizmoDrag {
     translate: DVec3,
     rotation: DQuat,
     scale: DVec3,
+    sizes: DVec3,
 }
 
 const AXES: [DVec3; 3] = [DVec3::X, DVec3::Y, DVec3::Z];
@@ -47,33 +74,105 @@ fn dist_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     p.distance(a + ab * t)
 }
 
+fn snap_to(v: f64, step: f64) -> f64 {
+    if step > 0.0 {
+        (v / step).round() * step
+    } else {
+        v
+    }
+}
+
+/// A round step (1, 2 or 5 × 10ⁿ) close to `x`.
+fn nice_step(x: f64) -> f64 {
+    if !(x > 0.0 && x.is_finite()) {
+        return 1.0;
+    }
+    let p = 10f64.powf(x.log10().floor());
+    [1.0, 2.0, 5.0, 10.0].into_iter().map(|k| k * p).min_by(|a, b| (a / x).ln().abs().total_cmp(&(b / x).ln().abs())).unwrap()
+}
+
+/// Extents of `m` along the unit axes `axes`, and the centre of that box.
+fn extents_along(m: &Mesh, axes: [DVec3; 3]) -> (DVec3, DVec3) {
+    let mut lo = DVec3::splat(f64::INFINITY);
+    let mut hi = DVec3::splat(f64::NEG_INFINITY);
+    for v in m.vertex_ids() {
+        let p = m.vertex(v);
+        let q = DVec3::new(p.dot(axes[0]), p.dot(axes[1]), p.dot(axes[2]));
+        lo = lo.min(q);
+        hi = hi.max(q);
+    }
+    if lo.x > hi.x {
+        return (DVec3::ZERO, DVec3::ZERO);
+    }
+    let c = (lo + hi) * 0.5;
+    (hi - lo, axes[0] * c.x + axes[1] * c.y + axes[2] * c.z)
+}
+
 impl TransformTool {
     pub fn new(cx: &mut ToolCx) -> Self {
-        let (object, source) = match cx.scene.active() {
-            Some(o) => (Some(o.id), o.mesh.clone()),
-            None => (None, std::sync::Arc::new(Mesh::new())),
+        let (object, source, frame) = match cx.scene.active() {
+            Some(o) => (Some(o.id), o.mesh.clone(), o.frame),
+            None => (None, std::sync::Arc::new(Mesh::new()), DQuat::IDENTITY),
         };
-        let pivot = source.bounds().center();
-        Self {
+        let mut t = Self {
             object,
+            original: source.clone(),
             source,
+            frame,
+            space: Space::Local,
             preview: None,
             translate: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             scale: DVec3::ONE,
-            uniform: true,
-            pivot,
-            dirty: false,
+            uniform: false,
+            snap: false,
+            absolute: false,
+            snap_step: 1.0,
+            pivot: DVec3::ZERO,
+            sizes: DVec3::ZERO,
+            dirty: true,
             drag: None,
             hover: None,
+        };
+        t.snap_step = nice_step(t.source.bounds().diagonal() / 100.0);
+        t.reset_pivot();
+        t
+    }
+
+    /// Axes the scale applies along, in the source's coordinates.
+    fn scale_frame(&self) -> DQuat {
+        match self.space {
+            Space::Local => self.frame,
+            Space::World => DQuat::IDENTITY,
+        }
+    }
+
+    /// Gizmo axes: the frame's axes as currently rotated, or the world axes.
+    fn axes(&self) -> [DVec3; 3] {
+        match self.space {
+            Space::Local => AXES.map(|a| (self.rotation * self.frame) * a),
+            Space::World => AXES,
+        }
+    }
+
+    fn reset_pivot(&mut self) {
+        let f = self.scale_frame();
+        self.pivot = extents_along(&self.source, AXES.map(|a| f * a)).1;
+    }
+
+    fn linear(&self) -> DMat3 {
+        let s = DMat3::from_diagonal(self.scale);
+        match self.space {
+            Space::Local => {
+                let f = DMat3::from_quat(self.frame);
+                DMat3::from_quat(self.rotation) * f * s * f.transpose()
+            }
+            Space::World => s * DMat3::from_quat(self.rotation),
         }
     }
 
     fn matrix(&self) -> DMat4 {
-        DMat4::from_translation(self.pivot + self.translate)
-            * DMat4::from_quat(self.rotation)
-            * DMat4::from_scale(self.scale)
-            * DMat4::from_translation(-self.pivot)
+        DMat4::from_translation(self.pivot + self.translate) * DMat4::from_mat3(self.linear()) * DMat4::from_translation(-self.pivot)
     }
 
     fn rebuild(&mut self) {
@@ -83,6 +182,7 @@ impl TransformTool {
         if m.determinant() < 0.0 {
             mesh.reverse_orientation();
         }
+        self.sizes = extents_along(&mesh, self.axes()).0;
         self.preview = Some(mesh);
         self.dirty = false;
     }
@@ -91,12 +191,30 @@ impl TransformTool {
         self.translate == DVec3::ZERO && self.rotation.angle_between(DQuat::IDENTITY) < 1e-12 && self.scale == DVec3::ONE
     }
 
+    /// Make the current result the new starting point (used when the coordinate space
+    /// changes, since a pending scale means different things in the two spaces).
+    fn bake(&mut self) {
+        if self.dirty || self.preview.is_none() {
+            self.rebuild();
+        }
+        if !self.is_identity() {
+            self.frame = (self.rotation * self.frame).normalize();
+            self.source = std::sync::Arc::new(self.preview.clone().unwrap_or_default());
+            self.translate = DVec3::ZERO;
+            self.rotation = DQuat::IDENTITY;
+            self.scale = DVec3::ONE;
+        }
+        self.reset_pivot();
+        self.dirty = true;
+    }
+
     fn commit(&mut self, cx: &mut ToolCx) -> bool {
         let Some(id) = self.object else { return true };
-        if self.is_identity() {
+        let baked = !std::sync::Arc::ptr_eq(&self.source, &self.original);
+        if self.is_identity() && !baked {
             return true;
         }
-        if !cx.scene.get(id).map(|o| std::sync::Arc::ptr_eq(&o.mesh, &self.source)).unwrap_or(false) {
+        if !cx.scene.get(id).map(|o| std::sync::Arc::ptr_eq(&o.mesh, &self.original)).unwrap_or(false) {
             *cx.status = "Transform cancelled: the object changed while the tool was open.".into();
             return true;
         }
@@ -104,13 +222,42 @@ impl TransformTool {
             self.rebuild();
         }
         cx.history.push("Transform", cx.scene);
+        let frame = (self.rotation * self.frame).normalize();
         if let (Some(o), Some(m)) = (cx.scene.get_mut(id), self.preview.take()) {
             let sel = o.selection.clone();
             o.mesh = std::sync::Arc::new(m);
+            o.frame = frame;
             o.selection = sel;
             o.touch_selection();
         }
         true
+    }
+
+    /// Set the size along gizmo axis `i` (all axes proportionally with uniform scaling).
+    fn set_size(&mut self, i: usize, size: f64, base: DVec3, base_scale: DVec3) {
+        if !(base[i] > 0.0 && size > 0.0) {
+            return;
+        }
+        let f = size / base[i];
+        if self.uniform {
+            self.scale = base_scale * f;
+        } else {
+            self.scale = base_scale;
+            self.scale[i] = base_scale[i] * f;
+        }
+        self.dirty = true;
+    }
+
+    fn snapped_size(&self, size: f64, base: f64) -> f64 {
+        if !self.snap {
+            return size;
+        }
+        let s = if self.absolute { snap_to(size, self.snap_step) } else { base + snap_to(size - base, self.snap_step) };
+        if s > 0.0 {
+            s
+        } else {
+            size
+        }
     }
 
     /// Gizmo size in world units (constant on screen).
@@ -122,11 +269,16 @@ impl TransformTool {
         let c3 = self.pivot + self.translate;
         let c = cx.project(c3)?;
         if (p - c).abs().max_elem() < 8.0 {
-            return Some(Handle::Scale);
+            return Some(Handle::UniformScale);
         }
         let len = self.gizmo_len(cx);
         let mut best: Option<(f32, Handle)> = None;
-        for (i, a) in AXES.iter().enumerate() {
+        for (i, a) in self.axes().iter().enumerate() {
+            if let Some(q) = cx.project(c3 + *a * len * 1.18) {
+                if (p - q).abs().max_elem() < 7.0 {
+                    return Some(Handle::Scale(i));
+                }
+            }
             if let Some(tip) = cx.project(c3 + *a * len) {
                 let d = dist_to_segment(p, c, tip);
                 if d < 8.0 && best.map(|b| d < b.0).unwrap_or(true) {
@@ -155,28 +307,62 @@ impl TransformTool {
         let Some(d) = self.drag else { return };
         let c3 = self.pivot + d.translate;
         let Some(c) = cx.project(c3) else { return };
+        // Axes as they were when the drag started.
+        let axes = {
+            let now = self.rotation;
+            self.rotation = d.rotation;
+            let a = self.axes();
+            self.rotation = now;
+            a
+        };
+        let len = self.gizmo_len(cx);
+        let screen_dir = |i: usize| -> Option<(egui::Vec2, f32)> {
+            let tip = cx.project(c3 + axes[i] * len)?;
+            let v = tip - c;
+            let l = v.length().max(1e-3);
+            Some((v / l, l))
+        };
         match d.handle {
             Handle::Move(i) => {
-                let len = self.gizmo_len(cx);
-                let Some(tip) = cx.project(c3 + AXES[i] * len) else { return };
-                let axis_px = tip - c;
-                let px_len = axis_px.length().max(1e-3);
-                let along = (p - d.start).dot(axis_px / px_len);
-                self.translate = d.translate + AXES[i] * (along as f64 / px_len as f64 * len);
+                let Some((dir, px_len)) = screen_dir(i) else { return };
+                let mut along = (p - d.start).dot(dir) as f64 / px_len as f64 * len;
+                if self.snap {
+                    along = if self.absolute {
+                        let c0 = c3.dot(axes[i]);
+                        snap_to(c0 + along, self.snap_step) - c0
+                    } else {
+                        snap_to(along, self.snap_step)
+                    };
+                }
+                self.translate = d.translate + axes[i] * along;
             }
             Handle::Rotate(i) => {
                 let a0 = (d.start - c).angle();
                 let a1 = (p - c).angle();
                 let mut ang = (a1 - a0) as f64;
                 // Screen angles run clockwise; flip when the axis points away from the viewer.
-                let toward_viewer = AXES[i].dot(-cx.camera.forward()) > 0.0;
-                if toward_viewer {
+                if axes[i].dot(-cx.camera.forward()) > 0.0 {
                     ang = -ang;
                 }
-                self.rotation = DQuat::from_axis_angle(AXES[i], ang) * d.rotation;
+                if self.snap {
+                    ang = snap_to(ang, SNAP_ANGLE_DEG.to_radians());
+                }
+                self.rotation = DQuat::from_axis_angle(axes[i], ang) * d.rotation;
             }
-            Handle::Scale => {
+            Handle::Scale(i) => {
+                let Some((dir, _)) = screen_dir(i) else { return };
+                let s0 = (d.start - c).dot(dir).abs().max(4.0) as f64;
+                let s1 = (p - c).dot(dir) as f64;
+                let size = d.sizes[i] * (s1 / s0).clamp(0.02, 50.0);
+                let size = self.snapped_size(size, d.sizes[i]);
+                self.set_size(i, size, d.sizes, d.scale);
+            }
+            Handle::UniformScale => {
                 let f = (1.0 + (d.start.y - p.y) as f64 * 0.01).clamp(0.05, 20.0);
+                // Snap through the largest dimension.
+                let k = (0..3).max_by(|&a, &b| d.sizes[a].total_cmp(&d.sizes[b])).unwrap_or(0);
+                let size = self.snapped_size(d.sizes[k] * f, d.sizes[k]);
+                let f = if d.sizes[k] > 0.0 { size / d.sizes[k] } else { f };
                 self.scale = d.scale * f;
             }
         }
@@ -195,18 +381,45 @@ impl Tool for TransformTool {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
         }
-        ui.small("Drag the arrows to move, the rings to rotate, the centre square to scale — or type values.");
+        if self.dirty {
+            self.rebuild();
+        }
+        ui.small("Drag the arrows to move, the rings to rotate, the end boxes to scale an axis, the centre square to scale uniformly — or type values.");
         let mut changed = false;
+        let before = self.space;
+        egui::ComboBox::from_label("Coordinate space")
+            .selected_text(match self.space {
+                Space::Local => "Local Frame",
+                Space::World => "World Frame",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.space, Space::Local, "Local Frame").on_hover_text("Axes turn with the object");
+                ui.selectable_value(&mut self.space, Space::World, "World Frame");
+            });
+        if self.space != before {
+            let now = self.space;
+            self.space = before;
+            self.bake();
+            self.space = now;
+            self.reset_pivot();
+            self.rebuild();
+        }
+        let f = self.scale_frame();
         let step = (self.source.bounds().diagonal() * 0.002).max(1e-4);
         ui.label("Translate");
+        let mut t = f.inverse() * self.translate;
         ui.horizontal(|ui| {
             for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
                 ui.label(*n);
-                changed |= ui.add(egui::DragValue::new(&mut self.translate[i]).speed(step).max_decimals(3)).changed();
+                if ui.add(egui::DragValue::new(&mut t[i]).speed(step).max_decimals(3)).changed() {
+                    self.translate = f * t;
+                    changed = true;
+                }
             }
         });
         ui.label("Rotate (degrees, XYZ)");
-        let (rx, ry, rz) = self.rotation.to_euler(EulerRot::XYZ);
+        let local_rot = f.inverse() * self.rotation * f;
+        let (rx, ry, rz) = local_rot.to_euler(EulerRot::XYZ);
         let mut deg = [rx.to_degrees() + 0.0, ry.to_degrees() + 0.0, rz.to_degrees() + 0.0];
         let mut rot_changed = false;
         ui.horizontal(|ui| {
@@ -216,32 +429,53 @@ impl Tool for TransformTool {
             }
         });
         if rot_changed {
-            self.rotation = DQuat::from_euler(EulerRot::XYZ, deg[0].to_radians(), deg[1].to_radians(), deg[2].to_radians());
+            self.rotation = f * DQuat::from_euler(EulerRot::XYZ, deg[0].to_radians(), deg[1].to_radians(), deg[2].to_radians()) * f.inverse();
             changed = true;
         }
+        ui.label("Scale");
         ui.horizontal(|ui| {
-            ui.label("Scale");
-            changed |= ui.checkbox(&mut self.uniform, "uniform").changed();
-        });
-        ui.horizontal(|ui| {
-            if self.uniform {
-                let mut s = self.scale.x;
-                if ui.add(egui::DragValue::new(&mut s).speed(0.005).range(1e-6..=1e6).max_decimals(4)).changed() {
-                    self.scale = DVec3::splat(s);
+            for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.label(*n);
+                let mut s = self.scale[i];
+                if ui.add(egui::DragValue::new(&mut s).speed(0.005).range(1e-6..=1e6).max_decimals(4)).changed() && self.scale[i] != 0.0 {
+                    if self.uniform {
+                        self.scale *= s / self.scale[i];
+                    } else {
+                        self.scale[i] = s;
+                    }
                     changed = true;
-                }
-            } else {
-                for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-                    ui.label(*n);
-                    changed |= ui.add(egui::DragValue::new(&mut self.scale[i]).speed(0.005).range(1e-6..=1e6).max_decimals(4)).changed();
                 }
             }
         });
+        ui.label("Size");
+        let (sizes, scale) = (self.sizes, self.scale);
+        ui.horizontal(|ui| {
+            for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.label(*n);
+                let mut v = sizes[i];
+                if ui.add(egui::DragValue::new(&mut v).speed(step).range(1e-9..=1e9).max_decimals(3)).changed() {
+                    self.set_size(i, v, sizes, scale);
+                    changed = true;
+                }
+            }
+        });
+        ui.checkbox(&mut self.uniform, "Uniform scaling");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.snap, "Enable snapping")
+                .on_hover_text(format!("Gizmo moves and sizes snap to the step, rotations to {SNAP_ANGLE_DEG}°"));
+            if self.snap {
+                let speed = self.snap_step * 0.05;
+                ui.add(egui::DragValue::new(&mut self.snap_step).speed(speed).range(1e-6..=1e6).max_decimals(4));
+            }
+        });
+        if self.snap {
+            ui.checkbox(&mut self.absolute, "Absolute coords/sizes").on_hover_text("Snap the resulting position and size to the grid, not the change");
+        }
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             let b = self.source.bounds();
-            if ui.button("Center at origin").clicked() {
-                self.translate = -b.center();
+            if ui.button("Center at origin").on_hover_text("Move the pivot (box centre) to the origin").clicked() {
+                self.translate = -self.pivot;
                 changed = true;
             }
             if ui.button("Drop to ground").on_hover_text("Move the lowest point onto the ground plane").clicked() {
@@ -287,7 +521,17 @@ impl Tool for TransformTool {
         }
         if input.pressed {
             if let Some(h) = self.hit_test(cx, pos) {
-                self.drag = Some(GizmoDrag { handle: h, start: pos, translate: self.translate, rotation: self.rotation, scale: self.scale });
+                if self.dirty {
+                    self.rebuild();
+                }
+                self.drag = Some(GizmoDrag {
+                    handle: h,
+                    start: pos,
+                    translate: self.translate,
+                    rotation: self.rotation,
+                    scale: self.scale,
+                    sizes: self.sizes,
+                });
             }
         }
         if input.down && self.drag.is_some() {
@@ -309,7 +553,8 @@ impl Tool for TransformTool {
         let Some(c) = cx.project(c3) else { return };
         let len = self.gizmo_len(cx);
         let active = self.drag.map(|d| d.handle).or(self.hover);
-        for (i, a) in AXES.iter().enumerate() {
+        let axes = self.axes();
+        for (i, a) in axes.iter().enumerate() {
             let hot = active == Some(Handle::Rotate(i));
             let (u, v) = mm_core::geom::orthonormal_basis(*a);
             let pts: Vec<egui::Pos2> = (0..=64)
@@ -321,15 +566,20 @@ impl Tool for TransformTool {
             let col = if hot { egui::Color32::YELLOW } else { AXIS_COLORS[i].gamma_multiply(0.7) };
             painter.add(egui::Shape::line(pts, egui::Stroke::new(if hot { 3.0 } else { 1.5 }, col)));
         }
-        for (i, a) in AXES.iter().enumerate() {
+        for (i, a) in axes.iter().enumerate() {
             let hot = active == Some(Handle::Move(i));
             if let Some(tip) = cx.project(c3 + *a * len) {
                 let col = if hot { egui::Color32::YELLOW } else { AXIS_COLORS[i] };
                 painter.arrow(c, tip - c, egui::Stroke::new(if hot { 4.0 } else { 2.5 }, col));
             }
+            if let Some(q) = cx.project(c3 + *a * len * 1.18) {
+                let hot = active == Some(Handle::Scale(i));
+                let col = if hot { egui::Color32::YELLOW } else { AXIS_COLORS[i] };
+                painter.rect_filled(egui::Rect::from_center_size(q, egui::vec2(8.0, 8.0)), 1.0, col);
+            }
         }
         let sq = egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0));
-        painter.rect_filled(sq, 1.0, if active == Some(Handle::Scale) { egui::Color32::YELLOW } else { egui::Color32::from_gray(230) });
+        painter.rect_filled(sq, 1.0, if active == Some(Handle::UniformScale) { egui::Color32::YELLOW } else { egui::Color32::from_gray(230) });
     }
 
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {
@@ -423,5 +673,95 @@ impl Tool for UnitsTool {
             return ToolOutcome::Close;
         }
         ToolOutcome::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    /// A 2 × 1 × 1 box turned by `angle` about Z, with that turn as its frame.
+    fn tool(angle: f64, space: Space) -> TransformTool {
+        let frame = DQuat::from_rotation_z(angle);
+        let mut m = primitives::cube(1.0, 1);
+        m.transform(|p| frame * DVec3::new(2.0 * p.x, p.y, p.z));
+        let source = std::sync::Arc::new(m);
+        let mut t = TransformTool {
+            object: Some(1),
+            original: source.clone(),
+            source,
+            frame,
+            space,
+            preview: None,
+            translate: DVec3::ZERO,
+            rotation: DQuat::IDENTITY,
+            scale: DVec3::ONE,
+            uniform: false,
+            snap: false,
+            absolute: false,
+            snap_step: 0.5,
+            pivot: DVec3::ZERO,
+            sizes: DVec3::ZERO,
+            dirty: true,
+            drag: None,
+            hover: None,
+        };
+        t.reset_pivot();
+        t.rebuild();
+        t
+    }
+
+    fn close(a: DVec3, b: DVec3) -> bool {
+        (a - b).abs().max_element() < 1e-9
+    }
+
+    #[test]
+    fn local_frame_sizes_follow_the_object() {
+        let mut t = tool(0.5, Space::Local);
+        assert!(close(t.sizes, DVec3::new(2.0, 1.0, 1.0)), "{}", t.sizes);
+        // Doubling local X stretches the box along its own long axis.
+        let (sizes, scale) = (t.sizes, t.scale);
+        t.set_size(0, 4.0, sizes, scale);
+        t.rebuild();
+        assert!(close(t.sizes, DVec3::new(4.0, 1.0, 1.0)), "{}", t.sizes);
+        // In world space the same box measures its axis-aligned extents.
+        let w = tool(0.5, Space::World);
+        let e = w.source.bounds().extents();
+        assert!(close(w.sizes, e));
+    }
+
+    #[test]
+    fn switching_space_keeps_the_result() {
+        let mut t = tool(0.4, Space::Local);
+        t.rotation = DQuat::from_rotation_x(0.3);
+        t.scale = DVec3::new(1.5, 1.0, 0.5);
+        t.translate = DVec3::new(0.2, -0.1, 0.3);
+        t.rebuild();
+        let before = t.preview.clone().unwrap();
+        t.bake();
+        t.space = Space::World;
+        t.reset_pivot();
+        t.rebuild();
+        let after = t.preview.as_ref().unwrap();
+        assert!(before.vertex_ids().all(|v| close(before.vertex(v), after.vertex(v))));
+        // The frame took the rotation; the parameters start over.
+        assert!(t.frame.angle_between(DQuat::from_rotation_x(0.3) * DQuat::from_rotation_z(0.4)) < 1e-12);
+        assert!(t.is_identity());
+    }
+
+    #[test]
+    fn snapping_steps() {
+        assert_eq!(nice_step(0.37), 0.5);
+        assert_eq!(nice_step(1.6), 2.0);
+        assert_eq!(nice_step(4.1), 5.0);
+        assert_eq!(nice_step(7.2), 10.0);
+        let mut t = tool(0.0, Space::World);
+        t.snap = true;
+        // Relative: the change is a multiple of the step; absolute: the result is.
+        assert!((t.snapped_size(2.3, 2.0) - 2.5).abs() < 1e-12);
+        t.absolute = true;
+        assert!((t.snapped_size(2.3, 2.1) - 2.5).abs() < 1e-12);
+        assert!((t.snapped_size(0.1, 2.0) - 0.1).abs() < 1e-12, "never snaps to zero");
     }
 }

@@ -221,8 +221,11 @@ pub fn duplicate_object(cx: &mut CmdCx) {
     }
     cx.history.push("Duplicate object", cx.scene);
     let o = cx.scene.active().unwrap();
-    let (name, mesh) = (format!("{} copy", o.name), (*o.mesh).clone());
-    cx.scene.add(name, mesh);
+    let (name, mesh, frame) = (format!("{} copy", o.name), (*o.mesh).clone(), o.frame);
+    let id = cx.scene.add(name, mesh);
+    if let Some(o) = cx.scene.get_mut(id) {
+        o.frame = frame;
+    }
 }
 
 pub fn delete_object(cx: &mut CmdCx, id: ObjectId) {

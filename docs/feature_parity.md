@@ -188,7 +188,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Mirror | ✅ | Weld at the plane |
 | Duplicate | ✅ | |
-| Transform (T) | 🟡 | Gizmo, numeric, center, drop to ground ✅; World/Local frame, snapping ❌ |
+| Transform (T) | ✅ | Gizmo (move / rotate / per-axis + uniform scale), Local Frame (default; objects remember their frame) / World Frame, Translate / Rotate / Scale / Size X/Y/Z, Uniform Scaling, snapping (step; 15° rotations) with Absolute Coords/Sizes, center, drop to ground |
 | Align (N) — align surfaces/axes to world | 🟡 | Principal-axes alignment only |
 | Create Pivot | ⚪ ❌ | |
 | Plane Cut | ✅ | Cut/Slice; No / Minimal / Fixed / Remeshed Fill (Remeshed also remeshes a band across the cut edge); Slice Groups; plus a vessel cross-section mode |
