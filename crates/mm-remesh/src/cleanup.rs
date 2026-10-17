@@ -41,12 +41,13 @@ pub fn refine_uniform(
     }
     let setup = Setup {
         region,
-        constraints: ConstraintOptions { boundary: BoundaryRule::Free, sharp_deg: None, groups: false, corner_deg: None },
+        constraints: ConstraintOptions { boundary: BoundaryRule::Free, sharp_deg: None, groups: false, corner_deg: None, smooth_groups: None },
         base: max_edge_length,
         adaptive: false,
         project: false,
         smoothing: 0.0,
         free_boundary: false,
+        group_smoothing: None,
     };
     let mut prog = Progress::new(progress);
     let mut r = Remesher::new(mesh, setup);
@@ -82,12 +83,13 @@ pub fn collapse_short_edges(
     }
     let setup = Setup {
         region,
-        constraints: ConstraintOptions { boundary: BoundaryRule::Curve, sharp_deg: None, groups: true, corner_deg: None },
+        constraints: ConstraintOptions { boundary: BoundaryRule::Curve, sharp_deg: None, groups: true, corner_deg: None, smooth_groups: None },
         base: min_edge_length,
         adaptive: false,
         project: false,
         smoothing: 0.0,
         free_boundary: false,
+        group_smoothing: None,
     };
     let mut prog = Progress::new(progress);
     let mut r = Remesher::new(mesh, setup);

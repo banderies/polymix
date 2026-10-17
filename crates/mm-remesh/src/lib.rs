@@ -26,7 +26,7 @@ mod util;
 
 pub use cleanup::{collapse_short_edges, refine_uniform, CleanupReport};
 pub use reduce::{reduce, ReduceParams, ReduceReport, ReduceTarget};
-pub use remesh::{remesh, BoundaryMode, PassTimings, RemeshParams, RemeshReport};
+pub use remesh::{remesh, BoundaryMode, GroupBorderSmoothing, PassTimings, RemeshParams, RemeshReport};
 pub use stats::{edge_length_stats, edge_length_stats_in, triangle_quality, EdgeLengthStats};
 
 #[cfg(doc)]

@@ -22,17 +22,28 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let files: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
-    let options = eframe::NativeOptions {
+    let scripted = std::env::var_os("POLYMIX_SCRIPT").is_some();
+    #[allow(unused_mut)]
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Polymix")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_drag_and_drop(true)
-            .with_icon(app_icon()),
+            .with_icon(app_icon())
+            .with_active(!scripted),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
         ..Default::default()
     };
+    // Scripted test runs must not steal focus (or keystrokes) from whatever the user is doing.
+    #[cfg(target_os = "macos")]
+    if scripted {
+        options.event_loop_builder = Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activate_ignoring_other_apps(false).with_activation_policy(ActivationPolicy::Accessory);
+        }));
+    }
     eframe::run_native("Polymix", options, Box::new(move |cc| Ok(Box::new(app::PolymixApp::new(cc, files)))))
 }
 

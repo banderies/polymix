@@ -161,8 +161,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | 🟡 | ⌘B ✅; J and P with their tools |
 | Edit: Fit Primitive | ❌ | |
 | Edit: Grow Hair | ⚪ ❌ | |
-| **Deform** menu: Smooth (⌘F) | ✅ | `B` also smooths until Smooth Boundary lands (M2.1) |
-| Deform: Smooth Boundary ("Smooth Loop", B) | ❌ | |
+| **Deform** menu: Smooth (⌘F) | ✅ | |
+| Deform: Smooth Boundary ("Smooth Loop", B) | ✅ | Meshmixer's parameters and defaults; remesher smooths the border curve |
 | Deform: Soft Transform (Shift+T) / Transform selection (T) | ❌ | Polymix Transform is whole-object only |
 | Deform: Warp | ❌ | |
 | **Convert To**: Open Part / Solid Part / Stamp | ⚪ ❌ | |

@@ -340,3 +340,55 @@ fn invalid_parameters_rejected() {
     assert_eq!(rep.region_triangles, Some(vec![]));
     assert_valid(&m);
 }
+
+/// Mean distance of the group-border vertices from the straight line x = 0 on a plane.
+fn border_roughness(m: &Mesh) -> (f64, usize) {
+    let mut verts = Vec::new();
+    for e in m.edge_ids() {
+        let [t0, t1] = m.edge_triangles(e);
+        if t1 != mm_core::INVALID && m.tri_group(t0) != m.tri_group(t1) {
+            verts.extend(m.edge_vertices(e));
+        }
+    }
+    verts.sort_unstable();
+    verts.dedup();
+    let inner: Vec<f64> = verts.iter().map(|&v| m.vertex(v)).filter(|p| p.y.abs() < 3.0).map(|p| p.x.abs()).collect();
+    (inner.iter().sum::<f64>() / inner.len().max(1) as f64, inner.len())
+}
+
+#[test]
+fn group_borders_can_be_smoothed() {
+    // A staircase border between two groups on a plane: alternate rows step left/right.
+    let make = || {
+        let mut m = primitives::plane_grid(10.0, 10.0, 40, 40);
+        let tris: Vec<u32> = m.triangle_ids().collect();
+        for &t in &tris {
+            let c = m.tri_centroid(t);
+            let row = ((c.y + 5.0) / 0.25).floor() as i64;
+            let offset = if row % 2 == 0 { 0.5 } else { -0.5 };
+            m.set_tri_group(t, if c.x > offset { 1 } else { 0 });
+        }
+        m
+    };
+    let mut exact = make();
+    let (r0, n0) = border_roughness(&exact);
+    assert!(r0 > 0.2 && n0 > 20, "staircase border to start with ({r0}, {n0})");
+    remesh(&mut exact, &RemeshParams { preserve_group_boundaries: true, ..RemeshParams::with_target(0.25) }, None).unwrap();
+    let (r_exact, _) = border_roughness(&exact);
+    assert!(r_exact > 0.2, "without smoothing the staircase is kept ({r_exact})");
+
+    let mut smooth = make();
+    let params = RemeshParams {
+        preserve_group_boundaries: true,
+        iterations: 30,
+        smooth_group_boundaries: Some(GroupBorderSmoothing { strength: 0.5, anchor: 0.05, split: None }),
+        ..RemeshParams::with_target(0.25)
+    };
+    remesh(&mut smooth, &params, None).unwrap();
+    assert_valid(&smooth);
+    let (r_smooth, n) = border_roughness(&smooth);
+    assert!(n > 10);
+    assert!(r_smooth < 0.5 * r0, "smoothing straightens the border: {r0} -> {r_smooth}");
+    // Still a plane, still two connected groups.
+    assert!(smooth.vertex_ids().all(|v| smooth.vertex(v).z.abs() < 1e-9));
+}

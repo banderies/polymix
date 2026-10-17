@@ -39,7 +39,7 @@ cargo run -p polymix --example gen_test_meshes --release -- test_meshes
    vertices / floating parts, or **Auto Repair All** (`Q`). Fill mode Minimal / Flat / Smooth.
 3. Remove unwanted pieces: **Edit → Separate Shells** (`Shift+Y`), or **Select** (`S`), paint
    or lasso the region, then `X` (Discard) or `F` (Erase & Fill: delete and fill smoothly).
-4. **Smooth**: select a bumpy region and press `B` (Max Smoothness fairs it into its
+4. **Smooth**: select a bumpy region and press `Cmd+F` (Max Smoothness fairs it into its
    surroundings), smooth the whole model (Shape Preserving, volume-preserving), or use the
    *Robust smooth* sculpt brush.
 5. **Vessel → Trim branch**: click a branch where an inlet/outlet should be. It is cut
@@ -76,7 +76,7 @@ Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |
 | Switching tools | Opening another tool (hotkey, palette, menu) accepts the current one, as in Meshmixer; only `Esc` / Cancel discards |
-| With a selection | `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `B` smooth, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, `S` clear selection |
+| With a selection | `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `Cmd+F` smooth, `B` smooth boundary, `Y` separate, `Cmd+B` bridge, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, `S` clear selection |
 | Select tool | Drag on the model: paint · Drag from the background: lasso (closed loop selects inside) or laser cut (open curve selects the smaller side, through the model) · Double-click a triangle at an open edge: select the ring around that hole (then `F` to erase & fill it cleanly) · Double-click elsewhere: connected part · Shift: deselect |
 
 Shading: *View → Sharp edges* (on by default) keeps hard corners on CAD parts crisp: edges

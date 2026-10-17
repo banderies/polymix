@@ -359,8 +359,11 @@ impl Tool for SelectTool {
         ui_util::section(ui, "Modify");
         ui.add_enabled_ui(has_sel, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Smooth").on_hover_text("Deform > Smooth").clicked() {
+                if ui.button("Smooth").on_hover_text("Deform > Smooth (Cmd+F)").clicked() {
                     self.request = Some(Box::new(ops::SmoothTool::new(cx)));
+                }
+                if ui.button("Smooth Boundary").on_hover_text("Smooth the border of the selection (B)").clicked() {
+                    self.request = Some(Box::new(ops::SmoothBoundaryTool::new(cx)));
                 }
                 if ui.button("Remesh").on_hover_text("R").clicked() {
                     self.request = Some(Box::new(ops::RemeshTool::new(cx)));
@@ -544,8 +547,7 @@ impl Tool for SelectTool {
         } else if i.key_pressed(Key::R) && !cmd {
             self.request = Some(Box::new(ops::RemeshTool::new(cx)));
         } else if i.key_pressed(Key::B) && !cmd {
-            // Meshmixer's B is Smooth Boundary (ROADMAP M2.1); until then B smooths too.
-            self.request = Some(Box::new(ops::SmoothTool::new(cx)));
+            self.request = Some(Box::new(ops::SmoothBoundaryTool::new(cx)));
         } else if i.key_pressed(Key::F) && cmd {
             self.request = Some(Box::new(ops::SmoothTool::new(cx)));
         } else if i.key_pressed(Key::B) && cmd {

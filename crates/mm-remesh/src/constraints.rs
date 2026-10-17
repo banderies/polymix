@@ -66,12 +66,17 @@ pub(crate) struct ConstraintOptions {
     pub groups: bool,
     /// Curve vertices whose curve turns by more than this angle become corners.
     pub corner_deg: Option<f64>,
+    /// Flag group-border curves for smoothing: `Some(None)` = every group border,
+    /// `Some(Some(split))` = borders between groups `< split` and `>= split`.
+    pub smooth_groups: Option<Option<i32>>,
 }
 
 pub(crate) struct Constraints {
     pub v: Vec<VCons>,
     pub e: Vec<ECons>,
     pub curve_count: u32,
+    /// Per curve: flagged for smoothing (see `ConstraintOptions::smooth_groups`).
+    pub smooth: Vec<bool>,
 }
 
 /// Classify `edges` and `verts` (the edges and vertices of the region triangles).
@@ -168,12 +173,14 @@ pub(crate) fn build_constraints(
 
     // Chain feature edges into curves, walking through curve vertices.
     let mut curve_count = 0u32;
+    let mut smooth = Vec::new();
     for &e in edges {
         if ec[e as usize].kind != E_FEATURE || ec[e as usize].curve != INVALID {
             continue;
         }
         let id = curve_count;
         curve_count += 1;
+        smooth.push(opts.smooth_groups.is_some_and(|split| smoothable_group_border(mesh, e, split, cos_sharp)));
         ec[e as usize].curve = id;
         for start in mesh.edge_vertices(e) {
             let mut v = start;
@@ -198,5 +205,21 @@ pub(crate) fn build_constraints(
             }
         }
     }
-    Constraints { v: vc, e: ec, curve_count }
+    Constraints { v: vc, e: ec, curve_count, smooth }
+}
+
+/// Is feature edge `e` a face-group border selected for smoothing (and not a sharp crease)?
+fn smoothable_group_border(mesh: &Mesh, e: u32, split: Option<i32>, cos_sharp: Option<f64>) -> bool {
+    let [t0, t1] = mesh.edge_triangles(e);
+    if t1 == INVALID {
+        return false;
+    }
+    let (g0, g1) = (mesh.tri_group(t0), mesh.tri_group(t1));
+    if g0 == g1 || split.is_some_and(|s| (g0 < s) == (g1 < s)) {
+        return false;
+    }
+    match cos_sharp {
+        Some(c) => mesh.tri_normal(t0).dot(mesh.tri_normal(t1)) >= c,
+        None => true,
+    }
 }

@@ -33,14 +33,13 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M1.4 Hotkeys.** `A` accept; Alt+←/→ undo/redo; Alt+Shift+←/→ undo/redo skipping tool
       changes; ⌘⇧O object browser; selection: `B` Smooth Boundary, ⌘F Smooth, `Y` Separate,
       `J` Join, `P` Fit Primitive, ⌘B Bridge (bound as the tools land); Remesh/Reduce in-tool
-      D/F density ±10, T adaptive, G preserve groups. Done except `B` → Smooth Boundary (M2.1),
-      `J` (M3.2) and `P` (M4.6).
+      D/F density ±10, T adaptive, G preserve groups. Done except `J` (M3.2) and `P` (M4.6).
 - [x] **M1.5 View commands.** Recenter at cursor (Alt+click / View menu), Previous/Next view (⌘[ ⌘]),
       Show grid.
 
 ## M2 — Selection
 
-- [ ] **M2.1 Smooth Boundary** (Smoothness, Preserve Shape, Iterations, Border Rings, Preserve
+- [x] **M2.1 Smooth Boundary** (Smoothness, Preserve Shape, Iterations, Border Rings, Preserve
       Mesh Boundary, Preserve Group Borders, Create New Groups).
 - [ ] **M2.2 Erase & Fill parity**: Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth,
       Scale, Bulge, Create New Groups.

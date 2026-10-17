@@ -580,6 +580,7 @@ impl OpSpec for RemeshSpec {
             adaptive: p.mode == RemeshMode::AdaptiveDensity,
             project_to_original: true,
             region: sel.map(|s| s.to_vec()),
+            smooth_group_boundaries: None,
         };
         let r = mm_remesh::remesh(&mut m, &params, Some(progress))?;
         if r.cancelled {
@@ -599,6 +600,118 @@ impl OpSpec for RemeshSpec {
     }
 }
 pub type RemeshTool = OpTool<RemeshSpec>;
+
+// ---------------------------------------------------------------------------
+// Smooth Boundary (B with a selection; Meshmixer "Smooth Loop")
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SmoothBoundaryUi {
+    /// 0..100: how strongly the border curve is smoothed each pass.
+    pub smoothness: f64,
+    /// 0..100: how much of the original border shape is kept.
+    pub preserve_shape: f64,
+    pub iterations: usize,
+    /// Rings of triangles on each side of the border that are re-triangulated.
+    pub border_rings: usize,
+    pub preserve_mesh_boundary: bool,
+    /// Other face-group borders near the selection stay exact (otherwise they are smoothed
+    /// too).
+    pub preserve_group_borders: bool,
+    /// The selected region becomes one new face group.
+    pub create_new_groups: bool,
+}
+
+pub struct SmoothBoundarySpec;
+impl OpSpec for SmoothBoundarySpec {
+    type Params = SmoothBoundaryUi;
+    const NAME: &'static str = "Smooth Boundary";
+    fn defaults(_info: &OpInfo) -> Self::Params {
+        // Meshmixer's defaults.
+        SmoothBoundaryUi {
+            smoothness: 50.0,
+            preserve_shape: 50.0,
+            iterations: 30,
+            border_rings: 2,
+            preserve_mesh_boundary: false,
+            preserve_group_borders: true,
+            create_new_groups: true,
+        }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, _info: &OpInfo) {
+        ui.add(egui::Slider::new(&mut p.smoothness, 0.0..=100.0).text("Smoothness"));
+        ui.add(egui::Slider::new(&mut p.preserve_shape, 0.0..=100.0).text("Preserve shape"));
+        ui.add(egui::Slider::new(&mut p.iterations, 1..=100).text("Iterations"));
+        ui.add(egui::Slider::new(&mut p.border_rings, 1..=8).text("Border rings"));
+        ui.checkbox(&mut p.preserve_mesh_boundary, "Preserve mesh boundary");
+        ui.checkbox(&mut p.preserve_group_borders, "Preserve group borders");
+        ui.checkbox(&mut p.create_new_groups, "Create new groups");
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let tris = sel.ok_or_else(|| anyhow::anyhow!("select a region first"))?;
+        let mut m = mesh.clone();
+        let selection = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
+        // Give the selected triangles their own (offset) groups, so the selection border is
+        // a group border the remesher keeps as a curve and smooths.
+        let offset = m.max_group_id().max(0) + 1;
+        for &t in tris {
+            m.set_tri_group(t, m.tri_group(t) + offset);
+        }
+        // Band of triangles around the border (interior border only: open mesh boundaries
+        // are not part of the selection border).
+        let mut ring: Vec<u32> = Vec::new();
+        for t in selection.iter() {
+            for e in m.tri_edges(t) {
+                let o = m.edge_other_triangle(e, t);
+                if o != mm_core::INVALID && !selection.contains(o) {
+                    ring.extend(m.edge_vertices(e));
+                }
+            }
+        }
+        if ring.is_empty() {
+            anyhow::bail!("the selection has no border inside the mesh");
+        }
+        let mut band = mm_core::TriSelection::new(&m);
+        for &v in &ring {
+            for t in m.vertex_triangles(v) {
+                band.insert(t);
+            }
+        }
+        for _ in 1..p.border_rings {
+            band.expand(&m);
+        }
+        let band: Vec<u32> = band.iter().collect();
+        let target = mm_remesh::edge_length_stats_in(&m, &band).mean;
+        let params = mm_remesh::RemeshParams {
+            target_edge_length: target,
+            iterations: p.iterations,
+            smoothing: 0.5,
+            boundary: if p.preserve_mesh_boundary { mm_remesh::BoundaryMode::Fixed } else { mm_remesh::BoundaryMode::ConstrainToBoundary },
+            preserve_sharp_edges: None,
+            preserve_group_boundaries: true,
+            adaptive: false,
+            project_to_original: true,
+            region: Some(band),
+            smooth_group_boundaries: Some(mm_remesh::GroupBorderSmoothing {
+                strength: (p.smoothness / 100.0).clamp(0.0, 1.0),
+                anchor: 0.2 * (p.preserve_shape / 100.0).clamp(0.0, 1.0).powi(2),
+                split: p.preserve_group_borders.then_some(offset),
+            }),
+        };
+        let r = mm_remesh::remesh(&mut m, &params, Some(progress))?;
+        if r.cancelled {
+            anyhow::bail!("cancelled");
+        }
+        // The selection is whatever carries an offset group; restore or merge groups.
+        let selected: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_group(t) >= offset).collect();
+        for &t in &selected {
+            let g = if p.create_new_groups { offset } else { m.tri_group(t) - offset };
+            m.set_tri_group(t, g);
+        }
+        Ok(OpOutput { message: format!("smoothed the border of {} triangles", selected.len()), mesh: m, selection: Some(selected) })
+    }
+}
+pub type SmoothBoundaryTool = OpTool<SmoothBoundarySpec>;
 
 // ---------------------------------------------------------------------------
 // Reduce (Shift+R)
@@ -1041,6 +1154,46 @@ mod tests {
         let mut state = egui::InputState::default();
         state = state.begin_pass(raw, false, 1.0, egui::InputOptions::default());
         state
+    }
+
+    /// Total turning angle along the selection border (lower = smoother).
+    fn border_turning(m: &Mesh, sel: &[u32]) -> f64 {
+        let s = mm_core::TriSelection::from_tris(m, sel.iter().copied());
+        let edges: Vec<u32> = s.boundary_edges(m).into_iter().filter(|&e| !m.is_boundary_edge(e)).collect();
+        let mut nb: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for &e in &edges {
+            let [a, b] = m.edge_vertices(e);
+            nb.entry(a).or_default().push(b);
+            nb.entry(b).or_default().push(a);
+        }
+        nb.iter()
+            .filter(|(_, n)| n.len() == 2)
+            .map(|(&v, n)| {
+                let p = m.vertex(v);
+                let d1 = (p - m.vertex(n[0])).normalize_or_zero();
+                let d2 = (m.vertex(n[1]) - p).normalize_or_zero();
+                d1.dot(d2).clamp(-1.0, 1.0).acos()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn smooth_boundary_straightens_a_jagged_selection() {
+        let m = mm_core::primitives::icosphere(1.0, 4);
+        // Upper half: its border follows triangle edges, so it zigzags around the equator.
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.0).collect();
+        let before = border_turning(&m, &sel);
+        let out = run_spec::<SmoothBoundarySpec>(&m, Some(&sel)).unwrap();
+        assert!(out.mesh.is_closed());
+        let new_sel = out.selection.unwrap();
+        assert!(!new_sel.is_empty());
+        let after = border_turning(&out.mesh, &new_sel);
+        assert!(after < 0.6 * before, "border turning {before:.2} -> {after:.2}");
+        // Still on the sphere, and the selection became one new group.
+        assert!(out.mesh.vertex_ids().all(|v| (out.mesh.vertex(v).length() - 1.0).abs() < 0.02));
+        let g = out.mesh.tri_group(new_sel[0]);
+        assert!(new_sel.iter().all(|&t| out.mesh.tri_group(t) == g));
+        assert!(out.mesh.triangle_ids().filter(|t| !new_sel.contains(t)).all(|t| out.mesh.tri_group(t) != g));
     }
 
     #[test]

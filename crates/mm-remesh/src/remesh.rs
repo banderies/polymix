@@ -63,6 +63,23 @@ pub struct RemeshParams {
     /// Only remesh these triangles. The region border is kept fixed and everything
     /// outside is left bit-identical. The new region ids are returned in the report.
     pub region: Option<Vec<u32>>,
+    /// Smooth face-group borders instead of keeping them exactly (needs
+    /// `preserve_group_boundaries`; Meshmixer "Smooth Group Boundaries" / Smooth Boundary).
+    pub smooth_group_boundaries: Option<GroupBorderSmoothing>,
+}
+
+/// How [`RemeshParams::smooth_group_boundaries`] smooths face-group border curves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupBorderSmoothing {
+    /// Per pass, border vertices move this fraction (0..1) toward the midpoint of their two
+    /// neighbours along the border.
+    pub strength: f64,
+    /// Per pass, they are pulled back toward the original border by this fraction (0..1);
+    /// higher keeps more of the original shape and stops loops from shrinking.
+    pub anchor: f64,
+    /// Only smooth borders between a group `< split` and a group `>= split` (other group
+    /// borders stay exact). `None` smooths every group border.
+    pub split: Option<i32>,
 }
 
 impl Default for RemeshParams {
@@ -77,6 +94,7 @@ impl Default for RemeshParams {
             adaptive: false,
             project_to_original: true,
             region: None,
+            smooth_group_boundaries: None,
         }
     }
 }
@@ -147,12 +165,17 @@ pub fn remesh(mesh: &mut Mesh, params: &RemeshParams, progress: Option<ProgressF
             sharp_deg: params.preserve_sharp_edges,
             groups: params.preserve_group_boundaries,
             corner_deg: params.preserve_sharp_edges,
+            smooth_groups: params.smooth_group_boundaries.filter(|_| params.preserve_group_boundaries).map(|g| g.split),
         },
         base: params.target_edge_length,
         adaptive: params.adaptive,
         project: params.project_to_original,
         smoothing: params.smoothing.clamp(0.0, 1.0),
         free_boundary: params.boundary == BoundaryMode::Free,
+        group_smoothing: params
+            .smooth_group_boundaries
+            .filter(|_| params.preserve_group_boundaries)
+            .map(|g| (g.strength.clamp(0.0, 1.0), g.anchor.clamp(0.0, 1.0))),
     };
     let mut r = Remesher::new(mesh, setup);
     r.timings.setup = start.elapsed();
@@ -194,6 +217,8 @@ pub(crate) struct Setup<'a> {
     pub project: bool,
     pub smoothing: f64,
     pub free_boundary: bool,
+    /// (strength, anchor) for smoothing the flagged group-border curves.
+    pub group_smoothing: Option<(f64, f64)>,
 }
 
 /// Frozen copy of the input surface used for projection and the sizing field.
@@ -217,6 +242,9 @@ pub(crate) struct Remesher<'m> {
     pub smoothing: f64,
     pub project: bool,
     pub curves: CurveIndex,
+    /// Per curve: smooth it (group border selected for smoothing).
+    pub curve_smooth: Vec<bool>,
+    pub group_smoothing: Option<(f64, f64)>,
     pub reference: Option<Reference>,
     /// Reject collapses that create edges longer than `MAX_FACTOR` x target.
     pub check_collapse_len: bool,
@@ -278,6 +306,7 @@ impl<'m> Remesher<'m> {
             }
         }
         let curves = CurveIndex::new(segs, cons.curve_count);
+        let curve_smooth = cons.smooth;
 
         Remesher {
             mesh,
@@ -291,6 +320,8 @@ impl<'m> Remesher<'m> {
             smoothing: s.smoothing,
             project: s.project,
             curves,
+            curve_smooth,
+            group_smoothing: s.group_smoothing,
             reference,
             check_collapse_len: true,
             collapse_min_quality: 0.1,
@@ -667,6 +698,8 @@ impl<'m> Remesher<'m> {
             ec: &self.ec,
             vsize: &self.vsize,
             curves: &self.curves,
+            curve_smooth: &self.curve_smooth,
+            group_smoothing: self.group_smoothing,
             reference: if self.project || self.adaptive { self.reference.as_ref() } else { None },
             project: self.project,
             lambda: self.smoothing,
@@ -741,6 +774,8 @@ struct SmoothCtx<'a> {
     ec: &'a [ECons],
     vsize: &'a [f64],
     curves: &'a CurveIndex,
+    curve_smooth: &'a [bool],
+    group_smoothing: Option<(f64, f64)>,
     reference: Option<&'a Reference>,
     project: bool,
     lambda: f64,
@@ -769,6 +804,20 @@ impl SmoothCtx<'_> {
             }
             if k != 2 {
                 return (p, h);
+            }
+            if let (Some((strength, anchor)), true) = (self.group_smoothing, self.curve_smooth.get(c.curve as usize).copied().unwrap_or(false)) {
+                // Smoothed group border: toward the neighbours' midpoint, back toward the
+                // original border by `anchor`, then onto the surface.
+                let mut ps = p + ((nb[0] + nb[1]) * 0.5 - p) * strength;
+                if let Some((q, _)) = self.curves.nearest(c.curve, ps) {
+                    ps += (q - ps) * anchor;
+                }
+                if let Some(r) = self.reference {
+                    if let Some(hit) = r.bvh.nearest(&r.mesh, ps, 4.0 * h).or_else(|| r.bvh.nearest(&r.mesh, ps, f64::INFINITY)) {
+                        return (hit.point, h);
+                    }
+                }
+                return (ps, h);
             }
             let t = (nb[1] - nb[0]).normalize_or_zero();
             let target = (nb[0] + nb[1]) * 0.5;

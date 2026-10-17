@@ -201,6 +201,7 @@ impl<'m> Reducer<'m> {
             sharp_deg: None,
             groups: p.preserve_group_boundaries,
             corner_deg: None,
+            smooth_groups: None,
         };
         let cons = build_constraints(mesh, &region, &edges, &verts, &opts);
         let count = region.triangle_count(mesh);

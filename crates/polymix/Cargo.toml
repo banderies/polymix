@@ -30,3 +30,5 @@ png = "0.18"
 [target.'cfg(target_os = "macos")'.dependencies]
 # 3D mouse: the 3Dconnexion driver framework is loaded at run time.
 libloading = "0.8"
+# Scripted test runs open their window without activating the app.
+winit = "0.30"

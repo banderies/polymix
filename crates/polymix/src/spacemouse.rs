@@ -320,6 +320,10 @@ mod mac {
         }
         // SAFETY: for device-state messages the driver passes a pointer to its report struct.
         let s = unsafe { std::ptr::read_unaligned(arg as *const DeviceState) };
+        if std::env::var_os("POLYMIX_DEBUG_3D").is_some() {
+            let (command, param, value, buttons, b8) = (s.command, s.param, s.value, s.buttons, s.buttons8);
+            eprintln!("[3d] command {command} param {param} value {value} buttons {buttons:#x} buttons8 {b8:#x} axis {:?}", { s.axis });
+        }
         match s.command {
             CMD_AXIS => on_axis(s.axis),
             CMD_BUTTONS => on_buttons(s.buttons),
