@@ -23,6 +23,7 @@ pub mod bridge;
 pub mod cap;
 pub mod cut;
 pub mod extrude;
+pub mod face_groups;
 pub mod flow;
 pub mod mirror;
 pub mod region;
@@ -36,6 +37,7 @@ pub use cut::{
     local_plane_cut, local_plane_cut_with, nearest_intersection_curve, plane_cut, plane_intersection_curves, CutFill,
     IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,
 };
+pub use face_groups::{generate_face_groups, FaceGroupMode};
 pub use extrude::{
     extract_solid, extrude_selection, offset_selection, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
 };

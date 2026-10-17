@@ -71,6 +71,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "closecracks" => Box::new(tools::ops::CloseCracksTool::new(cx)),
         "join" => Box::new(tools::ops::JoinTool::new(cx)),
         "regionbridge" => Box::new(tools::ops::RegionBridgeTool::new(cx)),
+        "facegroups" => Box::new(tools::ops::FaceGroupsTool::new(cx)),
         "weldboundaries" => Box::new(tools::ops::WeldBoundariesTool::new(cx)),
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
@@ -677,6 +678,9 @@ impl PolymixApp {
                     }
                     if ui.button("Close Cracks").on_hover_text("Zip open boundaries that lie on top of each other").clicked() {
                         open = Some("closecracks");
+                    }
+                    if ui.button("Generate Face Groups").on_hover_text("Segment the mesh into face groups by crease or normal angle").clicked() {
+                        open = Some("facegroups");
                     }
                     ui.separator();
                     if ui.button("Separate Shells  (Shift+Y)").clicked() {
@@ -1436,7 +1440,7 @@ impl PolymixApp {
                 color: o.color,
                 wireframe: self.view.wireframe,
                 flat: self.view.flat,
-                group_colors: self.view.group_colors,
+                group_colors: self.view.group_colors || self.tools.last().is_some_and(|t| t.shows_groups()),
                 dim: multiple && Some(o.id) != active,
                 cut_tint: matches!(cut_tint, Some(t) if t.is_none() || t == Some(o.id)),
                 crease_deg: self.view.sharp_edges.then_some(self.view.crease_deg),

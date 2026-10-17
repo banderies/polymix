@@ -37,6 +37,8 @@ pub trait OpSpec: Send + 'static {
     const USES_SELECTION: bool = true;
     /// Recompute automatically while parameters change.
     const LIVE: bool = true;
+    /// Show face-group colours while the tool is open.
+    const SHOWS_GROUPS: bool = false;
     fn defaults(info: &OpInfo) -> Self::Params;
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo);
     fn run(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput>;
@@ -187,6 +189,10 @@ impl<S: OpSpec> OpTool<S> {
 impl<S: OpSpec> Tool for OpTool<S> {
     fn name(&self) -> &'static str {
         S::NAME
+    }
+
+    fn shows_groups(&self) -> bool {
+        S::SHOWS_GROUPS
     }
 
     fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
@@ -1004,6 +1010,49 @@ impl OpSpec for RegionBridgeSpec {
 pub type RegionBridgeTool = OpTool<RegionBridgeSpec>;
 
 // ---------------------------------------------------------------------------
+// Generate Face Groups (Edit)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FaceGroupsUi {
+    pub mode: mm_edit::FaceGroupMode,
+    pub angle: f64,
+    /// Groups with fewer triangles are merged into a neighbour.
+    pub min_size: usize,
+}
+
+pub struct FaceGroupsSpec;
+impl OpSpec for FaceGroupsSpec {
+    type Params = FaceGroupsUi;
+    const NAME: &'static str = "Generate Face Groups";
+    const USES_SELECTION: bool = false;
+    const SHOWS_GROUPS: bool = true;
+    fn defaults(_: &OpInfo) -> Self::Params {
+        FaceGroupsUi { mode: mm_edit::FaceGroupMode::EdgeAngle, angle: 10.0, min_size: 0 }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, _info: &OpInfo) {
+        egui::ComboBox::from_label("Mode")
+            .selected_text(match p.mode {
+                mm_edit::FaceGroupMode::EdgeAngle => "Edge Angle",
+                mm_edit::FaceGroupMode::NormalAngle => "Normal Angle",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut p.mode, mm_edit::FaceGroupMode::EdgeAngle, "Edge Angle").on_hover_text("Split along edges sharper than the threshold");
+                ui.selectable_value(&mut p.mode, mm_edit::FaceGroupMode::NormalAngle, "Normal Angle").on_hover_text("Near-planar patches: faces within the threshold of each patch's first face");
+            });
+        ui.add(egui::Slider::new(&mut p.angle, 1.0..=90.0).suffix("°").text("Angle threshold"));
+        ui.add(egui::Slider::new(&mut p.min_size, 0..=2000).logarithmic(true).text("Size threshold (triangles)"));
+        ui.small("Replaces all face groups. Group colours are shown while this tool is open.");
+    }
+    fn run(mesh: &Mesh, _sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let mut m = mesh.clone();
+        let n = mm_edit::generate_face_groups(&mut m, p.mode, p.angle, p.min_size);
+        Ok(OpOutput { mesh: m, message: format!("{n} face groups"), ..Default::default() })
+    }
+}
+pub type FaceGroupsTool = OpTool<FaceGroupsSpec>;
+
+// ---------------------------------------------------------------------------
 // Reduce (Shift+R)
 // ---------------------------------------------------------------------------
 
@@ -1733,6 +1782,7 @@ mod tests {
         run_spec::<EraseFillSpec>(&m, Some(&sel)).unwrap();
         run_spec::<MirrorSpec>(&m, None).unwrap();
         run_spec::<CloseCracksSpec>(&m, None).unwrap();
+        run_spec::<FaceGroupsSpec>(&m, None).unwrap();
         run_spec::<SmoothBoundarySpec>(&m, Some(&sel)).unwrap();
         let solid = run_spec::<MakeSolidSpec>(&m, None).unwrap();
         assert!(solid.mesh.is_closed());

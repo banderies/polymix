@@ -249,6 +249,10 @@ pub trait Tool {
     fn take_request(&mut self) -> Option<Box<dyn Tool>> {
         None
     }
+    /// Show face-group colours while this tool is open (its result is about groups).
+    fn shows_groups(&self) -> bool {
+        false
+    }
     /// Whether the tool is computing something (shows a spinner, blocks other tools).
     fn busy(&self) -> Option<(String, f32)> {
         None
