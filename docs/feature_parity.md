@@ -158,8 +158,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Tube Handle | ✅ | Curved tube between two selected regions |
 | Edit: Align To Target / Attract To Target | ✅ | Align: ICP on the selected (or all) faces, Translate and Rotate / Translate Only. Attract: offset, smooth, normal threshold, preserve mesh / group boundaries, optional refinement (density). Project to Target in Erase & Fill and Smooth Boundary |
 | Edit: Separate (Y) / Duplicate selection | ✅ | |
-| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | 🟡 | J, ⌘B ✅; P with Fit Primitive (M4.6) |
-| Edit: Fit Primitive | ❌ | |
+| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | ✅ | |
+| Edit: Fit Primitive | ✅ | Square, Rectangle, Cylinder, Sphere from plane / best-fit, Disc, Linear Sweep, Convex Hull, Height Field; Mesh Density, Single Primitive, Create New Objects; fitted sizes shown. The per-primitive adjust gizmo ❌ (use Transform) |
 | Edit: Grow Hair | ⚪ ❌ | |
 | **Deform** menu: Smooth (⌘F) | ✅ | |
 | Deform: Smooth Boundary ("Smooth Loop", B) | ✅ | Meshmixer's parameters and defaults; remesher smooths the border curve |

@@ -80,7 +80,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M4.4 Align** (source/destination picking: base point, surface, world origin/axes).
 - [x] **M4.5 Target surface**: Set/Clear Target (menu + object browser), Transparent Target,
       Align To Target, Attract To Target, "Project to Target" options.
-- [ ] **M4.6 Fit Primitive** (Square, Rectangle, Cylinder, Spheres, Disc, Linear Sweep, Convex
+- [x] **M4.6 Fit Primitive** (Square, Rectangle, Cylinder, Spheres, Disc, Linear Sweep, Convex
       Hull, Height Field).
 - [ ] **M4.7 Add Tube** (spline tube between points; vessel bypass/repair).
 

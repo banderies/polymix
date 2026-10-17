@@ -4,6 +4,7 @@ mod boolean_tests;
 mod bridge_tests;
 mod cut_tests;
 mod extrude_tests;
+mod fit_tests;
 mod flow_tests;
 mod local_cut_tests;
 mod misc_tests;

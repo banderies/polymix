@@ -69,6 +69,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "align" => Box::new(tools::align::AlignTool::new(cx)),
         "attracttotarget" => Box::new(tools::ops::AttractToTargetTool::new(cx)),
         "aligntotarget" => Box::new(tools::ops::AlignToTargetTool::new(cx)),
+        "fitprimitive" => Box::new(tools::ops::FitPrimitiveTool::new(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),

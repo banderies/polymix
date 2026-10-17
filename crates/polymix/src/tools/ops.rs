@@ -2006,6 +2006,96 @@ impl OpSpec for AlignToTargetSpec {
 }
 pub type AlignToTargetTool = OpTool<AlignToTargetSpec>;
 
+// ---------------------------------------------------------------------------
+// Fit Primitive
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FitPrimitiveUi {
+    pub kind: mm_edit::PrimitiveType,
+    pub density: usize,
+    /// One primitive for the whole selection instead of one per connected piece.
+    pub single: bool,
+    pub create_new_objects: bool,
+}
+
+/// Connected pieces of a triangle set.
+fn selection_pieces(m: &Mesh, tris: &[u32]) -> Vec<Vec<u32>> {
+    let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for &t in tris {
+        if !seen.insert(t) {
+            continue;
+        }
+        let mut piece = vec![t];
+        let mut stack = vec![t];
+        while let Some(x) = stack.pop() {
+            for n in m.tri_neighbors(x) {
+                if n != mm_core::INVALID && set.contains(&n) && seen.insert(n) {
+                    piece.push(n);
+                    stack.push(n);
+                }
+            }
+        }
+        out.push(piece);
+    }
+    out
+}
+
+pub struct FitPrimitiveSpec;
+impl OpSpec for FitPrimitiveSpec {
+    type Params = FitPrimitiveUi;
+    const NAME: &'static str = "Fit Primitive";
+    fn defaults(_: &OpInfo) -> Self::Params {
+        // Meshmixer's defaults.
+        FitPrimitiveUi { kind: mm_edit::PrimitiveType::Square, density: 32, single: false, create_new_objects: false }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        egui::ComboBox::from_label("Primitive type").selected_text(p.kind.label()).show_ui(ui, |ui| {
+            for k in mm_edit::PrimitiveType::ALL {
+                ui.selectable_value(&mut p.kind, k, k.label());
+            }
+        });
+        ui.add(egui::Slider::new(&mut p.density, 4..=128).text("mesh density"));
+        ui.checkbox(&mut p.single, "Single primitive").on_hover_text("One primitive for the whole selection instead of one per piece");
+        ui.checkbox(&mut p.create_new_objects, "Create new objects").on_hover_text("Each primitive becomes its own object (otherwise it is added to this one)");
+        if info.selection.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select the faces to fit first.");
+        }
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let tris = sel.ok_or_else(|| anyhow::anyhow!("select the faces to fit first"))?;
+        let pieces = if p.single { vec![tris.to_vec()] } else { selection_pieces(mesh, tris) };
+        let mut fits = Vec::new();
+        for piece in &pieces {
+            fits.push(mm_edit::fit_primitive(mesh, piece, p.kind, p.density)?);
+        }
+        let message = fits.iter().map(|f| f.description.clone()).collect::<Vec<_>>().join("; ");
+        let mut out = mesh.clone();
+        if p.create_new_objects {
+            let mut preview = mesh.clone();
+            for f in &fits {
+                preview.append_mesh(&f.mesh, preview.max_group_id() + 1);
+            }
+            let name = p.kind.label().to_lowercase();
+            return Ok(OpOutput {
+                mesh: out,
+                selection: Some(tris.to_vec()),
+                message,
+                new_objects: fits.into_iter().map(|f| (name.clone(), f.mesh)).collect(),
+                preview: Some(preview),
+            });
+        }
+        for f in &fits {
+            let g = out.max_group_id() + 1;
+            out.append_mesh(&f.mesh, g);
+        }
+        Ok(OpOutput { mesh: out, selection: Some(tris.to_vec()), message, ..Default::default() })
+    }
+}
+pub type FitPrimitiveTool = OpTool<FitPrimitiveSpec>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2405,5 +2495,25 @@ mod target_tests {
         let out = AlignToTargetSpec::run_with(&m, None, &p, Some(&t), &|_| true).unwrap();
         let err = base.vertex_ids().map(|v| out.mesh.vertex(v).distance(base.vertex(v))).fold(0.0, f64::max);
         assert!(err < 1e-3, "{err}: {}", out.message);
+    }
+}
+
+#[cfg(test)]
+mod fit_primitive_tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn one_primitive_per_piece_or_new_objects() {
+        let m = primitives::plane_grid(6.0, 2.0, 24, 8);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).x.abs() > 1.5).collect();
+        let p = FitPrimitiveUi { kind: mm_edit::PrimitiveType::Rectangle, density: 4, single: false, create_new_objects: false };
+        let out = FitPrimitiveSpec::run(&m, Some(&sel), &p, &|_| true).unwrap();
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 3, "two rectangles added");
+        let single = FitPrimitiveSpec::run(&m, Some(&sel), &FitPrimitiveUi { single: true, ..p }, &|_| true).unwrap();
+        assert_eq!(mm_core::topology::connected_components(&single.mesh).len(), 2);
+        let objects = FitPrimitiveSpec::run(&m, Some(&sel), &FitPrimitiveUi { create_new_objects: true, ..p }, &|_| true).unwrap();
+        assert_eq!(objects.new_objects.len(), 2);
+        assert_eq!(objects.mesh.triangle_count(), m.triangle_count());
     }
 }

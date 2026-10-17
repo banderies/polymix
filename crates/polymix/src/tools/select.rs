@@ -683,6 +683,9 @@ impl Tool for SelectTool {
                 if ui.button("Attract To Target").on_hover_text("Pull the selected faces onto the target surface").clicked() {
                     self.request = Some(Box::new(ops::AttractToTargetTool::new(cx)));
                 }
+                if ui.button("Fit Primitive").on_hover_text("P: fit a plane, cylinder, sphere, hull … to the selected faces").clicked() {
+                    self.request = Some(Box::new(ops::FitPrimitiveTool::new(cx)));
+                }
                 if ui.button("Separate").clicked() {
                     self.cmd(cx, |x| commands::separate_selection(x, false));
                 }
@@ -947,6 +950,8 @@ impl Tool for SelectTool {
             self.request = Some(Box::new(ops::SmoothTool::new(cx)));
         } else if i.key_pressed(Key::B) && cmd {
             self.request = Some(Box::new(ops::RegionBridgeTool::new(cx)));
+        } else if i.key_pressed(Key::P) && !cmd && !shift {
+            self.request = Some(Box::new(ops::FitPrimitiveTool::new(cx)));
         } else if i.key_pressed(Key::J) && !cmd && !shift {
             self.request = Some(Box::new(ops::JoinTool::new(cx)));
         } else if i.key_pressed(Key::Y) && !cmd && !shift {
