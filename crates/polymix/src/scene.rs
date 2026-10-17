@@ -35,6 +35,9 @@ pub struct SceneObject {
     /// Per-triangle values in [0, 1] shown with a colormap (e.g. deviation analysis),
     /// with a stamp that changes whenever the values do.
     pub scalars: Option<(u64, Arc<Vec<f32>>)>,
+    /// Per-triangle display colours (`0xRRGGBB`, e.g. Mesh Query); take precedence over
+    /// `scalars`.
+    pub colors: Option<(u64, Arc<Vec<u32>>)>,
     /// Optional names for face groups (CFD boundary patches: wall, inlet, outlet_1, …).
     pub group_names: std::collections::HashMap<i32, String>,
     /// Orientation of the object's local frame: the rotations applied by Transform so far
@@ -58,6 +61,7 @@ impl SceneObject {
             moved_vertices: Vec::new(),
             moved_from: 0,
             scalars: None,
+            colors: None,
             frame: glam::DQuat::IDENTITY,
             bvh: None,
         }
@@ -267,6 +271,7 @@ impl Scene {
             o.touch_selection();
             o.moved_vertices.clear();
             o.scalars = None;
+            o.colors = None;
         }
     }
 

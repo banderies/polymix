@@ -18,7 +18,8 @@ struct Globals {
 
 struct Object {
     color: vec4<f32>,
-    // x: wireframe, y: flat shading, z: color mode (0 object, 1 face groups, 2 scalar field),
+    // x: wireframe, y: flat shading, z: color mode (0 object, 1 face groups, 2 scalar field,
+    // 3 per-triangle RGB),
     // w: bit 0 dim (non-active object), bit 1 show cut-plane tint
     flags: vec4<u32>,
 };
@@ -98,6 +99,9 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         base = hash_color(in.tflags >> 8u);
     } else if (object.flags.z == 2u) {
         base = diverging(f32((in.tflags >> 8u) & 0xffffu) / 65535.0);
+    } else if (object.flags.z == 3u) {
+        let rgb = in.tflags >> 8u;
+        base = vec3<f32>(f32((rgb >> 16u) & 0xffu), f32((rgb >> 8u) & 0xffu), f32(rgb & 0xffu)) / 255.0;
     }
     if (selected) {
         base = vec3<f32>(1.0, 0.45, 0.08);

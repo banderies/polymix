@@ -67,9 +67,17 @@ pub struct ObjectStyle {
     pub crease_deg: Option<f32>,
 }
 
-/// Per-triangle scalar values in `[0, 1]` (indexed by triangle id) shown with a colormap
-/// instead of the object colour; the stamp must change whenever the values do.
-pub type ScalarField<'a> = Option<(u64, &'a [f32])>;
+/// Per-triangle display values (indexed by triangle id) shown instead of the object colour.
+#[derive(Clone, Copy)]
+pub enum TriField<'a> {
+    /// Values in `[0, 1]` shown with a diverging colormap.
+    Scalar(&'a [f32]),
+    /// Colours as `0xRRGGBB`.
+    Rgb(&'a [u32]),
+}
+
+/// A [`TriField`] with a stamp that must change whenever the values do.
+pub type ScalarField<'a> = Option<(u64, TriField<'a>)>;
 
 /// GPU copy of one mesh.
 pub struct GpuMesh {
@@ -465,7 +473,8 @@ impl SceneRenderer {
                 .map(|&t| {
                     let sel = selection.map(|s| s.contains(t)).unwrap_or(false) as u32;
                     let payload = match scalars {
-                        Some((_, vals)) => (vals.get(t as usize).copied().unwrap_or(0.5).clamp(0.0, 1.0) * 65535.0) as u32,
+                        Some((_, TriField::Scalar(vals))) => (vals.get(t as usize).copied().unwrap_or(0.5).clamp(0.0, 1.0) * 65535.0) as u32,
+                        Some((_, TriField::Rgb(cols))) => cols.get(t as usize).copied().unwrap_or(0x808080) & 0x00ff_ffff,
                         None => (mesh.tri_group(t) as u32) & 0x00ff_ffff,
                     };
                     sel | (payload << 8)
@@ -482,7 +491,11 @@ impl SceneRenderer {
             flags: [
                 style.wireframe as u32,
                 style.flat as u32,
-                if scalars.is_some() { 2 } else { style.group_colors as u32 },
+                match scalars {
+                    Some((_, TriField::Scalar(_))) => 2,
+                    Some((_, TriField::Rgb(_))) => 3,
+                    None => style.group_colors as u32,
+                },
                 style.dim as u32 | ((style.cut_tint as u32) << 1),
             ],
         };

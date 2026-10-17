@@ -12,6 +12,7 @@ pub mod select;
 pub mod lasso;
 pub mod add_tube;
 pub mod align;
+pub mod mesh_query;
 pub mod surface_lasso;
 pub mod warp;
 pub mod transform;

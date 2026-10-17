@@ -247,3 +247,25 @@ fn split_bowtie_and_partial_fan() {
     s.check_validity().unwrap();
     assert!(!s.is_closed());
 }
+
+#[test]
+fn curvature_and_triangle_quality() {
+    let s = crate::primitives::icosphere(2.0, 4);
+    let k = crate::measure::gaussian_curvature(&s);
+    let h = crate::measure::mean_curvature(&s);
+    for v in s.vertex_ids() {
+        assert!((k[v as usize] - 0.25).abs() < 0.03, "K {}", k[v as usize]);
+        assert!((h[v as usize] - 0.5).abs() < 0.03, "H {}", h[v as usize]);
+    }
+    // Total Gaussian curvature of a closed genus-0 surface is 4π.
+    let areas = crate::measure::mixed_areas(&s);
+    let total: f64 = s.vertex_ids().map(|v| k[v as usize] * areas[v as usize]).sum();
+    assert!((total - 4.0 * std::f64::consts::PI).abs() < 1e-9);
+    let mut eq = Mesh::new();
+    let a = eq.append_vertex(DVec3::ZERO);
+    let b = eq.append_vertex(DVec3::X);
+    let c = eq.append_vertex(DVec3::new(0.5, 3f64.sqrt() / 2.0, 0.0));
+    let t = eq.append_triangle([a, b, c], 0).unwrap();
+    assert!((crate::measure::triangle_aspect_ratio(&eq, t) - 1.0).abs() < 1e-12);
+    assert!(crate::measure::triangle_angles(&eq, t).iter().all(|x| (x.to_degrees() - 60.0).abs() < 1e-9));
+}

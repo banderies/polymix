@@ -88,7 +88,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 - [x] **M5.1 Measure parity**: point coordinates, normal, axis X/Y/Z, min/max interior/exterior,
       fit cylinder, snapping (vertices / edges / group borders), set target length.
-- [ ] **M5.2 Mesh Query**: per-triangle/vertex info, curvature and normal colour modes.
+- [x] **M5.2 Mesh Query**: per-triangle/vertex info, curvature and normal colour modes.
 - [ ] **M5.3 Units/Dimensions from measurements** (set scale from a measured length).
 - [ ] **M5.4 Clearance** (minimum distance between objects).
 

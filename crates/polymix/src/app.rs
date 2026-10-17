@@ -73,6 +73,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "addtube" => Box::new(tools::add_tube::AddTubeTool::new(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
+        "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
         "remesh" => Box::new(tools::ops::RemeshTool::new(cx)),
         "reduce" => Box::new(tools::ops::ReduceTool::new(cx)),
@@ -768,6 +769,9 @@ impl PolymixApp {
                     }
                     if ui.button("Measure").clicked() {
                         open = Some("measure");
+                    }
+                    if ui.button("Mesh Query").on_hover_text("Colour by normal, position, triangle quality or curvature; click for triangle info").clicked() {
+                        open = Some("meshquery");
                     }
                     if ui.button("Units / Dimensions").clicked() {
                         open = Some("units");
@@ -1523,7 +1527,11 @@ impl PolymixApp {
                 }
             }
             let g = self.gpu.entry(o.id).or_insert_with(|| renderer.create_mesh(&rs.device));
-            let scalars = o.scalars.as_ref().map(|(stamp, v)| (*stamp, v.as_slice()));
+            let scalars = match (&o.colors, &o.scalars) {
+                (Some((stamp, c)), _) => Some((*stamp, renderer::TriField::Rgb(c.as_slice()))),
+                (None, Some((stamp, v))) => Some((*stamp, renderer::TriField::Scalar(v.as_slice()))),
+                (None, None) => None,
+            };
             renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars);
         }
         if preview.is_none() {

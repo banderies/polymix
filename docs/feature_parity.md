@@ -216,7 +216,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Inspector (I, Q = Auto Repair All) | ✅ | Minimal/Flat/Smooth fill, small-part threshold, click markers; + keep flat vessel ends |
 | Units / Dimensions | ✅ | |
 | Measure | ✅ | Point to point (clicks or drag), point coordinates, min/max interior/exterior along the normal or axis X/Y/Z, fit cylinder, plus vessel cross-section diameter; snapping to vertices / edges / group borders; set target length (scales the object) |
-| Mesh Query | 🟡 | Statistics panel (counts, size, area, volume, open edges) |
+| Mesh Query | ✅ | Color Mode: Vertex Position / Surface Normal / Aspect Ratio / Internal Angle / Gaussian / Mean Curvature with Color Range; click for triangle id, group, aspect ratio, min/max angle, nearest edge / vertex and curvatures. Per-triangle colours (Meshmixer blends per vertex) |
 | Thickness (identify / thicken thin regions) | ⛔ | 3D printing wall check |
 | Deviation | ✅ | Signed colour map + statistics |
 | Clearance | ❌ | |
