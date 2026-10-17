@@ -33,7 +33,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M1.4 Hotkeys.** `A` accept; Alt+←/→ undo/redo; Alt+Shift+←/→ undo/redo skipping tool
       changes; ⌘⇧O object browser; selection: `B` Smooth Boundary, ⌘F Smooth, `Y` Separate,
       `J` Join, `P` Fit Primitive, ⌘B Bridge (bound as the tools land); Remesh/Reduce in-tool
-      D/F density ±10, T adaptive, G preserve groups. Done except `J` (M3.2) and `P` (M4.6).
+      D/F density ±10, T adaptive, G preserve groups. Done except `P` (M4.6).
 - [x] **M1.5 View commands.** Recenter at cursor (Alt+click / View menu), Previous/Next view (⌘[ ⌘]),
       Show grid.
 
@@ -60,7 +60,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 ## M3 — Repair and topology
 
 - [x] **M3.1 Close Cracks** (weld coincident open edges, T-junctions; Edit → Close Cracks).
-- [ ] **M3.2 Weld Boundaries** and **Join** (selection boundaries).
+- [x] **M3.2 Weld Boundaries** and **Join** (selection boundaries; `J`).
 - [ ] **M3.3 Bridge between two selected regions** (Meshmixer style) and **Tube Handle**.
 - [ ] **M3.4 Generate Face Groups** (Edge Angle mode, Angle / Size thresholds, …).
 - [ ] **M3.5 Remesh parity**: Linear Subdivision, Regularity, Transition, Threshold.

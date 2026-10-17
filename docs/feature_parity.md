@@ -153,12 +153,12 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Offset (Ctrl+D) | 🟡 | Distance, Soft Transition, Preserve Boundary, Regularity ✅; Connected, Accuracy, Preserve Groups ❌ (meaning to confirm in Meshmixer) |
 | Edit: Remesh (R) / Reduce (Shift+R) on the selection | ✅ | In-tool D/F density ±10, T adaptive (Remesh), G preserve groups |
 | Edit: Bridge (two selected regions) | 🟡 | Polymix bridges two boundary loops |
-| Edit: Join (along boundary edges) | ❌ |  |
-| Edit: Weld Boundaries | ❌ |  |
+| Edit: Join (along boundary edges) | ✅ | `J`: stitches the two open boundaries next to the selection |
+| Edit: Weld Boundaries | ✅ | Close Cracks restricted to the selection's open edges, tolerance in edge lengths |
 | Edit: Tube Handle | ❌ | Connect two selected regions with a tube |
 | Edit: Align To Target / Attract To Target | ❌ | Needs target surface |
 | Edit: Separate (Y) / Duplicate selection | ✅ | |
-| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | 🟡 | ⌘B ✅; J and P with their tools |
+| Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | 🟡 | J, ⌘B ✅; P with Fit Primitive (M4.6) |
 | Edit: Fit Primitive | ❌ | |
 | Edit: Grow Hair | ⚪ ❌ | |
 | **Deform** menu: Smooth (⌘F) | ✅ | |

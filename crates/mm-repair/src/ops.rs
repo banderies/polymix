@@ -56,11 +56,16 @@ pub struct WeldReport {
 /// duplicated seams typical of STL exports). Merges that would create a non-manifold edge
 /// are skipped. Vertices left without triangles are removed.
 pub fn weld_boundary_vertices(mesh: &mut Mesh, tolerance: f64) -> WeldReport {
+    weld_boundary_vertices_in(mesh, tolerance, &|_| true)
+}
+
+/// [`weld_boundary_vertices`] restricted to vertices accepted by `only`.
+fn weld_boundary_vertices_in(mesh: &mut Mesh, tolerance: f64, only: &(dyn Fn(u32) -> bool + Sync)) -> WeldReport {
     let mut report = WeldReport::default();
     let bverts: Vec<u32> = {
         let m: &Mesh = mesh;
         let ids: Vec<u32> = m.vertex_ids().collect();
-        ids.into_par_iter().filter(|&v| m.is_boundary_vertex(v)).collect()
+        ids.into_par_iter().filter(|&v| only(v) && m.is_boundary_vertex(v)).collect()
     };
     if bverts.len() < 2 {
         return report;
@@ -159,25 +164,44 @@ pub struct CloseCracksReport {
 /// vertex on them are split first (T-junctions, e.g. where a fine and a coarse patch meet),
 /// then coincident boundary vertices are welded (see [`weld_boundary_vertices`]).
 pub fn close_cracks(mesh: &mut Mesh, tolerance: f64) -> CloseCracksReport {
+    close_cracks_in(mesh, tolerance, None)
+}
+
+/// [`close_cracks`] restricted to the given vertices (Meshmixer *Weld Boundaries* on a
+/// selection): only boundary vertices in `only` are welded or used to split edges, and only
+/// boundary edges with both ends in `only` are split.
+pub fn close_cracks_in(mesh: &mut Mesh, tolerance: f64, only: Option<&[u32]>) -> CloseCracksReport {
+    let mask: Option<Vec<bool>> = only.map(|vs| {
+        let mut m = vec![false; mesh.max_vid()];
+        for &v in vs {
+            if (v as usize) < m.len() {
+                m[v as usize] = true;
+            }
+        }
+        m
+    });
+    // Vertices created by splits are always allowed (they lie on allowed edges).
+    let n0 = mesh.max_vid();
+    let allowed = |v: u32| mask.as_ref().is_none_or(|m| v as usize >= n0 || m[v as usize]);
     let tol = tolerance.max(0.0);
     // Plain welding first; T-junction splits only help where the split vertices can then be
     // welded, so keep them only if they leave fewer open edges.
     let mut welded = mesh.clone();
-    let plain = CloseCracksReport { splits: 0, weld: weld_boundary_vertices(&mut welded, tol) };
+    let plain = CloseCracksReport { splits: 0, weld: weld_boundary_vertices_in(&mut welded, tol, &allowed) };
     let mut best = (welded, plain);
     if tol > 0.0 {
         let mut split = mesh.clone();
         let mut report = CloseCracksReport::default();
         // A few rounds: a split creates new boundary edges that may host further vertices.
         for _ in 0..8 {
-            let n = split_t_junctions(&mut split, tol);
+            let n = split_t_junctions(&mut split, tol, &allowed);
             report.splits += n;
             if n == 0 {
                 break;
             }
         }
         if report.splits > 0 {
-            report.weld = weld_boundary_vertices(&mut split, tol);
+            report.weld = weld_boundary_vertices_in(&mut split, tol, &allowed);
             if split.boundary_edge_ids().count() < best.0.boundary_edge_ids().count() {
                 best = (split, report);
             }
@@ -189,8 +213,8 @@ pub fn close_cracks(mesh: &mut Mesh, tolerance: f64) -> CloseCracksReport {
 
 /// Split boundary edges that have a boundary vertex (not their own) within `tol` of their
 /// interior, at that vertex's projection. Returns the number of splits.
-fn split_t_junctions(mesh: &mut Mesh, tol: f64) -> usize {
-    let bedges: Vec<u32> = mesh.boundary_edge_ids().collect();
+fn split_t_junctions(mesh: &mut Mesh, tol: f64, allowed: &dyn Fn(u32) -> bool) -> usize {
+    let bedges: Vec<u32> = mesh.boundary_edge_ids().filter(|&e| mesh.edge_vertices(e).iter().all(|&v| allowed(v))).collect();
     if bedges.is_empty() {
         return 0;
     }

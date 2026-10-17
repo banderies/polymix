@@ -852,6 +852,91 @@ impl OpSpec for CloseCracksSpec {
 pub type CloseCracksTool = OpTool<CloseCracksSpec>;
 
 // ---------------------------------------------------------------------------
+// Weld Boundaries and Join (selection)
+// ---------------------------------------------------------------------------
+
+/// Open (mesh-boundary) edges touching the selection's vertices.
+fn selection_open_edges(m: &Mesh, tris: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut verts: Vec<u32> = tris.iter().flat_map(|&t| m.triangle(t)).collect();
+    verts.sort_unstable();
+    verts.dedup();
+    let edges: Vec<u32> = m.boundary_edge_ids().filter(|&e| m.edge_vertices(e).iter().any(|v| verts.binary_search(v).is_ok())).collect();
+    (verts, edges)
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct WeldBoundariesUi {
+    /// Tolerance in multiples of the mean open-edge length near the selection.
+    pub tolerance: f64,
+}
+
+pub struct WeldBoundariesSpec;
+impl OpSpec for WeldBoundariesSpec {
+    type Params = WeldBoundariesUi;
+    const NAME: &'static str = "Weld Boundaries";
+    fn defaults(_: &OpInfo) -> Self::Params {
+        WeldBoundariesUi { tolerance: 0.5 }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        ui.add(egui::Slider::new(&mut p.tolerance, 0.01..=5.0).logarithmic(true).text("Tolerance (× edge length)"));
+        ui.small("Welds the open edges of the selected faces that lie close together.");
+        if info.selection.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select faces along the open edges first.");
+        }
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let tris = sel.ok_or_else(|| anyhow::anyhow!("select faces along the open edges first"))?;
+        let (verts, edges) = selection_open_edges(mesh, tris);
+        if edges.is_empty() {
+            anyhow::bail!("the selection has no open edges");
+        }
+        let mean = edges.iter().map(|&e| mesh.edge_length(e)).sum::<f64>() / edges.len() as f64;
+        let mut m = mesh.clone();
+        let before = m.boundary_edge_ids().count();
+        let r = mm_repair::close_cracks_in(&mut m, p.tolerance * mean, Some(&verts));
+        let after = m.boundary_edge_ids().count();
+        Ok(OpOutput { mesh: m, message: format!("open edges {before} → {after} ({} welded, {} split)", r.weld.welded, r.splits), ..Default::default() })
+    }
+}
+pub type WeldBoundariesTool = OpTool<WeldBoundariesSpec>;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct JoinUi;
+
+pub struct JoinSpec;
+impl OpSpec for JoinSpec {
+    type Params = JoinUi;
+    const NAME: &'static str = "Join";
+    fn defaults(_: &OpInfo) -> Self::Params {
+        JoinUi
+    }
+    fn ui(ui: &mut egui::Ui, _p: &mut Self::Params, info: &OpInfo) {
+        ui.small("Stitches the two open boundaries next to the selected faces together with one strip of triangles.");
+        if info.selection.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select faces next to the two open boundaries first.");
+        }
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, _p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let tris = sel.ok_or_else(|| anyhow::anyhow!("select faces next to two open boundaries"))?;
+        let (verts, _) = selection_open_edges(mesh, tris);
+        // The two boundary loops the selection touches most.
+        let mut loops: Vec<(usize, Vec<u32>)> = mm_core::topology::boundary_loops(mesh)
+            .into_iter()
+            .map(|l| (l.vertices.iter().filter(|v| verts.binary_search(v).is_ok()).count(), l.vertices))
+            .filter(|(n, _)| *n > 0)
+            .collect();
+        loops.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+        if loops.len() < 2 {
+            anyhow::bail!("the selection touches {} open boundary loop(s); Join needs two", loops.len());
+        }
+        let mut m = mesh.clone();
+        let r = mm_edit::join_loops(&mut m, &loops[0].1, &loops[1].1, &mm_edit::BridgeParams { segments: 1, smooth: false })?;
+        Ok(OpOutput { message: format!("joined with {} triangles", r.triangles.len()), selection: Some(r.triangles), mesh: m, ..Default::default() })
+    }
+}
+pub type JoinTool = OpTool<JoinSpec>;
+
+// ---------------------------------------------------------------------------
 // Reduce (Shift+R)
 // ---------------------------------------------------------------------------
 
@@ -1466,6 +1551,31 @@ mod tests {
         let patch = grouped.selection.unwrap();
         let g = grouped.mesh.tri_group(patch[0]);
         assert!(g != 0 && patch.iter().all(|&t| grouped.mesh.tri_group(t) == g));
+    }
+
+    #[test]
+    fn join_and_weld_boundaries() {
+        use mm_core::primitives;
+        // Two open tube segments with a gap between them.
+        let mut m = primitives::cylinder(1.0, 1.0, 16, 2, false);
+        let mut b = primitives::cylinder(1.0, 1.0, 16, 2, false);
+        b.transform(|p| p + DVec3::new(0.0, 0.0, 1.3));
+        m.append_mesh(&b, 0);
+        assert_eq!(mm_core::topology::boundary_loops(&m).len(), 4);
+        let near: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t).z - 1.15).abs() < 0.4).collect();
+        let out = run_spec::<JoinSpec>(&m, Some(&near)).unwrap();
+        assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 2, "the gap is closed");
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1);
+        // Weld: two grids whose seam edges are 0.01 apart (edge length 0.5).
+        let mut g = primitives::plane_grid(2.0, 4.0, 4, 8);
+        g.transform(|p| p - DVec3::new(1.0, 0.0, 0.0));
+        let mut h = primitives::plane_grid(2.0, 4.0, 4, 8);
+        h.transform(|p| p + DVec3::new(1.01, 0.0, 0.0));
+        g.append_mesh(&h, 0);
+        let seam: Vec<u32> = g.triangle_ids().filter(|&t| g.tri_centroid(t).x.abs() < 0.5).collect();
+        let out = run_spec::<WeldBoundariesSpec>(&g, Some(&seam)).unwrap();
+        let open_at_seam = out.mesh.boundary_edge_ids().filter(|&e| out.mesh.edge_midpoint(e).x.abs() < 0.1).count();
+        assert_eq!(open_at_seam, 0, "{}", out.message);
     }
 
     #[test]

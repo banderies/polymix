@@ -32,7 +32,7 @@ pub use inspect::{
     SingleRepair,
 };
 pub use laplacian::LaplacianWeights;
-pub use ops::{close_cracks, CloseCracksReport, ComponentInfo};
+pub use ops::{close_cracks, close_cracks_in, CloseCracksReport, ComponentInfo};
 pub use smooth::{
     fair_region, fair_region_with, smooth_vertices, smooth_vertices_with_progress, FairParams, SmoothMethod, SmoothParams,
 };

@@ -663,6 +663,12 @@ impl Tool for SelectTool {
                 if ui.button("Offset").on_hover_text("Ctrl/Cmd+D").clicked() {
                     self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Offset)));
                 }
+                if ui.button("Join").on_hover_text("J: stitch the two open boundaries next to the selection").clicked() {
+                    self.request = Some(Box::new(ops::JoinTool::new(cx)));
+                }
+                if ui.button("Weld Boundaries").on_hover_text("Weld the selection's open edges that lie close together").clicked() {
+                    self.request = Some(Box::new(ops::WeldBoundariesTool::new(cx)));
+                }
                 if ui.button("Separate").clicked() {
                     self.cmd(cx, |x| commands::separate_selection(x, false));
                 }
@@ -913,6 +919,8 @@ impl Tool for SelectTool {
             self.request = Some(Box::new(ops::SmoothTool::new(cx)));
         } else if i.key_pressed(Key::B) && cmd {
             self.request = Some(Box::new(ops::BridgeTool::new(cx)));
+        } else if i.key_pressed(Key::J) && !cmd && !shift {
+            self.request = Some(Box::new(ops::JoinTool::new(cx)));
         } else if i.key_pressed(Key::Y) && !cmd && !shift {
             run(&mut |x| commands::separate_selection(x, false));
         } else {
