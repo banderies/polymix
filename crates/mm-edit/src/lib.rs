@@ -44,7 +44,7 @@ pub use cut::{
     IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,
 };
 pub use face_groups::{generate_face_groups, FaceGroupMode};
-pub use fit::{convex_hull, fit_primitive, FitResult, PrimitiveType};
+pub use fit::{convex_hull, fit_cylinder, fit_primitive, CylinderFit, FitResult, PrimitiveType};
 pub use extrude::{
     extract_solid, extrude_selection, offset_selection, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
 };

@@ -374,6 +374,50 @@ pub fn convex_hull(pts: &[DVec3]) -> Option<Mesh> {
     Some(m)
 }
 
+/// A cylinder fitted to a surface region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CylinderFit {
+    /// Point on the axis at the region's start (`z0`) and the unit axis.
+    pub base: DVec3,
+    pub axis: DVec3,
+    pub radius: f64,
+    /// Extent of the region along the axis.
+    pub length: f64,
+}
+
+impl CylinderFit {
+    /// The point on the axis closest to `p`.
+    pub fn axis_point(&self, p: DVec3) -> DVec3 {
+        self.base + self.axis * (p - self.base).dot(self.axis)
+    }
+}
+
+/// Fit a cylinder to the triangles `tris`: the axis is the direction the surface normals
+/// are perpendicular to, the radius a geometric circle fit of the cross-section.
+pub fn fit_cylinder(mesh: &Mesh, tris: &[u32]) -> Option<CylinderFit> {
+    let tris: Vec<u32> = tris.iter().copied().filter(|&t| mesh.is_triangle(t)).collect();
+    let r = Region::new(mesh, &tris);
+    if r.pts.len() < 4 {
+        return None;
+    }
+    cylinder_of(&r)
+}
+
+fn cylinder_of(r: &Region) -> Option<CylinderFit> {
+    let mut a = [[0.0; 3]; 3];
+    for &(_, w, nn) in &r.tris {
+        add_outer(&mut a, nn, w);
+    }
+    let (_, vecs) = sym_eigen3(a);
+    let axis = vecs[0];
+    let (u, v) = mm_core::geom::orthonormal_basis(axis);
+    let c = r.centroid();
+    let p2: Vec<DVec2> = r.pts.iter().map(|&p| DVec2::new((p - c).dot(u), (p - c).dot(v))).collect();
+    let (cc, radius) = fit_circle(&p2);
+    let (z0, z1) = r.pts.iter().map(|&p| (p - c).dot(axis)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), z| (lo.min(z), hi.max(z)));
+    (radius.is_finite() && radius > 0.0).then_some(CylinderFit { base: c + u * cc.x + v * cc.y + axis * z0, axis, radius, length: (z1 - z0).max(1e-9) })
+}
+
 /// Fit `kind` to the triangles `tris` of `mesh`; `density` sets the resolution of the
 /// generated surface (Meshmixer's Mesh Density, 32 by default).
 pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: usize) -> EditResult<FitResult> {
@@ -424,23 +468,10 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
             FitResult { mesh: s, description: format!("sphere r {radius:.4}") }
         }
         PrimitiveType::Cylinder => {
-            // Axis: the direction the normals are (least) spread along.
-            let mut a = [[0.0; 3]; 3];
-            for &(_, w, nn) in &r.tris {
-                add_outer(&mut a, nn, w);
-            }
-            let (_, vecs) = sym_eigen3(a);
-            let axis = vecs[0];
-            let (u, v) = mm_core::geom::orthonormal_basis(axis);
-            let c = r.centroid();
-            let p2: Vec<DVec2> = r.pts.iter().map(|&p| DVec2::new((p - c).dot(u), (p - c).dot(v))).collect();
-            let (cc, radius) = fit_circle(&p2);
-            let along: Vec<f64> = r.pts.iter().map(|&p| (p - c).dot(axis)).collect();
-            let (z0, z1) = along.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &z| (lo.min(z), hi.max(z)));
-            let len = (z1 - z0).max(1e-9);
-            let cyl = primitives::cylinder(radius, len, 2 * n, (n / 4).max(1), true);
-            let base = c + u * cc.x + v * cc.y + axis * z0;
-            FitResult { mesh: place(cyl, base, u, v, axis), description: format!("cylinder r {radius:.4}, length {len:.4}") }
+            let f = cylinder_of(&r).ok_or_else(|| EditError::Failed("no cylinder fits the selection".into()))?;
+            let (u, v) = mm_core::geom::orthonormal_basis(f.axis);
+            let cyl = primitives::cylinder(f.radius, f.length, 2 * n, (n / 4).max(1), true);
+            FitResult { mesh: place(cyl, f.base, u, v, f.axis), description: format!("cylinder r {:.4}, length {:.4}", f.radius, f.length) }
         }
         PrimitiveType::LinearSweep => {
             let c = r.centroid();
