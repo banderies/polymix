@@ -70,6 +70,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "smoothboundary" => Box::new(tools::ops::SmoothBoundaryTool::new(cx)),
         "closecracks" => Box::new(tools::ops::CloseCracksTool::new(cx)),
         "join" => Box::new(tools::ops::JoinTool::new(cx)),
+        "regionbridge" => Box::new(tools::ops::RegionBridgeTool::new(cx)),
         "weldboundaries" => Box::new(tools::ops::WeldBoundariesTool::new(cx)),
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),

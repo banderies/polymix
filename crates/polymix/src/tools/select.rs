@@ -663,6 +663,14 @@ impl Tool for SelectTool {
                 if ui.button("Offset").on_hover_text("Ctrl/Cmd+D").clicked() {
                     self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Offset)));
                 }
+                if ui.button("Bridge").on_hover_text("Cmd+B: remove two selected regions and join the openings with a tube").clicked() {
+                    self.request = Some(Box::new(ops::RegionBridgeTool::new(cx)));
+                }
+                if ui.button("Tube Handle").on_hover_text("Like Bridge, with a curved tube").clicked() {
+                    let mut t = ops::RegionBridgeTool::new(cx);
+                    t.params.tube = true;
+                    self.request = Some(Box::new(t));
+                }
                 if ui.button("Join").on_hover_text("J: stitch the two open boundaries next to the selection").clicked() {
                     self.request = Some(Box::new(ops::JoinTool::new(cx)));
                 }
@@ -918,7 +926,7 @@ impl Tool for SelectTool {
         } else if i.key_pressed(Key::F) && cmd {
             self.request = Some(Box::new(ops::SmoothTool::new(cx)));
         } else if i.key_pressed(Key::B) && cmd {
-            self.request = Some(Box::new(ops::BridgeTool::new(cx)));
+            self.request = Some(Box::new(ops::RegionBridgeTool::new(cx)));
         } else if i.key_pressed(Key::J) && !cmd && !shift {
             self.request = Some(Box::new(ops::JoinTool::new(cx)));
         } else if i.key_pressed(Key::Y) && !cmd && !shift {

@@ -56,7 +56,7 @@ pub struct OpTool<S: OpSpec> {
     object: ObjectId,
     source: Arc<Mesh>,
     selection: Option<Arc<Vec<u32>>>,
-    params: S::Params,
+    pub params: S::Params,
     avg_edge: f64,
     bbox_diag: f64,
     /// Params of the running job / of the current result.
@@ -937,6 +937,73 @@ impl OpSpec for JoinSpec {
 pub type JoinTool = OpTool<JoinSpec>;
 
 // ---------------------------------------------------------------------------
+// Bridge / Tube Handle between two selected regions (Cmd+B)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RegionBridgeUi {
+    /// Smooth curved tube leaving each region along its normal (Tube Handle); otherwise a
+    /// straight bridge.
+    pub tube: bool,
+    /// Rows of triangles along the bridge; 0 = automatic.
+    pub segments: usize,
+}
+
+pub struct RegionBridgeSpec;
+impl OpSpec for RegionBridgeSpec {
+    type Params = RegionBridgeUi;
+    const NAME: &'static str = "Bridge";
+    fn defaults(_: &OpInfo) -> Self::Params {
+        RegionBridgeUi { tube: false, segments: 0 }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut p.tube, false, "Bridge").on_hover_text("Straight connection");
+            ui.selectable_value(&mut p.tube, true, "Tube handle").on_hover_text("Curved tube leaving each region along its surface normal");
+        });
+        ui.add(egui::Slider::new(&mut p.segments, 0..=60).text("Segments (0 = auto)"));
+        ui.small("Select two separate regions: they are removed and the openings joined by a tube.");
+        if info.selection.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select two regions first.");
+        }
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let tris = sel.ok_or_else(|| anyhow::anyhow!("select two regions"))?;
+        // The two largest edge-connected parts of the selection.
+        let s = mm_core::TriSelection::from_tris(mesh, tris.iter().copied());
+        let mut parts: Vec<Vec<u32>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for &t in tris {
+            if seen.contains(&t) {
+                continue;
+            }
+            let part = mm_core::topology::flood_fill_triangles(mesh, &[t], |x| s.contains(x));
+            seen.extend(part.iter().copied());
+            parts.push(part);
+        }
+        parts.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        if parts.len() < 2 {
+            anyhow::bail!("select two separate regions (found {})", parts.len());
+        }
+        let mut m = mesh.clone();
+        let mut loops = Vec::new();
+        for part in &parts[..2] {
+            let border: std::collections::HashSet<u32> = mm_core::TriSelection::from_tris(&m, part.iter().copied()).boundary_vertices(&m).into_iter().collect();
+            m.remove_triangles(part.iter().copied());
+            let lp = mm_core::topology::boundary_loops(&m)
+                .into_iter()
+                .filter(|l| l.vertices.iter().any(|v| border.contains(v)))
+                .max_by_key(|l| l.vertices.len())
+                .ok_or_else(|| anyhow::anyhow!("a region did not leave an opening (does it cover a whole part?)"))?;
+            loops.push(lp.vertices);
+        }
+        let r = mm_edit::join_loops(&mut m, &loops[0], &loops[1], &mm_edit::BridgeParams { segments: p.segments, smooth: p.tube })?;
+        Ok(OpOutput { message: format!("bridged with {} triangles", r.triangles.len()), selection: Some(r.triangles), mesh: m, ..Default::default() })
+    }
+}
+pub type RegionBridgeTool = OpTool<RegionBridgeSpec>;
+
+// ---------------------------------------------------------------------------
 // Reduce (Shift+R)
 // ---------------------------------------------------------------------------
 
@@ -1576,6 +1643,28 @@ mod tests {
         let out = run_spec::<WeldBoundariesSpec>(&g, Some(&seam)).unwrap();
         let open_at_seam = out.mesh.boundary_edge_ids().filter(|&e| out.mesh.edge_midpoint(e).x.abs() < 0.1).count();
         assert_eq!(open_at_seam, 0, "{}", out.message);
+    }
+
+    #[test]
+    fn bridge_two_selected_regions() {
+        use mm_core::primitives;
+        // Two spheres side by side; select the caps facing each other.
+        let mut m = primitives::icosphere(1.0, 3);
+        let mut b = primitives::icosphere(1.0, 3);
+        b.transform(|p| p + DVec3::new(3.0, 0.0, 0.0));
+        m.append_mesh(&b, 0);
+        let caps: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t) - DVec3::new(1.5, 0.0, 0.0)).length() < 0.9).collect();
+        for tube in [false, true] {
+            let info = OpInfo { mesh: &m, selection: Some(&caps), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+            let p = RegionBridgeUi { tube, ..RegionBridgeSpec::defaults(&info) };
+            let out = RegionBridgeSpec::run(&m, Some(&caps), &p, &|_| true).unwrap();
+            out.mesh.check_validity().unwrap();
+            assert!(out.mesh.is_closed(), "the two spheres are joined into one closed surface");
+            assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1);
+        }
+        // One region is not enough.
+        let one: Vec<u32> = caps.iter().copied().filter(|&t| m.tri_centroid(t).x < 1.5).collect();
+        assert!(run_spec::<RegionBridgeSpec>(&m, Some(&one)).is_err());
     }
 
     #[test]
