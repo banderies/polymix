@@ -191,7 +191,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Transform (T) | 🟡 | Gizmo, numeric, center, drop to ground ✅; World/Local frame, snapping ❌ |
 | Align (N) — align surfaces/axes to world | 🟡 | Principal-axes alignment only |
 | Create Pivot | ⚪ ❌ | |
-| Plane Cut | 🟡 | Cut/Slice, No/Minimal/Remeshed fill ✅ (+ vessel cross-section mode); Fixed Fill, Slice Groups ❌ |
+| Plane Cut | ✅ | Cut/Slice; No / Minimal / Fixed / Remeshed Fill (Remeshed also remeshes a band across the cut edge); Slice Groups; plus a vessel cross-section mode |
 | Combine | ✅ | |
 | Boolean Union / Difference / Intersection | 🟡 | Volumetric (SDF) result; exact mesh boolean ("Precise", "Max Quality") ❌ |
 | Close Cracks | ✅ | Welds coincident open boundaries incl. T-junctions; tolerance slider with live preview |

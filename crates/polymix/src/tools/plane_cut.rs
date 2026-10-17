@@ -19,7 +19,11 @@ pub enum CutType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillType {
     None,
+    /// Fewest triangles.
     Minimal,
+    /// Remeshed cap; the cut edge stays as cut.
+    Fixed,
+    /// Remeshed cap, and the band across the cut is remeshed too so cap and side blend.
     Remeshed,
 }
 
@@ -31,6 +35,8 @@ pub struct PlaneCutTool {
     half_size: f64,
     cut_type: CutType,
     fill: FillType,
+    /// Slice mode: the far half gets its own face group.
+    slice_groups: bool,
     /// Restrict the cut to the cross-section nearest this point (vessel mode).
     local_seed: Option<DVec3>,
     local_radius: f64,
@@ -54,6 +60,7 @@ impl PlaneCutTool {
             half_size: (b.diagonal() * 0.6).max(1e-3),
             cut_type: CutType::Discard,
             fill: FillType::Remeshed,
+            slice_groups: false,
             local_seed: None,
             local_radius: b.diagonal() * 0.15,
             drag: None,
@@ -75,31 +82,68 @@ impl PlaneCutTool {
     fn start(&mut self, cx: &mut ToolCx) {
         let src = self.source.clone();
         let plane = self.plane();
-        let (cut_type, fill, seed, avg) = (self.cut_type, self.fill, self.local_seed, self.avg_edge);
+        let (cut_type, fill, seed, avg, groups) = (self.cut_type, self.fill, self.local_seed, self.avg_edge, self.slice_groups);
         self.error = None;
         self.job = Some(Job::spawn("Plane cut", cx.egui.clone(), move |_p| {
             let mut m = (*src).clone();
-            let msg = run_cut(&mut m, plane, cut_type, fill, seed, avg)?;
+            let msg = run_cut(&mut m, plane, cut_type, fill, seed, avg, groups)?;
             Ok((m, msg))
         }));
     }
 }
 
 /// Perform the cut. The plane normal points toward the half that is discarded.
-fn run_cut(m: &mut Mesh, plane: Plane, cut_type: CutType, fill: FillType, seed: Option<DVec3>, avg_edge: f64) -> anyhow::Result<String> {
+fn run_cut(m: &mut Mesh, plane: Plane, cut_type: CutType, fill: FillType, seed: Option<DVec3>, avg_edge: f64, slice_groups: bool) -> anyhow::Result<String> {
     let keep = match cut_type {
         CutType::Discard => mm_edit::KeepSide::Below,
         CutType::Slice => mm_edit::KeepSide::Both,
     };
-    let fill = match fill {
+    let cut_fill = match fill {
         FillType::None => mm_edit::CutFill::None,
         FillType::Minimal => mm_edit::CutFill::Flat,
-        FillType::Remeshed => mm_edit::CutFill::FlatRemeshed { target_edge_length: avg_edge },
+        FillType::Fixed | FillType::Remeshed => mm_edit::CutFill::FlatRemeshed { target_edge_length: avg_edge },
     };
     let r = match seed {
-        Some(seed) => mm_edit::local_plane_cut(m, plane, seed, keep, fill)?.cut,
-        None => mm_edit::plane_cut(m, plane, &mm_edit::PlaneCutParams { keep, fill, ..Default::default() })?,
+        Some(seed) => mm_edit::local_plane_cut(m, plane, seed, keep, cut_fill)?.cut,
+        None => mm_edit::plane_cut(m, plane, &mm_edit::PlaneCutParams { keep, fill: cut_fill, ..Default::default() })?,
     };
+    if fill == FillType::Remeshed && !r.cap_triangles.is_empty() {
+        // Remesh a band across each capped cut edge (cap groups keep the crease crisp).
+        let mut band = mm_core::TriSelection::new(m);
+        for lp in r.cut_loops.iter().zip(&r.loop_capped).filter(|(_, c)| **c).map(|(l, _)| l) {
+            for &v in lp {
+                if m.is_vertex(v) {
+                    for t in m.vertex_triangles(v) {
+                        band.insert(t);
+                    }
+                }
+            }
+        }
+        band.expand(m);
+        let band: Vec<u32> = band.iter().collect();
+        if !band.is_empty() {
+            let params = mm_remesh::RemeshParams {
+                target_edge_length: avg_edge,
+                iterations: 6,
+                preserve_group_boundaries: true,
+                region: Some(band),
+                ..Default::default()
+            };
+            mm_remesh::remesh(m, &params, None)?;
+        }
+    }
+    if cut_type == CutType::Slice && slice_groups {
+        // The far half (above the plane) gets a new face group.
+        let g = m.max_group_id() + 1;
+        for comp in mm_core::topology::connected_components(m) {
+            let c = comp.iter().map(|&t| m.tri_centroid(t)).sum::<DVec3>() / comp.len() as f64;
+            if plane.signed_distance(c) > 0.0 {
+                for t in comp {
+                    m.set_tri_group(t, g);
+                }
+            }
+        }
+    }
     let capped = r.loop_capped.iter().filter(|c| **c).count();
     Ok(format!(
         "Plane cut: removed {} triangles, {} cut loop(s), {} capped",
@@ -126,12 +170,22 @@ impl Tool for PlaneCutTool {
             ui.selectable_value(&mut self.cut_type, CutType::Discard, "Cut (discard half)");
             ui.selectable_value(&mut self.cut_type, CutType::Slice, "Slice (keep both)");
         });
-        ui.horizontal(|ui| {
-            ui.label("Fill type");
-            ui.selectable_value(&mut self.fill, FillType::None, "No fill");
-            ui.selectable_value(&mut self.fill, FillType::Minimal, "Minimal");
-            ui.selectable_value(&mut self.fill, FillType::Remeshed, "Remeshed");
-        });
+        egui::ComboBox::from_label("Fill type")
+            .selected_text(match self.fill {
+                FillType::None => "No Fill",
+                FillType::Minimal => "Minimal Fill",
+                FillType::Fixed => "Fixed Fill",
+                FillType::Remeshed => "Remeshed Fill",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.fill, FillType::None, "No Fill");
+                ui.selectable_value(&mut self.fill, FillType::Minimal, "Minimal Fill").on_hover_text("Fewest triangles");
+                ui.selectable_value(&mut self.fill, FillType::Fixed, "Fixed Fill").on_hover_text("Remeshed cap; the cut edge stays as cut");
+                ui.selectable_value(&mut self.fill, FillType::Remeshed, "Remeshed Fill").on_hover_text("Remeshed cap blended into the side");
+            });
+        if self.cut_type == CutType::Slice {
+            ui.checkbox(&mut self.slice_groups, "Slice groups").on_hover_text("Give the far half its own face group");
+        }
         let mut local = self.local_seed.is_some();
         if ui.checkbox(&mut local, "Only the nearest cross-section (vessel mode)").changed() {
             self.local_seed = if local { Some(self.origin) } else { None };
@@ -305,5 +359,81 @@ impl Tool for PlaneCutTool {
 
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|j| ("Cutting".to_string(), j.progress()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    fn mean_edge(m: &Mesh) -> f64 {
+        let (mut sum, mut n) = (0.0, 0);
+        for t in m.triangle_ids() {
+            let [a, b, c] = m.triangle(t).map(|v| m.vertex(v));
+            sum += a.distance(b) + b.distance(c) + c.distance(a);
+            n += 3;
+        }
+        sum / n as f64
+    }
+
+    #[test]
+    fn fill_types_close_the_cut() {
+        let src = primitives::icosphere(1.0, 4);
+        let avg = mean_edge(&src);
+        let plane = Plane::from_point_normal(DVec3::new(0.0, 0.0, 0.3), DVec3::new(0.2, 0.0, 1.0));
+        for fill in [FillType::Minimal, FillType::Fixed, FillType::Remeshed] {
+            let mut m = src.clone();
+            run_cut(&mut m, plane, CutType::Discard, fill, None, avg, false).unwrap();
+            assert!(m.is_closed(), "{fill:?} leaves the mesh closed");
+            // Nothing is left above the plane, and the cap stays flat (its own group).
+            let cap_group = m.max_group_id();
+            for t in m.triangle_ids() {
+                for v in m.triangle(t) {
+                    assert!(plane.signed_distance(m.vertex(v)) < 1e-6, "{fill:?}: vertex above the plane");
+                    if m.tri_group(t) == cap_group {
+                        assert!(plane.signed_distance(m.vertex(v)).abs() < 1e-6, "{fill:?}: cap vertex off the plane");
+                    }
+                }
+            }
+        }
+        // Remeshed Fill evens out the slivers the cut leaves along the rim.
+        let rim_min_angle = |fill| {
+            let mut m = src.clone();
+            run_cut(&mut m, plane, CutType::Discard, fill, None, avg, false).unwrap();
+            let cap_group = m.max_group_id();
+            m.triangle_ids()
+                .filter(|&t| m.tri_group(t) != cap_group && m.triangle(t).iter().any(|&v| plane.signed_distance(m.vertex(v)).abs() < 1e-6))
+                .map(|t| {
+                    let p = m.triangle(t).map(|v| m.vertex(v));
+                    (0..3).map(|i| (p[(i + 1) % 3] - p[i]).angle_between(p[(i + 2) % 3] - p[i])).fold(f64::INFINITY, f64::min)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (fixed, remeshed) = (rim_min_angle(FillType::Fixed), rim_min_angle(FillType::Remeshed));
+        assert!(remeshed > fixed, "rim min angle {:.1}° > {:.1}°", remeshed.to_degrees(), fixed.to_degrees());
+        let mut none = src.clone();
+        run_cut(&mut none, plane, CutType::Discard, FillType::None, None, avg, false).unwrap();
+        assert!(!none.is_closed());
+    }
+
+    #[test]
+    fn slice_groups_split_the_halves() {
+        let src = primitives::icosphere(1.0, 3);
+        let avg = mean_edge(&src);
+        let plane = Plane::from_point_normal(DVec3::ZERO, DVec3::Z);
+        let mut plain = src.clone();
+        run_cut(&mut plain, plane, CutType::Slice, FillType::Fixed, None, avg, false).unwrap();
+        let mut grouped = src.clone();
+        run_cut(&mut grouped, plane, CutType::Slice, FillType::Fixed, None, avg, true).unwrap();
+        let g = grouped.max_group_id();
+        assert!(g > plain.max_group_id(), "a new group");
+        for t in grouped.triangle_ids() {
+            // Cap triangles lie on the plane; the rest tell the halves apart.
+            let z = grouped.tri_centroid(t).z;
+            if z.abs() > 1e-9 {
+                assert_eq!(grouped.tri_group(t) == g, z > 0.0, "only the upper half gets the new group");
+            }
+        }
     }
 }

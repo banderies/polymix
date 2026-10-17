@@ -67,7 +67,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       scale and defaults, Preserve vs Smooth group borders.
 - [x] **M3.6 Reduce / Smooth parity**: Uniform reduce; Uniform Triangles, Preserve Group Borders,
       Per-Group Membranes smoothing; Smoothing Scale, Constraint Rings.
-- [ ] **M3.7 Plane Cut parity**: Fixed Fill, Slice Groups.
+- [x] **M3.7 Plane Cut parity**: Fixed Fill, Slice Groups.
 - [ ] **M3.8 Make Solid parity**: Sharp Edge Preserve, Offset Distance, colour/group transfer,
       Cull Edges Threshold.
 - [ ] **M3.9 Exact mesh booleans** (Precise / Max Quality) alongside the volumetric one.
