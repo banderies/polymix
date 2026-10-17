@@ -1,5 +1,6 @@
 //! Tests for mm-edit. Every test checks `check_validity()` and consistent orientation.
 
+mod boolean_tests;
 mod bridge_tests;
 mod cut_tests;
 mod extrude_tests;

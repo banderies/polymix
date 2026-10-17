@@ -7,9 +7,11 @@ license.workspace = true
 
 [dependencies]
 mm-core = { path = "../mm-core" }
+mm-solid = { path = "../mm-solid" }
 glam.workspace = true
 rayon.workspace = true
 smallvec.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+robust = "1"
 

@@ -9,6 +9,7 @@
 //! * [`cap`] — planar capping of boundary loops, including nested loops (polygons with holes).
 //! * [`extrude`] — extrude / offset a face selection, naive whole-surface offset.
 //! * [`region`] — discard / separate / duplicate / flip a face selection.
+//! * [`boolean`] — exact mesh booleans (union / difference / intersection).
 //! * [`mod@mirror`], [`mod@bridge`] (bridge spans, join loops), [`smooth`] (smooth boundary),
 //!   [`transform`] (affine transforms, drop to ground, principal-axis alignment).
 //!
@@ -18,6 +19,7 @@
 mod triangulate;
 mod util;
 
+pub mod boolean;
 pub mod bridge;
 pub mod cap;
 pub mod cut;
@@ -30,6 +32,7 @@ pub mod smooth;
 pub mod transform;
 pub mod vessel;
 
+pub use boolean::{mesh_boolean, BooleanOp, BooleanResult};
 pub use bridge::{bridge, join_loops, BridgeParams, BridgeResult};
 pub use cap::{cap_planar_loops, CapResult};
 pub use cut::{

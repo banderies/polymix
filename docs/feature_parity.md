@@ -193,7 +193,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Create Pivot | ⚪ ❌ | |
 | Plane Cut | ✅ | Cut/Slice; No / Minimal / Fixed / Remeshed Fill (Remeshed also remeshes a band across the cut edge); Slice Groups; plus a vessel cross-section mode |
 | Combine | ✅ | |
-| Boolean Union / Difference / Intersection | 🟡 | Volumetric (SDF) result; exact mesh boolean ("Precise", "Max Quality") ❌ |
+| Boolean Union / Difference / Intersection | ✅ | Fast Approximate (volumetric), Precise (exact, keeps triangles away from the seam; Auto-Reduce Result), Max Quality (seam band remesh: Target Edge Scale, Merge Border Rings). Precise needs closed meshes; coplanar faces are nudged automatically. Search Depth / Use Intersection Curves / Preview Iterations not exposed |
 | Close Cracks | ✅ | Welds coincident open boundaries incl. T-junctions; tolerance slider with live preview |
 | Generate Face Groups | ✅ | Edge Angle / Normal Angle, angle and size thresholds; shows group colours while open |
 | Make Solid | 🟡 | Blocky / Fast / Accurate / Sharp Edge Preserve, accuracy, density, offset, min thickness, Cull Edges Threshold, close boundaries, Transfer Groups ✅; Color Transfer Mode ❌ (needs vertex colours, M6.2) |

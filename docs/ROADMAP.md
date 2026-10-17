@@ -70,7 +70,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M3.7 Plane Cut parity**: Fixed Fill, Slice Groups.
 - [x] **M3.8 Make Solid parity**: Sharp Edge Preserve, Offset Distance, group transfer,
       Cull Edges Threshold. (Colour Transfer Mode needs vertex colours and moves to M6.2.)
-- [ ] **M3.9 Exact mesh booleans** (Precise / Max Quality) alongside the volumetric one.
+- [x] **M3.9 Exact mesh booleans** (Precise / Max Quality) alongside the volumetric one.
 
 ## M4 — Transform, deformation and targets
 
