@@ -128,7 +128,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | Paint Mode: sphere brush, Shift deselect | ✅ | Brush keeps its size on the model |
-| Brush types: SphereDisc, Unwrap (geodesic) | ❌ | |
+| Brush types: Sphere, SphereDisc, Unwrap (geodesic) | ✅ | Unwrap is the default, as in your Meshmixer |
 | **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Wheel in Meshmixer navigation, Shift+wheel in Fusion 360 navigation |
 | RMB-drag expands / contracts the selection | ✅ | With a selection; geodesic distance (other expand modes: ROADMAP M2.5) |
 | Laser Lasso (curve from background; closed = inside, open = smaller side, through the model) | ✅ | |
@@ -137,9 +137,9 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Double-click an open-edge triangle: hole-border ring | ✅ | Polymix addition (requested) |
 | S inside Select clears the selection | ✅ | Polymix addition (requested) |
 | Expand Mode: Geodesic / Crease Angle / Vertex Color + Crease Angle Thresh | ❌ | |
-| Allow Back Faces | 🟡 | "Lasso selects through the model" (lasso only) |
-| Restrict To Exterior Faces | ❌ | |
-| Symmetry plane (Set / Reset) | ❌ | |
+| Allow Back Faces | ✅ | Brush filter; the lasso has "selects through the model" |
+| Restrict To Exterior Faces | ✅ | Winding-number test: skips faces buried inside other parts |
+| Symmetry plane (Set / Reset) | 🟡 | Mirror across the object's centre on X/Y/Z; free plane placement ❌ |
 | Magic wand | ❌ | |
 | **Modify Selection** menu: Select All, Expand/Contract Ring, Optimize Boundary, Invert, Invert (Connected), Expand to Connected, Expand to Groups | ✅ | Ctrl+A, < >, O, I, Shift+I, E, G |
 | Modify: Expand to Same Groups (non-connected) | ✅ | "Same groups"; `G` now expands through connected faces only, as in Meshmixer |

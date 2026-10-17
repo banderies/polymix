@@ -28,6 +28,16 @@ pub struct SelectTool {
     pub size_pct: f32,
     /// Lasso / laser select through the model (occluded and back-facing faces too).
     pub through: bool,
+    /// Brush shape (Meshmixer's Brush Mode); Unwrap measures along the surface.
+    pub brush_shape: mm_core::BrushShape,
+    /// The brush may select faces turned away from the camera.
+    pub allow_back_faces: bool,
+    /// The brush only selects faces whose outer side is outside the solid (skips faces
+    /// buried inside other parts, e.g. overlapping tubes).
+    pub restrict_exterior: bool,
+    /// Mirror brush strokes across this axis through the object's centre.
+    pub symmetry: Option<usize>,
+    exterior: Option<ExteriorCache>,
     stroke: Option<Stroke>,
     /// Screen curve being drawn (lasso or laser).
     curve: Option<Vec<egui::Pos2>>,
@@ -103,6 +113,11 @@ impl Default for SelectTool {
             mode: SelectMode::Brush,
             size_pct: 2.5,
             through: true,
+            brush_shape: mm_core::BrushShape::Unwrap,
+            allow_back_faces: false,
+            restrict_exterior: false,
+            symmetry: None,
+            exterior: None,
             stroke: None,
             curve: None,
             hover_brush: None,
@@ -110,6 +125,27 @@ impl Default for SelectTool {
             expand: None,
             request: None,
         }
+    }
+}
+
+/// Winding-number test for "exterior" faces, cached per mesh version.
+struct ExteriorCache {
+    object: ObjectId,
+    version: u64,
+    wn: std::sync::Arc<mm_solid::WindingNumber>,
+    eps: f64,
+    known: std::collections::HashMap<u32, bool>,
+}
+
+impl ExteriorCache {
+    fn is_exterior(&mut self, mesh: &Mesh, t: u32) -> bool {
+        if let Some(&e) = self.known.get(&t) {
+            return e;
+        }
+        let p = mesh.tri_centroid(t) + mesh.tri_normal(t) * self.eps;
+        let e = self.wn.eval(p).abs() < 0.5;
+        self.known.insert(t, e);
+        e
     }
 }
 
@@ -179,9 +215,43 @@ impl SelectTool {
                 }
             }
         }
+        // Symmetry: also paint the mirror image of every stamp.
+        if let Some(axis) = self.symmetry {
+            let c = bvh.bounds().center();
+            let mirrored: Vec<(u32, DVec3)> = stamps
+                .iter()
+                .filter_map(|&(_, p)| {
+                    let mut q = p;
+                    q[axis] = 2.0 * c[axis] - p[axis];
+                    bvh.nearest(&mesh, q, r).map(|n| (n.tid, n.point))
+                })
+                .collect();
+            stamps.extend(mirrored);
+        }
+        if self.restrict_exterior && self.exterior.as_ref().is_none_or(|e| e.object != object || e.version != mesh.shape_version()) {
+            let eps = mesh.bounds().diagonal() * 1e-4;
+            self.exterior = Some(ExteriorCache { object, version: mesh.shape_version(), wn: std::sync::Arc::new(mm_solid::WindingNumber::new(&mesh)), eps, known: Default::default() });
+        }
+        let (eye, fwd, ortho) = (cx.camera.eye(), cx.camera.forward(), cx.camera.orthographic);
+        let allow_back = self.allow_back_faces;
+        let shape = self.brush_shape;
+        let exterior = if self.restrict_exterior { self.exterior.as_mut() } else { None };
+        let exterior = std::cell::RefCell::new(exterior);
+        let allow = |t: u32| {
+            if !allow_back {
+                let to_eye = if ortho { -fwd } else { eye - mesh.tri_centroid(t) };
+                if mesh.tri_normal(t).dot(to_eye) <= 0.0 {
+                    return false;
+                }
+            }
+            match exterior.borrow_mut().as_mut() {
+                Some(e) => e.is_exterior(&mesh, t),
+                None => true,
+            }
+        };
         let mut changed = 0;
         for (tid, p) in stamps {
-            changed += o.selection.paint_sphere(&mesh, &bvh, tid, p, r, deselect);
+            changed += o.selection.paint_brush(&mesh, &bvh, shape, tid, p, mesh.tri_normal(tid), r, allow, deselect);
         }
         if changed > 0 {
             o.touch_selection();
@@ -317,6 +387,9 @@ impl Tool for SelectTool {
         match cmd {
             "lasso" => self.mode = SelectMode::Lasso,
             "brush" => self.mode = SelectMode::Brush,
+            "sphere" => self.brush_shape = mm_core::BrushShape::Sphere,
+            "disc" => self.brush_shape = mm_core::BrushShape::SphereDisc,
+            "unwrap" => self.brush_shape = mm_core::BrushShape::Unwrap,
             _ => {}
         }
     }
@@ -333,8 +406,38 @@ impl Tool for SelectTool {
         });
         match self.mode {
             SelectMode::Brush => {
+                use mm_core::BrushShape;
+                let label = |b: BrushShape| match b {
+                    BrushShape::Sphere => "Sphere Brush",
+                    BrushShape::SphereDisc => "SphereDisc Brush",
+                    BrushShape::Unwrap => "Unwrap Brush",
+                };
+                egui::ComboBox::from_label("Brush mode").selected_text(label(self.brush_shape)).show_ui(ui, |ui| {
+                    for b in [BrushShape::Sphere, BrushShape::SphereDisc, BrushShape::Unwrap] {
+                        ui.selectable_value(&mut self.brush_shape, b, label(b)).on_hover_text(match b {
+                            BrushShape::Sphere => "Everything inside the sphere",
+                            BrushShape::SphereDisc => "The connected surface near the brush, not the far side of thin walls",
+                            BrushShape::Unwrap => "A disc measured along the surface",
+                        });
+                    }
+                });
                 let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size_pct));
                 brush_size_ui(ui, &mut self.size_pct, r);
+                ui.horizontal(|ui| {
+                    let mut on = self.symmetry.is_some();
+                    ui.checkbox(&mut on, "Symmetry").on_hover_text("Mirror strokes across the object's centre");
+                    if on {
+                        let axis = self.symmetry.get_or_insert(0);
+                        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.selectable_value(axis, i, *n);
+                        }
+                    } else {
+                        self.symmetry = None;
+                    }
+                });
+                ui_util::section(ui, "Filters");
+                ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush select faces turned away from you");
+                ui.checkbox(&mut self.restrict_exterior, "Restrict to exterior faces").on_hover_text("Skip faces buried inside other parts of the mesh (e.g. overlapping tubes)");
             }
             SelectMode::Lasso => {}
         }
@@ -646,6 +749,31 @@ pub fn hole_ring(mesh: &Mesh, t: u32) -> Vec<u32> {
 mod tests {
     use super::*;
     use mm_core::primitives;
+
+    #[test]
+    fn exterior_filter_skips_buried_faces() {
+        // Two overlapping closed spheres (like overlapping vessel segments).
+        let mut m = primitives::icosphere(1.0, 3);
+        let mut b = primitives::icosphere(1.0, 3);
+        b.transform(|p| p + DVec3::new(1.0, 0.0, 0.0));
+        m.append_mesh(&b, 0);
+        let mut ext = ExteriorCache { object: 0, version: 0, wn: std::sync::Arc::new(mm_solid::WindingNumber::new(&m)), eps: 1e-4, known: Default::default() };
+        let tris: Vec<u32> = m.triangle_ids().collect();
+        let inside_other = |t: u32| {
+            let c = m.tri_centroid(t);
+            c.length() < 0.95 || (c - DVec3::new(1.0, 0.0, 0.0)).length() < 0.95
+        };
+        let mut buried = 0;
+        for &t in &tris {
+            if inside_other(t) {
+                buried += 1;
+                assert!(!ext.is_exterior(&m, t), "triangle {t} is buried");
+            } else if m.tri_centroid(t).x < -0.5 || m.tri_centroid(t).x > 1.5 {
+                assert!(ext.is_exterior(&m, t));
+            }
+        }
+        assert!(buried > 50);
+    }
 
     #[test]
     fn view_test_sees_the_front_half() {

@@ -44,8 +44,9 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M2.2 Erase & Fill parity**: Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth,
       Scale, Bulge, Create New Groups.
 - [x] **M2.3 Modify menu**: Select Visible, Expand to Same Groups (non-connected).
-- [ ] **M2.4 Brush modes**: Sphere / SphereDisc / Unwrap (geodesic) brush; Allow Back Faces and
-      Restrict To Exterior Faces for the brush; Symmetry plane.
+- [x] **M2.4 Brush modes**: Sphere / SphereDisc / Unwrap (geodesic) brush; Allow Back Faces and
+      Restrict To Exterior Faces for the brush; Symmetry plane (mirror across the object's centre on
+      X, Y or Z; arbitrary planes later).
 - [ ] **M2.5 Expand modes**: Geodesic Distance / Crease Angle / Vertex Color with Crease Angle
       Threshold (drives RMB-drag expand and brush spread).
 - [ ] **M2.6 Lasso Mode**: multi-curve loop drawn on the surface, rotating between curves.
