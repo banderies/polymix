@@ -145,7 +145,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Modify: Expand to Same Groups (non-connected) | ❌ | |
 | Modify: Select Visible | ❌ | |
 | **Edit** menu: Discard (X) | ✅ | |
-| Edit: Erase & Fill (F) | 🟡 | Fill types Minimal/Flat/Smooth ✅; Smoothness, Border Rings, Preserve Group Borders, Project to Target, Create New Groups ❌ |
+| Edit: Erase & Fill (F) | ✅ | Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth, Scale, Bulge, Create New Groups (Meshmixer's defaults) |
 | Edit: Flip Normals | ✅ | |
 | Edit: Create / Clear FaceGroup (Ctrl+G / Ctrl+Shift+G) | ✅ | |
 | Edit: Extrude (D) | ✅ | |

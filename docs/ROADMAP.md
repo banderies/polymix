@@ -41,7 +41,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 - [x] **M2.1 Smooth Boundary** (Smoothness, Preserve Shape, Iterations, Border Rings, Preserve
       Mesh Boundary, Preserve Group Borders, Create New Groups).
-- [ ] **M2.2 Erase & Fill parity**: Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth,
+- [x] **M2.2 Erase & Fill parity**: Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth,
       Scale, Bulge, Create New Groups.
 - [ ] **M2.3 Modify menu**: Select Visible, Expand to Same Groups (non-connected).
 - [ ] **M2.4 Brush modes**: Sphere / SphereDisc / Unwrap (geodesic) brush; Allow Back Faces and

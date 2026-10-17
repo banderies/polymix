@@ -979,9 +979,39 @@ pub type OffsetSolidTool = OpTool<OffsetSolidSpec>;
 // Erase & Fill (F)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FillKind {
+    /// Fewest triangles, no new vertices.
+    FlatMinimal,
+    /// Flat patch with triangles matching the surroundings.
+    FlatRemeshed,
+    /// Curved patch continuing the surrounding surface (Meshmixer "Smooth MVC").
+    SmoothMvc,
+}
+
+impl FillKind {
+    fn label(self) -> &'static str {
+        match self {
+            FillKind::FlatMinimal => "Flat Minimal",
+            FillKind::FlatRemeshed => "Flat Remeshed",
+            FillKind::SmoothMvc => "Smooth MVC",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct EraseFillUi {
-    pub mode: mm_repair::FillMode,
+    pub kind: FillKind,
+    /// 0..100: patch density; 50 matches the surrounding edge length, +25 halves it.
+    pub refine: f64,
+    /// 0..100: how much of the smooth patch's curvature is kept (0 = flat).
+    pub smooth: f64,
+    /// Multiplies the patch's height above the hole's plane.
+    pub scale: f64,
+    /// -100..100: pushes the middle of the patch out (+) or in (−), relative to the hole size.
+    pub bulge: f64,
+    /// The patch gets its own face group (otherwise the surrounding group).
+    pub create_new_groups: bool,
 }
 
 pub struct EraseFillSpec;
@@ -989,15 +1019,21 @@ impl OpSpec for EraseFillSpec {
     type Params = EraseFillUi;
     const NAME: &'static str = "Erase & Fill";
     fn defaults(_: &OpInfo) -> Self::Params {
-        EraseFillUi { mode: mm_repair::FillMode::Smooth }
+        // Meshmixer's defaults.
+        EraseFillUi { kind: FillKind::SmoothMvc, refine: 50.0, smooth: 100.0, scale: 1.0, bulge: 0.0, create_new_groups: false }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
-        ui.horizontal(|ui| {
-            ui.label("Fill type");
-            ui.selectable_value(&mut p.mode, mm_repair::FillMode::Minimal, "Minimal");
-            ui.selectable_value(&mut p.mode, mm_repair::FillMode::Flat, "Flat");
-            ui.selectable_value(&mut p.mode, mm_repair::FillMode::Smooth, "Smooth");
+        egui::ComboBox::from_label("Fill type").selected_text(p.kind.label()).show_ui(ui, |ui| {
+            for k in [FillKind::FlatMinimal, FillKind::FlatRemeshed, FillKind::SmoothMvc] {
+                ui.selectable_value(&mut p.kind, k, k.label());
+            }
         });
+        let patch = p.kind != FillKind::FlatMinimal;
+        ui.add_enabled(patch, egui::Slider::new(&mut p.refine, 0.0..=100.0).text("Refine"));
+        ui.add_enabled(p.kind == FillKind::SmoothMvc, egui::Slider::new(&mut p.smooth, 0.0..=100.0).text("Smooth"));
+        ui.add_enabled(patch, egui::Slider::new(&mut p.scale, 0.0..=4.0).text("Scale"));
+        ui.add_enabled(patch, egui::Slider::new(&mut p.bulge, -100.0..=100.0).text("Bulge"));
+        ui.checkbox(&mut p.create_new_groups, "Create new groups");
         ui.small("Deletes the selection and fills the opening so it blends into the surrounding surface.");
         if info.selection.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select a region first.");
@@ -1008,25 +1044,113 @@ impl OpSpec for EraseFillSpec {
         let mut m = mesh.clone();
         let selection = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
         let border: std::collections::HashSet<u32> = selection.boundary_vertices(&m).into_iter().collect();
-        let target = mm_remesh::edge_length_stats_in(&m, tris).mean;
+        let target = mm_remesh::edge_length_stats_in(&m, tris).mean * 2f64.powf((50.0 - p.refine) / 25.0);
+        let new_group = m.max_group_id().max(0) + 1;
         m.remove_triangles(tris.iter().copied());
         let loops: Vec<_> = mm_core::topology::boundary_loops(&m).into_iter().filter(|l| l.vertices.iter().any(|v| border.contains(v))).collect();
         if loops.is_empty() {
             anyhow::bail!("the selection did not leave a hole to fill (did it cover a whole part?)");
         }
+        let mode = match p.kind {
+            FillKind::FlatMinimal => mm_repair::FillMode::Minimal,
+            FillKind::FlatRemeshed => mm_repair::FillMode::Flat,
+            FillKind::SmoothMvc => mm_repair::FillMode::Smooth,
+        };
         let n = loops.len();
         let mut new_tris = Vec::new();
         for (k, lp) in loops.iter().enumerate() {
             if !progress(k as f32 / n as f32) {
                 anyhow::bail!("cancelled");
             }
-            let group = lp.edges.first().map(|&e| m.tri_group(m.edge_triangles(e)[0])).unwrap_or(0);
-            let fp = mm_repair::FillParams { mode: p.mode, target_edge_length: Some(target), group: Some(group), ..Default::default() };
+            let group = if p.create_new_groups { new_group } else { lp.edges.first().map(|&e| m.tri_group(m.edge_triangles(e)[0])).unwrap_or(0) };
+            let fp = mm_repair::FillParams { mode, target_edge_length: Some(target), group: Some(group), ..Default::default() };
             let r = mm_repair::fill_hole(&mut m, lp, &fp)?;
+            shape_patch(&mut m, lp, &r, p);
             new_tris.extend(r.new_triangles);
         }
         Ok(OpOutput { message: format!("replaced {} triangles with {}", tris.len(), new_tris.len()), mesh: m, selection: Some(new_tris) })
     }
+}
+
+/// Apply Smooth / Scale / Bulge to a fill patch's interior vertices, relative to the plane
+/// of its boundary loop.
+fn shape_patch(m: &mut Mesh, lp: &mm_core::topology::EdgeLoop, r: &mm_repair::FillResult, p: &EraseFillUi) {
+    if r.new_vertices.is_empty() {
+        return;
+    }
+    let height = match p.kind {
+        FillKind::SmoothMvc => p.smooth / 100.0 * p.scale,
+        _ => p.scale,
+    };
+    if height == 1.0 && p.bulge == 0.0 {
+        return;
+    }
+    let pts = lp.positions(m);
+    let c = pts.iter().copied().sum::<DVec3>() / pts.len() as f64;
+    // Newell normal of the loop, turned to point out of the surface (along the patch).
+    let mut nrm = DVec3::ZERO;
+    for i in 0..pts.len() {
+        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+        nrm += DVec3::new((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y));
+    }
+    let patch_n: DVec3 = r.new_triangles.iter().map(|&t| m.tri_cross(t)).sum();
+    let mut n = nrm.normalize_or_zero();
+    if n.dot(patch_n) < 0.0 {
+        n = -n;
+    }
+    let radius = pts.iter().map(|q| q.distance(c)).sum::<f64>() / pts.len() as f64;
+    // Distance from the loop across the patch, for the bulge profile.
+    let dist = patch_distance(m, lp, r);
+    let dmax = dist.values().copied().fold(0.0, f64::max).max(1e-12);
+    for &v in &r.new_vertices {
+        let q = m.vertex(v);
+        let d = (q - c).dot(n);
+        let flat = q - n * d;
+        let h = dist.get(&v).copied().unwrap_or(dmax) / dmax;
+        let bump = (h * std::f64::consts::FRAC_PI_2).sin();
+        m.set_vertex(v, flat + n * (d * height + p.bulge / 100.0 * radius * bump));
+    }
+}
+
+/// Edge-path distance from the loop to each patch vertex (Dijkstra over the patch only).
+fn patch_distance(m: &Mesh, lp: &mm_core::topology::EdgeLoop, r: &mm_repair::FillResult) -> std::collections::HashMap<u32, f64> {
+    use std::collections::{BinaryHeap, HashMap, HashSet};
+    #[derive(PartialEq)]
+    struct Item(f64, u32);
+    impl Eq for Item {}
+    impl PartialOrd for Item {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Item {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            o.0.total_cmp(&self.0)
+        }
+    }
+    let inside: HashSet<u32> = r.new_vertices.iter().copied().chain(lp.vertices.iter().copied()).collect();
+    let mut dist: HashMap<u32, f64> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    for &v in &lp.vertices {
+        dist.insert(v, 0.0);
+        heap.push(Item(0.0, v));
+    }
+    while let Some(Item(d, v)) = heap.pop() {
+        if d > dist.get(&v).copied().unwrap_or(f64::INFINITY) {
+            continue;
+        }
+        for u in m.vertex_neighbors(v) {
+            if !inside.contains(&u) {
+                continue;
+            }
+            let nd = d + m.vertex(v).distance(m.vertex(u));
+            if nd < dist.get(&u).copied().unwrap_or(f64::INFINITY) {
+                dist.insert(u, nd);
+                heap.push(Item(nd, u));
+            }
+        }
+    }
+    dist
 }
 pub type EraseFillTool = OpTool<EraseFillSpec>;
 
@@ -1175,6 +1299,33 @@ mod tests {
                 d1.dot(d2).clamp(-1.0, 1.0).acos()
             })
             .sum()
+    }
+
+    #[test]
+    fn erase_fill_parameters() {
+        let m = mm_core::primitives::icosphere(1.0, 4);
+        let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.6).collect();
+        let info = OpInfo { mesh: &m, selection: Some(&cap), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let base = EraseFillSpec::defaults(&info);
+        let run = |p: EraseFillUi| EraseFillSpec::run(&m, Some(&cap), &p, &|_| true).unwrap();
+        // Height of the patch's highest point above the hole plane (the cap border sits at z ≈ 0.6).
+        let top = |out: &OpOutput| out.selection.as_ref().unwrap().iter().flat_map(|&t| out.mesh.tri_positions(t)).map(|p| p.z).fold(f64::MIN, f64::max);
+        let smooth = run(base);
+        assert!(smooth.mesh.is_closed());
+        let h_smooth = top(&smooth);
+        assert!(h_smooth > 0.75, "the smooth fill bulges like the sphere ({h_smooth})");
+        let flat = run(EraseFillUi { smooth: 0.0, ..base });
+        assert!(top(&flat) < 0.66, "smooth 0 gives a flat patch ({})", top(&flat));
+        let bulged = run(EraseFillUi { bulge: 60.0, ..base });
+        assert!(top(&bulged) > h_smooth + 0.05);
+        let minimal = run(EraseFillUi { kind: FillKind::FlatMinimal, ..base });
+        assert!(minimal.mesh.vertex_count() < m.vertex_count(), "minimal fill adds no vertices");
+        let dense = run(EraseFillUi { refine: 90.0, ..base });
+        assert!(dense.selection.unwrap().len() > smooth.selection.as_ref().unwrap().len());
+        let grouped = run(EraseFillUi { create_new_groups: true, ..base });
+        let patch = grouped.selection.unwrap();
+        let g = grouped.mesh.tri_group(patch[0]);
+        assert!(g != 0 && patch.iter().all(|&t| grouped.mesh.tri_group(t) == g));
     }
 
     #[test]
