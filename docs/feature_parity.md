@@ -49,7 +49,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Print / Send to printer | ⛔ | |
 | Preferences (Alt+T / ⌘,) | 🟡 | View options persist; no Preferences window |
 | Pref: Flip Z-Y axis on import/export (on in your install) | ❌ | Polymix has a Z-up *view* but does not convert file axes |
-| Pref: Mesh Normal Mode Vertex / Face / Group normals | 🟡 | Smooth (+ sharp edges) and flat ✅; group normals ❌ |
+| Pref: Mesh Normal Mode Vertex / Face / Group normals | ✅ | View menu and hotbox; Group (default) keeps group borders crisp; Vertex still honours Sharp edges |
 | Pref: Mesh Color Mode Group / Vertex / Constant | 🟡 | Group and constant ✅; vertex ❌ |
 | Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | 🟡 | Export active object or all visible; OBJ groups ✅ |
 | Pref: Import dialogs (append/replace, scale models) | ❌ | |

@@ -24,9 +24,41 @@ enum Category {
     Sculpt,
 }
 
+/// How shading normals are made (Meshmixer's Mesh Normal Mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NormalMode {
+    /// Smooth across the surface (crisp only at sharp edges, if enabled).
+    Vertex,
+    /// Flat triangles.
+    Face,
+    /// Smooth within each face group, crisp along group borders.
+    Group,
+}
+
+impl NormalMode {
+    pub const ALL: [NormalMode; 3] = [NormalMode::Vertex, NormalMode::Face, NormalMode::Group];
+    pub fn label(self) -> &'static str {
+        match self {
+            NormalMode::Vertex => "Vertex normals",
+            NormalMode::Face => "Face normals",
+            NormalMode::Group => "Group normals",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            NormalMode::Vertex => "vertex",
+            NormalMode::Face => "face",
+            NormalMode::Group => "group",
+        }
+    }
+    fn from_key(k: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key() == k)
+    }
+}
+
 pub struct ViewOptions {
     pub wireframe: bool,
-    pub flat: bool,
+    pub normals: NormalMode,
     pub group_colors: bool,
     pub boundaries: bool,
     pub show_stats: bool,
@@ -42,7 +74,7 @@ pub struct ViewOptions {
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true }
+        Self { wireframe: false, normals: NormalMode::Group, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true }
     }
 }
 
@@ -208,7 +240,11 @@ impl PolymixApp {
         if let Some(st) = cc.storage.filter(|_| std::env::var_os("POLYMIX_SCRIPT").is_none()) {
             let flag = |k: &str, d: bool| st.get_string(k).map(|v| v == "1").unwrap_or(d);
             app.view.wireframe = flag("wireframe", false);
-            app.view.flat = flag("flat", false);
+            // Older settings only had a flat-shading flag.
+            app.view.normals = st
+                .get_string("normals")
+                .and_then(|k| NormalMode::from_key(&k))
+                .unwrap_or(if flag("flat", false) { NormalMode::Face } else { NormalMode::Group });
             app.view.boundaries = flag("boundaries", true);
             app.view.group_colors = flag("group_colors", false);
             app.view.show_grid = flag("grid", false);
@@ -565,7 +601,11 @@ impl PolymixApp {
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.view.wireframe, "Wireframe  (W)");
-                ui.checkbox(&mut self.view.flat, "Flat shading");
+                ui.horizontal(|ui| {
+                    for m in NormalMode::ALL {
+                        ui.selectable_value(&mut self.view.normals, m, m.label());
+                    }
+                });
                 ui.checkbox(&mut self.view.sharp_edges, "Sharp edges")
                     .on_hover_text("Keep hard corners crisp instead of averaging normals across them (CAD parts). Edges bending more than the crease angle are shaded sharp.");
                 ui.add_enabled(self.view.sharp_edges, egui::Slider::new(&mut self.view.crease_deg, 5.0..=90.0).suffix("°").text("Crease angle"));
@@ -992,8 +1032,9 @@ impl PolymixApp {
                 });
                 ui.strong("Mesh");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.view.flat, false, "Smooth");
-                    ui.selectable_value(&mut self.view.flat, true, "Faceted");
+                    for m in NormalMode::ALL {
+                        ui.selectable_value(&mut self.view.normals, m, m.label().trim_end_matches(" normals"));
+                    }
                     ui.toggle_value(&mut self.view.wireframe, "Wireframe");
                 });
                 ui.horizontal(|ui| {
@@ -1517,11 +1558,12 @@ impl PolymixApp {
             let style = ObjectStyle {
                 color,
                 wireframe: self.view.wireframe,
-                flat: self.view.flat,
+                flat: self.view.normals == NormalMode::Face,
                 group_colors: self.view.group_colors || self.tools.last().is_some_and(|t| t.shows_groups()),
                 dim: multiple && Some(o.id) != active,
                 cut_tint: matches!(cut_tint, Some(t) if t.is_none() || t == Some(o.id)),
                 crease_deg: self.view.sharp_edges.then_some(self.view.crease_deg),
+                group_normals: self.view.normals == NormalMode::Group,
             };
             if let Some((pid, pm)) = preview {
                 if pid == o.id {
@@ -1637,7 +1679,8 @@ impl PolymixApp {
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             "open" => self.start_import(vec![PathBuf::from(arg)], ctx),
             "wire" => self.view.wireframe = !self.view.wireframe,
-            "flat" => self.view.flat = !self.view.flat,
+            "flat" => self.view.normals = if self.view.normals == NormalMode::Face { NormalMode::Group } else { NormalMode::Face },
+            "normals" => self.view.normals = NormalMode::from_key(arg.as_str()).unwrap_or(self.view.normals),
             "grid" => self.view.show_grid = !self.view.show_grid,
             "crease" => match arg.parse() {
                 Ok(d) => (self.view.sharp_edges, self.view.crease_deg) = (true, d),
@@ -1870,7 +1913,7 @@ impl eframe::App for PolymixApp {
         }
         let b = |v: bool| if v { "1".to_string() } else { "0".to_string() };
         st.set_string("wireframe", b(self.view.wireframe));
-        st.set_string("flat", b(self.view.flat));
+        st.set_string("normals", self.view.normals.key().to_string());
         st.set_string("boundaries", b(self.view.boundaries));
         st.set_string("group_colors", b(self.view.group_colors));
         st.set_string("grid", b(self.view.show_grid));

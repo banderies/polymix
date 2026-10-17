@@ -65,6 +65,8 @@ pub struct ObjectStyle {
     pub cut_tint: bool,
     /// Keep edges sharper than this (degrees) crisp in smooth shading; `None` = smooth.
     pub crease_deg: Option<f32>,
+    /// Keep face-group borders crisp too (Group Normals).
+    pub group_normals: bool,
 }
 
 /// Per-triangle display values (indexed by triangle id) shown instead of the object colour.
@@ -95,6 +97,8 @@ pub struct GpuMesh {
     scalar_stamp: Option<u64>,
     /// Crease angle the uploaded normals were computed with.
     crease_deg: Option<f32>,
+    /// Group-normal setting and mesh group version the normals were built with.
+    group_normals: Option<u64>,
     /// Mesh triangle id -> soup triangle index (u32::MAX if absent).
     soup_index: Vec<u32>,
 }
@@ -362,6 +366,7 @@ impl SceneRenderer {
             selection_stamp: u64::MAX,
             scalar_stamp: None,
             crease_deg: None,
+            group_normals: None,
             soup_index: Vec::new(),
         }
     }
@@ -409,19 +414,23 @@ impl SceneRenderer {
         scalars: ScalarField,
     ) {
         let (moved_vertices, moved_from) = moved;
-        let geometry_changed = gpu.shape_version != mesh.shape_version() || gpu.crease_deg != style.crease_deg;
+        let groups_key = style.group_normals.then_some(mesh.group_version());
+        let geometry_changed = gpu.shape_version != mesh.shape_version() || gpu.crease_deg != style.crease_deg || gpu.group_normals != groups_key;
         let crease = style.crease_deg.map(f64::from);
+        let groups = style.group_normals;
         // Partial uploads are only valid on top of exactly the geometry the moves started from.
         let partial = geometry_changed
+            && gpu.crease_deg == style.crease_deg
+            && gpu.group_normals == groups_key
             && gpu.topo_version == mesh.topology_version()
             && gpu.shape_version == moved_from
             && !moved_vertices.is_empty();
         if partial {
-            Self::partial_update(queue, gpu, mesh, moved_vertices, crease);
+            Self::partial_update(queue, gpu, mesh, moved_vertices, crease, groups);
             gpu.shape_version = mesh.shape_version();
         } else if geometry_changed {
             let tri_ids: Vec<u32> = mesh.triangle_ids().collect();
-            let normals = ShadingNormals::new(mesh, crease);
+            let normals = ShadingNormals::new(mesh, crease, groups);
             let verts: Vec<MeshVertex> = tri_ids
                 .par_iter()
                 .flat_map_iter(|&t| {
@@ -463,6 +472,7 @@ impl SceneRenderer {
             gpu.shape_version = mesh.shape_version();
             gpu.topo_version = mesh.topology_version();
             gpu.crease_deg = style.crease_deg;
+            gpu.group_normals = groups_key;
         }
         moved_vertices.clear();
         let scalar_stamp = scalars.map(|(s, _)| s);
@@ -503,7 +513,7 @@ impl SceneRenderer {
     }
 
     /// Re-upload only the triangles around moved vertices (positions and normals).
-    fn partial_update(queue: &wgpu::Queue, gpu: &GpuMesh, mesh: &Mesh, moved: &[u32], crease: Option<f64>) {
+    fn partial_update(queue: &wgpu::Queue, gpu: &GpuMesh, mesh: &Mesh, moved: &[u32], crease: Option<f64>, groups: bool) {
         // Normals change on the one-ring of moved vertices, so refresh their triangles too.
         let mut verts: Vec<u32> = Vec::with_capacity(moved.len() * 7);
         for &v in moved {
@@ -534,7 +544,7 @@ impl SceneRenderer {
                 for (j, v) in mesh.triangle(t).into_iter().enumerate() {
                     run.push(MeshVertex {
                         position: mesh.vertex(v).as_vec3().to_array(),
-                        normal: corner_normal(mesh, t, j, crease).as_vec3().to_array(),
+                        normal: corner_normal(mesh, t, j, crease, groups).as_vec3().to_array(),
                     });
                 }
                 j += 1;

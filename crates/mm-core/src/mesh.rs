@@ -132,6 +132,9 @@ pub struct Mesh {
     topo_version: u64,
     /// Incremented on any vertex position change (and on topology changes).
     shape_version: u64,
+    /// Incremented when a triangle's face group changes (only meaningful together with the
+    /// shape version: a different mesh always has a different shape version).
+    group_version: u64,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -277,6 +280,10 @@ impl Mesh {
     #[inline]
     pub fn set_tri_group(&mut self, t: u32, g: i32) {
         self.tgroup[t as usize] = g;
+        self.group_version = self.group_version.wrapping_add(1);
+    }
+    pub fn group_version(&self) -> u64 {
+        self.group_version
     }
     pub fn max_group_id(&self) -> i32 {
         self.triangle_ids().map(|t| self.tgroup[t as usize]).max().unwrap_or(0)

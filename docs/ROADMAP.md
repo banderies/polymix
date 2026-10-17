@@ -94,7 +94,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 ## M6 — Display and shading
 
-- [ ] **M6.1 Normal modes**: Vertex / Face / Group normals (Preferences + Hotbox).
+- [x] **M6.1 Normal modes**: Vertex / Face / Group normals (Preferences + Hotbox).
 - [ ] **M6.2 Vertex colours**: display, colour mode (Group / Vertex / Constant), OBJ/PLY export;
       Make Solid's Color Transfer Mode (No Colors / Vertex-to-Vertex / Material-to-Vertex).
 - [ ] **M6.3 Hotbox parity**: camera drag buttons, background colour, brush Size/Strength.
