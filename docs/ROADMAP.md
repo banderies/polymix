@@ -16,10 +16,10 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 ## M1 — Navigation, input and hotkeys
 
-- [ ] **M1.1 Navigation modes.** Preference *Fusion 360* (MMB pan, Shift+MMB tumble, wheel zoom;
+- [x] **M1.1 Navigation modes.** Preference *Fusion 360* (MMB pan, Shift+MMB tumble, wheel zoom;
       the user's Meshmixer setting, default) / *Meshmixer* (RMB or Alt+LMB tumble, Alt+MMB /
-      Shift+RMB / Alt+Shift+LMB pan, Alt+RMB and Alt+⌘+LMB zoom). Behaviour checked against
-      the live Meshmixer.
+      Shift+RMB / Alt+Shift+LMB pan, Alt+RMB and Alt+⌘+LMB zoom). View → Navigation; mapping per
+      Meshmixer's hotkeys.pdf (live check pending: Meshmixer was closed).
 - [ ] **M1.2 3D mouse (3Dconnexion SpaceMouse).** 6-DoF camera navigation (pan/zoom/tumble
       around the view's axes, matching the free-rotation setting), device buttons (Fit, views),
       sensitivity and axis-invert settings; macOS first via the 3Dconnexion driver, with a

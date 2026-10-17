@@ -90,10 +90,10 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Tumble: RMB or Alt+LMB | ✅ | Free trackball (Hotbox "Free" / View → Free rotation), or turntable |
 | Pan: Alt+MMB, Shift+RMB, Alt+Shift+LMB | ✅ | plus MMB |
-| Zoom: Alt+RMB (Maya) | ❌ | Polymix: wheel/pinch and Alt+⌘+LMB |
+| Zoom: Alt+RMB (Maya) | ✅ | In Meshmixer navigation mode |
 | Zoom: Alt+Ctrl/⌘+LMB (pen-friendly) | ✅ | |
 | Wheel zooms (outside brush tools) | ✅ | Zooms toward the cursor |
-| "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ❌ | **This is the mode your Meshmixer uses** (Preferences → Navigation Mode) |
+| "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ✅ | View → Navigation; default, as in your Meshmixer |
 | ViewCube / SteeringWheels | ⚪ ❌ | Autodesk components; Polymix has an axis gizmo |
 
 ### Hotbox (Space) — hotkeys.pdf page 5

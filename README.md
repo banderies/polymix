@@ -67,9 +67,10 @@ Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs
 
 | Action | Mouse / key |
 |---|---|
-| Tumble (free trackball in every direction; *View → Free rotation* off = turntable) | Right-drag, or Alt + left-drag |
+| Tumble (free trackball in every direction; *View → Free rotation* off = turntable) | Shift + middle-drag (Fusion 360 mode), right-drag, or Alt + left-drag |
 | Pan | Middle-drag, Shift + right-drag, or Alt + Shift + left-drag |
-| Zoom | Scroll / pinch, or Alt + Cmd + left-drag |
+| Zoom | Scroll / pinch, Alt + right-drag (Meshmixer mode), or Alt + Cmd + left-drag |
+| Navigation scheme | *View → Navigation*: Fusion 360 (default) or Meshmixer, as in Meshmixer's preferences |
 | Focus / wireframe / hotbox | `F` / `W` / `Space` |
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |

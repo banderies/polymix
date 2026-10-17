@@ -3,6 +3,7 @@
 use crate::camera::{Camera, UpAxis};
 use crate::commands::{self, CmdCx};
 use crate::jobs::Job;
+use crate::navigation::{NavAction, NavMode};
 use crate::renderer::{self, ColorVertex, GpuMesh, ObjectStyle, SceneRenderer};
 use crate::scene::{History, ObjectId, Scene};
 use crate::tools::{self, Overlay, PointerInput, Tool, ToolCx, ToolOutcome, Viewport};
@@ -31,11 +32,13 @@ pub struct ViewOptions {
     /// Keep edges sharper than `crease_deg` crisp in smooth shading (CAD parts).
     pub sharp_edges: bool,
     pub crease_deg: f32,
+    /// Mouse navigation scheme (Meshmixer's Preferences → Navigation Mode).
+    pub nav_mode: NavMode,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG }
+        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360 }
     }
 }
 
@@ -168,6 +171,7 @@ impl PolymixApp {
             app.view.boundaries = flag("boundaries", true);
             app.view.group_colors = flag("group_colors", false);
             app.view.sharp_edges = flag("sharp_edges", true);
+            app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
             app.view.crease_deg = st.get_string("crease_deg").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CREASE_DEG);
             app.show_objects = flag("show_objects", true);
             app.camera.orthographic = flag("orthographic", false);
@@ -511,6 +515,13 @@ impl PolymixApp {
                     .on_hover_text("On: tumble freely in every direction (trackball). Off: turntable that keeps the up axis vertical.");
                 ui.checkbox(&mut self.show_objects, "Object browser");
                 ui.checkbox(&mut self.view.show_stats, "Statistics");
+                ui.separator();
+                ui.label("Navigation").on_hover_text("Mouse buttons for tumble / pan / zoom (Meshmixer: Preferences → Navigation Mode). See Help → Controls.");
+                ui.horizontal(|ui| {
+                    for m in NavMode::ALL {
+                        ui.selectable_value(&mut self.view.nav_mode, m, m.label());
+                    }
+                });
                 ui.separator();
                 ui.label("Up axis");
                 ui.horizontal(|ui| {
@@ -894,10 +905,9 @@ impl PolymixApp {
     fn help_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Controls & hotkeys").open(&mut self.show_help).resizable(false).show(ctx, |ui| {
             egui::Grid::new("help").num_columns(2).striped(true).show(ui, |ui| {
-                for (k, v) in [
-                    ("Right-drag / Alt+left-drag", "Tumble (orbit)"),
-                    ("Middle-drag / Shift+right-drag / Alt+Shift+left-drag", "Pan"),
-                    ("Scroll / pinch / Alt+Cmd+left-drag", "Zoom"),
+                ui.label(RichText::new(format!("{} navigation", self.view.nav_mode.label())).strong());
+                ui.end_row();
+                for (k, v) in self.view.nav_mode.help_rows().into_iter().chain([
                     ("F", "Focus on scene"),
                     ("Space", "Hotbox (view settings)"),
                     ("W", "Toggle wireframe"),
@@ -913,7 +923,7 @@ impl PolymixApp {
                     ("Select: R, Shift+R, B", "Remesh, Reduce, Smooth"),
                     ("Enter / Esc", "Accept / Cancel tool"),
                     ("Cmd+Z / Shift+Cmd+Z", "Undo / Redo"),
-                ] {
+                ]) {
                     ui.label(RichText::new(k).monospace());
                     ui.label(v);
                     ui.end_row();
@@ -938,26 +948,23 @@ impl PolymixApp {
         });
         // `hovered` respects layering, so popups over the viewport don't leak input into it.
         let in_rect = hover.map(|p| rect.contains(p)).unwrap_or(false) && (response.hovered() || response.dragged());
-        let primary_nav = mods.alt;
-        if response.drag_started_by(PointerButton::Secondary) {
-            self.nav_drag = Some(PointerButton::Secondary);
-        } else if response.drag_started_by(PointerButton::Middle) {
-            self.nav_drag = Some(PointerButton::Middle);
-        } else if response.drag_started_by(PointerButton::Primary) && primary_nav {
-            self.nav_drag = Some(PointerButton::Primary);
+        let nav = self.view.nav_mode;
+        let primary_nav = nav.starts_navigation(PointerButton::Primary, mods);
+        for btn in [PointerButton::Secondary, PointerButton::Middle, PointerButton::Primary] {
+            if response.drag_started_by(btn) && nav.starts_navigation(btn, mods) {
+                self.nav_drag = Some(btn);
+                break;
+            }
         }
         let nav_active = self.nav_drag.is_some();
         if let Some(btn) = self.nav_drag {
             if response.dragged_by(btn) {
                 let d = pointer_delta;
-                match btn {
-                    PointerButton::Secondary if mods.shift => self.camera.pan(d.x as f64, d.y as f64, rect.height() as f64),
-                    PointerButton::Secondary => self.camera.tumble(d.x as f64, d.y as f64),
-                    PointerButton::Middle => self.camera.pan(d.x as f64, d.y as f64, rect.height() as f64),
-                    PointerButton::Primary if mods.shift => self.camera.pan(d.x as f64, d.y as f64, rect.height() as f64),
-                    PointerButton::Primary if mods.command => self.camera.zoom((1.0 + d.y as f64 * 0.005).max(0.05)),
-                    PointerButton::Primary => self.camera.tumble(d.x as f64, d.y as f64),
-                    _ => {}
+                match nav.drag_action(btn, mods) {
+                    Some(NavAction::Tumble) => self.camera.tumble(d.x as f64, d.y as f64),
+                    Some(NavAction::Pan) => self.camera.pan(d.x as f64, d.y as f64, rect.height() as f64),
+                    Some(NavAction::Zoom) => self.camera.zoom((1.0 + d.y as f64 * 0.005).max(0.05)),
+                    None => {}
                 }
             }
             if response.drag_stopped_by(btn) || !ctx.input(|i| i.pointer.button_down(btn)) {
@@ -1481,6 +1488,7 @@ impl eframe::App for PolymixApp {
         st.set_string("boundaries", b(self.view.boundaries));
         st.set_string("group_colors", b(self.view.group_colors));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
+        st.set_string("nav_mode", self.view.nav_mode.key().to_string());
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));
         st.set_string("orthographic", b(self.camera.orthographic));
