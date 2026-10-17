@@ -74,6 +74,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "units" => Box::new(tools::units::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
+        "clearance" => Box::new(tools::clearance::ClearanceTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
         "remesh" => Box::new(tools::ops::RemeshTool::new(cx)),
         "reduce" => Box::new(tools::ops::ReduceTool::new(cx)),
@@ -772,6 +773,9 @@ impl PolymixApp {
                     }
                     if ui.button("Mesh Query").on_hover_text("Colour by normal, position, triangle quality or curvature; click for triangle info").clicked() {
                         open = Some("meshquery");
+                    }
+                    if ui.button("Clearance").on_hover_text("Minimum distance to another object, coloured by distance").clicked() {
+                        open = Some("clearance");
                     }
                     if ui.button("Units / Dimensions").clicked() {
                         open = Some("units");

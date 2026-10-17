@@ -163,3 +163,66 @@ pub fn mean_curvature(m: &Mesh) -> Vec<f64> {
         })
         .collect()
 }
+
+/// Result of [`clearance`].
+#[derive(Clone, Debug)]
+pub struct Clearance {
+    /// Distance from each vertex of the first mesh to the second (indexed by vertex id).
+    pub dist_a: Vec<f64>,
+    /// Distance from each vertex of the second mesh to the first, when computed both ways.
+    pub dist_b: Option<Vec<f64>>,
+    /// The smallest distance found (0 when the meshes intersect).
+    pub min: f64,
+    /// Closest points (on the first and the second mesh).
+    pub closest: (DVec3, DVec3),
+    pub intersecting: bool,
+}
+
+/// Clearance between two meshes: per-vertex distances to the other surface (one or both
+/// ways), the closest pair of points, and whether the surfaces cross each other.
+pub fn clearance(a: &Mesh, bvh_a: &crate::Bvh, b: &Mesh, bvh_b: &crate::Bvh, both_ways: bool) -> Clearance {
+    use rayon::prelude::*;
+    let one_way = |from: &Mesh, to: &Mesh, bvh: &crate::Bvh| -> (Vec<f64>, Option<(f64, DVec3, DVec3)>) {
+        let ids: Vec<u32> = from.vertex_ids().collect();
+        let hits: Vec<(u32, f64, DVec3)> = ids
+            .par_iter()
+            .filter_map(|&v| bvh.nearest(to, from.vertex(v), f64::INFINITY).map(|h| (v, h.dist_sq.sqrt(), h.point)))
+            .collect();
+        let mut d = vec![f64::INFINITY; from.max_vid()];
+        let mut best: Option<(f64, DVec3, DVec3)> = None;
+        for (v, dist, q) in hits {
+            d[v as usize] = dist;
+            if best.is_none_or(|b| dist < b.0) {
+                best = Some((dist, from.vertex(v), q));
+            }
+        }
+        (d, best)
+    };
+    let (dist_a, best_a) = one_way(a, b, bvh_b);
+    let (dist_b, best_b) = if both_ways { let (d, x) = one_way(b, a, bvh_a); (Some(d), x) } else { (None, None) };
+    let mut min = f64::INFINITY;
+    let mut closest = (DVec3::ZERO, DVec3::ZERO);
+    if let Some((d, p, q)) = best_a {
+        (min, closest) = (d, (p, q));
+    }
+    if let Some((d, p, q)) = best_b.filter(|x| x.0 < min) {
+        (min, closest) = (d, (q, p));
+    }
+    // Crossing surfaces: any triangle pair that intersects.
+    let tris: Vec<u32> = a.triangle_ids().collect();
+    let crossing = tris.par_iter().find_map_any(|&t| {
+        let p = a.tri_positions(t);
+        let mut found = None;
+        bvh_b.query_aabb(&crate::Aabb::from_points(p), |o| {
+            if found.is_none() && crate::intersect::triangles_intersect(p, b.tri_positions(o)) {
+                found = Some(a.tri_centroid(t));
+            }
+        });
+        found
+    });
+    if let Some(c) = crossing {
+        min = 0.0;
+        closest = (c, c);
+    }
+    Clearance { dist_a, dist_b, min, closest, intersecting: crossing.is_some() }
+}

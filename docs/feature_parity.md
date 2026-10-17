@@ -219,7 +219,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Mesh Query | ✅ | Color Mode: Vertex Position / Surface Normal / Aspect Ratio / Internal Angle / Gaussian / Mean Curvature with Color Range; click for triangle id, group, aspect ratio, min/max angle, nearest edge / vertex and curvatures. Per-triangle colours (Meshmixer blends per vertex) |
 | Thickness (identify / thicken thin regions) | ⛔ | 3D printing wall check |
 | Deviation | ✅ | Signed colour map + statistics |
-| Clearance | ❌ | |
+| Clearance | ✅ | Min clearance threshold, Bi-Directional colouring, min distance with the closest points, intersection detection |
 | Stability, Strength, Orientation, Overhangs/Support, Slicing, Layout/Packing | ⛔ | 3D printing |
 | Mass properties | 🟡 | Area, volume (centre of mass ❌) |
 

@@ -91,7 +91,7 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 | Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag |
 | Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid, Remesh, Reduce, Smooth, Offset / Hollow, Boolean (union/difference/intersection; exact or volumetric), Add Tube, Fit Primitive (`P` in Select), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
 | Vessel | Trim branch, Flow extensions, Cap open ends, Measure diameter, Centerline, Boundary patches / CFD export, Check for CFD |
-| Analysis | Inspector, Measure, Units / Dimensions, Check for CFD, Deviation |
+| Analysis | Inspector, Measure (distance, thickness, gaps, cylinder fit, vessel diameter, snapping), Mesh Query (normals, quality, curvature), Units / Dimensions (incl. scale from measurements), Clearance, Check for CFD, Deviation |
 
 ## Project layout
 

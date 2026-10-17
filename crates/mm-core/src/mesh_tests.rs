@@ -269,3 +269,20 @@ fn curvature_and_triangle_quality() {
     assert!((crate::measure::triangle_aspect_ratio(&eq, t) - 1.0).abs() < 1e-12);
     assert!(crate::measure::triangle_angles(&eq, t).iter().all(|x| (x.to_degrees() - 60.0).abs() < 1e-9));
 }
+
+#[test]
+fn clearance_between_spheres() {
+    let a = crate::primitives::icosphere(1.0, 3);
+    let mut b = crate::primitives::icosphere(1.0, 3);
+    b.transform(|p| p + DVec3::new(2.5, 0.0, 0.0));
+    let (ba, bb) = (crate::Bvh::build(&a), crate::Bvh::build(&b));
+    let c = crate::measure::clearance(&a, &ba, &b, &bb, true);
+    assert!(!c.intersecting);
+    assert!((c.min - 0.5).abs() < 0.01, "{}", c.min);
+    assert!(c.closest.0.x > 0.95 && c.closest.1.x < 1.55);
+    assert!(c.dist_b.is_some());
+    let mut near = crate::primitives::icosphere(1.0, 3);
+    near.transform(|p| p + DVec3::new(1.5, 0.0, 0.0));
+    let c = crate::measure::clearance(&a, &ba, &near, &crate::Bvh::build(&near), false);
+    assert!(c.intersecting && c.min == 0.0);
+}
