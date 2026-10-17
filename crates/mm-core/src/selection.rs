@@ -245,22 +245,11 @@ impl TriSelection {
         }
     }
 
-    /// Paint (or erase, with `deselect`) one brush stamp at `center` on triangle `seed`,
-    /// whose surface normal is `normal`. `allow` filters candidate triangles (back faces,
-    /// interior faces); the seed triangle is always eligible. Returns the number changed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn paint_brush(
-        &mut self,
-        m: &Mesh,
-        bvh: &Bvh,
-        shape: BrushShape,
-        seed: u32,
-        center: DVec3,
-        normal: DVec3,
-        radius: f64,
-        allow: impl Fn(u32) -> bool,
-        deselect: bool,
-    ) -> usize {
+    /// Paint (or erase, with `deselect`) one brush stamp. `allow` filters candidate
+    /// triangles (back faces, interior faces); the seed triangle is always eligible.
+    /// Returns the number of triangles changed.
+    pub fn paint_brush(&mut self, m: &Mesh, bvh: &Bvh, stamp: &BrushStamp, allow: impl Fn(u32) -> bool, deselect: bool) -> usize {
+        let BrushStamp { shape, seed, center, normal, radius, crease_cos } = *stamp;
         let region: Vec<u32> = match shape {
             BrushShape::Sphere => {
                 let mut out = Vec::new();
@@ -284,9 +273,9 @@ impl TriSelection {
                     }
                 });
                 inside.insert(seed);
-                crate::topology::flood_fill_triangles(m, &[seed], |t| inside.contains(&t))
+                flood_across(m, seed, |t| inside.contains(&t), crease_cos)
             }
-            BrushShape::Unwrap => geodesic_disc(m, seed, center, radius, &allow),
+            BrushShape::Unwrap => geodesic_disc(m, seed, center, radius, &allow, crease_cos),
         };
         let mut n = 0;
         for t in region {
@@ -297,6 +286,44 @@ impl TriSelection {
         }
         n
     }
+}
+
+/// One brush stamp for [`TriSelection::paint_brush`].
+#[derive(Clone, Copy, Debug)]
+pub struct BrushStamp {
+    pub shape: BrushShape,
+    /// Triangle under the brush centre.
+    pub seed: u32,
+    pub center: DVec3,
+    /// Surface normal at the centre.
+    pub normal: DVec3,
+    pub radius: f64,
+    /// Do not spread across edges sharper than this (cosine of the angle between the
+    /// faces' normals); `None` = no limit. Not used by the Sphere brush.
+    pub crease_cos: Option<f64>,
+}
+
+/// Is the edge between adjacent triangles `a` and `b` sharper than `crease_cos` allows?
+pub fn is_crease(m: &Mesh, a: u32, b: u32, crease_cos: Option<f64>) -> bool {
+    crease_cos.is_some_and(|c| m.tri_normal(a).dot(m.tri_normal(b)) < c)
+}
+
+/// Edge-connected flood from `seed` through triangles accepted by `accept`, not crossing
+/// creases.
+fn flood_across(m: &Mesh, seed: u32, accept: impl Fn(u32) -> bool, crease_cos: Option<f64>) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::from([seed]);
+    let mut out = vec![seed];
+    let mut stack = vec![seed];
+    while let Some(t) = stack.pop() {
+        for n in m.tri_neighbors(t) {
+            if n != INVALID && !seen.contains(&n) && accept(n) && !is_crease(m, t, n, crease_cos) {
+                seen.insert(n);
+                out.push(n);
+                stack.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// Shape of the selection brush (Meshmixer's Brush Mode).
@@ -310,9 +337,11 @@ pub enum BrushShape {
     Unwrap,
 }
 
-/// Triangles within geodesic distance `radius` of `center` (on triangle `seed`), growing
-/// only through triangles accepted by `allow`.
-fn geodesic_disc(m: &Mesh, seed: u32, center: DVec3, radius: f64, allow: &impl Fn(u32) -> bool) -> Vec<u32> {
+/// Triangles within geodesic distance `radius` of `center` (on triangle `seed`): surface
+/// distances to the vertices first (bounded Dijkstra), then an edge-connected flood from the
+/// seed through triangles whose corners average within the radius, accepted by `allow`, and
+/// not across creases.
+fn geodesic_disc(m: &Mesh, seed: u32, center: DVec3, radius: f64, allow: &impl Fn(u32) -> bool, crease_cos: Option<f64>) -> Vec<u32> {
     use std::collections::{BinaryHeap, HashMap};
     #[derive(PartialEq)]
     struct Item(f64, u32);
@@ -334,44 +363,24 @@ fn geodesic_disc(m: &Mesh, seed: u32, center: DVec3, radius: f64, allow: &impl F
         dist.insert(v, d);
         heap.push(Item(d, v));
     }
-    let mut region = vec![seed];
-    let mut taken = std::collections::HashSet::from([seed]);
     while let Some(Item(d, v)) = heap.pop() {
         if d > dist.get(&v).copied().unwrap_or(f64::INFINITY) || d > radius {
             continue;
         }
-        for t in m.vertex_triangles(v) {
-            if taken.contains(&t) || !allow(t) {
-                continue;
-            }
-            // A triangle joins once its corners are on average within the radius.
-            let tv = m.triangle(t);
-            if tv.iter().all(|u| dist.contains_key(u)) && tv.iter().map(|u| dist[u]).sum::<f64>() / 3.0 <= radius {
-                taken.insert(t);
-                region.push(t);
-            }
-            for u in tv {
-                let nd = d + m.vertex(v).distance(m.vertex(u));
-                if nd < dist.get(&u).copied().unwrap_or(f64::INFINITY) {
-                    dist.insert(u, nd);
-                    heap.push(Item(nd, u));
-                }
+        let p = m.vertex(v);
+        for u in m.vertex_neighbors(v) {
+            let nd = d + p.distance(m.vertex(u));
+            if nd < dist.get(&u).copied().unwrap_or(f64::INFINITY) {
+                dist.insert(u, nd);
+                heap.push(Item(nd, u));
             }
         }
     }
-    // Second sweep: triangles whose corners all got distances after they were visited.
-    let candidates: Vec<u32> = dist.iter().filter(|(_, d)| **d <= radius).flat_map(|(&v, _)| m.vertex_triangles(v)).collect();
-    for t in candidates {
-        if taken.contains(&t) || !allow(t) {
-            continue;
-        }
+    let within = |t: u32| {
         let tv = m.triangle(t);
-        if tv.iter().all(|u| dist.contains_key(u)) && tv.iter().map(|u| dist[u]).sum::<f64>() / 3.0 <= radius {
-            taken.insert(t);
-            region.push(t);
-        }
-    }
-    region
+        tv.iter().all(|u| dist.contains_key(u)) && tv.iter().map(|u| dist[u]).sum::<f64>() / 3.0 <= radius
+    };
+    flood_across(m, seed, |t| within(t) && allow(t), crease_cos)
 }
 
 #[cfg(test)]
@@ -388,9 +397,10 @@ mod tests {
         let bvh = Bvh::build(&m);
         let center = DVec3::ZERO;
         let seed = bvh.nearest(&m, center, 1.0).unwrap().tid;
+        let stamp = |shape: BrushShape| BrushStamp { shape, seed, center, normal: DVec3::Z, radius: 0.5, crease_cos: None };
         let count = |shape: BrushShape| {
             let mut s = TriSelection::new(&m);
-            s.paint_brush(&m, &bvh, shape, seed, center, DVec3::Z, 0.5, |_| true, false);
+            s.paint_brush(&m, &bvh, &stamp(shape), |_| true, false);
             s
         };
         let sphere = count(BrushShape::Sphere);
@@ -405,7 +415,7 @@ mod tests {
         assert!(unwrap.len() > 50);
         // Filters apply (except to the seed).
         let mut f = TriSelection::new(&m);
-        f.paint_brush(&m, &bvh, BrushShape::Unwrap, seed, center, DVec3::Z, 0.5, |t| m.tri_centroid(t).x < 0.0, false);
+        f.paint_brush(&m, &bvh, &stamp(BrushShape::Unwrap), |t| m.tri_centroid(t).x < 0.0, false);
         assert!(f.iter().all(|t| t == seed || m.tri_centroid(t).x < 0.0));
     }
     use super::*;
@@ -451,12 +461,33 @@ mod tests {
     }
 
     #[test]
+    fn brush_stops_at_creases() {
+        // A cube: the brush at a face centre with a large radius spills over the edges unless
+        // a crease limit is set.
+        let m = primitives::cube(2.0, 8);
+        let bvh = Bvh::build(&m);
+        let hit = bvh.raycast(&m, &crate::geom::Ray::new(DVec3::new(0.2, 0.1, 5.0), -DVec3::Z)).unwrap();
+        for shape in [BrushShape::Unwrap, BrushShape::SphereDisc] {
+            let base = BrushStamp { shape, seed: hit.tid, center: hit.point, normal: DVec3::Z, radius: 1.6, crease_cos: None };
+            let mut free = TriSelection::new(&m);
+            free.paint_brush(&m, &bvh, &base, |_| true, false);
+            let mut limited = TriSelection::new(&m);
+            limited.paint_brush(&m, &bvh, &BrushStamp { crease_cos: Some(30f64.to_radians().cos()), ..base }, |_| true, false);
+            assert!(limited.iter().all(|t| m.tri_normal(t).z > 0.99), "{shape:?} stays on the top face");
+            if shape == BrushShape::Unwrap {
+                assert!(free.iter().any(|t| m.tri_normal(t).z < 0.5), "without a limit it spills over");
+            }
+        }
+    }
+
+    #[test]
     fn paint_selects_local_patch() {
         let m = primitives::icosphere(1.0, 3);
         let bvh = Bvh::build(&m);
         let hit = bvh.raycast(&m, &crate::geom::Ray::new(DVec3::new(0.0, 0.0, 5.0), -DVec3::Z)).unwrap();
         let mut s = TriSelection::new(&m);
-        s.paint_brush(&m, &bvh, BrushShape::SphereDisc, hit.tid, hit.point, DVec3::Z, 0.3, |_| true, false);
+        let stamp = BrushStamp { shape: BrushShape::SphereDisc, seed: hit.tid, center: hit.point, normal: DVec3::Z, radius: 0.3, crease_cos: None };
+        s.paint_brush(&m, &bvh, &stamp, |_| true, false);
         assert!(s.len() > 3 && s.len() < m.triangle_count() / 4);
         for t in s.iter() {
             assert!(m.tri_centroid(t).z > 0.5);

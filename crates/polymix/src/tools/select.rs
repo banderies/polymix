@@ -37,6 +37,10 @@ pub struct SelectTool {
     pub restrict_exterior: bool,
     /// Mirror brush strokes across this axis through the object's centre.
     pub symmetry: Option<usize>,
+    /// Right-drag grow/shrink metric (Meshmixer's Expand Mode).
+    pub expand_mode: ExpandMode,
+    /// Brush spread and geodesic growth stop at edges sharper than this (degrees; 0 = off).
+    pub crease_deg: f32,
     exterior: Option<ExteriorCache>,
     stroke: Option<Stroke>,
     /// Screen curve being drawn (lasso or laser).
@@ -50,45 +54,100 @@ pub struct SelectTool {
     pub request: Option<Box<dyn Tool>>,
 }
 
-/// Right-drag grow/shrink (Meshmixer's "Expand Mode: Geodesic Distance"): drag right to grow
-/// the selection by a surface distance, left to shrink it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpandMode {
+    /// Grow by surface distance.
+    Geodesic,
+    /// Grow across edges flatter than an angle that increases with the drag: fills smooth
+    /// regions up to their creases.
+    CreaseAngle,
+}
+
+/// Right-drag grow/shrink (Meshmixer's right-click-drag Expand Mode): drag right to grow the
+/// selection, left to shrink it.
 struct ExpandSession {
     object: ObjectId,
     original: TriSelection,
-    /// Per triangle: surface distance from the selection border (max over its vertices).
+    /// Per triangle: surface distance (across faces) from the selection border, with
+    /// creases as barriers.
     dist: Vec<f32>,
     /// World length per screen point at the press position.
     scale: f64,
+    mode: ExpandMode,
+    crease_cos: Option<f64>,
 }
 
 impl ExpandSession {
-    fn new(mesh: &Mesh, object: ObjectId, original: TriSelection, scale: f64) -> Self {
-        // Border vertices: on edges between selected and unselected triangles.
-        let mut sources = Vec::new();
-        let mut mark = vec![false; mesh.max_vid()];
+    fn new(mesh: &Mesh, object: ObjectId, original: TriSelection, scale: f64, mode: ExpandMode, crease_cos: Option<f64>) -> Self {
+        use std::collections::BinaryHeap;
+        #[derive(PartialEq)]
+        struct Item(f64, u32);
+        impl Eq for Item {}
+        impl PartialOrd for Item {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for Item {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                o.0.total_cmp(&self.0)
+            }
+        }
+        // Dijkstra over the face graph from both sides of the border.
+        let mut dist = vec![f64::INFINITY; mesh.max_tid()];
+        let mut heap = BinaryHeap::new();
         for t in original.iter() {
-            for e in mesh.tri_edges(t) {
-                let o = mesh.edge_other_triangle(e, t);
-                if o != mm_core::INVALID && !original.contains(o) {
-                    for v in mesh.edge_vertices(e) {
-                        if !std::mem::replace(&mut mark[v as usize], true) {
-                            sources.push(v);
-                        }
+            for n in mesh.tri_neighbors(t) {
+                if n == mm_core::INVALID || original.contains(n) || mm_core::selection::is_crease(mesh, t, n, crease_cos) {
+                    continue;
+                }
+                let half = 0.5 * mesh.tri_centroid(t).distance(mesh.tri_centroid(n));
+                for x in [t, n] {
+                    if half < dist[x as usize] {
+                        dist[x as usize] = half;
+                        heap.push(Item(half, x));
                     }
                 }
             }
         }
-        let vd = crate::centerline::geodesic_distance(mesh, &sources);
-        let mut dist = vec![f32::INFINITY; mesh.max_tid()];
-        for t in mesh.triangle_ids() {
-            dist[t as usize] = mesh.triangle(t).iter().map(|&v| vd[v as usize]).fold(0.0, f64::max) as f32;
+        while let Some(Item(d, t)) = heap.pop() {
+            if d > dist[t as usize] {
+                continue;
+            }
+            let side = original.contains(t);
+            let c = mesh.tri_centroid(t);
+            for n in mesh.tri_neighbors(t) {
+                // Stay on this side of the border; creases are barriers.
+                if n == mm_core::INVALID || original.contains(n) != side || mm_core::selection::is_crease(mesh, t, n, crease_cos) {
+                    continue;
+                }
+                let nd = d + c.distance(mesh.tri_centroid(n));
+                if nd < dist[n as usize] {
+                    dist[n as usize] = nd;
+                    heap.push(Item(nd, n));
+                }
+            }
         }
-        Self { object, original, dist, scale }
+        Self { object, original, dist: dist.into_iter().map(|d| d as f32).collect(), scale, mode, crease_cos }
     }
 
-    /// Selection for a signed surface distance `d` (positive grows).
+    /// Selection for a signed drag of `d` world units (positive grows).
     fn apply(&self, mesh: &Mesh, d: f64, out: &mut TriSelection) {
         *out = self.original.clone();
+        if d > 0.0 && self.mode == ExpandMode::CreaseAngle {
+            // 0.4 degrees per screen point of drag.
+            let limit = (d / self.scale.max(1e-12) * 0.4).min(180.0).to_radians().cos();
+            let mut stack: Vec<u32> = self.original.iter().collect();
+            while let Some(t) = stack.pop() {
+                for n in mesh.tri_neighbors(t) {
+                    if n != mm_core::INVALID && !out.contains(n) && !mm_core::selection::is_crease(mesh, t, n, self.crease_cos) && mesh.tri_normal(t).dot(mesh.tri_normal(n)) >= limit {
+                        out.insert(n);
+                        stack.push(n);
+                    }
+                }
+            }
+            return;
+        }
         let d = d as f32;
         for t in mesh.triangle_ids() {
             let within = self.dist[t as usize] <= d.abs();
@@ -117,6 +176,8 @@ impl Default for SelectTool {
             allow_back_faces: false,
             restrict_exterior: false,
             symmetry: None,
+            expand_mode: ExpandMode::Geodesic,
+            crease_deg: 0.0,
             exterior: None,
             stroke: None,
             curve: None,
@@ -184,6 +245,10 @@ impl ViewTest {
 }
 
 impl SelectTool {
+    fn crease_cos(&self) -> Option<f64> {
+        (self.crease_deg > 0.0).then(|| (self.crease_deg as f64).to_radians().cos())
+    }
+
     fn paint_at(&mut self, cx: &mut ToolCx, pos: egui::Pos2) {
         let Some(stroke) = &mut self.stroke else { return };
         let ray = cx.ray_at(pos);
@@ -235,6 +300,7 @@ impl SelectTool {
         let (eye, fwd, ortho) = (cx.camera.eye(), cx.camera.forward(), cx.camera.orthographic);
         let allow_back = self.allow_back_faces;
         let shape = self.brush_shape;
+        let crease_cos = self.crease_cos();
         let exterior = if self.restrict_exterior { self.exterior.as_mut() } else { None };
         let exterior = std::cell::RefCell::new(exterior);
         let allow = |t: u32| {
@@ -251,7 +317,8 @@ impl SelectTool {
         };
         let mut changed = 0;
         for (tid, p) in stamps {
-            changed += o.selection.paint_brush(&mesh, &bvh, shape, tid, p, mesh.tri_normal(tid), r, allow, deselect);
+            let stamp = mm_core::BrushStamp { shape, seed: tid, center: p, normal: mesh.tri_normal(tid), radius: r, crease_cos };
+            changed += o.selection.paint_brush(&mesh, &bvh, &stamp, allow, deselect);
         }
         if changed > 0 {
             o.touch_selection();
@@ -436,8 +503,19 @@ impl Tool for SelectTool {
                     }
                 });
                 ui_util::section(ui, "Filters");
+                egui::ComboBox::from_label("Expand mode (right-drag)")
+                    .selected_text(match self.expand_mode {
+                        ExpandMode::Geodesic => "Geodesic Distance",
+                        ExpandMode::CreaseAngle => "Crease Angle",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.expand_mode, ExpandMode::Geodesic, "Geodesic Distance").on_hover_text("Grow by distance along the surface");
+                        ui.selectable_value(&mut self.expand_mode, ExpandMode::CreaseAngle, "Crease Angle").on_hover_text("Grow across edges flatter than an angle that increases with the drag");
+                    });
                 ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush select faces turned away from you");
                 ui.checkbox(&mut self.restrict_exterior, "Restrict to exterior faces").on_hover_text("Skip faces buried inside other parts of the mesh (e.g. overlapping tubes)");
+                ui.add(egui::Slider::new(&mut self.crease_deg, 0.0..=180.0).suffix("°").text("Crease angle threshold"))
+                    .on_hover_text("The brush and right-drag growth stop at edges sharper than this (0 = off)");
             }
             SelectMode::Lasso => {}
         }
@@ -607,7 +685,7 @@ impl Tool for SelectTool {
                 let o = cx.scene.get_mut(id).unwrap();
                 let mesh = o.mesh.clone();
                 o.selection.sync(&mesh);
-                self.expand = Some(ExpandSession::new(&mesh, id, o.selection.clone(), scale));
+                self.expand = Some(ExpandSession::new(&mesh, id, o.selection.clone(), scale, self.expand_mode, self.crease_cos()));
             }
             DragPhase::Move | DragPhase::End => {
                 let Some(session) = &self.expand else { return };
@@ -619,7 +697,11 @@ impl Tool for SelectTool {
                 let d = total.x as f64 * session.scale;
                 session.apply(&mesh, d, &mut o.selection);
                 o.touch_selection();
-                *cx.status = format!("{} by {:.3} · {} triangles selected", if d >= 0.0 { "Grow" } else { "Shrink" }, d.abs(), o.selection.len());
+                *cx.status = if d > 0.0 && session.mode == ExpandMode::CreaseAngle {
+                    format!("Grow across edges under {:.0}° · {} triangles selected", (d / session.scale.max(1e-12) * 0.4).min(180.0), o.selection.len())
+                } else {
+                    format!("{} by {:.3} · {} triangles selected", if d >= 0.0 { "Grow" } else { "Shrink" }, d.abs(), o.selection.len())
+                };
                 if phase == DragPhase::End {
                     self.expand = None;
                 }
@@ -814,7 +896,7 @@ mod tests {
             }
         }
         let n0 = sel.len();
-        let session = ExpandSession::new(&m, 0, sel.clone(), 1.0);
+        let session = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::Geodesic, None);
         let mut out = TriSelection::new(&m);
         session.apply(&m, 0.0, &mut out);
         assert_eq!(out.len(), n0);
@@ -828,6 +910,26 @@ mod tests {
         session.apply(&m, -0.8, &mut out);
         assert!(out.len() < n0 && !out.is_empty());
         assert!(out.iter().all(|t| sel.contains(t)), "shrinking only removes");
+    }
+
+    #[test]
+    fn crease_angle_expand_and_barriers() {
+        let m = primitives::cube(2.0, 6);
+        let top: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_normal(t).z > 0.99).collect();
+        let mut sel = TriSelection::new(&m);
+        sel.insert(top[0]);
+        let mut out = TriSelection::new(&m);
+        // Crease Angle mode: a short drag (10°) fills the flat top face only…
+        let crease = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::CreaseAngle, None);
+        crease.apply(&m, 25.0, &mut out);
+        assert_eq!(out.len(), top.len());
+        // …a long one (100°) crosses the 90° edges.
+        crease.apply(&m, 250.0, &mut out);
+        assert_eq!(out.len(), m.triangle_count());
+        // Geodesic growth with a 30° crease limit stays on the top face however far it grows.
+        let limited = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::Geodesic, Some(30f64.to_radians().cos()));
+        limited.apply(&m, 100.0, &mut out);
+        assert_eq!(out.len(), top.len());
     }
 
     #[test]

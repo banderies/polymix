@@ -47,8 +47,9 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M2.4 Brush modes**: Sphere / SphereDisc / Unwrap (geodesic) brush; Allow Back Faces and
       Restrict To Exterior Faces for the brush; Symmetry plane (mirror across the object's centre on
       X, Y or Z; arbitrary planes later).
-- [ ] **M2.5 Expand modes**: Geodesic Distance / Crease Angle / Vertex Color with Crease Angle
-      Threshold (drives RMB-drag expand and brush spread).
+- [x] **M2.5 Expand modes**: Geodesic Distance / Crease Angle / Vertex Color with Crease Angle
+      Threshold (drives RMB-drag expand and brush spread). Vertex Color mode comes with vertex
+      colours (M6.2).
 - [ ] **M2.6 Lasso Mode**: multi-curve loop drawn on the surface, rotating between curves.
 - [ ] **M2.7 Extract** (Shift+D) and Extrude/Offset parity (Harden, Density, Direction Normal /
       Constant / Axis, EndType Offset / Flat, Soft Transition, Connected, Preserve Boundary /

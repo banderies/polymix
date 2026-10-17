@@ -136,7 +136,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Double-click: connected part | ✅ | |
 | Double-click an open-edge triangle: hole-border ring | ✅ | Polymix addition (requested) |
 | S inside Select clears the selection | ✅ | Polymix addition (requested) |
-| Expand Mode: Geodesic / Crease Angle / Vertex Color + Crease Angle Thresh | ❌ | |
+| Expand Mode: Geodesic / Crease Angle / Vertex Color + Crease Angle Thresh | 🟡 | Geodesic, Crease Angle and the threshold ✅ (brush and growth stop at creases); Vertex Color with M6.2 |
 | Allow Back Faces | ✅ | Brush filter; the lasso has "selects through the model" |
 | Restrict To Exterior Faces | ✅ | Winding-number test: skips faces buried inside other parts |
 | Symmetry plane (Set / Reset) | 🟡 | Mirror across the object's centre on X/Y/Z; free plane placement ❌ |

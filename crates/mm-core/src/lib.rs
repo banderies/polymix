@@ -21,7 +21,7 @@ pub use bvh::Bvh;
 pub use geom::{Aabb, Plane, Ray};
 pub use glam::{DMat3, DMat4, DQuat, DVec2, DVec3};
 pub use mesh::{Mesh, MeshError, MeshResult, INVALID};
-pub use selection::{BrushShape, TriSelection};
+pub use selection::{BrushShape, BrushStamp, TriSelection};
 
 #[cfg(test)]
 mod mesh_tests;
