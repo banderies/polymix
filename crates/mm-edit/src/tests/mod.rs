@@ -8,6 +8,7 @@ mod flow_tests;
 mod local_cut_tests;
 mod misc_tests;
 mod perf;
+mod soft_tests;
 
 use mm_core::topology::{boundary_loops, connected_components};
 use mm_core::{measure, primitives, DVec3, Mesh};

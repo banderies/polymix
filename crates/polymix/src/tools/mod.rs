@@ -11,6 +11,7 @@ use mm_core::{Mesh, Ray};
 pub mod select;
 pub mod lasso;
 pub mod surface_lasso;
+pub mod warp;
 pub mod transform;
 pub mod inspector;
 pub mod ops;
@@ -227,6 +228,8 @@ pub trait Tool {
     }
     /// A right-button drag owned by the tool; `total` is the pointer offset since the press.
     fn secondary_drag(&mut self, _phase: DragPhase, _pos: egui::Pos2, _total: egui::Vec2, _cx: &mut ToolCx) {}
+    /// A right-click (no drag) in the viewport.
+    fn secondary_click(&mut self, _pos: egui::Pos2, _cx: &mut ToolCx) {}
     /// Esc pressed. Return true to close the tool.
     fn cancel(&mut self, _cx: &mut ToolCx) -> bool {
         true

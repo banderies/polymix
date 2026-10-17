@@ -62,6 +62,8 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "inspector" => Box::new(tools::inspector::InspectorTool::new(cx)),
         "transform" => Box::new(tools::transform::TransformTool::new(cx)),
         "facetransform" => Box::new(tools::transform::TransformTool::new_faces(cx)),
+        "softtransform" => Box::new(tools::transform::TransformTool::new_soft(cx)),
+        "warp" => Box::new(tools::warp::WarpTool::new(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
@@ -1035,6 +1037,14 @@ impl PolymixApp {
     }
 
     /// Send a right-drag to the active tool.
+    fn tool_secondary_click(&mut self, ctx: &egui::Context, vp: Viewport, pos: egui::Pos2) {
+        if let Some(mut t) = self.tools.pop() {
+            let mut cx = self.tool_cx(ctx, vp);
+            t.secondary_click(pos, &mut cx);
+            self.tools.push(t);
+        }
+    }
+
     fn tool_secondary(&mut self, ctx: &egui::Context, vp: Viewport, phase: DragPhase, pos: egui::Pos2, total: egui::Vec2) {
         if let Some(mut t) = self.tools.pop() {
             let mut cx = self.tool_cx(ctx, vp);
@@ -1190,6 +1200,11 @@ impl PolymixApp {
             self.tool_secondary(&ctx, vp, phase, pos, pos - start);
             if !down {
                 self.tool_rmb = None;
+            }
+        }
+        if response.secondary_clicked() && !mods.alt {
+            if let Some(p) = hover {
+                self.tool_secondary_click(&ctx, vp, p);
             }
         }
         let nav_active = self.nav_drag.is_some();
@@ -1510,6 +1525,13 @@ impl PolymixApp {
                     self.synthetic.push_back(PointerInput { pos: Some(*last), released: true, ..Default::default() });
                 }
                 script.wait = 2;
+            }
+            "rclick" => {
+                let v: Vec<f32> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 2 {
+                    let p = vp.rect.min + egui::vec2(v[0] * vp.rect.width(), v[1] * vp.rect.height());
+                    self.tool_secondary_click(ctx, vp, p);
+                }
             }
             "click" | "dclick" | "drag" | "sdrag" => {
                 // Viewport-relative coordinates in 0..1.

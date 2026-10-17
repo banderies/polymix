@@ -29,6 +29,7 @@ pub mod flow;
 pub mod mirror;
 pub mod region;
 pub mod smooth;
+pub mod soft;
 pub mod transform;
 pub mod vessel;
 
@@ -47,6 +48,7 @@ pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, Flow
 pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};
 pub use region::{discard, duplicate, flip_normals, separate};
 pub use smooth::smooth_boundary;
+pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion};
 pub use transform::{align_to_principal_axes, center_on_origin, drop_to_ground, transform_mesh};
 pub use vessel::{estimate_vessel_cross_section, suggest_cut_plane, VesselCrossSection};
 

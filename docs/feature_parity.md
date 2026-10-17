@@ -164,8 +164,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | **Deform** menu: Smooth (⌘F) | ✅ | |
 | Deform: Smooth Boundary ("Smooth Loop", B) | ✅ | Meshmixer's parameters and defaults; remesher smooths the border curve |
 | Deform: Transform selection (T) | ✅ | Face Transform: T in Select with a selection; frame along the selection normal; Shared Frame, Fixed Boundary |
-| Deform: Soft Transform (Shift+T) | ❌ | |
-| Deform: Warp | ❌ | |
+| Deform: Soft Transform (Shift+T) | ✅ | Linear / Nonlinear (ARAP) Deformation, Flat / Stretchy Transition; Boundary Continuity Boundaries / SoftPosition / SoftTangent; Falloff, Fixed Boundary, Ignore Groups, Shared Frame. Refine Mesh ❌ |
+| Deform: Warp | ✅ | Right-click adds/removes handles, drag to warp; smooth (biharmonic) or detail-preserving (ARAP); handle size |
 | **Convert To**: Open Part / Solid Part / Stamp | ⚪ ❌ | |
 
 ## 3. Sculpt

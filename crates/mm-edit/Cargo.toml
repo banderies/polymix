@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 mm-core = { path = "../mm-core" }
 mm-solid = { path = "../mm-solid" }
+mm-repair = { path = "../mm-repair" }
 glam.workspace = true
 rayon.workspace = true
 smallvec.workspace = true

@@ -26,6 +26,18 @@ struct FaceRegion {
     fixed_boundary: bool,
     /// Moving vertices per piece, with the piece's pivot.
     groups: Vec<(Vec<u32>, DVec3)>,
+    /// Soft Transform: the change fades out over a band instead of stopping at the border.
+    soft: Option<SoftState>,
+}
+
+struct SoftState {
+    kind: mm_edit::SoftKind,
+    continuity: mm_edit::Continuity,
+    falloff: f64,
+    ignore_groups: bool,
+    region: mm_edit::SoftRegion,
+    /// Pivot per piece label of `region`.
+    pivots: Vec<DVec3>,
 }
 
 /// Frame with Z along the area-weighted normal of `tris`.
@@ -173,9 +185,26 @@ impl TransformTool {
         let tris: Vec<u32> = cx.scene.active().map(|o| o.selection.iter().collect()).unwrap_or_default();
         if !tris.is_empty() {
             t.frame = region_frame(&t.source, &tris);
-            t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new() });
+            t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new(), soft: None });
             t.update_region();
         }
+        t
+    }
+
+    /// Soft Transform: the selected faces move, and the change fades out over a falloff band.
+    pub fn new_soft(cx: &mut ToolCx) -> Self {
+        let mut t = Self::new_faces(cx);
+        let Some(r) = t.region.as_mut() else { return t };
+        let b = mm_core::Aabb::from_points(r.tris.iter().flat_map(|&tr| t.source.triangle(tr)).map(|v| t.source.vertex(v)));
+        r.soft = Some(SoftState {
+            kind: mm_edit::SoftKind::Linear,
+            continuity: mm_edit::Continuity::SoftPosition,
+            falloff: (0.5 * b.diagonal()).max(t.source.average_edge_length() * 2.0),
+            ignore_groups: false,
+            region: Default::default(),
+            pivots: Vec::new(),
+        });
+        t.update_region();
         t
     }
 
@@ -225,6 +254,20 @@ impl TransformTool {
             })
             .collect();
         self.pivot = extents_of(r.groups.iter().flat_map(|g| g.0.iter()).map(|&v| m.vertex(v)), axes).1;
+        if let Some(soft) = r.soft.as_mut() {
+            soft.region = mm_edit::soft_region(m, &r.tris, soft.falloff, r.fixed_boundary, soft.ignore_groups, r.shared_frame);
+            // Pivot per piece: the centre of its selected vertices.
+            let pieces = soft.region.handle_piece.iter().chain(&soft.region.band_piece).max().map_or(0, |&p| p as usize + 1);
+            let mut members: Vec<Vec<DVec3>> = vec![Vec::new(); pieces];
+            let in_sel: std::collections::HashSet<u32> = r.tris.iter().flat_map(|&t| m.triangle(t)).collect();
+            let all = soft.region.handle.iter().zip(&soft.region.handle_piece).chain(soft.region.band.iter().zip(&soft.region.band_piece));
+            for (&v, &p) in all {
+                if in_sel.contains(&v) {
+                    members[p as usize].push(m.vertex(v));
+                }
+            }
+            soft.pivots = members.into_iter().map(|pts| extents_of(pts.into_iter(), axes).1).collect();
+        }
         self.dirty = true;
     }
 
@@ -270,7 +313,19 @@ impl TransformTool {
 
     fn rebuild(&mut self) {
         let mut mesh = (*self.source).clone();
-        if let Some(r) = &self.region {
+        if let Some(soft) = self.region.as_ref().and_then(|r| r.soft.as_ref().map(|s| (s, r.shared_frame))) {
+            let (soft, shared) = soft;
+            let lin = self.linear();
+            let (pivot, t) = (self.pivot, self.translate);
+            let tf = |piece: u32, x: DVec3| {
+                let c = if shared { pivot } else { soft.pivots.get(piece as usize).copied().unwrap_or(pivot) };
+                c + t + lin * (x - c)
+            };
+            for (v, p) in mm_edit::soft_deform(&self.source, &soft.region, &tf, soft.kind, soft.continuity) {
+                mesh.set_vertex(v, p);
+            }
+            self.sizes = extents_of(soft.region.handle.iter().map(|&v| mesh.vertex(v)), self.axes()).0;
+        } else if let Some(r) = &self.region {
             let lin = self.linear();
             for (verts, pivot) in &r.groups {
                 let pivot = if r.shared_frame { self.pivot } else { *pivot };
@@ -480,10 +535,10 @@ impl TransformTool {
 
 impl Tool for TransformTool {
     fn name(&self) -> &'static str {
-        if self.region.is_some() {
-            "Face Transform"
-        } else {
-            "Transform"
+        match &self.region {
+            Some(r) if r.soft.is_some() => "Soft Transform",
+            Some(_) => "Face Transform",
+            None => "Transform",
         }
     }
 
@@ -518,6 +573,44 @@ impl Tool for TransformTool {
         }
         if let Some(r) = &mut self.region {
             let mut region_changed = false;
+            let mut redraw = false;
+            if let Some(soft) = r.soft.as_mut() {
+                use mm_edit::{Continuity, SoftKind};
+                let kind_name = |k: SoftKind| match k {
+                    SoftKind::Linear => "Linear Deformation",
+                    SoftKind::Nonlinear => "Nonlinear Deformation",
+                    SoftKind::Flat => "Flat Transition",
+                    SoftKind::Stretchy => "Stretchy Transition",
+                };
+                egui::ComboBox::from_label("Deformation type").selected_text(kind_name(soft.kind)).show_ui(ui, |ui| {
+                    for (k, tip) in [
+                        (SoftKind::Linear, "Blend the change across the falloff band (fast)"),
+                        (SoftKind::Nonlinear, "As-rigid-as-possible band: detail keeps its shape when the selection turns"),
+                        (SoftKind::Flat, "Re-solve the band as a smooth surface (detail in the band is smoothed away)"),
+                        (SoftKind::Stretchy, "Spread the movement smoothly, stretching the band's detail"),
+                    ] {
+                        redraw |= ui.selectable_value(&mut soft.kind, k, kind_name(k)).on_hover_text(tip).changed();
+                    }
+                });
+                let cont_name = |c: Continuity| match c {
+                    Continuity::Boundaries => "Boundaries",
+                    Continuity::SoftPosition => "SoftPosition Boundary",
+                    Continuity::SoftTangent => "SoftTangent",
+                };
+                ui.add_enabled_ui(soft.kind != SoftKind::Nonlinear, |ui| {
+                    egui::ComboBox::from_label("Boundary continuity").selected_text(cont_name(soft.continuity)).show_ui(ui, |ui| {
+                        for c in [Continuity::Boundaries, Continuity::SoftPosition, Continuity::SoftTangent] {
+                            redraw |= ui.selectable_value(&mut soft.continuity, c, cont_name(c)).changed();
+                        }
+                    });
+                });
+                let max = (self.source.bounds().diagonal() * 0.5).max(soft.falloff);
+                region_changed |= ui
+                    .add(egui::Slider::new(&mut soft.falloff, 0.0..=max).text("falloff"))
+                    .on_hover_text("Width of the transition band (along the surface)")
+                    .changed();
+                region_changed |= ui.checkbox(&mut soft.ignore_groups, "Ignore groups").on_hover_text("Let the band spread across face-group borders").changed();
+            }
             ui.horizontal(|ui| {
                 region_changed |= ui.checkbox(&mut r.shared_frame, "Shared frame").on_hover_text("Off: each selected piece turns and scales about its own centre").changed();
                 region_changed |= ui.checkbox(&mut r.fixed_boundary, "Fixed boundary").on_hover_text("Keep the selection's border in place").changed();
@@ -525,6 +618,8 @@ impl Tool for TransformTool {
             if region_changed {
                 self.update_region();
                 self.rebuild();
+            } else if redraw {
+                self.dirty = true;
             }
         }
         let f = self.scale_frame();
@@ -930,7 +1025,7 @@ mod face_tests {
             drag: None,
             hover: None,
         };
-        t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new() });
+        t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new(), soft: None });
         t.update_region();
         t.rebuild();
         t

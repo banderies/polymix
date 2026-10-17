@@ -694,6 +694,20 @@ impl Tool for SelectTool {
                 }
             });
         });
+        ui_util::section(ui, "Deform");
+        ui.add_enabled_ui(has_sel, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Transform").on_hover_text("T: move the selected faces").clicked() {
+                    self.request = Some(Box::new(super::transform::TransformTool::new_faces(cx)));
+                }
+                if ui.button("Soft Transform").on_hover_text("Shift+T: move the selection with a smooth falloff").clicked() {
+                    self.request = Some(Box::new(super::transform::TransformTool::new_soft(cx)));
+                }
+                if ui.button("Warp").on_hover_text("Bend the selection with handles").clicked() {
+                    self.request = Some(Box::new(super::warp::WarpTool::new(cx)));
+                }
+            });
+        });
         ui_util::section(ui, "Modify");
         ui.add_enabled_ui(has_sel, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -931,9 +945,10 @@ impl Tool for SelectTool {
             self.request = Some(Box::new(ops::JoinTool::new(cx)));
         } else if i.key_pressed(Key::Y) && !cmd && !shift {
             run(&mut |x| commands::separate_selection(x, false));
-        } else if i.key_pressed(Key::T) && !cmd && !shift && cx.scene.active().is_some_and(|o| !o.selection.is_empty()) {
-            // T with a selection transforms just the selected faces.
-            self.request = Some(Box::new(super::transform::TransformTool::new_faces(cx)));
+        } else if i.key_pressed(Key::T) && !cmd && cx.scene.active().is_some_and(|o| !o.selection.is_empty()) {
+            // T with a selection transforms just the selected faces; Shift+T softly.
+            let t = if shift { super::transform::TransformTool::new_soft(cx) } else { super::transform::TransformTool::new_faces(cx) };
+            self.request = Some(Box::new(t));
         } else {
             return false;
         }
