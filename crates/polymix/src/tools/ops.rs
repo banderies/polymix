@@ -28,6 +28,8 @@ pub struct OpInfo<'a> {
     pub selection: Option<&'a [u32]>,
     pub avg_edge: f64,
     pub bbox_diag: f64,
+    /// The scene's target surface, if one is set (and is not this object).
+    pub target: Option<&'a TargetSurface>,
 }
 
 pub trait OpSpec: Send + 'static {
@@ -42,6 +44,10 @@ pub trait OpSpec: Send + 'static {
     fn defaults(info: &OpInfo) -> Self::Params;
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo);
     fn run(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput>;
+    /// [`OpSpec::run`] with the scene's target surface, for ops that use one.
+    fn run_with(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, _target: Option<&TargetSurface>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run(mesh, selection, p, progress)
+    }
     /// In-tool hotkeys (Meshmixer: D/F density ±10, T adaptive, G groups). Return true if
     /// the parameters changed.
     fn keys(_p: &mut Self::Params, _i: &egui::InputState) -> bool {
@@ -58,6 +64,7 @@ pub struct OpTool<S: OpSpec> {
     object: ObjectId,
     source: Arc<Mesh>,
     selection: Option<Arc<Vec<u32>>>,
+    target: Option<TargetSurface>,
     pub params: S::Params,
     avg_edge: f64,
     bbox_diag: f64,
@@ -72,6 +79,7 @@ pub struct OpTool<S: OpSpec> {
 
 impl<S: OpSpec> OpTool<S> {
     pub fn new(cx: &mut ToolCx) -> Self {
+        let target = cx.scene.target_surface(cx.scene.active);
         let Some(o) = cx.scene.active() else {
             return Self::invalid();
         };
@@ -79,12 +87,13 @@ impl<S: OpSpec> OpTool<S> {
         let source = o.mesh.clone();
         let avg_edge = source.average_edge_length();
         let bbox_diag = source.bounds().diagonal();
-        let info = OpInfo { mesh: &source, selection: selection.as_deref().map(|v| v.as_slice()), avg_edge, bbox_diag };
+        let info = OpInfo { mesh: &source, selection: selection.as_deref().map(|v| v.as_slice()), avg_edge, bbox_diag, target: target.as_ref() };
         let params = S::defaults(&info);
         Self {
             object: o.id,
             source,
             selection,
+            target,
             params,
             avg_edge,
             bbox_diag,
@@ -98,12 +107,13 @@ impl<S: OpSpec> OpTool<S> {
     }
 
     fn invalid() -> Self {
-        let info = OpInfo { mesh: &Mesh::new(), selection: None, avg_edge: 1.0, bbox_diag: 1.0 };
+        let info = OpInfo { mesh: &Mesh::new(), selection: None, avg_edge: 1.0, bbox_diag: 1.0, target: None };
         let params = S::defaults(&info);
         Self {
             object: 0,
             source: Arc::new(Mesh::new()),
             selection: None,
+            target: None,
             params,
             avg_edge: 1.0,
             bbox_diag: 1.0,
@@ -123,8 +133,9 @@ impl<S: OpSpec> OpTool<S> {
         let p = self.params.clone();
         let src = self.source.clone();
         let sel = self.selection.clone();
+        let target = self.target.clone();
         let p2 = p.clone();
-        let job = Job::spawn(S::NAME, ctx.clone(), move |progress| S::run(&src, sel.as_deref().map(|v| v.as_slice()), &p2, progress));
+        let job = Job::spawn(S::NAME, ctx.clone(), move |progress| S::run_with(&src, sel.as_deref().map(|v| v.as_slice()), &p2, target.as_ref(), progress));
         self.job = Some((p, job));
         self.error = None;
     }
@@ -215,7 +226,13 @@ impl<S: OpSpec> Tool for OpTool<S> {
         }
         let before = self.params.clone();
         {
-            let info = OpInfo { mesh: &self.source, selection: self.selection.as_deref().map(|v| v.as_slice()), avg_edge: self.avg_edge, bbox_diag: self.bbox_diag };
+            let info = OpInfo {
+                mesh: &self.source,
+                selection: self.selection.as_deref().map(|v| v.as_slice()),
+                avg_edge: self.avg_edge,
+                bbox_diag: self.bbox_diag,
+                target: self.target.as_ref(),
+            };
             S::ui(ui, &mut self.params, &info);
         }
         if self.params != before {
@@ -837,6 +854,8 @@ pub struct SmoothBoundaryUi {
     pub preserve_group_borders: bool,
     /// The selected region becomes one new face group.
     pub create_new_groups: bool,
+    /// Snap the smoothed band onto the target surface.
+    pub project_to_target: bool,
 }
 
 pub struct SmoothBoundarySpec;
@@ -853,9 +872,10 @@ impl OpSpec for SmoothBoundarySpec {
             preserve_mesh_boundary: false,
             preserve_group_borders: true,
             create_new_groups: true,
+            project_to_target: false,
         }
     }
-    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, _info: &OpInfo) {
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         ui.add(egui::Slider::new(&mut p.smoothness, 0.0..=100.0).text("Smoothness"));
         ui.add(egui::Slider::new(&mut p.preserve_shape, 0.0..=100.0).text("Preserve shape"));
         ui.add(egui::Slider::new(&mut p.iterations, 1..=100).text("Iterations"));
@@ -863,8 +883,12 @@ impl OpSpec for SmoothBoundarySpec {
         ui.checkbox(&mut p.preserve_mesh_boundary, "Preserve mesh boundary");
         ui.checkbox(&mut p.preserve_group_borders, "Preserve group borders");
         ui.checkbox(&mut p.create_new_groups, "Create new groups");
+        project_to_target_ui(ui, &mut p.project_to_target, info);
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_with(mesh, sel, p, None, progress)
+    }
+    fn run_with(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, surface: Option<&TargetSurface>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let tris = sel.ok_or_else(|| anyhow::anyhow!("select a region first"))?;
         let mut m = mesh.clone();
         let selection = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
@@ -919,6 +943,10 @@ impl OpSpec for SmoothBoundarySpec {
         let r = mm_remesh::remesh(&mut m, &params, Some(progress))?;
         if r.cancelled {
             anyhow::bail!("cancelled");
+        }
+        if let (true, Some(t), Some(band)) = (p.project_to_target, surface, r.region_triangles.as_deref()) {
+            let verts = interior_vertices(&m, band);
+            mm_edit::project_to_target(&mut m, &verts, &t.mesh, &t.bvh, 0.0, None);
         }
         // The selection is whatever carries an offset group; restore or merge groups.
         let selected: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_group(t) >= offset).collect();
@@ -1497,6 +1525,8 @@ pub struct EraseFillUi {
     pub bulge: f64,
     /// The patch gets its own face group (otherwise the surrounding group).
     pub create_new_groups: bool,
+    /// Snap the patch onto the target surface.
+    pub project_to_target: bool,
 }
 
 pub struct EraseFillSpec;
@@ -1505,7 +1535,7 @@ impl OpSpec for EraseFillSpec {
     const NAME: &'static str = "Erase & Fill";
     fn defaults(_: &OpInfo) -> Self::Params {
         // Meshmixer's defaults.
-        EraseFillUi { kind: FillKind::SmoothMvc, refine: 50.0, smooth: 100.0, scale: 1.0, bulge: 0.0, create_new_groups: false }
+        EraseFillUi { kind: FillKind::SmoothMvc, refine: 50.0, smooth: 100.0, scale: 1.0, bulge: 0.0, create_new_groups: false, project_to_target: false }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         egui::ComboBox::from_label("Fill type").selected_text(p.kind.label()).show_ui(ui, |ui| {
@@ -1519,12 +1549,16 @@ impl OpSpec for EraseFillSpec {
         ui.add_enabled(patch, egui::Slider::new(&mut p.scale, 0.0..=4.0).text("Scale"));
         ui.add_enabled(patch, egui::Slider::new(&mut p.bulge, -100.0..=100.0).text("Bulge"));
         ui.checkbox(&mut p.create_new_groups, "Create new groups");
+        project_to_target_ui(ui, &mut p.project_to_target, info);
         ui.small("Deletes the selection and fills the opening so it blends into the surrounding surface.");
         if info.selection.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select a region first.");
         }
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_with(mesh, sel, p, None, progress)
+    }
+    fn run_with(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, surface: Option<&TargetSurface>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let tris = sel.ok_or_else(|| anyhow::anyhow!("select a region first"))?;
         let mut m = mesh.clone();
         let selection = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
@@ -1553,8 +1587,32 @@ impl OpSpec for EraseFillSpec {
             shape_patch(&mut m, lp, &r, p);
             new_tris.extend(r.new_triangles);
         }
+        if let (true, Some(t)) = (p.project_to_target, surface) {
+            let verts = interior_vertices(&m, &new_tris);
+            mm_edit::project_to_target(&mut m, &verts, &t.mesh, &t.bvh, 0.0, None);
+        }
         Ok(OpOutput { message: format!("replaced {} triangles with {}", tris.len(), new_tris.len()), mesh: m, selection: Some(new_tris), ..Default::default() })
     }
+}
+
+/// Vertices whose triangles all belong to `tris` (the region's interior).
+fn interior_vertices(m: &Mesh, tris: &[u32]) -> Vec<u32> {
+    let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+    let mut v: Vec<u32> = tris.iter().flat_map(|&t| m.triangle(t)).filter(|&v| m.vertex_triangles(v).iter().all(|t| set.contains(t))).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// "Project to Target" checkbox, available once a target surface is set.
+fn project_to_target_ui(ui: &mut egui::Ui, on: &mut bool, info: &OpInfo) {
+    let has = info.target.is_some();
+    if !has {
+        *on = false;
+    }
+    ui.add_enabled(has, egui::Checkbox::new(on, "Project to target"))
+        .on_hover_text("Snap the new surface onto the target surface")
+        .on_disabled_hover_text("Set a target surface first (Edit → Set as target)");
 }
 
 /// Apply Smooth / Scale / Bulge to a fill patch's interior vertices, relative to the plane
@@ -1799,6 +1857,155 @@ impl OpSpec for SmoothSpec {
 }
 pub type SmoothTool = OpTool<SmoothSpec>;
 
+// ---------------------------------------------------------------------------
+// Attract / Align To Target
+// ---------------------------------------------------------------------------
+
+const NO_TARGET: &str = "No target surface set: set one with Edit → Set as target or the object list.";
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AttractToTargetUi {
+    pub offset: f64,
+    /// 0..100: relaxation between projections.
+    pub smooth: f64,
+    /// Only attract vertices whose normal is within this angle of the target's (degrees).
+    pub normal_threshold: f64,
+    pub preserve_mesh_boundaries: bool,
+    pub preserve_group_boundaries: bool,
+    /// Remesh the selection first (Density as in Remesh).
+    pub refine: bool,
+    pub density: f64,
+}
+
+pub struct AttractToTargetSpec;
+impl OpSpec for AttractToTargetSpec {
+    type Params = AttractToTargetUi;
+    const NAME: &'static str = "Attract To Target";
+    fn defaults(_: &OpInfo) -> Self::Params {
+        AttractToTargetUi {
+            offset: 0.0,
+            smooth: 50.0,
+            normal_threshold: 90.0,
+            preserve_mesh_boundaries: true,
+            preserve_group_boundaries: false,
+            refine: false,
+            density: 0.0,
+        }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        if info.target.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), NO_TARGET);
+        }
+        let span = (info.bbox_diag * 0.05).max(info.avg_edge * 5.0);
+        ui.add(egui::Slider::new(&mut p.offset, -span..=span).text("offset"));
+        ui.add(egui::Slider::new(&mut p.smooth, 0.0..=100.0).text("smooth"));
+        ui.add(egui::Slider::new(&mut p.normal_threshold, 0.0..=180.0).suffix("°").text("normal threshold"))
+            .on_hover_text("Only attract where the surface faces the same way as the target");
+        ui.checkbox(&mut p.preserve_mesh_boundaries, "Preserve mesh boundaries");
+        ui.checkbox(&mut p.preserve_group_boundaries, "Preserve group boundaries");
+        ui.checkbox(&mut p.refine, "Enable refinement").on_hover_text("Remesh the selection first so it can follow the target's detail");
+        ui.add_enabled(p.refine, egui::Slider::new(&mut p.density, -100.0..=100.0).text("density"));
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_with(mesh, sel, p, None, progress)
+    }
+    fn run_with(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, surface: Option<&TargetSurface>, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let t = surface.ok_or_else(|| anyhow::anyhow!(NO_TARGET))?;
+        let tris = sel.ok_or_else(|| anyhow::anyhow!("select the faces to attract first"))?;
+        let mut m = mesh.clone();
+        let mut region = tris.to_vec();
+        if p.refine {
+            let edge = mm_remesh::edge_length_stats_in(&m, tris).mean * 2f64.powf(-p.density / 50.0);
+            let rp = mm_remesh::RemeshParams { target_edge_length: edge, iterations: 6, region: Some(region.clone()), ..Default::default() };
+            let r = mm_remesh::remesh(&mut m, &rp, None)?;
+            region = r.region_triangles.unwrap_or(region);
+        }
+        let ap = mm_edit::AttractParams {
+            offset: p.offset,
+            smooth: p.smooth / 100.0,
+            normal_threshold_deg: p.normal_threshold,
+            preserve_mesh_boundary: p.preserve_mesh_boundaries,
+            preserve_group_boundaries: p.preserve_group_boundaries,
+            ..Default::default()
+        };
+        let moved = mm_edit::attract_to_target(&mut m, &region, &t.mesh, &t.bvh, &ap);
+        Ok(OpOutput { message: format!("attracted {} vertices", moved.len()), mesh: m, selection: Some(region), ..Default::default() })
+    }
+}
+pub type AttractToTargetTool = OpTool<AttractToTargetSpec>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AlignSource {
+    SelectedFaces,
+    AllFaces,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AlignToTargetUi {
+    pub source: AlignSource,
+    pub rotate: bool,
+    pub max_iterations: usize,
+    pub tolerance: f64,
+}
+
+pub struct AlignToTargetSpec;
+impl OpSpec for AlignToTargetSpec {
+    type Params = AlignToTargetUi;
+    const NAME: &'static str = "Align To Target";
+    fn defaults(info: &OpInfo) -> Self::Params {
+        AlignToTargetUi {
+            source: if info.selection.is_some() { AlignSource::SelectedFaces } else { AlignSource::AllFaces },
+            rotate: true,
+            max_iterations: 100,
+            tolerance: info.avg_edge * 1e-4,
+        }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        if info.target.is_none() {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), NO_TARGET);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Source");
+            ui.add_enabled_ui(info.selection.is_some(), |ui| {
+                ui.selectable_value(&mut p.source, AlignSource::SelectedFaces, "Selected faces");
+            });
+            ui.selectable_value(&mut p.source, AlignSource::AllFaces, "All faces");
+        });
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut p.rotate, true, "Translate and Rotate");
+            ui.selectable_value(&mut p.rotate, false, "Translate Only");
+        });
+        ui.add(egui::Slider::new(&mut p.max_iterations, 1..=500).text("max iterations"));
+        ui.small("Moves the whole object so the source faces fit the target surface (iterative closest point).");
+    }
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_with(mesh, sel, p, None, progress)
+    }
+    fn run_with(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, surface: Option<&TargetSurface>, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let t = surface.ok_or_else(|| anyhow::anyhow!(NO_TARGET))?;
+        let mut verts: Vec<u32> = match (p.source, sel) {
+            (AlignSource::SelectedFaces, Some(tris)) => tris.iter().flat_map(|&t| mesh.triangle(t)).collect(),
+            _ => mesh.vertex_ids().collect(),
+        };
+        verts.sort_unstable();
+        verts.dedup();
+        // Enough samples for a stable fit without slowing down on dense meshes.
+        let stride = (verts.len() / 20_000).max(1);
+        let pts: Vec<DVec3> = verts.iter().step_by(stride).map(|&v| mesh.vertex(v)).collect();
+        let ip = mm_edit::IcpParams { rotate: p.rotate, max_iterations: p.max_iterations, tolerance: p.tolerance };
+        let r = mm_edit::icp_align(&pts, &t.mesh, &t.bvh, &ip);
+        let mut m = mesh.clone();
+        m.transform(|x| r.apply(x));
+        Ok(OpOutput {
+            message: format!("aligned in {} iterations, RMS distance {:.4}", r.iterations, r.rms),
+            mesh: m,
+            selection: sel.map(|s| s.to_vec()),
+            ..Default::default()
+        })
+    }
+}
+pub type AlignToTargetTool = OpTool<AlignToTargetSpec>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,7 +2059,7 @@ mod tests {
     fn erase_fill_parameters() {
         let m = mm_core::primitives::icosphere(1.0, 4);
         let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.6).collect();
-        let info = OpInfo { mesh: &m, selection: Some(&cap), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let info = OpInfo { mesh: &m, selection: Some(&cap), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
         let base = EraseFillSpec::defaults(&info);
         let run = |p: EraseFillUi| EraseFillSpec::run(&m, Some(&cap), &p, &|_| true).unwrap();
         // Height of the patch's highest point above the hole plane (the cap border sits at z ≈ 0.6).
@@ -1910,7 +2117,7 @@ mod tests {
         m.append_mesh(&b, 0);
         let caps: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t) - DVec3::new(1.5, 0.0, 0.0)).length() < 0.9).collect();
         for tube in [false, true] {
-            let info = OpInfo { mesh: &m, selection: Some(&caps), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+            let info = OpInfo { mesh: &m, selection: Some(&caps), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
             let p = RegionBridgeUi { tube, ..RegionBridgeSpec::defaults(&info) };
             let out = RegionBridgeSpec::run(&m, Some(&caps), &p, &|_| true).unwrap();
             out.mesh.check_validity().unwrap();
@@ -1927,7 +2134,7 @@ mod tests {
         use mm_core::primitives;
         let m = primitives::icosphere(1.0, 4);
         let info = |sel: Option<&'static [u32]>| -> RemeshUi {
-            let i = OpInfo { mesh: &m, selection: sel, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+            let i = OpInfo { mesh: &m, selection: sel, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
             RemeshSpec::defaults(&i)
         };
         let base = info(None);
@@ -1944,7 +2151,7 @@ mod tests {
         // flatter middle, more so with a higher threshold.
         let mut e = primitives::icosphere(1.0, 4);
         e.transform(|p| DVec3::new(p.x * 3.0, p.y, p.z));
-        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal() };
+        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal(), target: None };
         let eb = RemeshSpec::defaults(&ei);
         let tip_over_middle = |t: f64| {
             let o = RemeshSpec::run(&e, None, &RemeshUi { mode: RemeshMode::AdaptiveDensity, threshold: t, ..eb }, &|_| true).unwrap();
@@ -1972,7 +2179,7 @@ mod tests {
         // Uniform reduction evens out edge lengths more than shape-preserving reduction.
         let mut e = primitives::icosphere(1.0, 4);
         e.transform(|p| DVec3::new(p.x * 3.0, p.y, p.z));
-        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal() };
+        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal(), target: None };
         let rb = ReduceSpec::defaults(&ei);
         let cv = |uniform: bool| {
             let o = ReduceSpec::run(&e, None, &ReduceUi { uniform, ..rb }, &|_| true).unwrap();
@@ -1996,7 +2203,7 @@ mod tests {
             }
         }
         let rough = |mm: &Mesh| mm.vertex_ids().map(|v| (mm.vertex(v).length() - 1.0).abs()).sum::<f64>();
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
         let base = SmoothSpec::defaults(&info);
         let group_border: Vec<u32> = m.vertex_ids().filter(|&v| {
             let ts = m.vertex_triangles(v);
@@ -2048,7 +2255,7 @@ mod tests {
     #[test]
     fn remesh_and_reduce_hotkeys() {
         let m = mm_core::primitives::icosphere(1.0, 2);
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
         let mut p = RemeshSpec::defaults(&info);
         let d0 = p.density;
         assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::D)));
@@ -2068,7 +2275,7 @@ mod tests {
     }
 
     fn run_spec<S: OpSpec>(mesh: &Mesh, sel: Option<&[u32]>) -> anyhow::Result<OpOutput> {
-        let info = OpInfo { mesh, selection: sel, avg_edge: mesh.average_edge_length(), bbox_diag: mesh.bounds().diagonal() };
+        let info = OpInfo { mesh, selection: sel, avg_edge: mesh.average_edge_length(), bbox_diag: mesh.bounds().diagonal(), target: None };
         let p = S::defaults(&info);
         let r = S::run(mesh, sel, &p, &|_| true);
         if let Ok(out) = &r {
@@ -2122,7 +2329,7 @@ mod tests {
             m.set_tri_group(t, (2 * axis + (n[axis] > 0.0) as usize) as i32);
         }
         m.transform(|p| q * p);
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
         let base = MakeSolidUi { accuracy: 0.0, ..MakeSolidSpec::defaults(&info) };
         let run = |p: MakeSolidUi| MakeSolidSpec::run(&m, None, &p, &|_| true).unwrap().mesh;
         // Sharp Edge Preserve keeps the cube's edges through the remesh, with its groups.
@@ -2147,5 +2354,56 @@ mod tests {
         let full = run(raw);
         let none = run(MakeSolidUi { cull_edges: 0.0, ..raw });
         assert!(none.triangle_count() > full.triangle_count(), "{} > {}", none.triangle_count(), full.triangle_count());
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use mm_core::primitives;
+
+    fn surface(m: Mesh) -> TargetSurface {
+        let bvh = Arc::new(mm_core::Bvh::build(&m));
+        TargetSurface { id: 99, mesh: Arc::new(m), bvh }
+    }
+
+    fn info<'a>(m: &'a Mesh, sel: Option<&'a [u32]>, t: Option<&'a TargetSurface>) -> OpInfo<'a> {
+        OpInfo { mesh: m, selection: sel, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: t }
+    }
+
+    #[test]
+    fn attract_and_project_need_and_use_the_target() {
+        let t = surface(primitives::icosphere(1.0, 4));
+        let m = primitives::icosphere(1.15, 3);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&tr| m.tri_centroid(tr).z > 0.7).collect();
+        let p = AttractToTargetSpec::defaults(&info(&m, Some(&sel), Some(&t)));
+        assert!(AttractToTargetSpec::run_with(&m, Some(&sel), &p, None, &|_| true).is_err(), "no target, no attract");
+        for refine in [false, true] {
+            let out = AttractToTargetSpec::run_with(&m, Some(&sel), &AttractToTargetUi { refine, density: 30.0, ..p }, Some(&t), &|_| true).unwrap();
+            out.mesh.check_validity().unwrap();
+            let region = out.selection.unwrap();
+            let verts = interior_vertices(&out.mesh, &region);
+            assert!(!verts.is_empty() && verts.iter().all(|&v| (out.mesh.vertex(v).length() - 1.0).abs() < 0.01));
+        }
+        // Erase & Fill with Project to Target lands the patch on the target.
+        let ep = EraseFillUi { project_to_target: true, ..EraseFillSpec::defaults(&info(&m, Some(&sel), Some(&t))) };
+        let out = EraseFillSpec::run_with(&m, Some(&sel), &ep, Some(&t), &|_| true).unwrap();
+        let verts = interior_vertices(&out.mesh, out.selection.as_ref().unwrap());
+        let on_target = |p: DVec3| t.bvh.nearest(&t.mesh, p, 1.0).is_some_and(|h| h.dist_sq < 1e-18);
+        assert!(!verts.is_empty() && verts.iter().all(|&v| on_target(out.mesh.vertex(v))));
+    }
+
+    #[test]
+    fn align_to_target_registers_a_moved_copy() {
+        let mut base = primitives::cube(1.0, 4);
+        base.transform(|p| DVec3::new(2.0 * p.x, p.y, 0.6 * p.z));
+        let t = surface(base.clone());
+        let mut m = base.clone();
+        let q = mm_core::DQuat::from_rotation_z(0.2);
+        m.transform(|p| q * p + DVec3::new(0.1, 0.05, -0.04));
+        let p = AlignToTargetSpec::defaults(&info(&m, None, Some(&t)));
+        let out = AlignToTargetSpec::run_with(&m, None, &p, Some(&t), &|_| true).unwrap();
+        let err = base.vertex_ids().map(|v| out.mesh.vertex(v).distance(base.vertex(v))).fold(0.0, f64::max);
+        assert!(err < 1e-3, "{err}: {}", out.message);
     }
 }

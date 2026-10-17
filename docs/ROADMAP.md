@@ -78,7 +78,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M4.2 Transform selection** (Face Transform, T with a selection).
 - [x] **M4.3 Soft Transform** (Shift+T) and **Warp**.
 - [x] **M4.4 Align** (source/destination picking: base point, surface, world origin/axes).
-- [ ] **M4.5 Target surface**: Set/Clear Target (menu + object browser), Transparent Target,
+- [x] **M4.5 Target surface**: Set/Clear Target (menu + object browser), Transparent Target,
       Align To Target, Attract To Target, "Project to Target" options.
 - [ ] **M4.6 Fit Primitive** (Square, Rectangle, Cylinder, Spheres, Disc, Linear Sweep, Convex
       Hull, Height Field).

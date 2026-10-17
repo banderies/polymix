@@ -36,11 +36,13 @@ pub struct ViewOptions {
     /// Mouse navigation scheme (Meshmixer's Preferences → Navigation Mode).
     pub nav_mode: NavMode,
     pub show_grid: bool,
+    /// Draw the target surface see-through.
+    pub transparent_target: bool,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false }
+        Self { wireframe: false, flat: false, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true }
     }
 }
 
@@ -65,6 +67,8 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "softtransform" => Box::new(tools::transform::TransformTool::new_soft(cx)),
         "warp" => Box::new(tools::warp::WarpTool::new(cx)),
         "align" => Box::new(tools::align::AlignTool::new(cx)),
+        "attracttotarget" => Box::new(tools::ops::AttractToTargetTool::new(cx)),
+        "aligntotarget" => Box::new(tools::ops::AlignToTargetTool::new(cx)),
         "units" => Box::new(tools::transform::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
@@ -204,6 +208,7 @@ impl PolymixApp {
             app.view.boundaries = flag("boundaries", true);
             app.view.group_colors = flag("group_colors", false);
             app.view.show_grid = flag("grid", false);
+            app.view.transparent_target = flag("transparent_target", true);
             app.view.sharp_edges = flag("sharp_edges", true);
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
             if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
@@ -538,6 +543,21 @@ impl PolymixApp {
                         self.scene_changed(&ctx, vp);
                     }
                 }
+                ui.separator();
+                let can_target = self.scene.objects.len() >= 2 && self.scene.active.is_some();
+                if ui
+                    .add_enabled(can_target, egui::Button::new("Set as target"))
+                    .on_hover_text("Use the active object as the target surface (Attract / Align To Target, Project to Target)")
+                    .clicked()
+                {
+                    ui.close();
+                    let active = self.scene.active;
+                    commands::set_target(&mut self.cmd_cx(), active);
+                }
+                if ui.add_enabled(self.scene.target.is_some(), egui::Button::new("Clear target")).clicked() {
+                    ui.close();
+                    commands::set_target(&mut self.cmd_cx(), None);
+                }
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.view.wireframe, "Wireframe  (W)");
@@ -589,6 +609,7 @@ impl PolymixApp {
                     self.next_view();
                 }
                 ui.checkbox(&mut self.view.show_grid, "Show grid");
+                ui.checkbox(&mut self.view.transparent_target, "Transparent target").on_hover_text("Draw the target surface see-through");
                 ui.menu_button("Standard views", |ui| {
                     use std::f64::consts::{FRAC_PI_2, PI};
                     for (name, yaw, pitch) in [
@@ -655,6 +676,9 @@ impl PolymixApp {
                     }
                     if ui.button("Align").on_hover_text("Put a picked face on the ground / world origin or against another object").clicked() {
                         open = Some("align");
+                    }
+                    if ui.button("Align To Target").on_hover_text("Register the object to the target surface (iterative closest point)").clicked() {
+                        open = Some("aligntotarget");
                     }
                     if ui.button("Plane Cut").clicked() {
                         open = Some("planecut");
@@ -792,6 +816,8 @@ impl PolymixApp {
         let mut solo = None;
         let mut show_all = false;
         let mut duplicate = None;
+        let mut new_target: Option<Option<ObjectId>> = None;
+        let target = self.scene.target;
         let rename_id = egui::Id::NULL.with("renaming");
         let mut renaming: Option<ObjectId> = ui.ctx().data(|d| d.get_temp(rename_id));
         for o in self.scene.objects.iter_mut() {
@@ -806,7 +832,8 @@ impl PolymixApp {
                     }
                     return;
                 }
-                let label = RichText::new(&o.name).color(if active { ui_util::ACCENT } else { Color32::from_gray(210) });
+                let name = if target == Some(o.id) { format!("{}  ◎ target", o.name) } else { o.name.clone() };
+                let label = RichText::new(name).color(if active { ui_util::ACCENT } else { Color32::from_gray(210) });
                 let r = ui.selectable_label(active, label).on_hover_text("Click: make active · Double-click: rename · Right-click: more");
                 if r.clicked() {
                     make_active = Some(o.id);
@@ -829,6 +856,15 @@ impl PolymixApp {
                     }
                     if ui.button("Duplicate").clicked() {
                         duplicate = Some(o.id);
+                        ui.close();
+                    }
+                    if target == Some(o.id) {
+                        if ui.button("Clear target").clicked() {
+                            new_target = Some(None);
+                            ui.close();
+                        }
+                    } else if ui.button("Set as target").on_hover_text("Target surface for Attract / Align To Target and Project to Target").clicked() {
+                        new_target = Some(Some(o.id));
                         ui.close();
                     }
                     if ui.button("Delete").clicked() {
@@ -867,6 +903,9 @@ impl PolymixApp {
             }
         }
         let ctx = ui.ctx().clone();
+        if let Some(t) = new_target {
+            commands::set_target(&mut self.cmd_cx(), t);
+        }
         if let Some(id) = duplicate {
             if self.accept_tools_for_command(&ctx, self.vp_prev(&ctx)) {
                 self.scene.active = Some(id);
@@ -1387,7 +1426,8 @@ impl PolymixApp {
                         objs.push((g, false));
                     }
                 } else if let Some(g) = self.gpu.get(&o.id) {
-                    objs.push((g, o.color.w < 0.999));
+                    let see_through = self.view.transparent_target && self.scene.target == Some(o.id);
+                    objs.push((g, o.color.w < 0.999 || see_through));
                 }
             }
             let input = renderer::FrameInput { globals, objects: objs, lines: &lines, overlay_tris: &overlay.tris };
@@ -1455,9 +1495,14 @@ impl PolymixApp {
         let multiple = self.scene.objects.iter().filter(|o| o.visible).count() > 1;
         let preview = self.tools.last().and_then(|t| t.preview());
         let mut no_moves = Vec::new();
+        let see_through = self.scene.target.filter(|_| self.view.transparent_target);
         for o in self.scene.objects.iter_mut().filter(|o| o.visible) {
+            let mut color = o.color;
+            if see_through == Some(o.id) {
+                color.w = color.w.min(0.35);
+            }
             let style = ObjectStyle {
-                color: o.color,
+                color,
                 wireframe: self.view.wireframe,
                 flat: self.view.flat,
                 group_colors: self.view.group_colors || self.tools.last().is_some_and(|t| t.shows_groups()),
@@ -1612,6 +1657,10 @@ impl PolymixApp {
             }
             "select_all" => commands::selection_command(&mut self.cmd_cx(), commands::SelectCmd::All),
             "duplicate" => commands::duplicate_object(&mut self.cmd_cx()),
+            "target" => {
+                let id = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id);
+                commands::set_target(&mut self.cmd_cx(), id);
+            }
             "activate" => {
                 if let Ok(i) = arg.parse::<usize>() {
                     self.scene.active = self.scene.objects.get(i).map(|o| o.id);
@@ -1808,6 +1857,7 @@ impl eframe::App for PolymixApp {
         st.set_string("boundaries", b(self.view.boundaries));
         st.set_string("group_colors", b(self.view.group_colors));
         st.set_string("grid", b(self.view.show_grid));
+        st.set_string("transparent_target", b(self.view.transparent_target));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
         st.set_string("spacemouse", self.space_cfg.to_pref());

@@ -677,6 +677,12 @@ impl Tool for SelectTool {
                 if ui.button("Weld Boundaries").on_hover_text("Weld the selection's open edges that lie close together").clicked() {
                     self.request = Some(Box::new(ops::WeldBoundariesTool::new(cx)));
                 }
+                if ui.button("Align To Target").on_hover_text("Move the object so the selected faces fit the target surface").clicked() {
+                    self.request = Some(Box::new(ops::AlignToTargetTool::new(cx)));
+                }
+                if ui.button("Attract To Target").on_hover_text("Pull the selected faces onto the target surface").clicked() {
+                    self.request = Some(Box::new(ops::AttractToTargetTool::new(cx)));
+                }
                 if ui.button("Separate").clicked() {
                     self.cmd(cx, |x| commands::separate_selection(x, false));
                 }
@@ -1112,7 +1118,7 @@ mod tests {
         let m = primitives::cylinder(1.0, 2.0, 24, 6, false);
         let rim_tri = m.triangle_ids().find(|&t| m.triangle(t).iter().any(|&v| m.vertex(v).z == 0.0)).unwrap();
         let ring = hole_ring(&m, rim_tri);
-        let info = OpInfo { mesh: &m, selection: Some(&ring), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let info = OpInfo { mesh: &m, selection: Some(&ring), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
         let out = EraseFillSpec::run(&m, Some(&ring), &EraseFillSpec::defaults(&info), &|_| true).unwrap();
         assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 1, "only the top rim stays open");
         out.mesh.check_validity().unwrap();

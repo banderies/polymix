@@ -215,6 +215,24 @@ pub fn combine_visible(cx: &mut CmdCx) {
     *cx.status = "Combined objects".into();
 }
 
+/// Make `id` the target surface (`None` clears it).
+pub fn set_target(cx: &mut CmdCx, id: Option<ObjectId>) {
+    match id {
+        Some(_) if cx.scene.objects.len() < 2 => {
+            *cx.status = "A target surface needs a second object in the scene.".into();
+        }
+        Some(id) => {
+            cx.scene.target = Some(id);
+            let name = cx.scene.get(id).map(|o| o.name.clone()).unwrap_or_default();
+            *cx.status = format!("{name} is the target surface");
+        }
+        None => {
+            cx.scene.target = None;
+            *cx.status = "Target cleared".into();
+        }
+    }
+}
+
 pub fn duplicate_object(cx: &mut CmdCx) {
     if cx.scene.active().is_none() {
         return;

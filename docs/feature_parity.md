@@ -64,7 +64,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Discard Undo History | ❌ | |
 | Accept (Enter **or A**) / Cancel (Esc) | ✅ | |
 | Switching tools accepts the current tool | ✅ | Hotkey, palette, menu; only Esc/Cancel discards |
-| Set as Target / Clear Target (target surface) | ❌ | Used by Attract/Align to Target, "Project to target" options |
+| Set as Target / Clear Target (target surface) | ✅ | Edit menu and object list; used by Attract / Align To Target and Project to Target |
 | Copy | ❌ | |
 | Toggle visibility / Show all | ✅ | Object browser |
 
@@ -78,7 +78,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Orthographic View | ✅ | |
 | Show Grid | ✅ | Floor grid under the scene |
 | Show Printer Bed | ⛔ | |
-| Transparent Target | ❌ | |
+| Transparent Target | ✅ | View menu, on by default |
 | Show Wireframe | ✅ | W |
 | Show Boundaries | ✅ | |
 | Show Objects Browser (Ctrl+Shift+O) | ✅ | |
@@ -115,7 +115,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | List, active object, visibility eye | ✅ | |
-| Set/clear target per object | ❌ | |
+| Set/clear target per object | ✅ | Right-click an object; the target is marked ◎ |
 | Duplicate, Delete buttons | ✅ | |
 | Rename | ✅ | |
 | Show only this / Show all | ✅ | |
@@ -156,7 +156,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Join (along boundary edges) | ✅ | `J`: stitches the two open boundaries next to the selection |
 | Edit: Weld Boundaries | ✅ | Close Cracks restricted to the selection's open edges, tolerance in edge lengths |
 | Edit: Tube Handle | ✅ | Curved tube between two selected regions |
-| Edit: Align To Target / Attract To Target | ❌ | Needs target surface |
+| Edit: Align To Target / Attract To Target | ✅ | Align: ICP on the selected (or all) faces, Translate and Rotate / Translate Only. Attract: offset, smooth, normal threshold, preserve mesh / group boundaries, optional refinement (density). Project to Target in Erase & Fill and Smooth Boundary |
 | Edit: Separate (Y) / Duplicate selection | ✅ | |
 | Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | 🟡 | J, ⌘B ✅; P with Fit Primitive (M4.6) |
 | Edit: Fit Primitive | ❌ | |

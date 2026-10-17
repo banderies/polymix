@@ -3,7 +3,7 @@
 
 use crate::camera::Camera;
 use crate::renderer::ColorVertex;
-use crate::scene::{History, ObjectId, Scene};
+use crate::scene::{History, ObjectId, Scene, TargetSurface};
 use glam::{DVec2, DVec3, Vec3, Vec4};
 use mm_core::bvh::RayHit;
 use mm_core::{Mesh, Ray};

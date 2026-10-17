@@ -16,7 +16,7 @@
 //!   to each one-ring, alternated with a global Laplacian solve), which keeps detail
 //!   undistorted when the handle turns.
 
-use mm_core::linalg::sym_eigen3;
+use mm_core::linalg::closest_rotation;
 use mm_core::{DMat3, DVec3, Mesh, INVALID};
 use mm_repair::sparse::{solve_pcg, CsrMatrix, PcgParams};
 use mm_repair::LaplacianWeights;
@@ -276,32 +276,6 @@ fn edge_weight(m: &Mesh, e: u32) -> f64 {
         w += 0.5 * u.dot(v) / u.cross(v).length().max(1e-300);
     }
     w.max(1e-3)
-}
-
-/// Closest rotation to `s` (orthogonal, det +1), via the eigen-decomposition of `sᵀs`.
-fn closest_rotation(s: DMat3) -> DMat3 {
-    let sts = s.transpose() * s;
-    let a = [0, 1, 2].map(|i| [0, 1, 2].map(|j| sts.col(j)[i]));
-    let (vals, vecs) = sym_eigen3(a);
-    // s = U Σ Vᵀ with V = eigenvectors of sᵀs (ascending), U columns = s v / σ.
-    let v = DMat3::from_cols(vecs[2], vecs[1], vecs[0]);
-    let sig = [vals[2], vals[1], vals[0]].map(|x| x.max(0.0).sqrt());
-    let mut u0 = s * v.col(0);
-    u0 = if sig[0] > 1e-12 { u0 / sig[0] } else { DVec3::X };
-    let mut u1 = s * v.col(1);
-    u1 = if sig[1] > 1e-12 * sig[0].max(1e-300) { u1 / sig[1] } else { mm_core::geom::orthonormal_basis(u0).0 };
-    u1 = (u1 - u0 * u0.dot(u1)).normalize_or_zero();
-    if u1 == DVec3::ZERO {
-        u1 = mm_core::geom::orthonormal_basis(u0).0;
-    }
-    let mut u2 = u0.cross(u1);
-    // Keep det(U Vᵀ) = +1.
-    if v.determinant() < 0.0 {
-        u2 = -u2;
-    }
-    let u = DMat3::from_cols(u0, u1, u2);
-    // R maps original edges onto deformed ones: R = U Vᵀ for s = Σ e' eᵀ.
-    u * v.transpose()
 }
 
 /// As-rigid-as-possible solve for the `free` vertices; every other vertex keeps the

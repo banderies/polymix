@@ -1,6 +1,6 @@
 //! Small dense linear algebra: symmetric 3x3 eigen-decomposition (cyclic Jacobi).
 
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 
 /// Eigen-decomposition of a symmetric 3x3 matrix (row-major). Returns eigenvalues in
 /// ascending order with matching unit eigenvectors.
@@ -73,6 +73,33 @@ pub fn add_outer(m: &mut [[f64; 3]; 3], x: DVec3, w: f64) {
     }
 }
 
+/// Closest rotation to `s` (orthogonal, det +1), via the eigen-decomposition of `sᵀs`.
+/// For `s = Σ bᵢ aᵢᵀ` it is the rotation that best maps the `aᵢ` onto the `bᵢ`.
+pub fn closest_rotation(s: DMat3) -> DMat3 {
+    let sts = s.transpose() * s;
+    let a = [0, 1, 2].map(|i| [0, 1, 2].map(|j| sts.col(j)[i]));
+    let (vals, vecs) = sym_eigen3(a);
+    // s = U Σ Vᵀ with V = eigenvectors of sᵀs (ascending), U columns = s v / σ.
+    let v = DMat3::from_cols(vecs[2], vecs[1], vecs[0]);
+    let sig = [vals[2], vals[1], vals[0]].map(|x| x.max(0.0).sqrt());
+    let mut u0 = s * v.col(0);
+    u0 = if sig[0] > 1e-12 { u0 / sig[0] } else { DVec3::X };
+    let mut u1 = s * v.col(1);
+    u1 = if sig[1] > 1e-12 * sig[0].max(1e-300) { u1 / sig[1] } else { crate::geom::orthonormal_basis(u0).0 };
+    u1 = (u1 - u0 * u0.dot(u1)).normalize_or_zero();
+    if u1 == DVec3::ZERO {
+        u1 = crate::geom::orthonormal_basis(u0).0;
+    }
+    let mut u2 = u0.cross(u1);
+    // Keep det(U Vᵀ) = +1.
+    if v.determinant() < 0.0 {
+        u2 = -u2;
+    }
+    let u = DMat3::from_cols(u0, u1, u2);
+    // R maps original edges onto deformed ones: R = U Vᵀ for s = Σ e' eᵀ.
+    u * v.transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +118,20 @@ mod tests {
             );
             assert!((mx - x * vals[k]).length() < 1e-9, "eigenpair {k} wrong");
         }
+    }
+
+    #[test]
+    fn rotation_fit_recovers_rotations() {
+        let r0 = DMat3::from_quat(glam::DQuat::from_euler(glam::EulerRot::XYZ, 0.4, -1.1, 2.0));
+        let pts = [DVec3::new(1.0, 0.2, 0.0), DVec3::new(-0.3, 1.0, 0.5), DVec3::new(0.1, -0.4, 1.0), DVec3::new(0.7, 0.7, -0.2)];
+        let s = pts.iter().fold(DMat3::ZERO, |acc, &a| {
+            let b = r0 * a;
+            acc + DMat3::from_cols(b * a.x, b * a.y, b * a.z)
+        });
+        let r = closest_rotation(s);
+        assert!((r - r0).to_cols_array().iter().all(|x| x.abs() < 1e-9));
+        // Planar input (rank 2) still gives a proper rotation.
+        let flat = DMat3::from_cols(DVec3::X, DVec3::Y, DVec3::ZERO);
+        assert!((closest_rotation(flat).determinant() - 1.0).abs() < 1e-9);
     }
 }

@@ -112,6 +112,23 @@ fn default_color(id: ObjectId) -> Vec4 {
 pub struct Scene {
     pub objects: Vec<SceneObject>,
     pub active: Option<ObjectId>,
+    /// The target surface (Meshmixer's Set as Target) for Attract / Align To Target and
+    /// "Project to Target" options.
+    pub target: Option<ObjectId>,
+}
+
+/// A target surface ready for nearest-point queries.
+#[derive(Clone)]
+pub struct TargetSurface {
+    pub id: ObjectId,
+    pub mesh: Arc<Mesh>,
+    pub bvh: Arc<Bvh>,
+}
+
+impl PartialEq for TargetSurface {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id && Arc::ptr_eq(&self.mesh, &o.mesh)
+    }
 }
 
 impl Scene {
@@ -136,7 +153,17 @@ impl Scene {
         let id = self.active?;
         self.get_mut(id)
     }
+    /// The target surface, unless it is `except` (an object can't be its own target).
+    pub fn target_surface(&mut self, except: Option<ObjectId>) -> Option<TargetSurface> {
+        let id = self.target.filter(|&t| Some(t) != except)?;
+        let o = self.get_mut(id)?;
+        Some(TargetSurface { id, mesh: o.mesh.clone(), bvh: o.bvh() })
+    }
+
     pub fn remove(&mut self, id: ObjectId) {
+        if self.target == Some(id) {
+            self.target = None;
+        }
         self.objects.retain(|o| o.id != id);
         if self.active == Some(id) {
             self.active = self.objects.last().map(|o| o.id);
@@ -246,6 +273,7 @@ impl Scene {
     /// Keep user-facing metadata that is not part of the edit history (names, colours,
     /// visibility, patch names) when switching to an undo/redo snapshot.
     fn carry_metadata(&mut self, from: &Scene) {
+        self.target = from.target.filter(|&t| self.get(t).is_some());
         for o in &mut self.objects {
             if let Some(src) = from.get(o.id) {
                 o.name = src.name.clone();
