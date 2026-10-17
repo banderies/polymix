@@ -65,13 +65,14 @@ reporting how much a cleanup changed the geometry), **Units/Dimensions**.
 
 | Action | Mouse / key |
 |---|---|
-| Tumble | Right-drag, or Alt + left-drag |
+| Tumble (unlimited, over the top and underneath) | Right-drag, or Alt + left-drag |
 | Pan | Middle-drag, Shift + right-drag, or Alt + Shift + left-drag |
 | Zoom | Scroll / pinch, or Alt + Cmd + left-drag |
 | Focus / wireframe / hotbox | `F` / `W` / `Space` |
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |
-| With a selection | `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `B` smooth, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, double-click: select connected |
+| With a selection | `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `B` smooth, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, `S` clear selection |
+| Select tool | Drag on the model: paint · Drag from the background: lasso (closed loop selects inside) or laser cut (open curve selects the smaller side, through the model) · Double-click a triangle at an open edge: select the ring around that hole (then `F` to erase & fill it cleanly) · Double-click elsewhere: connected part · Shift: deselect |
 
 Shading: *View → Sharp edges* (on by default) keeps hard corners on CAD parts crisp: edges
 that bend more than the crease angle (default 40°) are shaded sharp, so flat faces render flat.
@@ -81,7 +82,7 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 
 | Category | Tools |
 |---|---|
-| Select | Sphere brush, lasso (visible or through), grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
+| Select | Sphere brush (fixed size on the model), lasso and laser lasso (through or visible only), hole-border ring, grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
 | Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag |
 | Edit | Transform (gizmo + numeric, centre, drop to ground, principal axes), Plane Cut, Mirror, Make Solid, Remesh, Reduce, Smooth, Offset / Hollow, Boolean (union/difference/intersection), Bridge, Separate Shells, Combine, Duplicate, Flip normals |
 | Vessel | Trim branch, Flow extensions, Cap open ends, Measure diameter, Centerline, Boundary patches / CFD export, Check for CFD |

@@ -28,7 +28,8 @@ impl Brush {
 
 pub struct SculptTool {
     brush: Brush,
-    size_px: f32,
+    /// Brush radius in percent of the model size.
+    size_pct: f32,
     strength: f64,
     stroke: Option<SculptStroke>,
     armed: bool,
@@ -48,7 +49,7 @@ struct SculptStroke {
 
 impl SculptTool {
     pub fn new(_cx: &mut ToolCx) -> Self {
-        Self { brush: Brush::RobustSmooth, size_px: 40.0, strength: 0.5, stroke: None, armed: false, hover: None, hold_boundary: true }
+        Self { brush: Brush::RobustSmooth, size_pct: 4.0, strength: 0.5, stroke: None, armed: false, hover: None, hold_boundary: true }
     }
 }
 
@@ -149,17 +150,15 @@ impl Tool for SculptTool {
         "Sculpt"
     }
 
-    fn panel(&mut self, ui: &mut egui::Ui, _cx: &mut ToolCx) -> ToolOutcome {
+    fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Sculpt brushes");
         ui.horizontal_wrapped(|ui| {
             for b in [Brush::RobustSmooth, Brush::Smooth, Brush::Inflate, Brush::Flatten, Brush::Drag] {
                 ui.selectable_value(&mut self.brush, b, b.label());
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            ui.add(egui::Slider::new(&mut self.size_px, 4.0..=300.0).logarithmic(true).suffix(" px"));
-        });
+        let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size_pct));
+        brush_size_ui(ui, &mut self.size_pct, r);
         ui.horizontal(|ui| {
             ui.label("Strength");
             ui.add(egui::Slider::new(&mut self.strength, 0.01..=1.0));
@@ -176,7 +175,7 @@ impl Tool for SculptTool {
     fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
         let Some(pos) = input.pos else { return };
         let hover = cx.pick(pos, cx.scene.active);
-        self.hover = hover.map(|(_, h)| (h.point, cx.world_per_point(h.point) * self.size_px as f64));
+        self.hover = hover.map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.size_pct)));
         if input.pressed {
             self.armed = true;
         }
@@ -202,7 +201,7 @@ impl Tool for SculptTool {
         if brush == Brush::Drag {
             if stroke.drag_origin.is_none() {
                 let Some((_, h)) = hover else { return };
-                let r = cx.world_per_point(h.point) * self.size_px as f64;
+                let r = brush_radius(cx.scene, stroke.object, self.size_pct);
                 let Some(o) = cx.scene.get_mut(stroke.object) else { return };
                 let bvh = o.bvh();
                 stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, hold);
@@ -228,7 +227,7 @@ impl Tool for SculptTool {
             return;
         }
         let Some((_, h)) = hover else { return };
-        let r = cx.world_per_point(h.point) * self.size_px as f64;
+        let r = brush_radius(cx.scene, stroke.object, self.size_pct);
         let invert = stroke.invert;
         let Some(o) = cx.scene.get_mut(stroke.object) else { return };
         let bvh = o.bvh();
@@ -248,10 +247,10 @@ impl Tool for SculptTool {
 
     fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) {
         if i.key_pressed(egui::Key::OpenBracket) {
-            self.size_px = (self.size_px / 1.15).max(4.0);
+            step_brush_size(&mut self.size_pct, false);
         }
         if i.key_pressed(egui::Key::CloseBracket) {
-            self.size_px = (self.size_px * 1.15).min(300.0);
+            step_brush_size(&mut self.size_pct, true);
         }
     }
 }

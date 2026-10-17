@@ -1,9 +1,19 @@
-//! Face selection tool (Meshmixer "Select", hotkey S): sphere brush and lasso, with the
-//! selection-based Edit / Modify / Deform commands in its panel.
+//! Face selection tool (Meshmixer "Select", hotkey S): sphere brush, lasso and laser lasso,
+//! with the selection-based Edit / Modify / Deform commands in its panel.
+//!
+//! * Brush: drag on the surface. The brush has a fixed size on the model (zooming does not
+//!   change what it covers).
+//! * Lasso / Laser Lasso: a drag that starts on the background (or any drag in Lasso mode)
+//!   draws a screen curve. A closed curve selects what is inside it; an open curve cuts
+//!   across the model and selects the smaller side (see [`super::lasso`]).
+//! * Double-click: on a triangle at an open boundary, selects the ring of triangles around
+//!   that hole (ready for Erase & Fill); elsewhere, selects the connected part.
 
+use super::lasso::ScreenCurve;
 use super::*;
 use crate::commands::{self, CmdCx, SelectCmd};
 use crate::ui_util;
+use mm_core::TriSelection;
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,14 +24,16 @@ pub enum SelectMode {
 
 pub struct SelectTool {
     pub mode: SelectMode,
-    /// Brush radius in screen points.
-    pub brush_px: f32,
-    /// Lasso selects through the model (back-facing / occluded triangles too).
+    /// Brush radius in percent of the model size.
+    pub size_pct: f32,
+    /// Lasso / laser select through the model (occluded and back-facing faces too).
     pub through: bool,
     stroke: Option<Stroke>,
-    armed: bool,
-    lasso: Vec<egui::Pos2>,
+    /// Screen curve being drawn (lasso or laser).
+    curve: Option<Vec<egui::Pos2>>,
     hover_brush: Option<(DVec3, f64)>,
+    /// Selection before the latest click, so a double-click can undo its two brush dabs.
+    before_click: Option<(ObjectId, TriSelection, f64)>,
     /// Sub-tool requested from the panel (opened by the app).
     pub request: Option<Box<dyn Tool>>,
 }
@@ -34,22 +46,24 @@ struct Stroke {
 
 impl Default for SelectTool {
     fn default() -> Self {
-        Self { mode: SelectMode::Brush, brush_px: 28.0, through: false, stroke: None, armed: false, lasso: Vec::new(), hover_brush: None, request: None }
+        Self {
+            mode: SelectMode::Brush,
+            size_pct: 2.5,
+            through: true,
+            stroke: None,
+            curve: None,
+            hover_brush: None,
+            before_click: None,
+            request: None,
+        }
     }
 }
 
-fn point_in_polygon(p: egui::Pos2, poly: &[egui::Pos2]) -> bool {
-    let mut inside = false;
-    let n = poly.len();
-    let mut j = n - 1;
-    for i in 0..n {
-        let (a, b) = (poly[i], poly[j]);
-        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
+/// Clicks closer together than this (seconds) may form a double-click.
+const DOUBLE_CLICK_WINDOW: f64 = 0.6;
+
+fn to_dvec(p: egui::Pos2) -> DVec2 {
+    DVec2::new(p.x as f64, p.y as f64)
 }
 
 impl SelectTool {
@@ -60,10 +74,12 @@ impl SelectTool {
             stroke.last = None;
             return;
         };
-        let r = cx.world_per_point(hit.point) * self.brush_px as f64;
+        let object = stroke.object;
+        let r = brush_radius(cx.scene, object, self.size_pct);
+        let Some(stroke) = &mut self.stroke else { return };
         let deselect = stroke.deselect;
         let last = stroke.last.replace(hit.point);
-        let Some(o) = cx.scene.get_mut(stroke.object) else {
+        let Some(o) = cx.scene.get_mut(object) else {
             self.stroke = None;
             return;
         };
@@ -91,43 +107,53 @@ impl SelectTool {
         }
     }
 
-    fn finish_lasso(&mut self, cx: &mut ToolCx, deselect: bool) {
-        let poly = std::mem::take(&mut self.lasso);
-        if poly.len() < 3 {
-            return;
-        }
-        let Some(id) = cx.scene.active else { return };
+    /// Apply a finished lasso / laser curve to the active object.
+    fn finish_curve(&mut self, cx: &mut ToolCx, deselect: bool) {
+        let Some(pts) = self.curve.take() else { return };
+        let pts: Vec<DVec2> = pts.into_iter().map(to_dvec).collect();
+        let Some(curve) = ScreenCurve::new(&pts) else { return };
+        let Some(id) = cx.scene.active.filter(|id| cx.scene.get(*id).is_some()) else { return };
         let vp = cx.vp;
-        let aspect = vp.aspect();
-        let view_proj = cx.camera.view_proj(aspect);
+        let view_proj = cx.camera.view_proj(vp.aspect());
         let eye = cx.camera.eye();
         let ortho = cx.camera.orthographic;
         let fwd = cx.camera.forward();
         let through = self.through;
-        cx.snapshot("Lasso select");
+        cx.snapshot(if curve.closed { "Lasso select" } else { "Laser select" });
         let o = cx.scene.get_mut(id).unwrap();
         let bvh = o.bvh();
         let mesh = o.mesh.clone();
-        let min = poly.iter().fold(egui::pos2(f32::MAX, f32::MAX), |a, p| a.min(*p));
-        let max = poly.iter().fold(egui::pos2(f32::MIN, f32::MIN), |a, p| a.max(*p));
-        let tris: Vec<u32> = mesh.triangle_ids().collect();
-        let hits: Vec<u32> = tris
+        // Side of the curve for every triangle in front of the camera (by centroid).
+        let side: Vec<(u32, bool)> = mesh
+            .triangle_ids()
+            .collect::<Vec<_>>()
             .par_iter()
-            .copied()
-            .filter(|&t| {
-                let c = mesh.tri_centroid(t);
-                let clip = view_proj * c.extend(1.0);
+            .filter_map(|&t| {
+                let clip = view_proj * mesh.tri_centroid(t).extend(1.0);
                 if clip.w <= 0.0 {
-                    return false;
+                    return None;
                 }
-                let ndc = clip.truncate() / clip.w;
-                let sp = vp.to_screen(ndc);
-                if sp.x < min.x || sp.y < min.y || sp.x > max.x || sp.y > max.y || !point_in_polygon(sp, &poly) {
-                    return false;
-                }
+                let sp = vp.to_screen(clip.truncate() / clip.w);
+                Some((t, curve.contains(to_dvec(sp))))
+            })
+            .collect();
+        // Closed: the inside. Open (laser): the side with less surface area.
+        let pick_inside = curve.closed || {
+            let (a_in, a_out) = side.iter().fold((0.0, 0.0), |(i, o), &(t, inside)| {
+                let a = mesh.tri_area(t);
+                if inside { (i + a, o) } else { (i, o + a) }
+            });
+            a_in <= a_out
+        };
+        let hits: Vec<u32> = side
+            .par_iter()
+            .filter(|&&(_, inside)| inside == pick_inside)
+            .map(|&(t, _)| t)
+            .filter(|&t| {
                 if through {
                     return true;
                 }
+                let c = mesh.tri_centroid(t);
                 let to_eye = if ortho { -fwd } else { (eye - c).normalize() };
                 if mesh.tri_normal(t).dot(to_eye) <= 0.0 {
                     return false;
@@ -149,6 +175,34 @@ impl SelectTool {
         }
         o.touch_selection();
         *cx.status = format!("{} triangles selected", o.selection.len());
+    }
+
+    /// Double-click: the ring of triangles around the hole(s) at this triangle, or else the
+    /// connected part.
+    fn double_click(&mut self, cx: &mut ToolCx, pos: egui::Pos2, deselect: bool) {
+        let Some((id, hit)) = cx.pick(pos, None) else { return };
+        // Drop the brush dabs the two clicks just painted.
+        let before = self.before_click.take().filter(|(bid, _, _)| *bid == id).map(|(_, sel, _)| sel);
+        cx.snapshot("Select connected");
+        cx.scene.active = Some(id);
+        let o = cx.scene.get_mut(id).unwrap();
+        let mesh = o.mesh.clone();
+        if let Some(sel) = before {
+            o.selection = sel;
+        }
+        o.selection.sync(&mesh);
+        let ring = hole_ring(&mesh, hit.tid);
+        let what = if ring.is_empty() { "connected part" } else { "hole border" };
+        let tris = if ring.is_empty() { mm_core::topology::flood_fill_triangles(&mesh, &[hit.tid], |_| true) } else { ring };
+        for t in tris {
+            if deselect {
+                o.selection.remove(t);
+            } else {
+                o.selection.insert(t);
+            }
+        }
+        o.touch_selection();
+        *cx.status = format!("Selected {what}: {} triangles selected", o.selection.len());
     }
 
     fn cmd(&mut self, cx: &mut ToolCx, f: impl FnOnce(&mut CmdCx)) {
@@ -182,18 +236,20 @@ impl Tool for SelectTool {
         });
         match self.mode {
             SelectMode::Brush => {
-                ui.horizontal(|ui| {
-                    ui.label("Size");
-                    ui.add(egui::Slider::new(&mut self.brush_px, 3.0..=250.0).logarithmic(true).suffix(" px"));
-                });
+                let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size_pct));
+                brush_size_ui(ui, &mut self.size_pct, r);
             }
-            SelectMode::Lasso => {
-                ui.checkbox(&mut self.through, "Select through (include hidden faces)");
-            }
+            SelectMode::Lasso => {}
         }
+        ui.checkbox(&mut self.through, "Lasso selects through the model")
+            .on_hover_text("Include faces hidden behind the visible surface (Meshmixer's laser always cuts through). Turn off to select only what you can see.");
         let (n_sel, n_tri) = cx.scene.active().map(|o| (o.selection.len(), o.mesh.triangle_count())).unwrap_or((0, 0));
         ui.label(format!("{} / {} triangles selected", ui_util::format_count(n_sel), ui_util::format_count(n_tri)));
-        ui.small("Drag to select · Shift+drag to deselect · Double-click: connected");
+        ui.small(match self.mode {
+            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect",
+            SelectMode::Lasso => "Draw a closed loop to select inside, or an open curve across the model to select the smaller side · Shift: deselect",
+        });
+        ui.small("Double-click: hole border (on an open edge) or connected part · S: clear");
 
         ui_util::section(ui, "Selection");
         ui.horizontal_wrapped(|ui| {
@@ -269,68 +325,57 @@ impl Tool for SelectTool {
 
     fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
         let Some(pos) = input.pos else { return };
+        let deselect = input.shift || input.command;
         if input.double_clicked {
-            if let Some((id, hit)) = cx.pick(pos, None) {
-                cx.snapshot("Select connected");
-                cx.scene.active = Some(id);
-                let o = cx.scene.get_mut(id).unwrap();
-                let mesh = o.mesh.clone();
-                o.selection.sync(&mesh);
-                for t in mm_core::topology::flood_fill_triangles(&mesh, &[hit.tid], |_| true) {
-                    if input.shift {
-                        o.selection.remove(t);
-                    } else {
-                        o.selection.insert(t);
-                    }
-                }
-                o.touch_selection();
-            }
             self.stroke = None;
+            self.curve = None;
+            self.double_click(cx, pos, deselect);
             return;
         }
-        match self.mode {
-            SelectMode::Brush => {
-                if input.pressed {
-                    self.armed = true;
-                }
-                // A stroke begins as soon as the dragged cursor reaches a surface.
-                if input.down && self.armed && self.stroke.is_none() {
-                    let target = cx.pick(pos, cx.scene.active).or_else(|| cx.pick(pos, None));
-                    if let Some((id, _)) = target {
-                        cx.scene.active = Some(id);
-                        cx.snapshot("Brush select");
-                        self.stroke = Some(Stroke { object: id, deselect: input.shift || input.command, last: None });
-                    }
-                }
-                if input.down && self.stroke.is_some() {
-                    self.paint_at(cx, pos);
-                }
-                if input.released {
-                    self.armed = false;
-                    self.stroke = None;
-                    if let Some(o) = cx.scene.active() {
-                        *cx.status = format!("{} triangles selected", o.selection.len());
-                    }
-                }
-                // Hover cursor.
-                self.hover_brush = cx
-                    .pick(pos, cx.scene.active)
-                    .map(|(_, h)| (h.point, cx.world_per_point(h.point) * self.brush_px as f64));
+        if input.pressed {
+            let now = cx.egui.input(|i| i.time);
+            let hit = cx.pick(pos, cx.scene.active).or_else(|| cx.pick(pos, None));
+            // Remember the selection before this click unless it may be the second click of
+            // a double-click (then keep the state from before the first one).
+            let recent = self.before_click.as_ref().is_some_and(|(_, _, t)| now - t < DOUBLE_CLICK_WINDOW);
+            if !recent {
+                self.before_click = hit.as_ref().and_then(|(id, _)| cx.scene.get(*id).map(|o| (*id, o.selection.clone(), now)));
             }
-            SelectMode::Lasso => {
-                self.hover_brush = None;
-                if input.pressed {
-                    self.lasso.clear();
+            match (self.mode, hit) {
+                (SelectMode::Brush, Some((id, _))) => {
+                    cx.scene.active = Some(id);
+                    cx.snapshot("Brush select");
+                    self.stroke = Some(Stroke { object: id, deselect, last: None });
                 }
-                if input.down && self.lasso.last().map(|l| l.distance(pos) > 2.0).unwrap_or(true) {
-                    self.lasso.push(pos);
-                }
-                if input.released {
-                    let deselect = input.shift || input.command;
-                    self.finish_lasso(cx, deselect);
+                // Lasso mode, or a brush drag starting on the background: draw a curve.
+                _ => self.curve = Some(vec![pos]),
+            }
+        }
+        if input.down {
+            if self.stroke.is_some() {
+                self.paint_at(cx, pos);
+            }
+            if let Some(c) = &mut self.curve {
+                if c.last().map(|l| l.distance(pos) > 2.0).unwrap_or(true) {
+                    c.push(pos);
                 }
             }
         }
+        if input.released {
+            if self.stroke.take().is_some() {
+                if let Some(o) = cx.scene.active() {
+                    *cx.status = format!("{} triangles selected", o.selection.len());
+                }
+            }
+            if self.curve.is_some() {
+                self.finish_curve(cx, deselect);
+            }
+        }
+        // Hover cursor (brush mode, not while drawing a curve).
+        self.hover_brush = match (self.mode, &self.curve) {
+            (SelectMode::Brush, None) => cx.pick(pos, cx.scene.active).map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.size_pct))),
+            _ => None,
+        };
     }
 
     fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
@@ -340,10 +385,21 @@ impl Tool for SelectTool {
     }
 
     fn paint(&mut self, painter: &egui::Painter, _cx: &mut ToolCx) {
-        if self.lasso.len() > 1 {
-            let mut pts = self.lasso.clone();
-            pts.push(pts[0]);
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, ui_util::ACCENT)));
+        let Some(curve) = &self.curve else { return };
+        if curve.len() < 2 {
+            return;
+        }
+        let stroke = egui::Stroke::new(1.5, ui_util::ACCENT);
+        painter.add(egui::Shape::line(curve.clone(), stroke));
+        let pts: Vec<DVec2> = curve.iter().copied().map(to_dvec).collect();
+        if super::lasso::is_closed(&pts) {
+            painter.line_segment([*curve.last().unwrap(), curve[0]], stroke);
+        } else if let Some(ext) = super::lasso::extensions(&pts, 4000.0) {
+            // The laser continues straight past both ends.
+            let faint = egui::Stroke::new(1.0, ui_util::ACCENT.gamma_multiply(0.45));
+            for (a, b) in ext {
+                painter.line_segment([egui::pos2(a.x as f32, a.y as f32), egui::pos2(b.x as f32, b.y as f32)], faint);
+            }
         }
     }
 
@@ -357,6 +413,9 @@ impl Tool for SelectTool {
         };
         if i.key_pressed(Key::A) && cmd {
             run(&mut |x| commands::selection_command(x, SelectCmd::All));
+        } else if i.key_pressed(Key::S) && !cmd && !shift {
+            // S again while selecting starts over.
+            run(&mut |x| commands::selection_command(x, SelectCmd::Clear));
         } else if i.key_pressed(Key::I) && !cmd {
             let c = if shift { SelectCmd::InvertConnected } else { SelectCmd::Invert };
             run(&mut |x| commands::selection_command(x, c));
@@ -375,9 +434,9 @@ impl Tool for SelectTool {
         } else if i.key_pressed(Key::X) || i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) {
             run(&mut commands::discard_selection);
         } else if i.key_pressed(Key::OpenBracket) {
-            self.brush_px = (self.brush_px / 1.15).max(3.0);
+            step_brush_size(&mut self.size_pct, false);
         } else if i.key_pressed(Key::CloseBracket) {
-            self.brush_px = (self.brush_px * 1.15).min(250.0);
+            step_brush_size(&mut self.size_pct, true);
         } else if i.key_pressed(Key::F) && !cmd {
             self.request = Some(Box::new(ops::EraseFillTool::new(cx)));
         } else if i.key_pressed(Key::D) && !cmd && !shift {
@@ -405,5 +464,57 @@ impl Tool for SelectTool {
 
     fn take_request(&mut self) -> Option<Box<dyn Tool>> {
         self.request.take()
+    }
+}
+
+/// Triangles touching the open boundary loop(s) that pass through triangle `t` — the ring
+/// to erase and refill for a clean hole fill. Empty when `t` is not at an open boundary.
+pub fn hole_ring(mesh: &Mesh, t: u32) -> Vec<u32> {
+    let at_boundary: Vec<u32> = mesh.triangle(t).into_iter().filter(|&v| mesh.is_boundary_vertex(v)).collect();
+    if at_boundary.is_empty() {
+        return Vec::new();
+    }
+    let mut ring = Vec::new();
+    for lp in mm_core::topology::boundary_loops(mesh) {
+        if lp.vertices.iter().any(|v| at_boundary.contains(v)) {
+            for &v in &lp.vertices {
+                ring.extend(mesh.vertex_triangles(v));
+            }
+        }
+    }
+    ring.sort_unstable();
+    ring.dedup();
+    ring
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn hole_ring_surrounds_the_hole() {
+        // Open cylinder: double-clicking a triangle on the bottom rim selects that rim's ring.
+        let m = primitives::cylinder(1.0, 2.0, 24, 6, false);
+        let rim_tri = m.triangle_ids().find(|&t| m.triangle(t).iter().any(|&v| m.vertex(v).z == 0.0)).unwrap();
+        let ring = hole_ring(&m, rim_tri);
+        // One row of quads (2 triangles each) touches the bottom rim.
+        assert_eq!(ring.len(), 48);
+        assert!(ring.iter().all(|&t| m.triangle(t).iter().any(|&v| m.vertex(v).z == 0.0)));
+        // A triangle away from both rims has no ring.
+        let mid = m.triangle_ids().find(|&t| m.triangle(t).iter().all(|&v| m.vertex(v).z > 0.5 && m.vertex(v).z < 1.5)).unwrap();
+        assert!(hole_ring(&m, mid).is_empty());
+    }
+
+    #[test]
+    fn erase_and_fill_of_the_ring_closes_the_hole() {
+        use crate::tools::ops::{EraseFillSpec, OpInfo, OpSpec};
+        let m = primitives::cylinder(1.0, 2.0, 24, 6, false);
+        let rim_tri = m.triangle_ids().find(|&t| m.triangle(t).iter().any(|&v| m.vertex(v).z == 0.0)).unwrap();
+        let ring = hole_ring(&m, rim_tri);
+        let info = OpInfo { mesh: &m, selection: Some(&ring), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let out = EraseFillSpec::run(&m, Some(&ring), &EraseFillSpec::defaults(&info), &|_| true).unwrap();
+        assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 1, "only the top rim stays open");
+        out.mesh.check_validity().unwrap();
     }
 }

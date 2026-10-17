@@ -435,8 +435,8 @@ impl PolymixApp {
                         ("Back", PI, 0.0),
                         ("Left", -FRAC_PI_2, 0.0),
                         ("Right", FRAC_PI_2, 0.0),
-                        ("Top", 0.0, FRAC_PI_2 - 1e-4),
-                        ("Bottom", 0.0, -FRAC_PI_2 + 1e-4),
+                        ("Top", 0.0, FRAC_PI_2),
+                        ("Bottom", 0.0, -FRAC_PI_2),
                     ] {
                         if ui.button(name).clicked() {
                             ui.close();
@@ -1190,6 +1190,17 @@ impl PolymixApp {
             },
             "groups" => self.view.group_colors = !self.view.group_colors,
             "focus" => self.camera.focus(&self.scene.bounds()),
+            "zoom" => {
+                // zoom:x,y,factor — zoom toward the surface under a viewport-relative point.
+                let v: Vec<f64> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 3 {
+                    let p = vp.rect.min + egui::vec2(v[0] as f32 * vp.rect.width(), v[1] as f32 * vp.rect.height());
+                    let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
+                    if let Some((_, h)) = tools::pick_ray(&mut self.scene, &ray, None) {
+                        self.camera.zoom_towards(v[2], h.point);
+                    }
+                }
+            }
             "orbit" => {
                 let v: Vec<f64> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
                 if v.len() == 2 {

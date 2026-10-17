@@ -2,10 +2,8 @@
 
 use glam::dcamera::rh::{proj::directx, view as camview};
 use glam::{DMat4, DQuat, DVec2, DVec3, Mat4};
-
-/// Just short of straight up/down, so the view basis never degenerates.
-const PITCH_LIMIT: f64 = std::f64::consts::FRAC_PI_2 - 1e-4;
 use mm_core::{Aabb, Ray};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpAxis {
@@ -19,7 +17,8 @@ pub struct Camera {
     pub distance: f64,
     /// Rotation around the world up axis (radians).
     pub yaw: f64,
-    /// Elevation above the horizon (radians).
+    /// Elevation above the horizon (radians), unbounded in effect: past ±90° the camera goes
+    /// over the top / underneath and ends up upside down. Kept in (-π, π].
     pub pitch: f64,
     pub fov_y: f64,
     pub orthographic: bool,
@@ -74,6 +73,8 @@ impl Camera {
         self.target - self.forward() * self.distance
     }
 
+    /// The view uses the camera's own up vector (not the world's), so it never degenerates
+    /// when looking straight up or down.
     pub fn view(&self) -> DMat4 {
         camview::look_at_mat4(self.eye(), self.target, self.up())
     }
@@ -128,9 +129,12 @@ impl Camera {
         2.0 * self.distance * (self.fov_y * 0.5).tan() / height_px.max(1.0)
     }
 
+    /// Free orbit: vertical drags rotate over the top and underneath without limit.
     pub fn tumble(&mut self, dx: f64, dy: f64) {
-        self.yaw -= dx * 0.008;
-        self.pitch = (self.pitch + dy * 0.008).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        // Upside down, horizontal drags turn the other way so the model still follows the cursor.
+        let upright = if self.pitch.cos() >= 0.0 { 1.0 } else { -1.0 };
+        self.yaw = wrap_angle(self.yaw - dx * 0.008 * upright);
+        self.pitch = wrap_angle(self.pitch + dy * 0.008);
     }
 
     pub fn pan(&mut self, dx: f64, dy: f64, viewport_h: f64) {
@@ -166,14 +170,57 @@ impl Camera {
 
     /// Snap to the nearest axis-aligned view.
     pub fn snap_to_axis(&mut self) {
-        let q = std::f64::consts::FRAC_PI_2;
-        self.yaw = (self.yaw / q).round() * q;
-        self.pitch = (self.pitch / q).round() * q;
-        self.pitch = self.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        self.yaw = wrap_angle((self.yaw / FRAC_PI_2).round() * FRAC_PI_2);
+        self.pitch = wrap_angle((self.pitch / FRAC_PI_2).round() * FRAC_PI_2);
     }
 
     pub fn set_view(&mut self, yaw: f64, pitch: f64) {
-        self.yaw = yaw;
-        self.pitch = pitch;
+        self.yaw = wrap_angle(yaw);
+        self.pitch = wrap_angle(pitch);
+    }
+}
+
+/// Wrap an angle into (-π, π].
+fn wrap_angle(a: f64) -> f64 {
+    let w = a.rem_euclid(TAU);
+    if w > PI {
+        w - TAU
+    } else {
+        w
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tumble_goes_over_the_top() {
+        let mut c = Camera { pitch: 0.0, yaw: 0.0, ..Default::default() };
+        // Drag far enough to rotate 200 degrees vertically.
+        let steps = (200f64.to_radians() / 0.008 / 10.0).ceil() as usize;
+        let mut max_pitch: f64 = 0.0;
+        for _ in 0..steps {
+            c.tumble(0.0, 10.0);
+            max_pitch = max_pitch.max(c.pitch);
+            // The view basis stays orthonormal the whole way round.
+            assert!(c.forward().dot(c.up()).abs() < 1e-9);
+            assert!(c.view().is_finite());
+        }
+        assert!(max_pitch > FRAC_PI_2, "pitch must pass straight up");
+        // Now upside down: the camera's up points against the world up.
+        assert!(c.up().dot(c.world_up()) < 0.0);
+    }
+
+    #[test]
+    fn straight_down_views_are_valid() {
+        let mut c = Camera::default();
+        for pitch in [FRAC_PI_2, -FRAC_PI_2, PI] {
+            c.set_view(0.3, pitch);
+            assert!(c.view().is_finite());
+            assert!(c.forward().dot(c.up()).abs() < 1e-9);
+        }
+        c.set_view(0.0, 3.0 * PI);
+        assert!((c.pitch - PI).abs() < 1e-12);
     }
 }

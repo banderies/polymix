@@ -9,6 +9,7 @@ use mm_core::bvh::RayHit;
 use mm_core::{Mesh, Ray};
 
 pub mod select;
+pub mod lasso;
 pub mod transform;
 pub mod inspector;
 pub mod ops;
@@ -124,6 +125,32 @@ impl ToolCx<'_> {
     pub fn snapshot(&mut self, label: &str) {
         self.history.push(label, self.scene);
     }
+}
+
+/// World radius of a brush whose size is given in percent of the object's bounding-box
+/// diagonal. As in Meshmixer, brushes keep their size on the model when the view zooms.
+pub fn brush_radius(scene: &mut Scene, id: ObjectId, size_pct: f32) -> f64 {
+    scene.get_mut(id).map(|o| o.bvh().bounds().diagonal() * size_pct as f64 / 100.0).unwrap_or(0.0)
+}
+
+/// Brush size slider shared by the selection and sculpt brushes (percent of model size).
+pub fn brush_size_ui(ui: &mut egui::Ui, size_pct: &mut f32, radius: Option<f64>) {
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        ui.add(egui::Slider::new(size_pct, BRUSH_SIZE_RANGE.0..=BRUSH_SIZE_RANGE.1).logarithmic(true).suffix("%"))
+            .on_hover_text("Brush radius as a percentage of the model size. [ ] change it.");
+    });
+    if let Some(r) = radius {
+        ui.small(format!("Radius {r:.3} (model units)"));
+    }
+}
+
+pub const BRUSH_SIZE_RANGE: (f32, f32) = (0.1, 25.0);
+
+/// Step the brush size for the [ and ] keys.
+pub fn step_brush_size(size_pct: &mut f32, grow: bool) {
+    let f = if grow { 1.15 } else { 1.0 / 1.15 };
+    *size_pct = (*size_pct * f).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
 }
 
 pub fn pick_ray(scene: &mut Scene, ray: &Ray, only: Option<ObjectId>) -> Option<(ObjectId, RayHit)> {
