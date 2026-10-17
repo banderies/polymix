@@ -1,0 +1,28 @@
+[package]
+name = "polymix"
+description = "Polymix: an open-source mesh editor in the spirit of Meshmixer"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "polymix"
+path = "src/main.rs"
+
+[dependencies]
+mm-core = { path = "../mm-core" }
+mm-io = { path = "../mm-io" }
+mm-remesh = { path = "../mm-remesh" }
+mm-repair = { path = "../mm-repair" }
+mm-edit = { path = "../mm-edit" }
+mm-solid = { path = "../mm-solid" }
+glam.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "persistence", "system_fonts"] }
+egui = "0.37"
+bytemuck = { version = "1.25", features = ["derive"] }
+rfd = "0.17"
+log = "0.4"
+env_logger = "0.11"
+png = "0.18"

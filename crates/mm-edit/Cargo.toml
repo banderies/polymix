@@ -1,0 +1,15 @@
+[package]
+name = "mm-edit"
+description = "Modeling edits: plane cut, extrude, offset, bridge, mirror, flow extensions"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mm-core = { path = "../mm-core" }
+glam.workspace = true
+rayon.workspace = true
+smallvec.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+

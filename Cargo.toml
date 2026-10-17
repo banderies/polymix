@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/mm-core", "crates/mm-edit", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-solid", "crates/polymix"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+glam = { version = "0.34", features = ["bytemuck"] }
+rayon = "1.12"
+smallvec = { version = "1.15", features = ["union", "const_generics"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = 1
+lto = "thin"

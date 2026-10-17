@@ -1,0 +1,16 @@
+[package]
+name = "mm-io"
+description = "Mesh file formats: STL, OBJ, PLY, OFF, 3MF"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mm-core = { path = "../mm-core" }
+glam.workspace = true
+rayon.workspace = true
+smallvec.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+zip = { version = "9", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"

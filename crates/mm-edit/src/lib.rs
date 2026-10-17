@@ -1,0 +1,81 @@
+//! Modeling edits for Polymix (the Meshmixer "Edit" menu):
+//!
+//! * [`cut`] — plane cut (keep above / below / slice) with flat or remeshed caps, and the
+//!   *local* plane cut that trims a single vessel branch, plus intersection-curve previews.
+//! * [`vessel`] — estimate a vessel's local axis/cross-section from a click
+//!   ([`vessel::suggest_cut_plane`]).
+//! * [`flow`] — flow extensions: extrude a boundary loop straight out (optionally blending
+//!   to a circular cross-section) and cap it.
+//! * [`cap`] — planar capping of boundary loops, including nested loops (polygons with holes).
+//! * [`extrude`] — extrude / offset a face selection, naive whole-surface offset.
+//! * [`region`] — discard / separate / duplicate / flip a face selection.
+//! * [`mod@mirror`], [`mod@bridge`] (bridge spans, join loops), [`smooth`] (smooth boundary),
+//!   [`transform`] (affine transforms, drop to ground, principal-axis alignment).
+//!
+//! Every operation edits an [`mm_core::Mesh`] in place and keeps a manifold,
+//! consistently oriented input manifold and consistently oriented.
+
+mod linalg;
+mod triangulate;
+mod util;
+
+pub mod bridge;
+pub mod cap;
+pub mod cut;
+pub mod extrude;
+pub mod flow;
+pub mod mirror;
+pub mod region;
+pub mod smooth;
+pub mod transform;
+pub mod vessel;
+
+pub use bridge::{bridge, join_loops, BridgeParams, BridgeResult};
+pub use cap::{cap_planar_loops, CapResult};
+pub use cut::{
+    local_plane_cut, local_plane_cut_with, nearest_intersection_curve, plane_cut, plane_intersection_curves, CutFill,
+    IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,
+};
+pub use extrude::{
+    extrude_selection, offset_selection, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
+};
+pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
+pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};
+pub use region::{discard, duplicate, flip_normals, separate};
+pub use smooth::smooth_boundary;
+pub use transform::{align_to_principal_axes, center_on_origin, drop_to_ground, transform_mesh};
+pub use vessel::{estimate_vessel_cross_section, suggest_cut_plane, VesselCrossSection};
+
+use mm_core::MeshError;
+
+/// Errors reported by edit operations.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum EditError {
+    /// No (live) triangles were selected.
+    #[error("the selection is empty")]
+    EmptySelection,
+    /// The given vertices do not form a boundary loop / span.
+    #[error("invalid boundary loop: {0}")]
+    InvalidLoop(String),
+    /// A parameter is out of range.
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
+    /// The plane misses the mesh.
+    #[error("the plane does not intersect the mesh")]
+    NoIntersection,
+    /// A local cut curve that does not split the surface (e.g. around a handle).
+    #[error("the chosen cut curve does not separate the surface into two pieces")]
+    CurveDoesNotSeparate,
+    /// A low-level mesh edit failed.
+    #[error("mesh operation failed: {0}")]
+    Mesh(#[from] MeshError),
+    /// Any other failure.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// Result type of edit operations.
+pub type EditResult<T> = Result<T, EditError>;
+
+#[cfg(test)]
+mod tests;

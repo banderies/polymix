@@ -1,0 +1,8 @@
+/target
+/original_apks
+*.DS_Store
+/test_meshes/big_*
+dist/
+# Sample meshes (may contain patient data; never commit)
+/STLs/
+.vscode/

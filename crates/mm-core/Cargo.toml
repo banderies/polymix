@@ -1,0 +1,15 @@
+[package]
+name = "mm-core"
+description = "Geometry core: dynamic triangle mesh, repair, remeshing, and modeling operations"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+rayon.workspace = true
+smallvec.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
