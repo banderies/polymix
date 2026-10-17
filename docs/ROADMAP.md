@@ -59,7 +59,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 ## M3 — Repair and topology
 
-- [ ] **M3.1 Close Cracks** (weld coincident open edges).
+- [x] **M3.1 Close Cracks** (weld coincident open edges, T-junctions; Edit → Close Cracks).
 - [ ] **M3.2 Weld Boundaries** and **Join** (selection boundaries).
 - [ ] **M3.3 Bridge between two selected regions** (Meshmixer style) and **Tube Handle**.
 - [ ] **M3.4 Generate Face Groups** (Edge Angle mode, Angle / Size thresholds, …).

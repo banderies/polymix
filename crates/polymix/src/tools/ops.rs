@@ -814,6 +814,44 @@ impl OpSpec for SmoothBoundarySpec {
 pub type SmoothBoundaryTool = OpTool<SmoothBoundarySpec>;
 
 // ---------------------------------------------------------------------------
+// Close Cracks (Edit)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct CloseCracksUi {
+    /// Weld tolerance as log10 of a fraction of the model size.
+    pub tolerance_exp: f64,
+}
+
+pub struct CloseCracksSpec;
+impl OpSpec for CloseCracksSpec {
+    type Params = CloseCracksUi;
+    const NAME: &'static str = "Close Cracks";
+    const USES_SELECTION: bool = false;
+    fn defaults(_: &OpInfo) -> Self::Params {
+        CloseCracksUi { tolerance_exp: -5.0 }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        ui.add(egui::Slider::new(&mut p.tolerance_exp, -7.0..=-2.0).text("Tolerance").custom_formatter(|v, _| format!("{:.2e}", 10f64.powf(v) * info.bbox_diag)))
+            .on_hover_text("Open edges closer than this are zipped together");
+        ui.small(format!("Open edges now: {}", info.mesh.boundary_edge_ids().count()));
+        ui.small("Zips cracks: open boundaries lying on top of each other (e.g. CAD surfaces exported without shared vertices), including T-junctions.");
+    }
+    fn run(mesh: &Mesh, _sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let mut m = mesh.clone();
+        let before = m.boundary_edge_ids().count();
+        let r = mm_repair::close_cracks(&mut m, 10f64.powf(p.tolerance_exp) * mesh.bounds().diagonal());
+        let after = m.boundary_edge_ids().count();
+        Ok(OpOutput {
+            mesh: m,
+            message: format!("open edges {before} → {after} ({} welded, {} edges split)", r.weld.welded, r.splits),
+            ..Default::default()
+        })
+    }
+}
+pub type CloseCracksTool = OpTool<CloseCracksSpec>;
+
+// ---------------------------------------------------------------------------
 // Reduce (Shift+R)
 // ---------------------------------------------------------------------------
 
@@ -1495,6 +1533,8 @@ mod tests {
         assert!(run_spec::<ExtrudeSpec>(&m, None).is_err(), "extrude needs a selection");
         run_spec::<EraseFillSpec>(&m, Some(&sel)).unwrap();
         run_spec::<MirrorSpec>(&m, None).unwrap();
+        run_spec::<CloseCracksSpec>(&m, None).unwrap();
+        run_spec::<SmoothBoundarySpec>(&m, Some(&sel)).unwrap();
         let solid = run_spec::<MakeSolidSpec>(&m, None).unwrap();
         assert!(solid.mesh.is_closed());
         let off = run_spec::<OffsetSolidSpec>(&solid.mesh, None).unwrap();

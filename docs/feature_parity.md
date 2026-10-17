@@ -194,7 +194,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Plane Cut | 🟡 | Cut/Slice, No/Minimal/Remeshed fill ✅ (+ vessel cross-section mode); Fixed Fill, Slice Groups ❌ |
 | Combine | ✅ | |
 | Boolean Union / Difference / Intersection | 🟡 | Volumetric (SDF) result; exact mesh boolean ("Precise", "Max Quality") ❌ |
-| Close Cracks | ❌ | Weld near-coincident open edges |
+| Close Cracks | ✅ | Welds coincident open boundaries incl. T-junctions; tolerance slider with live preview |
 | Generate Face Groups | ❌ | Segment by crease angle / region |
 | Make Solid | 🟡 | Blocky / Fast / Accurate, accuracy, density, min thickness, close boundaries ✅; Sharp Edge Preserve, offset, colour/group transfer ❌ |
 | Hollow | ✅ | Hollow wall ✅; escape holes ⛔ (printing) |

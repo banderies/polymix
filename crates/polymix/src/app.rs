@@ -68,6 +68,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "reduce" => Box::new(tools::ops::ReduceTool::new(cx)),
         "smooth" => Box::new(tools::ops::SmoothTool::new(cx)),
         "smoothboundary" => Box::new(tools::ops::SmoothBoundaryTool::new(cx)),
+        "closecracks" => Box::new(tools::ops::CloseCracksTool::new(cx)),
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
         "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
@@ -670,6 +671,9 @@ impl PolymixApp {
                     }
                     if ui.button("Bridge boundaries").clicked() {
                         open = Some("bridge");
+                    }
+                    if ui.button("Close Cracks").on_hover_text("Zip open boundaries that lie on top of each other").clicked() {
+                        open = Some("closecracks");
                     }
                     ui.separator();
                     if ui.button("Separate Shells  (Shift+Y)").clicked() {

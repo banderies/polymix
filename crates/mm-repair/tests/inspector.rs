@@ -431,3 +431,22 @@ fn perf_auto_repair_3m_vessel() {
     assert!(rep.is_watertight());
     m.check_validity().unwrap();
 }
+
+#[test]
+fn close_cracks_zips_t_junctions() {
+    use mm_core::{primitives, DVec3};
+    // Left: 4 rows along the seam; right: 8 rows; they touch at x = 0 without sharing vertices.
+    let mut left = primitives::plane_grid(2.0, 4.0, 2, 4);
+    left.transform(|p| p - DVec3::new(1.0, 0.0, 0.0));
+    let mut right = primitives::plane_grid(2.0, 4.0, 2, 8);
+    right.transform(|p| p + DVec3::new(1.0 + 1e-7, 0.0, 0.0));
+    let mut m = left.clone();
+    m.append_mesh(&right, 0);
+    let seam_open = |m: &mm_core::Mesh| m.boundary_edge_ids().filter(|&e| m.edge_midpoint(e).x.abs() < 1e-3).count();
+    assert!(seam_open(&m) > 0);
+    let r = mm_repair::close_cracks(&mut m, 1e-5);
+    m.check_validity().unwrap();
+    assert!(r.splits >= 4, "the coarse side's seam edges get split ({r:?})");
+    assert_eq!(seam_open(&m), 0, "the seam is closed ({r:?})");
+    assert_eq!(mm_core::topology::connected_components(&m).len(), 1);
+}

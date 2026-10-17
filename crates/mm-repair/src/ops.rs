@@ -145,6 +145,115 @@ pub fn weld_boundary_vertices(mesh: &mut Mesh, tolerance: f64) -> WeldReport {
     report
 }
 
+/// Result of [`close_cracks`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloseCracksReport {
+    /// Boundary edges split where another boundary vertex lay on them (T-junctions).
+    pub splits: usize,
+    /// Vertex merges.
+    pub weld: WeldReport,
+}
+
+/// Close cracks (Meshmixer *Edit > Close Cracks*): open boundaries lying on top of each
+/// other within `tolerance` are zipped together. Boundary edges that have another boundary
+/// vertex on them are split first (T-junctions, e.g. where a fine and a coarse patch meet),
+/// then coincident boundary vertices are welded (see [`weld_boundary_vertices`]).
+pub fn close_cracks(mesh: &mut Mesh, tolerance: f64) -> CloseCracksReport {
+    let tol = tolerance.max(0.0);
+    // Plain welding first; T-junction splits only help where the split vertices can then be
+    // welded, so keep them only if they leave fewer open edges.
+    let mut welded = mesh.clone();
+    let plain = CloseCracksReport { splits: 0, weld: weld_boundary_vertices(&mut welded, tol) };
+    let mut best = (welded, plain);
+    if tol > 0.0 {
+        let mut split = mesh.clone();
+        let mut report = CloseCracksReport::default();
+        // A few rounds: a split creates new boundary edges that may host further vertices.
+        for _ in 0..8 {
+            let n = split_t_junctions(&mut split, tol);
+            report.splits += n;
+            if n == 0 {
+                break;
+            }
+        }
+        if report.splits > 0 {
+            report.weld = weld_boundary_vertices(&mut split, tol);
+            if split.boundary_edge_ids().count() < best.0.boundary_edge_ids().count() {
+                best = (split, report);
+            }
+        }
+    }
+    *mesh = best.0;
+    best.1
+}
+
+/// Split boundary edges that have a boundary vertex (not their own) within `tol` of their
+/// interior, at that vertex's projection. Returns the number of splits.
+fn split_t_junctions(mesh: &mut Mesh, tol: f64) -> usize {
+    let bedges: Vec<u32> = mesh.boundary_edge_ids().collect();
+    if bedges.is_empty() {
+        return 0;
+    }
+    let mean = bedges.iter().map(|&e| mesh.edge_length(e)).sum::<f64>() / bedges.len() as f64;
+    let cell = mean.max(tol * 2.0).max(1e-12);
+    let key = |p: DVec3| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64, (p.z / cell).floor() as i64);
+    let mut grid: FxHashMap<(i64, i64, i64), SmallVec<[u32; 4]>> = FxHashMap::default();
+    let mut bverts: Vec<u32> = bedges.iter().flat_map(|&e| mesh.edge_vertices(e)).collect();
+    bverts.sort_unstable();
+    bverts.dedup();
+    for &v in &bverts {
+        grid.entry(key(mesh.vertex(v))).or_default().push(v);
+    }
+    // (edge, split parameter) — at most one split per edge per round.
+    let mut splits: Vec<(u32, f64)> = Vec::new();
+    for &e in &bedges {
+        let [a, b] = mesh.edge_vertices(e);
+        let (pa, pb) = (mesh.vertex(a), mesh.vertex(b));
+        let d = pb - pa;
+        let l2 = d.length_squared();
+        if l2 <= tol * tol {
+            continue;
+        }
+        let (lo, hi) = (key(pa.min(pb) - DVec3::splat(tol)), key(pa.max(pb) + DVec3::splat(tol)));
+        if (hi.0 - lo.0 + 1) * (hi.1 - lo.1 + 1) * (hi.2 - lo.2 + 1) > 4096 {
+            continue;
+        }
+        let mut best: Option<(f64, f64)> = None;
+        for x in lo.0..=hi.0 {
+            for y in lo.1..=hi.1 {
+                for z in lo.2..=hi.2 {
+                    let Some(c) = grid.get(&(x, y, z)) else { continue };
+                    for &v in c {
+                        if v == a || v == b {
+                            continue;
+                        }
+                        let p = mesh.vertex(v);
+                        let t = (p - pa).dot(d) / l2;
+                        if t <= 0.0 || t >= 1.0 {
+                            continue;
+                        }
+                        let q = pa + d * t;
+                        let dist = q.distance(p);
+                        if dist <= tol && p.distance(pa) > tol && p.distance(pb) > tol && best.is_none_or(|(bd, _)| dist < bd) {
+                            best = Some((dist, t));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, t)) = best {
+            splits.push((e, t));
+        }
+    }
+    let mut n = 0;
+    for (e, t) in splits {
+        if mesh.is_edge(e) && mesh.is_boundary_edge(e) && mesh.split_edge_at(e, t).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// True if triangle `t` has (near) zero area relative to its longest edge:
 /// `area ≤ eps · max_edge²`, or all vertices coincide.
 #[inline]
