@@ -80,6 +80,10 @@ pub struct ReduceParams {
     /// Reject collapses rotating any triangle normal by more than this many degrees.
     /// Normal flips (> 90°) are always rejected.
     pub max_normal_change_deg: f64,
+    /// Uniform reduction (Meshmixer "Uniform"): collapse the shortest edges first and merge
+    /// at midpoints, for even triangles. Otherwise the quadric error is minimised ("Shape
+    /// Preserving").
+    pub uniform: bool,
 }
 
 impl Default for ReduceParams {
@@ -91,6 +95,7 @@ impl Default for ReduceParams {
             region: None,
             min_triangle_quality: 0.05,
             max_normal_change_deg: 60.0,
+            uniform: false,
         }
     }
 }
@@ -188,6 +193,7 @@ struct Reducer<'m> {
     count: usize,
     collapses: usize,
     stamp: Stamp,
+    uniform: bool,
 }
 
 impl<'m> Reducer<'m> {
@@ -278,6 +284,7 @@ impl<'m> Reducer<'m> {
             count,
             collapses: 0,
             stamp,
+            uniform: p.uniform,
         }
     }
 
@@ -299,7 +306,13 @@ impl<'m> Reducer<'m> {
         let q = self.q[a as usize].sum(&self.q[b as usize]);
         let (pa, pb) = (m.vertex(a), m.vertex(b));
         let (keep, rem, pos) = if ra && rb {
-            let pos = if c.kind == E_FEATURE { q.min_on_segment(pa, pb) } else { optimal_position(&q, pa, pb) };
+            let pos = if self.uniform {
+                (pa + pb) * 0.5
+            } else if c.kind == E_FEATURE {
+                q.min_on_segment(pa, pb)
+            } else {
+                optimal_position(&q, pa, pb)
+            };
             (a, b, pos)
         } else if ra {
             (b, a, pb)
@@ -309,7 +322,7 @@ impl<'m> Reducer<'m> {
         // Tiny length term (same length^4 units as the cost) orders zero-cost collapses in
         // flat regions shortest-first instead of by edge id.
         let l2 = pa.distance_squared(pb);
-        let cost = q.eval(pos) + 1e-6 * l2 * l2;
+        let cost = if self.uniform { l2 } else { q.eval(pos) + 1e-6 * l2 * l2 };
         Some(Cand { cost: cost as f32, keep, rem, pos })
     }
 

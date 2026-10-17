@@ -205,8 +205,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Generate / Filter / Split Complex, Convex Decomposition | ⚪ ❌ | |
 | Make Slices | ⛔ | |
 | Remesh (whole object) | ✅ | All four modes incl. Linear Subdivision; Density (%), Regularity, Threshold, Iterations, Transition, Preserve / Smooth group borders, sharp edges, boundary modes — Meshmixer's defaults |
-| Reduce | 🟡 | Percentage / triangle budget / max deviation ✅; Uniform vs Shape Preserving type ❌ |
-| Smooth (whole object) | 🟡 | Shape Preserving / Membrane / Max Smoothness ✅; Uniform Triangles, Per-Group Membranes ❌ |
+| Reduce | ✅ | Percentage / triangle budget / max deviation; Uniform vs Shape Preserving (T) |
+| Smooth (whole object) | ✅ | Shape Preserving / Uniform Triangles / Max Smoothness / Preserve Group Borders / Per-Group Membranes; Smoothing, Smoothing Scale, Constraint Rings (our reading: soft blend at the selection edge) |
 
 ## 5. Analysis category
 

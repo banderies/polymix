@@ -65,7 +65,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M3.4 Generate Face Groups** (Edge Angle / Normal Angle, Angle / Size thresholds).
 - [x] **M3.5 Remesh parity**: Linear Subdivision, Regularity, Transition, Threshold, Meshmixer density
       scale and defaults, Preserve vs Smooth group borders.
-- [ ] **M3.6 Reduce / Smooth parity**: Uniform reduce; Uniform Triangles, Preserve Group Borders,
+- [x] **M3.6 Reduce / Smooth parity**: Uniform reduce; Uniform Triangles, Preserve Group Borders,
       Per-Group Membranes smoothing; Smoothing Scale, Constraint Rings.
 - [ ] **M3.7 Plane Cut parity**: Fixed Fill, Slice Groups.
 - [ ] **M3.8 Make Solid parity**: Sharp Edge Preserve, Offset Distance, colour/group transfer,

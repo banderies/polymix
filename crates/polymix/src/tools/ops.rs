@@ -1178,6 +1178,8 @@ pub enum ReduceGoal {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ReduceUi {
     pub goal: ReduceGoal,
+    /// Uniform (even triangles) instead of Shape Preserving (quadric error).
+    pub uniform: bool,
     pub percentage: f64,
     pub budget: usize,
     pub deviation: f64,
@@ -1200,12 +1202,16 @@ impl OpSpec for ReduceSpec {
         if plain(i, egui::Key::G) {
             p.preserve_groups = !p.preserve_groups;
         }
+        if plain(i, egui::Key::T) {
+            p.uniform = !p.uniform;
+        }
         *p != before
     }
     fn defaults(info: &OpInfo) -> Self::Params {
         let n = info.selection.map(|s| s.len()).unwrap_or(info.mesh.triangle_count());
         ReduceUi {
             goal: ReduceGoal::Percentage,
+            uniform: false,
             percentage: 50.0,
             budget: (n / 2).max(4),
             deviation: info.avg_edge * 0.1,
@@ -1224,6 +1230,12 @@ impl OpSpec for ReduceSpec {
                 ui.selectable_value(&mut p.goal, ReduceGoal::Percentage, "Percentage");
                 ui.selectable_value(&mut p.goal, ReduceGoal::TriangleBudget, "Triangle Budget");
                 ui.selectable_value(&mut p.goal, ReduceGoal::MaxDeviation, "Max Deviation");
+            });
+        egui::ComboBox::from_label("Reduce type")
+            .selected_text(if p.uniform { "Uniform" } else { "Shape Preserving" })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut p.uniform, true, "Uniform").on_hover_text("Even triangles (T)");
+                ui.selectable_value(&mut p.uniform, false, "Shape Preserving").on_hover_text("Least shape change (T)");
             });
         let n = info.selection.map(|s| s.len()).unwrap_or(info.mesh.triangle_count());
         match p.goal {
@@ -1250,6 +1262,7 @@ impl OpSpec for ReduceSpec {
             },
             preserve_boundary: p.preserve_boundary,
             preserve_group_boundaries: p.preserve_groups,
+            uniform: p.uniform,
             region: sel.map(|s| s.to_vec()),
             ..Default::default()
         };
@@ -1615,16 +1628,38 @@ pub type EraseFillTool = OpTool<EraseFillSpec>;
 pub enum SmoothType {
     /// Volume-preserving Taubin iterations: removes noise / staircase artefacts.
     ShapePreserving,
-    /// Membrane (Laplacian) fairing of the region with fixed surroundings.
-    Membrane,
+    /// Uniform-weight relaxation: evens out the triangles as it smooths.
+    UniformTriangles,
     /// Thin-plate (bilaplacian) fairing: smoothest surface continuing the surroundings.
     MaxSmoothness,
+    /// Shape Preserving with face-group border vertices held in place.
+    PreserveGroupBorders,
+    /// Membrane fairing of each face group separately (group borders held).
+    PerGroupMembranes,
+}
+
+impl SmoothType {
+    const ALL: [SmoothType; 5] = [Self::ShapePreserving, Self::UniformTriangles, Self::MaxSmoothness, Self::PreserveGroupBorders, Self::PerGroupMembranes];
+    fn label(self) -> &'static str {
+        match self {
+            Self::ShapePreserving => "Shape Preserving",
+            Self::UniformTriangles => "Uniform Triangles",
+            Self::MaxSmoothness => "Max Smoothness",
+            Self::PreserveGroupBorders => "Preserve Group Borders",
+            Self::PerGroupMembranes => "Per-Group Membranes",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct SmoothUi {
     pub kind: SmoothType,
+    /// 0..1: strength (blend toward the fully smoothed result).
     pub amount: f64,
+    /// 1..10: how much smoothing (iterations for the iterative types).
+    pub scale: f64,
+    /// Rings at the selection border over which the result blends into the surroundings.
+    pub constraint_rings: usize,
     pub cotan: bool,
     pub preserve_boundary: bool,
 }
@@ -1633,69 +1668,109 @@ pub struct SmoothSpec;
 impl OpSpec for SmoothSpec {
     type Params = SmoothUi;
     const NAME: &'static str = "Smooth";
-    fn defaults(info: &OpInfo) -> Self::Params {
-        SmoothUi {
-            kind: if info.selection.is_some() { SmoothType::MaxSmoothness } else { SmoothType::ShapePreserving },
-            amount: 0.5,
-            cotan: true,
-            preserve_boundary: true,
-        }
+    fn defaults(_info: &OpInfo) -> Self::Params {
+        // Meshmixer's defaults.
+        SmoothUi { kind: SmoothType::ShapePreserving, amount: 1.0, scale: 4.0, constraint_rings: 3, cotan: true, preserve_boundary: true }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
-        egui::ComboBox::from_label("Smoothing type")
-            .selected_text(match p.kind {
-                SmoothType::ShapePreserving => "Shape Preserving",
-                SmoothType::Membrane => "Membrane",
-                SmoothType::MaxSmoothness => "Max Smoothness",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut p.kind, SmoothType::ShapePreserving, "Shape Preserving");
-                ui.selectable_value(&mut p.kind, SmoothType::Membrane, "Membrane");
-                ui.selectable_value(&mut p.kind, SmoothType::MaxSmoothness, "Max Smoothness");
-            });
-        ui.add(egui::Slider::new(&mut p.amount, 0.0..=1.0).text("smoothing"));
+        egui::ComboBox::from_label("Smoothing type").selected_text(p.kind.label()).show_ui(ui, |ui| {
+            for k in SmoothType::ALL {
+                ui.selectable_value(&mut p.kind, k, k.label());
+            }
+        });
+        ui.add(egui::Slider::new(&mut p.amount, 0.0..=1.0).text("Smoothing"));
+        ui.add(egui::Slider::new(&mut p.scale, 1.0..=10.0).text("Smoothing scale"));
+        if info.selection.is_some() {
+            ui.add(egui::Slider::new(&mut p.constraint_rings, 0..=10).text("Constraint rings")).on_hover_text("Blend into the surroundings over this many rings at the selection's edge");
+        }
         ui.checkbox(&mut p.cotan, "Cotangent weights (follow the surface geometry)");
         ui.checkbox(&mut p.preserve_boundary, "Preserve open boundaries");
-        if info.selection.is_none() && p.kind != SmoothType::ShapePreserving {
-            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Fairing needs a selected region; whole-mesh smoothing uses Shape Preserving.");
+        if info.selection.is_none() && p.kind == SmoothType::MaxSmoothness {
+            ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Max Smoothness fairs a selected region; without one, Shape Preserving is used.");
         }
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let mut m = mesh.clone();
         let weights = if p.cotan { mm_repair::LaplacianWeights::Cotangent } else { mm_repair::LaplacianWeights::Uniform };
-        // Vertices free to move: interior of the selection (its border stays fixed).
-        let free: Option<Vec<u32>> = sel.map(|tris| {
-            let s = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
-            let border: std::collections::HashSet<u32> = s.boundary_vertices(&m).into_iter().collect();
-            s.vertices(&m).into_iter().filter(|v| !border.contains(v)).collect()
-        });
-        let kind = if free.is_none() { SmoothType::ShapePreserving } else { p.kind };
+        // Vertices free to move, with their distance (in rings) from the selection border.
+        let (free, rings): (Vec<u32>, std::collections::HashMap<u32, usize>) = match sel {
+            Some(tris) => {
+                let s = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
+                let border: Vec<u32> = s.boundary_vertices(&m);
+                let inside: std::collections::HashSet<u32> = s.vertices(&m).into_iter().collect();
+                // Breadth-first ring distance from the border, inside the selection.
+                let mut ring: std::collections::HashMap<u32, usize> = border.iter().map(|&v| (v, 0)).collect();
+                let mut front = border;
+                let mut k = 0;
+                while !front.is_empty() {
+                    k += 1;
+                    let mut next = Vec::new();
+                    for v in front {
+                        for u in m.vertex_neighbors(v) {
+                            if inside.contains(&u) && !ring.contains_key(&u) {
+                                ring.insert(u, k);
+                                next.push(u);
+                            }
+                        }
+                    }
+                    front = next;
+                }
+                let free = inside.iter().copied().filter(|v| ring.get(v).copied().unwrap_or(1) > 0).collect();
+                (free, ring)
+            }
+            None => (m.vertex_ids().collect(), Default::default()),
+        };
+        let free: Vec<u32> = match p.kind {
+            SmoothType::PreserveGroupBorders | SmoothType::PerGroupMembranes => free.into_iter().filter(|&v| {
+                let ts = m.vertex_triangles(v);
+                ts.iter().all(|&t| m.tri_group(t) == m.tri_group(ts[0]))
+            }).collect(),
+            _ => free,
+        };
+        let free: Vec<u32> = if p.preserve_boundary { free.into_iter().filter(|&v| !m.is_boundary_vertex(v)).collect() } else { free };
+        if free.is_empty() {
+            anyhow::bail!("nothing to smooth (no free vertices)");
+        }
+        let before: Vec<DVec3> = free.iter().map(|&v| m.vertex(v)).collect();
+        let kind = if sel.is_none() && p.kind == SmoothType::MaxSmoothness { SmoothType::ShapePreserving } else { p.kind };
+        let iterations = (p.scale * 10.0).round().max(1.0) as usize;
         match kind {
-            SmoothType::ShapePreserving => {
+            SmoothType::ShapePreserving | SmoothType::PreserveGroupBorders | SmoothType::UniformTriangles => {
+                let uniform = kind == SmoothType::UniformTriangles;
                 let sp = mm_repair::SmoothParams {
-                    iterations: (2.0 + p.amount * 40.0) as usize,
+                    iterations,
                     strength: 0.5,
-                    weights,
+                    weights: if uniform { mm_repair::LaplacianWeights::Uniform } else { weights },
                     preserve_boundary: p.preserve_boundary,
-                    preserve_volume: true,
+                    preserve_volume: !uniform,
                     ..Default::default()
                 };
-                mm_repair::smooth_vertices_with_progress(&mut m, free.as_deref(), &sp, Some(&|f| progress(f)))?;
+                mm_repair::smooth_vertices_with_progress(&mut m, Some(&free), &sp, Some(&|f| progress(f)))?;
             }
-            SmoothType::Membrane | SmoothType::MaxSmoothness => {
-                let free = free.unwrap();
-                if free.is_empty() {
-                    anyhow::bail!("the selection has no interior vertices to move");
+            SmoothType::MaxSmoothness => {
+                mm_repair::fair_region(&mut m, &free, 2, weights)?;
+            }
+            SmoothType::PerGroupMembranes => {
+                // Each group's interior is faired on its own (its borders are not free).
+                let mut by_group: std::collections::HashMap<i32, Vec<u32>> = std::collections::HashMap::new();
+                for &v in &free {
+                    by_group.entry(m.tri_group(m.vertex_triangles(v)[0])).or_default().push(v);
                 }
-                let before: Vec<DVec3> = free.iter().map(|&v| m.vertex(v)).collect();
-                let order = if kind == SmoothType::Membrane { 1 } else { 2 };
-                mm_repair::fair_region(&mut m, &free, order, weights)?;
-                // Blend between original and fully faired positions.
-                for (k, &v) in free.iter().enumerate() {
-                    let faired = m.vertex(v);
-                    m.set_vertex(v, before[k].lerp(faired, p.amount.clamp(0.0, 1.0).sqrt()));
+                for verts in by_group.values() {
+                    mm_repair::fair_region(&mut m, verts, 1, weights)?;
                 }
             }
+        }
+        // Strength, and a soft blend over the constraint rings at the selection's edge.
+        let amount = p.amount.clamp(0.0, 1.0);
+        for (k, &v) in free.iter().enumerate() {
+            let edge_blend = match rings.get(&v) {
+                Some(&r) if p.constraint_rings > 0 && r < p.constraint_rings => r as f64 / p.constraint_rings as f64,
+                _ => 1.0,
+            };
+            let w = amount * edge_blend;
+            let done = m.vertex(v);
+            m.set_vertex(v, before[k].lerp(done, w));
         }
         let vol0 = mm_core::measure::volume(mesh);
         let vol1 = mm_core::measure::volume(&m);
@@ -1870,6 +1945,66 @@ mod tests {
         let band: Vec<u32> = out.mesh.triangle_ids().filter(|&t| (0.55..0.65).contains(&out.mesh.tri_centroid(t).z)).collect();
         let mean = mm_remesh::edge_length_stats_in(&out.mesh, &band).mean;
         assert!(mean < sel_base.base_edge * 0.95 && mean > p.target() * 1.05, "band edges {mean} between {} and {}", p.target(), sel_base.base_edge);
+    }
+
+    #[test]
+    fn reduce_types_and_smooth_types() {
+        use mm_core::primitives;
+        // Uniform reduction evens out edge lengths more than shape-preserving reduction.
+        let mut e = primitives::icosphere(1.0, 4);
+        e.transform(|p| DVec3::new(p.x * 3.0, p.y, p.z));
+        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal() };
+        let rb = ReduceSpec::defaults(&ei);
+        let cv = |uniform: bool| {
+            let o = ReduceSpec::run(&e, None, &ReduceUi { uniform, ..rb }, &|_| true).unwrap();
+            let st = mm_remesh::edge_length_stats(&o.mesh);
+            st.std_dev / st.mean
+        };
+        assert!(cv(true) < cv(false), "uniform: {:.3} vs shape preserving {:.3}", cv(true), cv(false));
+
+        // Smooth types on a noisy sphere with two face groups.
+        let mut m = primitives::icosphere(1.0, 4);
+        let ids: Vec<u32> = m.vertex_ids().collect();
+        for v in ids {
+            let p = m.vertex(v);
+            let n = ((v * 7919) % 13) as f64 / 13.0 - 0.5;
+            m.set_vertex(v, p * (1.0 + 0.04 * n));
+        }
+        let tris: Vec<u32> = m.triangle_ids().collect();
+        for &t in &tris {
+            if m.tri_centroid(t).x > 0.0 {
+                m.set_tri_group(t, 1);
+            }
+        }
+        let rough = |mm: &Mesh| mm.vertex_ids().map(|v| (mm.vertex(v).length() - 1.0).abs()).sum::<f64>();
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let base = SmoothSpec::defaults(&info);
+        let group_border: Vec<u32> = m.vertex_ids().filter(|&v| {
+            let ts = m.vertex_triangles(v);
+            ts.iter().any(|&t| m.tri_group(t) != m.tri_group(ts[0]))
+        }).collect();
+        for kind in [SmoothType::ShapePreserving, SmoothType::UniformTriangles, SmoothType::PreserveGroupBorders] {
+            let out = SmoothSpec::run(&m, None, &SmoothUi { kind, ..base }, &|_| true).unwrap();
+            out.mesh.check_validity().unwrap();
+            assert!(rough(&out.mesh) < rough(&m), "{kind:?} smooths");
+            if kind == SmoothType::PreserveGroupBorders {
+                assert!(group_border.iter().all(|&v| out.mesh.vertex(v) == m.vertex(v)), "group borders held");
+            }
+        }
+        // A selection: fairing types and the constraint-ring blend at its edge.
+        let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.3).collect();
+        for kind in [SmoothType::MaxSmoothness, SmoothType::PerGroupMembranes] {
+            let out = SmoothSpec::run(&m, Some(&cap), &SmoothUi { kind, ..base }, &|_| true).unwrap();
+            out.mesh.check_validity().unwrap();
+        }
+        let out = SmoothSpec::run(&m, Some(&cap), &SmoothUi { constraint_rings: 4, ..base }, &|_| true).unwrap();
+        let s = mm_core::TriSelection::from_tris(&m, cap.iter().copied());
+        let border = s.boundary_vertices(&m);
+        let near: Vec<u32> = border.iter().flat_map(|&v| m.vertex_neighbors(v)).collect();
+        let moved_near: f64 = near.iter().map(|&v| out.mesh.vertex(v).distance(m.vertex(v))).sum::<f64>() / near.len() as f64;
+        let deep: Vec<u32> = s.vertices(&m).into_iter().filter(|&v| m.vertex(v).z > 0.8).collect();
+        let moved_deep: f64 = deep.iter().map(|&v| out.mesh.vertex(v).distance(m.vertex(v))).sum::<f64>() / deep.len() as f64;
+        assert!(moved_near < moved_deep, "the edge of the selection moves less ({moved_near:.4} vs {moved_deep:.4})");
     }
 
     #[test]
