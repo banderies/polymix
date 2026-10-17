@@ -63,7 +63,8 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M3.2 Weld Boundaries** and **Join** (selection boundaries; `J`).
 - [x] **M3.3 Bridge between two selected regions** (Meshmixer style, ⌘B) and **Tube Handle**.
 - [x] **M3.4 Generate Face Groups** (Edge Angle / Normal Angle, Angle / Size thresholds).
-- [ ] **M3.5 Remesh parity**: Linear Subdivision, Regularity, Transition, Threshold.
+- [x] **M3.5 Remesh parity**: Linear Subdivision, Regularity, Transition, Threshold, Meshmixer density
+      scale and defaults, Preserve vs Smooth group borders.
 - [ ] **M3.6 Reduce / Smooth parity**: Uniform reduce; Uniform Triangles, Preserve Group Borders,
       Per-Group Membranes smoothing; Smoothing Scale, Constraint Rings.
 - [ ] **M3.7 Plane Cut parity**: Fixed Fill, Slice Groups.

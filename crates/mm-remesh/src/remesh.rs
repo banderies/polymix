@@ -55,9 +55,15 @@ pub struct RemeshParams {
     pub preserve_sharp_edges: Option<f64>,
     /// Keep face-group borders as feature curves (vertices on them only slide along them).
     pub preserve_group_boundaries: bool,
-    /// Curvature-adaptive sizing: the target varies between 0.5x and 2x
-    /// `target_edge_length`, shorter where the surface is more curved.
+    /// Curvature-adaptive sizing: the target varies with curvature around
+    /// `target_edge_length`, shorter where the surface is more curved (see `adaptivity`).
     pub adaptive: bool,
+    /// Strength of adaptive sizing in `[0, 1]`: 0.5 varies the target between 0.5× and 2×,
+    /// 1 between 0.25× and 4×, 0 is uniform.
+    pub adaptivity: f64,
+    /// Explicit target edge length per input vertex (indexed by vertex id); overrides
+    /// `adaptive` sizing. Used for smooth transitions around a remeshed selection.
+    pub vertex_sizes: Option<Vec<f64>>,
     /// Project vertices back onto the input surface after every iteration.
     pub project_to_original: bool,
     /// Only remesh these triangles. The region border is kept fixed and everything
@@ -92,6 +98,8 @@ impl Default for RemeshParams {
             preserve_sharp_edges: None,
             preserve_group_boundaries: true,
             adaptive: false,
+            adaptivity: 0.5,
+            vertex_sizes: None,
             project_to_original: true,
             region: None,
             smooth_group_boundaries: None,
@@ -169,6 +177,8 @@ pub fn remesh(mesh: &mut Mesh, params: &RemeshParams, progress: Option<ProgressF
         },
         base: params.target_edge_length,
         adaptive: params.adaptive,
+        adaptivity: params.adaptivity.clamp(0.0, 1.0),
+        sizes: params.vertex_sizes.as_deref(),
         project: params.project_to_original,
         smoothing: params.smoothing.clamp(0.0, 1.0),
         free_boundary: params.boundary == BoundaryMode::Free,
@@ -214,6 +224,10 @@ pub(crate) struct Setup<'a> {
     /// Target edge length; `<= 0` = mean edge length.
     pub base: f64,
     pub adaptive: bool,
+    /// Adaptive sizing strength (see `RemeshParams::adaptivity`).
+    pub adaptivity: f64,
+    /// Explicit per-input-vertex sizes (see `RemeshParams::vertex_sizes`).
+    pub sizes: Option<&'a [f64]>,
     pub project: bool,
     pub smoothing: f64,
     pub free_boundary: bool,
@@ -274,7 +288,9 @@ impl<'m> Remesher<'m> {
         let base = if base > 0.0 { base } else { 1.0 };
 
         let mut vsize = vec![base; mesh.max_vid()];
-        let reference = if s.project || s.adaptive {
+        // Explicit sizes behave like adaptive sizing with a given field.
+        let adaptive = s.adaptive || s.sizes.is_some();
+        let reference = if s.project || adaptive {
             let (rmesh, vmap) = if region.enabled() {
                 let tris = region.triangles_with_collar(mesh);
                 let (m, vmap) = mesh.submesh(&tris);
@@ -283,8 +299,22 @@ impl<'m> Remesher<'m> {
                 (mesh.clone(), None)
             };
             let bvh = Bvh::build(&rmesh);
-            let size = if s.adaptive { compute_sizing(&rmesh, base) } else { Vec::new() };
-            if s.adaptive {
+            let size = match s.sizes {
+                Some(input) => {
+                    // Reference vertex -> input vertex, then its given size.
+                    let mut out = vec![base; rmesh.max_vid()];
+                    for v in mesh.vertex_ids() {
+                        let rv = vmap.as_ref().map_or(v, |m| m.get(v as usize).copied().unwrap_or(INVALID));
+                        if rv != INVALID && (rv as usize) < out.len() {
+                            out[rv as usize] = input.get(v as usize).copied().filter(|x| x.is_finite() && *x > 0.0).unwrap_or(base);
+                        }
+                    }
+                    out
+                }
+                None if s.adaptive => compute_sizing(&rmesh, base, s.adaptivity),
+                None => Vec::new(),
+            };
+            if adaptive {
                 for &v in &verts {
                     let rv = vmap.as_ref().map_or(v, |m| m[v as usize]);
                     if rv != INVALID {
@@ -315,7 +345,7 @@ impl<'m> Remesher<'m> {
             ec: cons.e,
             vsize,
             base,
-            adaptive: s.adaptive,
+            adaptive,
             free_boundary: s.free_boundary,
             smoothing: s.smoothing,
             project: s.project,
@@ -882,7 +912,7 @@ impl SmoothCtx<'_> {
 /// Curvature-based sizing field on `m`: `base * sqrt(k_ref / k)` clamped to
 /// `[0.5, 2] * base`, where `k` is a smoothed max normal curvature estimate per vertex and
 /// `k_ref` its median (chord-error-like scaling: edge length ~ curvature^-1/2).
-fn compute_sizing(m: &Mesh, base: f64) -> Vec<f64> {
+fn compute_sizing(m: &Mesh, base: f64, adaptivity: f64) -> Vec<f64> {
     let n = m.max_vid();
     let normals = m.compute_vertex_normals();
     let mut k: Vec<f64> = (0..n as u32)
@@ -930,5 +960,7 @@ fn compute_sizing(m: &Mesh, base: f64) -> Vec<f64> {
     vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     let diag = m.bounds().diagonal().max(1e-12);
     let kref = vals[mid].max(1.0 / diag);
-    k.iter().map(|&kv| base * (kref / kv.max(1e-300)).sqrt().clamp(0.5, 2.0)).collect()
+    // adaptivity 0.5: sqrt(kref / k) within [0.5, 2]; 1: kref / k within [0.25, 4].
+    let (exp, range) = (adaptivity, 2f64.powf(4.0 * adaptivity));
+    k.iter().map(|&kv| base * (kref / kv.max(1e-300)).powf(exp).clamp(1.0 / range.sqrt(), range.sqrt())).collect()
 }

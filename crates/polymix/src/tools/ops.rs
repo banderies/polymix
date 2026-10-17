@@ -552,8 +552,21 @@ pub type MirrorTool = OpTool<MirrorSpec>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RemeshMode {
     RelativeDensity,
-    TargetEdgeLength,
     AdaptiveDensity,
+    TargetEdgeLength,
+    /// Split edges to the target length without moving any vertex.
+    LinearSubdivision,
+}
+
+impl RemeshMode {
+    fn label(self) -> &'static str {
+        match self {
+            RemeshMode::RelativeDensity => "Relative Density",
+            RemeshMode::AdaptiveDensity => "Adaptive Density",
+            RemeshMode::TargetEdgeLength => "Target Edge Length",
+            RemeshMode::LinearSubdivision => "Linear Subdivision",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -566,15 +579,23 @@ pub enum RemeshBoundary {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RemeshUi {
     pub mode: RemeshMode,
-    /// 0..100; 50 = current mean edge length, +25 halves the edge length.
+    /// -100..100 %: 0 keeps the current mean edge length, +50 halves it, −50 doubles it.
     pub density: f64,
     pub edge_length: f64,
-    /// Tangential relaxation 0..1 (Meshmixer "Regularity").
+    /// 0..100: tangential relaxation (triangle evenness).
     pub regularity: f64,
+    /// 0..100: how strongly Adaptive Density follows curvature.
+    pub threshold: f64,
     pub iterations: usize,
+    /// Width of the band around a selection where the edge length blends back to the
+    /// surroundings (world units; 0 = none).
+    pub transition: f64,
+    /// Keep face-group borders exactly where they are.
+    pub preserve_group_borders: bool,
+    /// Keep face-group borders, but smooth them.
+    pub smooth_group_boundaries: bool,
     pub preserve_sharp: bool,
     pub sharp_threshold: f64,
-    pub preserve_groups: bool,
     pub boundary: RemeshBoundary,
     pub base_edge: f64,
 }
@@ -583,9 +604,69 @@ impl RemeshUi {
     fn target(&self) -> f64 {
         match self.mode {
             RemeshMode::TargetEdgeLength => self.edge_length,
-            _ => self.base_edge * 2f64.powf((50.0 - self.density) / 25.0),
+            _ => self.base_edge * 2f64.powf(-self.density / 50.0),
         }
     }
+}
+
+/// The selection plus a band of `width` around it, and per-vertex target sizes that blend
+/// from `target` inside the selection to the local edge length at the band's outer edge.
+fn transition_band(m: &Mesh, sel: &[u32], width: f64, target: f64) -> (Vec<u32>, Vec<f64>) {
+    use std::collections::BinaryHeap;
+    #[derive(PartialEq)]
+    struct Item(f64, u32);
+    impl Eq for Item {}
+    impl PartialOrd for Item {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for Item {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            o.0.total_cmp(&self.0)
+        }
+    }
+    let s = mm_core::TriSelection::from_tris(m, sel.iter().copied());
+    let mut inside = vec![false; m.max_vid()];
+    for &t in sel {
+        for v in m.triangle(t) {
+            inside[v as usize] = true;
+        }
+    }
+    let mut dist = vec![f64::INFINITY; m.max_vid()];
+    let mut heap = BinaryHeap::new();
+    for v in s.boundary_vertices(m) {
+        dist[v as usize] = 0.0;
+        heap.push(Item(0.0, v));
+    }
+    while let Some(Item(d, v)) = heap.pop() {
+        if d > dist[v as usize] || d > width {
+            continue;
+        }
+        for u in m.vertex_neighbors(v) {
+            if inside[u as usize] {
+                continue;
+            }
+            let nd = d + m.vertex(v).distance(m.vertex(u));
+            if nd < dist[u as usize] {
+                dist[u as usize] = nd;
+                heap.push(Item(nd, u));
+            }
+        }
+    }
+    let mut region = sel.to_vec();
+    region.extend(m.triangle_ids().filter(|&t| !s.contains(t) && m.triangle(t).iter().all(|&v| inside[v as usize] || dist[v as usize] <= width)));
+    let mut sizes = vec![target; m.max_vid()];
+    for v in m.vertex_ids() {
+        if inside[v as usize] || !dist[v as usize].is_finite() {
+            continue;
+        }
+        let local = m.vertex_edges(v).iter().map(|&e| m.edge_length(e)).sum::<f64>() / m.vertex_valence(v).max(1) as f64;
+        let x = (dist[v as usize] / width).clamp(0.0, 1.0);
+        let w = x * x * (3.0 - 2.0 * x);
+        sizes[v as usize] = target + (local - target) * w;
+    }
+    (region, sizes)
 }
 
 pub struct RemeshSpec;
@@ -598,7 +679,7 @@ impl OpSpec for RemeshSpec {
             p.density = (p.density + 10.0).min(100.0);
         }
         if plain(i, egui::Key::F) {
-            p.density = (p.density - 10.0).max(0.0);
+            p.density = (p.density - 10.0).max(-100.0);
         }
         if (plain(i, egui::Key::D) || plain(i, egui::Key::F)) && p.mode == RemeshMode::TargetEdgeLength {
             p.mode = RemeshMode::RelativeDensity;
@@ -607,7 +688,7 @@ impl OpSpec for RemeshSpec {
             p.mode = if p.mode == RemeshMode::AdaptiveDensity { RemeshMode::RelativeDensity } else { RemeshMode::AdaptiveDensity };
         }
         if plain(i, egui::Key::G) {
-            p.preserve_groups = !p.preserve_groups;
+            p.preserve_group_borders = !p.preserve_group_borders;
         }
         *p != before
     }
@@ -617,53 +698,60 @@ impl OpSpec for RemeshSpec {
             None => info.avg_edge,
         }
         .max(1e-9);
+        // Meshmixer's defaults.
         RemeshUi {
             mode: RemeshMode::RelativeDensity,
-            density: 50.0,
+            density: 0.0,
             edge_length: base,
-            regularity: 0.5,
+            regularity: 25.0,
+            threshold: 50.0,
             iterations: 10,
+            transition: 0.0,
+            preserve_group_borders: false,
+            smooth_group_boundaries: true,
             preserve_sharp: false,
-            sharp_threshold: 30.0,
-            preserve_groups: true,
+            sharp_threshold: 45.0,
             boundary: RemeshBoundary::Fixed,
             base_edge: base,
         }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
-        egui::ComboBox::from_label("Remesh mode")
-            .selected_text(match p.mode {
-                RemeshMode::RelativeDensity => "Relative Density",
-                RemeshMode::TargetEdgeLength => "Target Edge Length",
-                RemeshMode::AdaptiveDensity => "Adaptive Density",
+        egui::ComboBox::from_label("Remesh mode").selected_text(p.mode.label()).show_ui(ui, |ui| {
+            for m in [RemeshMode::RelativeDensity, RemeshMode::AdaptiveDensity, RemeshMode::TargetEdgeLength, RemeshMode::LinearSubdivision] {
+                ui.selectable_value(&mut p.mode, m, m.label());
+            }
+        });
+        if p.mode == RemeshMode::TargetEdgeLength {
+            ui.add(egui::Slider::new(&mut p.edge_length, (p.base_edge * 0.1)..=(p.base_edge * 10.0)).logarithmic(true).text("Edge length"));
+        } else {
+            ui.add(egui::Slider::new(&mut p.density, -100.0..=100.0).suffix(" %").text("Density")).on_hover_text("D / F: ±10");
+            ui.weak(format!("edge length ≈ {:.4}", p.target()));
+        }
+        let smoothing = p.mode != RemeshMode::LinearSubdivision;
+        ui.add_enabled(smoothing, egui::Slider::new(&mut p.regularity, 0.0..=100.0).text("Regularity"));
+        ui.add_enabled(p.mode == RemeshMode::AdaptiveDensity, egui::Slider::new(&mut p.threshold, 0.0..=100.0).text("Threshold"))
+            .on_hover_text("How strongly Adaptive Density refines curved areas");
+        ui.add_enabled(smoothing, egui::Slider::new(&mut p.iterations, 1..=40).text("Iterations"));
+        if info.selection.is_some() {
+            let span = (p.base_edge * 20.0).max(1e-6);
+            ui.add_enabled(smoothing, egui::Slider::new(&mut p.transition, 0.0..=span).text("Transition"))
+                .on_hover_text("Blend the edge length back to the surroundings over this distance outside the selection");
+        }
+        ui.checkbox(&mut p.preserve_group_borders, "Preserve group borders").on_hover_text("G");
+        ui.add_enabled(!p.preserve_group_borders, egui::Checkbox::new(&mut p.smooth_group_boundaries, "Smooth group boundaries"));
+        ui.checkbox(&mut p.preserve_sharp, "Preserve sharp edges");
+        ui.add_enabled(p.preserve_sharp, egui::Slider::new(&mut p.sharp_threshold, 5.0..=90.0).suffix("°").text("Sharp threshold"));
+        egui::ComboBox::from_label("Boundary mode")
+            .selected_text(match p.boundary {
+                RemeshBoundary::Fixed => "Fixed Boundary",
+                RemeshBoundary::Refined => "Refined Boundary",
+                RemeshBoundary::Free => "Free Boundary",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut p.mode, RemeshMode::RelativeDensity, "Relative Density");
-                ui.selectable_value(&mut p.mode, RemeshMode::TargetEdgeLength, "Target Edge Length");
-                ui.selectable_value(&mut p.mode, RemeshMode::AdaptiveDensity, "Adaptive Density");
+                ui.selectable_value(&mut p.boundary, RemeshBoundary::Fixed, "Fixed Boundary");
+                ui.selectable_value(&mut p.boundary, RemeshBoundary::Refined, "Refined Boundary");
+                ui.selectable_value(&mut p.boundary, RemeshBoundary::Free, "Free Boundary");
             });
-        match p.mode {
-            RemeshMode::TargetEdgeLength => {
-                ui.add(egui::Slider::new(&mut p.edge_length, (p.base_edge * 0.1)..=(p.base_edge * 10.0)).logarithmic(true).text("edge length"));
-            }
-            _ => {
-                ui.add(egui::Slider::new(&mut p.density, 0.0..=100.0).text("density")).on_hover_text("D / F: ±10");
-                ui.weak(format!("target edge length ≈ {:.4}", p.target()));
-            }
-        }
-        ui.add(egui::Slider::new(&mut p.regularity, 0.0..=1.0).text("regularity"));
-        ui.add(egui::Slider::new(&mut p.iterations, 1..=40).text("iterations"));
-        ui.checkbox(&mut p.preserve_sharp, "Preserve sharp edges");
-        if p.preserve_sharp {
-            ui.add(egui::Slider::new(&mut p.sharp_threshold, 5.0..=90.0).text("sharp threshold °"));
-        }
-        ui.checkbox(&mut p.preserve_groups, "Preserve group boundaries");
-        ui.horizontal(|ui| {
-            ui.label("Boundary");
-            ui.selectable_value(&mut p.boundary, RemeshBoundary::Fixed, "Fixed");
-            ui.selectable_value(&mut p.boundary, RemeshBoundary::Refined, "Refined");
-            ui.selectable_value(&mut p.boundary, RemeshBoundary::Free, "Free");
-        });
         let est = (info.mesh.triangle_count() as f64 * (p.base_edge / p.target()).powi(2)) as usize;
         if info.selection.is_none() {
             ui.weak(format!("≈ {} triangles", crate::ui_util::format_count(est)));
@@ -671,21 +759,44 @@ impl OpSpec for RemeshSpec {
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let mut m = mesh.clone();
+        let target = p.target();
+        if p.mode == RemeshMode::LinearSubdivision {
+            let r = mm_remesh::refine_uniform(&mut m, target, sel, Some(progress))?;
+            if r.cancelled {
+                anyhow::bail!("cancelled");
+            }
+            return Ok(OpOutput {
+                message: format!("{} → {} triangles ({} splits)", mesh.triangle_count(), m.triangle_count(), r.splits),
+                selection: r.region_triangles,
+                mesh: m,
+                ..Default::default()
+            });
+        }
+        let (region, sizes) = match sel {
+            Some(sel) if p.transition > 0.0 => {
+                let (r, s) = transition_band(mesh, sel, p.transition, target);
+                (Some(r), Some(s))
+            }
+            _ => (sel.map(|s| s.to_vec()), None),
+        };
         let params = mm_remesh::RemeshParams {
-            target_edge_length: p.target(),
+            target_edge_length: target,
             iterations: p.iterations,
-            smoothing: p.regularity,
+            smoothing: (p.regularity / 100.0).clamp(0.0, 1.0).sqrt(),
             boundary: match p.boundary {
                 RemeshBoundary::Fixed => mm_remesh::BoundaryMode::Fixed,
                 RemeshBoundary::Refined => mm_remesh::BoundaryMode::ConstrainToBoundary,
                 RemeshBoundary::Free => mm_remesh::BoundaryMode::Free,
             },
             preserve_sharp_edges: p.preserve_sharp.then_some(p.sharp_threshold),
-            preserve_group_boundaries: p.preserve_groups,
+            preserve_group_boundaries: p.preserve_group_borders || p.smooth_group_boundaries,
+            smooth_group_boundaries: (!p.preserve_group_borders && p.smooth_group_boundaries)
+                .then_some(mm_remesh::GroupBorderSmoothing { strength: 0.5, anchor: 0.1, split: None }),
             adaptive: p.mode == RemeshMode::AdaptiveDensity,
+            adaptivity: p.threshold / 100.0,
+            vertex_sizes: sizes,
             project_to_original: true,
-            region: sel.map(|s| s.to_vec()),
-            smooth_group_boundaries: None,
+            region,
         };
         let r = mm_remesh::remesh(&mut m, &params, Some(progress))?;
         if r.cancelled {
@@ -803,6 +914,7 @@ impl OpSpec for SmoothBoundarySpec {
                 anchor: 0.2 * (p.preserve_shape / 100.0).clamp(0.0, 1.0).powi(2),
                 split: p.preserve_group_borders.then_some(offset),
             }),
+            ..Default::default()
         };
         let r = mm_remesh::remesh(&mut m, &params, Some(progress))?;
         if r.cancelled {
@@ -1717,6 +1829,50 @@ mod tests {
     }
 
     #[test]
+    fn remesh_parity_options() {
+        use mm_core::primitives;
+        let m = primitives::icosphere(1.0, 4);
+        let info = |sel: Option<&'static [u32]>| -> RemeshUi {
+            let i = OpInfo { mesh: &m, selection: sel, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+            RemeshSpec::defaults(&i)
+        };
+        let base = info(None);
+        // Density 0 keeps roughly the current resolution.
+        let out = RemeshSpec::run(&m, None, &base, &|_| true).unwrap();
+        let ratio = out.mesh.triangle_count() as f64 / m.triangle_count() as f64;
+        assert!((0.6..1.6).contains(&ratio), "density 0 keeps the size ({ratio})");
+        // Linear subdivision only splits: every vertex stays on the input surface (radius 1 or
+        // on a flat input triangle, so within the sphere).
+        let lin = RemeshSpec::run(&m, None, &RemeshUi { mode: RemeshMode::LinearSubdivision, density: 60.0, ..base }, &|_| true).unwrap();
+        assert!(lin.mesh.triangle_count() > 2 * m.triangle_count());
+        assert!(lin.mesh.vertex_ids().all(|v| lin.mesh.vertex(v).length() <= 1.0 + 1e-9));
+        // Adaptive threshold: on an elongated ellipsoid, the curved tips get finer than the
+        // flatter middle, more so with a higher threshold.
+        let mut e = primitives::icosphere(1.0, 4);
+        e.transform(|p| DVec3::new(p.x * 3.0, p.y, p.z));
+        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal() };
+        let eb = RemeshSpec::defaults(&ei);
+        let tip_over_middle = |t: f64| {
+            let o = RemeshSpec::run(&e, None, &RemeshUi { mode: RemeshMode::AdaptiveDensity, threshold: t, ..eb }, &|_| true).unwrap();
+            let tips: Vec<u32> = o.mesh.triangle_ids().filter(|&t| o.mesh.tri_centroid(t).x.abs() > 2.6).collect();
+            let mid: Vec<u32> = o.mesh.triangle_ids().filter(|&t| o.mesh.tri_centroid(t).x.abs() < 1.0).collect();
+            mm_remesh::edge_length_stats_in(&o.mesh, &tips).mean / mm_remesh::edge_length_stats_in(&o.mesh, &mid).mean
+        };
+        let (flat, strong) = (tip_over_middle(0.0), tip_over_middle(100.0));
+        assert!(strong < flat * 0.8, "tips refine more with a high threshold ({flat:.2} -> {strong:.2})");
+        // Transition: edges just outside a refined selection are in between.
+        let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.7).collect();
+        let cap: &'static [u32] = Box::leak(cap.into_boxed_slice());
+        let sel_base = info(Some(cap));
+        let p = RemeshUi { density: 100.0, transition: sel_base.base_edge * 5.0, ..sel_base };
+        let out = RemeshSpec::run(&m, Some(cap), &p, &|_| true).unwrap();
+        out.mesh.check_validity().unwrap();
+        let band: Vec<u32> = out.mesh.triangle_ids().filter(|&t| (0.55..0.65).contains(&out.mesh.tri_centroid(t).z)).collect();
+        let mean = mm_remesh::edge_length_stats_in(&out.mesh, &band).mean;
+        assert!(mean < sel_base.base_edge * 0.95 && mean > p.target() * 1.05, "band edges {mean} between {} and {}", p.target(), sel_base.base_edge);
+    }
+
+    #[test]
     fn smooth_boundary_straightens_a_jagged_selection() {
         let m = mm_core::primitives::icosphere(1.0, 4);
         // Upper half: its border follows triangle edges, so it zigzags around the equator.
@@ -1747,9 +1903,9 @@ mod tests {
         assert_eq!(p.density, d0);
         assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::T)));
         assert_eq!(p.mode, RemeshMode::AdaptiveDensity);
-        let g = p.preserve_groups;
+        let g = p.preserve_group_borders;
         assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::G)));
-        assert_eq!(p.preserve_groups, !g);
+        assert_eq!(p.preserve_group_borders, !g);
         assert!(!RemeshSpec::keys(&mut p, &key_input(egui::Key::K)));
         let mut r = ReduceSpec::defaults(&info);
         let k0 = r.percentage;
