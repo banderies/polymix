@@ -10,6 +10,7 @@
 pub mod bvh;
 pub mod geom;
 pub mod intersect;
+pub mod linalg;
 pub mod measure;
 pub mod mesh;
 pub mod primitives;

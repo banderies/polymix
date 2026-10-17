@@ -1,6 +1,6 @@
 //! Whole-mesh transforms.
 
-use crate::linalg::{add_outer, sym_eigen3};
+use mm_core::linalg::{add_outer, sym_eigen3};
 use mm_core::{DMat3, DMat4, DVec3, Mesh};
 
 /// Apply an affine transform. Mirroring transforms (negative determinant) also reverse the

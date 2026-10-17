@@ -27,6 +27,9 @@ pub enum SolidMode {
     /// Boundary faces of the voxels whose centres are inside (made well-composed by
     /// filling critical voxel configurations, so the result is still a 2-manifold).
     Blocky,
+    /// As `Accurate`, then vertices near the input's creases and corners move onto them and
+    /// edges are flipped to follow the creases, so CAD-like parts keep crisp edges.
+    SharpEdges,
 }
 
 /// Parameters for [`make_solid`], mirroring Meshmixer's Make Solid panel.
@@ -64,6 +67,11 @@ pub struct MakeSolidParams {
     pub min_edge_length: Option<f64>,
     /// Run quality-improving edge flips on nearly flat regions (default `true`).
     pub improve_quality: bool,
+    /// Give each output triangle the face group of the nearest input triangle ("Transfer
+    /// Groups"). Otherwise the output is a single group.
+    pub transfer_groups: bool,
+    /// Crease angle (degrees) that [`SolidMode::SharpEdges`] treats as a sharp edge.
+    pub sharp_angle_deg: f64,
 }
 
 impl Default for MakeSolidParams {
@@ -78,6 +86,8 @@ impl Default for MakeSolidParams {
             min_shell_volume: None,
             min_edge_length: None,
             improve_quality: true,
+            transfer_groups: false,
+            sharp_angle_deg: 30.0,
         }
     }
 }
@@ -209,8 +219,12 @@ pub fn make_solid(mesh: &Mesh, params: &MakeSolidParams, progress: Progress) -> 
     let mut out = extract_and_clean(&field, blocky, min_edge, params.improve_quality, shell_vol, &prog.sub(0.75, 0.92))?;
     drop(field);
     let flip_input = measure::volume(mesh) < 0.0;
-    if params.mode == SolidMode::Accurate {
+    if matches!(params.mode, SolidMode::Accurate | SolidMode::SharpEdges) {
         cleanup::project_to_input(&mut out, mesh, sdf.bvh(), h, params.offset, flip_input, thickened.as_deref());
+        if params.mode == SolidMode::SharpEdges {
+            let exclude = thickened.as_deref();
+            cleanup::sharpen_features(&mut out, mesh, sdf.bvh(), h, params.offset, flip_input, exclude, params.sharp_angle_deg);
+        }
         cleanup::collapse_short_edges(&mut out, 0.5 * min_edge);
         if params.improve_quality {
             cleanup::flip_to_improve(&mut out, 2);
@@ -221,9 +235,49 @@ pub fn make_solid(mesh: &Mesh, params: &MakeSolidParams, progress: Progress) -> 
         let extra = params.min_thickness.filter(|&t| t > 0.0).map_or(0.0, |t| 0.5 * t);
         remove_hole_caps(&mut out, mesh, sdf.bvh(), h, params.offset, extra);
     }
+    if params.transfer_groups {
+        transfer_face_groups_with(&mut out, mesh, sdf.bvh());
+    }
     let out = compact(out);
     prog.report(1.0)?;
     Ok(out)
+}
+
+/// Give each triangle of `out` the face group of the nearest triangle of `input` (measured
+/// from its centroid), then let single triangles stranded inside another group join it.
+pub fn transfer_face_groups(out: &mut Mesh, input: &Mesh) {
+    transfer_face_groups_with(out, input, &Bvh::build(input));
+}
+
+fn transfer_face_groups_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
+    let ids: Vec<u32> = out.triangle_ids().collect();
+    let snapshot: &Mesh = out;
+    let groups: Vec<Option<i32>> = ids
+        .par_iter()
+        .map(|&t| bvh.nearest(input, snapshot.tri_centroid(t), f64::INFINITY).map(|hit| input.tri_group(hit.tid)))
+        .collect();
+    for (&t, g) in ids.iter().zip(groups) {
+        if let Some(g) = g {
+            out.set_tri_group(t, g);
+        }
+    }
+    let islands: Vec<(u32, i32)> = ids
+        .iter()
+        .filter_map(|&t| {
+            let nb: Vec<i32> = out
+                .tri_edges(t)
+                .iter()
+                .map(|&e| out.edge_other_triangle(e, t))
+                .filter(|&o| o != mm_core::INVALID)
+                .map(|o| out.tri_group(o))
+                .collect();
+            let g = *nb.first()?;
+            (nb.len() == 3 && nb.iter().all(|&x| x == g) && g != out.tri_group(t)).then_some((t, g))
+        })
+        .collect();
+    for (t, g) in islands {
+        out.set_tri_group(t, g);
+    }
 }
 
 /// Compact ids by round-tripping through flat arrays (lower peak memory than

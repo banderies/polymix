@@ -196,7 +196,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Boolean Union / Difference / Intersection | 🟡 | Volumetric (SDF) result; exact mesh boolean ("Precise", "Max Quality") ❌ |
 | Close Cracks | ✅ | Welds coincident open boundaries incl. T-junctions; tolerance slider with live preview |
 | Generate Face Groups | ✅ | Edge Angle / Normal Angle, angle and size thresholds; shows group colours while open |
-| Make Solid | 🟡 | Blocky / Fast / Accurate, accuracy, density, min thickness, close boundaries ✅; Sharp Edge Preserve, offset, colour/group transfer ❌ |
+| Make Solid | 🟡 | Blocky / Fast / Accurate / Sharp Edge Preserve, accuracy, density, offset, min thickness, Cull Edges Threshold, close boundaries, Transfer Groups ✅; Color Transfer Mode ❌ (needs vertex colours, M6.2) |
 | Hollow | ✅ | Hollow wall ✅; escape holes ⛔ (printing) |
 | Make Pattern | ⚪ ❌ | |
 | Separate Shells (Shift+Y) | ✅ | |

@@ -413,3 +413,73 @@ fn min_thickness_inflates_thin_vessels() {
     assert!(e.x > 0.9 * t && e.x < 1.3 * t, "diameter {}", e.x);
     assert_eq!(component_count(&out), 1);
 }
+
+/// A cube turned off the grid axes, with one face group per side.
+fn turned_cube() -> (Mesh, glam::DQuat) {
+    let q = glam::DQuat::from_euler(glam::EulerRot::XYZ, 0.31, 0.47, 0.13);
+    let mut m = primitives::cube(1.0, 4);
+    for t in m.triangle_ids().collect::<Vec<_>>() {
+        let n = m.tri_normal(t);
+        let axis = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs())).unwrap();
+        m.set_tri_group(t, (2 * axis + (n[axis] > 0.0) as usize) as i32);
+    }
+    m.transform(|p| q * p);
+    (m, q)
+}
+
+/// Largest distance from the cube's edges and corners to `out`'s surface.
+fn crease_gap(out: &Mesh, q: glam::DQuat) -> (f64, f64) {
+    let bvh = mm_core::Bvh::build(out);
+    let gap = |p: DVec3| bvh.nearest(out, q * p, f64::INFINITY).unwrap().dist_sq.sqrt();
+    let corners: Vec<DVec3> = (0..8).map(|i| DVec3::new((i & 1) as f64 - 0.5, ((i >> 1) & 1) as f64 - 0.5, ((i >> 2) & 1) as f64 - 0.5)).collect();
+    let mut edge: f64 = 0.0;
+    for (i, &a) in corners.iter().enumerate() {
+        for &b in &corners[i + 1..] {
+            if a.distance(b) < 1.01 {
+                for k in 2..=18 {
+                    edge = edge.max(gap(a.lerp(b, k as f64 / 20.0)));
+                }
+            }
+        }
+    }
+    (edge, corners.iter().map(|&c| gap(c)).fold(0.0, f64::max))
+}
+
+#[test]
+fn sharp_edge_preserve_keeps_cube_edges() {
+    let (input, q) = turned_cube();
+    let h = 1.0 / 24.0;
+    let accurate = make_solid(&input, &MakeSolidParams { mode: SolidMode::Accurate, ..params(h) }, None).unwrap();
+    let sharp = make_solid(&input, &MakeSolidParams { mode: SolidMode::SharpEdges, ..params(h) }, None).unwrap();
+    assert_solid(&sharp, "sharp cube");
+    let (ae, ac) = crease_gap(&accurate, q);
+    let (se, sc) = crease_gap(&sharp, q);
+    eprintln!("accurate: edge {:.3}h corner {:.3}h; sharp: edge {:.3}h corner {:.3}h; min angle {:.1}°", ae / h, ac / h, se / h, sc / h, min_angle_deg(&sharp));
+    assert!(se < 0.1 * h && se < 0.5 * ae, "edges: sharp {se} vs accurate {ae}");
+    assert!(sc < 0.2 * h && sc < 0.5 * ac, "corners: sharp {sc} vs accurate {ac}");
+    let (max_dev, _) = distance_to(&sharp, &input);
+    assert!(max_dev < 0.3 * h, "faces stay on the input: {max_dev}");
+}
+
+#[test]
+fn groups_transfer_to_the_solid() {
+    let (input, q) = turned_cube();
+    let out = make_solid(&input, &MakeSolidParams { mode: SolidMode::SharpEdges, transfer_groups: true, ..params(1.0 / 24.0) }, None).unwrap();
+    let mut groups: Vec<i32> = out.triangle_ids().map(|t| out.tri_group(t)).collect();
+    groups.sort();
+    groups.dedup();
+    assert_eq!(groups, (0..6).collect::<Vec<_>>());
+    // Each triangle's group matches the side it faces.
+    let inv = q.inverse();
+    let wrong = out
+        .triangle_ids()
+        .filter(|&t| {
+            let n = inv * out.tri_normal(t);
+            let axis = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs())).unwrap();
+            out.tri_group(t) != (2 * axis + (n[axis] > 0.0) as usize) as i32
+        })
+        .count();
+    assert!(wrong * 50 < out.triangle_count(), "{wrong} of {} triangles in the wrong group", out.triangle_count());
+    let plain = make_solid(&input, &params(1.0 / 24.0), None).unwrap();
+    assert!(plain.triangle_ids().all(|t| plain.tri_group(t) == plain.tri_group(0)), "one group without transfer");
+}

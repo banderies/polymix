@@ -1,10 +1,10 @@
 //! Small dense linear algebra: symmetric 3x3 eigen-decomposition (cyclic Jacobi).
 
-use mm_core::DVec3;
+use glam::DVec3;
 
 /// Eigen-decomposition of a symmetric 3x3 matrix (row-major). Returns eigenvalues in
 /// ascending order with matching unit eigenvectors.
-pub(crate) fn sym_eigen3(m: [[f64; 3]; 3]) -> ([f64; 3], [DVec3; 3]) {
+pub fn sym_eigen3(m: [[f64; 3]; 3]) -> ([f64; 3], [DVec3; 3]) {
     let mut a = m;
     let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let scale: f64 = a.iter().flatten().map(|x| x * x).sum::<f64>().max(1e-300);
@@ -64,7 +64,7 @@ fn transpose(a: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 
 /// Accumulate `w * x xᵀ` into a symmetric matrix.
 #[inline]
-pub(crate) fn add_outer(m: &mut [[f64; 3]; 3], x: DVec3, w: f64) {
+pub fn add_outer(m: &mut [[f64; 3]; 3], x: DVec3, w: f64) {
     let a = [x.x, x.y, x.z];
     for i in 0..3 {
         for j in 0..3 {

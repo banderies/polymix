@@ -280,3 +280,176 @@ pub fn project_to_input(
     }
     moved
 }
+
+/// Input-surface sample near `p`: nearest point (shifted by `offset` along the normal) and
+/// the normal, or `None` when there is no input within `reach`, the point lies on an open
+/// boundary of the input, or the triangle is excluded.
+fn hermite_sample(input: &Mesh, bvh: &Bvh, p: DVec3, reach: f64, offset: f64, flip: bool, exclude: Option<&[bool]>) -> Option<(DVec3, DVec3, bool)> {
+    let hit = bvh.nearest(input, p, reach)?;
+    if exclude.is_some_and(|x| x.get(hit.tid as usize).copied().unwrap_or(false)) {
+        return None;
+    }
+    let mut n = input.tri_normal(hit.tid);
+    if flip {
+        n = -n;
+    }
+    let tv = input.triangle(hit.tid);
+    let mut rim = false;
+    for j in 0..3 {
+        if hit.bary[(j + 2) % 3] < 1e-9 {
+            rim |= input.find_edge(tv[j], tv[(j + 1) % 3]).is_some_and(|e| input.is_boundary_edge(e));
+        }
+    }
+    Some((hit.point + n * offset, n, rim))
+}
+
+/// Where `v` should move so that it lies on the input's sharp features: the least-squares
+/// meeting point of the input tangent planes sampled around its one-ring, or `None` when the
+/// samples all face the same way (no crease within reach) or the point is too far.
+#[allow(clippy::too_many_arguments)]
+fn feature_target(out: &Mesh, v: u32, input: &Mesh, bvh: &Bvh, h: f64, offset: f64, flip: bool, exclude: Option<&[bool]>, cos_sharp: f64) -> Option<DVec3> {
+    let c = out.vertex(v);
+    let mut probes = vec![c];
+    probes.extend(out.vertex_neighbors(v).map(|u| 0.5 * (c + out.vertex(u))));
+    probes.extend(out.vertex_triangles(v).iter().map(|&t| out.tri_centroid(t)));
+    let reach = 1.5 * h + offset.abs();
+    let mut samples: Vec<(DVec3, DVec3)> = Vec::with_capacity(probes.len());
+    for p in probes {
+        let (q, n, rim) = hermite_sample(input, bvh, p, reach, offset, flip, exclude)?;
+        if rim {
+            return None;
+        }
+        samples.push((q, n));
+    }
+    // Cluster the normals into faces; each face gets the same total weight so a crease seen
+    // by one sample counts as much as the face seen by the rest.
+    let mut cluster: Vec<usize> = Vec::with_capacity(samples.len());
+    let mut heads: Vec<DVec3> = Vec::new();
+    for &(_, n) in &samples {
+        match heads.iter().position(|&hn| hn.dot(n) >= cos_sharp) {
+            Some(k) => cluster.push(k),
+            None => {
+                cluster.push(heads.len());
+                heads.push(n);
+            }
+        }
+    }
+    if heads.len() < 2 {
+        return None;
+    }
+    let mut size = vec![0usize; heads.len()];
+    for &k in &cluster {
+        size[k] += 1;
+    }
+    // Minimise Σ wᵢ (nᵢ·(c + d − qᵢ))² over the displacement d, dropping directions the
+    // planes do not pin down (along a crease) so the vertex only slides onto the feature.
+    let mut a = [[0.0; 3]; 3];
+    let mut r = DVec3::ZERO;
+    for (&(q, n), &k) in samples.iter().zip(&cluster) {
+        let w = 1.0 / size[k] as f64;
+        mm_core::linalg::add_outer(&mut a, n, w);
+        r += n * (w * n.dot(q - c));
+    }
+    let (vals, vecs) = mm_core::linalg::sym_eigen3(a);
+    let mut d = DVec3::ZERO;
+    for k in 0..3 {
+        if vals[k] > 0.05 * vals[2] {
+            d += vecs[k] * (vecs[k].dot(r) / vals[k]);
+        }
+    }
+    (d.length() <= h && d.length() > 1e-6 * h).then_some(c + d)
+}
+
+/// Distance from `p` to the (offset) input surface, capped at `reach`.
+fn surface_gap(input: &Mesh, bvh: &Bvh, p: DVec3, reach: f64, offset: f64) -> f64 {
+    bvh.nearest(input, p, reach + offset.abs()).map_or(reach, |hit| (hit.dist_sq.sqrt() - offset.abs()).abs())
+}
+
+/// Recover the input's sharp edges and corners on a solidified surface (Make Solid's "Sharp
+/// Edge Preserve"): vertices near a crease (input normals within one ring differ by more
+/// than `sharp_deg`) move onto it, then edges that cut across a crease are flipped to run
+/// along it. Topology changes only through `flip_edge` and moves that would flip a triangle
+/// are halved, then skipped, so the result stays closed and manifold. Returns the number of
+/// vertices moved.
+#[allow(clippy::too_many_arguments)]
+pub fn sharpen_features(
+    out: &mut Mesh,
+    input: &Mesh,
+    bvh: &Bvh,
+    h: f64,
+    offset: f64,
+    flip_input: bool,
+    exclude: Option<&[bool]>,
+    sharp_deg: f64,
+) -> usize {
+    let cos_sharp = sharp_deg.to_radians().cos();
+    let mut moved = 0;
+    for _pass in 0..3 {
+        let ids: Vec<u32> = out.vertex_ids().collect();
+        let snapshot: &Mesh = out;
+        let targets: Vec<Option<DVec3>> =
+            ids.par_iter().map(|&v| feature_target(snapshot, v, input, bvh, h, offset, flip_input, exclude, cos_sharp)).collect();
+        let mut n = 0;
+        for (&v, t) in ids.iter().zip(targets) {
+            let Some(t) = t else { continue };
+            let p = out.vertex(v);
+            for s in [1.0, 0.5] {
+                let q = p.lerp(t, s);
+                if move_ok(out, v, q, 0.3) {
+                    out.set_vertex(v, q);
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        moved += n;
+        let flips = align_edges_to_features(out, input, bvh, h, offset);
+        if n == 0 && flips == 0 {
+            break;
+        }
+    }
+    moved
+}
+
+/// Flip edges whose midpoint lies off the input surface when the other diagonal of the quad
+/// lies on it (an edge cutting the corner of a crease). Returns the number of flips.
+fn align_edges_to_features(m: &mut Mesh, input: &Mesh, bvh: &Bvh, h: f64, offset: f64) -> usize {
+    let tol = 0.05 * h;
+    let reach = 2.0 * h;
+    let edges: Vec<u32> = m.edge_ids().collect();
+    let snapshot: &Mesh = m;
+    let gaps: Vec<f64> = edges
+        .par_iter()
+        .map(|&e| {
+            let [a, b] = snapshot.edge_vertices(e);
+            surface_gap(input, bvh, 0.5 * (snapshot.vertex(a) + snapshot.vertex(b)), reach, offset)
+        })
+        .collect();
+    let mut flips = 0;
+    for (&e, gap) in edges.iter().zip(gaps) {
+        if gap <= tol || !m.is_edge(e) || m.is_boundary_edge(e) {
+            continue;
+        }
+        let [a, b] = m.oriented_edge_vertices(e);
+        let [c, d] = m.edge_opposite_vertices(e);
+        if c == INVALID || d == INVALID || c == d {
+            continue;
+        }
+        let (pa, pb, pc, pd) = (m.vertex(a), m.vertex(b), m.vertex(c), m.vertex(d));
+        if surface_gap(input, bvh, 0.5 * (pc + pd), reach, offset) > gap - tol {
+            continue;
+        }
+        // After the flip: (c, a, d) and (d, b, c), both facing the old side and not slivers.
+        let navg = (pb - pa).cross(pc - pa) + (pa - pb).cross(pd - pb);
+        let m0 = (pa - pc).cross(pd - pc);
+        let m1 = (pb - pd).cross(pc - pd);
+        let cd2 = pc.distance_squared(pd);
+        if m0.dot(navg) <= 0.0 || m1.dot(navg) <= 0.0 || m0.length() < 0.05 * cd2 || m1.length() < 0.05 * cd2 {
+            continue;
+        }
+        if m.flip_edge(e).is_ok() {
+            flips += 1;
+        }
+    }
+    flips
+}

@@ -68,8 +68,8 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M3.6 Reduce / Smooth parity**: Uniform reduce; Uniform Triangles, Preserve Group Borders,
       Per-Group Membranes smoothing; Smoothing Scale, Constraint Rings.
 - [x] **M3.7 Plane Cut parity**: Fixed Fill, Slice Groups.
-- [ ] **M3.8 Make Solid parity**: Sharp Edge Preserve, Offset Distance, colour/group transfer,
-      Cull Edges Threshold.
+- [x] **M3.8 Make Solid parity**: Sharp Edge Preserve, Offset Distance, group transfer,
+      Cull Edges Threshold. (Colour Transfer Mode needs vertex colours and moves to M6.2.)
 - [ ] **M3.9 Exact mesh booleans** (Precise / Max Quality) alongside the volumetric one.
 
 ## M4 — Transform, deformation and targets
@@ -95,7 +95,8 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 ## M6 — Display and shading
 
 - [ ] **M6.1 Normal modes**: Vertex / Face / Group normals (Preferences + Hotbox).
-- [ ] **M6.2 Vertex colours**: display, colour mode (Group / Vertex / Constant), OBJ/PLY export.
+- [ ] **M6.2 Vertex colours**: display, colour mode (Group / Vertex / Constant), OBJ/PLY export;
+      Make Solid's Color Transfer Mode (No Colors / Vertex-to-Vertex / Material-to-Vertex).
 - [ ] **M6.3 Hotbox parity**: camera drag buttons, background colour, brush Size/Strength.
 - [ ] **M6.4 Material library** (clay variants, glossy, metal, resin).
 - [ ] **M6.5 View cube** (own design) with clickable faces/edges.

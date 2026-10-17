@@ -40,8 +40,8 @@ pub mod winding;
 pub use field::{ImplicitField, MeshSdf};
 pub use grid::{build_field, FieldSource, GridSpec, SparseField};
 pub use solid::{
-    cell_size_for_resolution, hollow, make_solid, mesh_implicit, offset_solid, sdf_boolean, BoolOp, MakeSolidParams,
-    SolidMode,
+    cell_size_for_resolution, hollow, make_solid, mesh_implicit, offset_solid, sdf_boolean, transfer_face_groups, BoolOp,
+    MakeSolidParams, SolidMode,
 };
 pub use winding::{winding_number_exact, WindingNumber};
 

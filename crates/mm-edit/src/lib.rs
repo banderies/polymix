@@ -15,7 +15,6 @@
 //! Every operation edits an [`mm_core::Mesh`] in place and keeps a manifold,
 //! consistently oriented input manifold and consistently oriented.
 
-mod linalg;
 mod triangulate;
 mod util;
 

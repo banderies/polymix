@@ -15,7 +15,7 @@
 //!    of the branch, which is usually the side to trim).
 
 use crate::cut::{compute_curves, curve_summary, point_segment_distance, CutContext};
-use crate::linalg::{add_outer, sym_eigen3};
+use mm_core::linalg::{add_outer, sym_eigen3};
 use crate::util::frame;
 use crate::{EditError, EditResult};
 use mm_core::bvh::RayHit;

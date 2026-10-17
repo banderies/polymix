@@ -1290,6 +1290,7 @@ pub enum SolidType {
     Blocky,
     Fast,
     Accurate,
+    SharpEdges,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1305,6 +1306,9 @@ pub struct MakeSolidUi {
     pub close_holes: bool,
     pub remove_small: bool,
     pub remesh_result: bool,
+    pub transfer_groups: bool,
+    /// "Cull Edges Threshold", 0..100: scales the short-edge collapse from none to full.
+    pub cull_edges: f64,
 }
 
 impl MakeSolidUi {
@@ -1329,6 +1333,8 @@ impl OpSpec for MakeSolidSpec {
             close_holes: true,
             remove_small: true,
             remesh_result: true,
+            transfer_groups: false,
+            cull_edges: 100.0,
         }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
@@ -1337,12 +1343,16 @@ impl OpSpec for MakeSolidSpec {
             ui.selectable_value(&mut p.solid_type, SolidType::Blocky, "Blocky");
             ui.selectable_value(&mut p.solid_type, SolidType::Fast, "Fast");
             ui.selectable_value(&mut p.solid_type, SolidType::Accurate, "Accurate");
+            ui.selectable_value(&mut p.solid_type, SolidType::SharpEdges, "Sharp Edge Preserve")
+                .on_hover_text("Keep the crisp edges and corners of CAD parts");
         });
         let ext = info.mesh.bounds().extents();
         let m = ext.x.max(ext.y).max(ext.z);
         ui.add(egui::Slider::new(&mut p.accuracy, 0.0..=1.0).text("solid accuracy").show_value(false));
         ui.weak(format!("{} cells, voxel size {:.4}", p.cells(), m / p.cells() as f64));
         ui.add(egui::Slider::new(&mut p.density, 0.0..=1.0).text("mesh density"));
+        ui.add(egui::Slider::new(&mut p.cull_edges, 0.0..=100.0).text("cull edges threshold").integer())
+            .on_hover_text("How short an edge must be (relative to the cell size) to be collapsed; 0 keeps every edge");
         let span = (info.bbox_diag * 0.05).max(info.avg_edge * 5.0);
         ui.add(egui::Slider::new(&mut p.offset, -span..=span).text("offset distance"));
         ui.horizontal(|ui| {
@@ -1354,6 +1364,7 @@ impl OpSpec for MakeSolidSpec {
         ui.checkbox(&mut p.close_holes, "Close open boundaries");
         ui.checkbox(&mut p.remove_small, "Remove small floating parts");
         ui.checkbox(&mut p.remesh_result, "Remesh result (better triangles for CFD)");
+        ui.checkbox(&mut p.transfer_groups, "Transfer groups").on_hover_text("Copy the face groups of the input onto the solid");
         if p.cells() >= 512 {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "High accuracy: this can take a while and use a lot of memory.");
         }
@@ -1364,8 +1375,12 @@ impl OpSpec for MakeSolidSpec {
             SolidType::Blocky => mm_solid::SolidMode::Blocky,
             SolidType::Fast => mm_solid::SolidMode::Fast,
             SolidType::Accurate => mm_solid::SolidMode::Accurate,
+            SolidType::SharpEdges => mm_solid::SolidMode::SharpEdges,
         };
+        // Groups go on after the remesh so its group constraints don't keep the raw borders.
+        params.transfer_groups = p.transfer_groups && !p.remesh_result;
         params.offset = p.offset;
+        params.min_edge_length = params.min_edge_length.map(|l| l * (p.cull_edges / 100.0).clamp(0.0, 1.0));
         params.min_thickness = p.use_min_thickness.then_some(p.min_thickness);
         params.close_holes = p.close_holes;
         if !p.remove_small {
@@ -1376,9 +1391,13 @@ impl OpSpec for MakeSolidSpec {
         let mut out = mm_solid::make_solid(mesh, &params, Some(&solid_progress)).map_err(|e| anyhow::anyhow!("{e}"))?;
         if p.remesh_result {
             let target = params.cell_size * (1.5 + (0.3 - 1.5) * p.density.clamp(0.0, 1.0)).max(0.5);
-            let rp = mm_remesh::RemeshParams { target_edge_length: target, iterations: 6, ..Default::default() };
+            let sharp = (p.solid_type == SolidType::SharpEdges).then_some(params.sharp_angle_deg);
+            let rp = mm_remesh::RemeshParams { target_edge_length: target, iterations: 6, preserve_sharp_edges: sharp, ..Default::default() };
             let remesh_progress = |f: f32| progress(0.7 + 0.3 * f);
             mm_remesh::remesh(&mut out, &rp, Some(&remesh_progress))?;
+            if p.transfer_groups {
+                mm_solid::transfer_face_groups(&mut out, mesh);
+            }
         }
         let shells = mm_core::topology::connected_components(&out).len();
         Ok(OpOutput {
@@ -2091,5 +2110,42 @@ mod tests {
         let _ = run_spec::<SmoothSpec>(&tri, None);
         let _ = run_spec::<MakeSolidSpec>(&tri, None);
         let _ = run_spec::<MirrorSpec>(&tri, None);
+    }
+
+    #[test]
+    fn make_solid_sharp_edges_groups_and_cull() {
+        let q = glam::DQuat::from_euler(glam::EulerRot::XYZ, 0.31, 0.47, 0.13);
+        let mut m = mm_core::primitives::cube(1.0, 4);
+        for t in m.triangle_ids().collect::<Vec<_>>() {
+            let n = m.tri_normal(t);
+            let axis = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs())).unwrap();
+            m.set_tri_group(t, (2 * axis + (n[axis] > 0.0) as usize) as i32);
+        }
+        m.transform(|p| q * p);
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal() };
+        let base = MakeSolidUi { accuracy: 0.0, ..MakeSolidSpec::defaults(&info) };
+        let run = |p: MakeSolidUi| MakeSolidSpec::run(&m, None, &p, &|_| true).unwrap().mesh;
+        // Sharp Edge Preserve keeps the cube's edges through the remesh, with its groups.
+        let sharp = run(MakeSolidUi { solid_type: SolidType::SharpEdges, transfer_groups: true, ..base });
+        let soft = run(MakeSolidUi { solid_type: SolidType::Accurate, ..base });
+        assert!(sharp.is_closed());
+        let edge_gap = |out: &Mesh| {
+            let bvh = mm_core::Bvh::build(out);
+            (0..=20)
+                .map(|k| q * DVec3::new(-0.5 + k as f64 / 20.0 * 0.8 + 0.1, 0.5, 0.5))
+                .map(|p| bvh.nearest(out, p, f64::INFINITY).unwrap().dist_sq.sqrt())
+                .fold(0.0, f64::max)
+        };
+        let h = mm_solid::cell_size_for_resolution(&m.bounds(), 64);
+        assert!(edge_gap(&sharp) < 0.1 * h && edge_gap(&sharp) < 0.3 * edge_gap(&soft), "{} vs {}", edge_gap(&sharp), edge_gap(&soft));
+        let mut groups: Vec<i32> = sharp.triangle_ids().map(|t| sharp.tri_group(t)).collect();
+        groups.sort();
+        groups.dedup();
+        assert_eq!(groups.len(), 6);
+        // A lower cull threshold collapses fewer short edges.
+        let raw = MakeSolidUi { remesh_result: false, ..base };
+        let full = run(raw);
+        let none = run(MakeSolidUi { cull_edges: 0.0, ..raw });
+        assert!(none.triangle_count() > full.triangle_count(), "{} > {}", none.triangle_count(), full.triangle_count());
     }
 }
