@@ -1,4 +1,4 @@
-//! Transform (translate / rotate / scale) and Units / Dimensions tools.
+//! Transform (translate / rotate / scale), Face Transform and Soft Transform.
 
 use super::*;
 use crate::ui_util;
@@ -818,91 +818,6 @@ impl Tool for TransformTool {
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
         self.commit(cx)
-    }
-}
-
-/// Units / Dimensions: inspect size and rescale (e.g. metres → millimetres).
-pub struct UnitsTool {
-    object: Option<ObjectId>,
-    target_axis: usize,
-    target_value: f64,
-}
-
-impl UnitsTool {
-    pub fn new(cx: &mut ToolCx) -> Self {
-        let object = cx.scene.active;
-        let e = cx.scene.active().map(|o| o.bounds().extents()).unwrap_or(DVec3::ONE);
-        Self { object, target_axis: 0, target_value: e.x }
-    }
-
-    fn scale_by(&self, cx: &mut ToolCx, s: f64, label: &str) {
-        let Some(id) = self.object.filter(|id| cx.scene.get(*id).is_some()) else { return };
-        cx.history.push(label, cx.scene);
-        let Some(o) = cx.scene.get_mut(id) else { return };
-        let c = o.bounds().center();
-        o.mesh_mut().transform(|p| c + (p - c) * s);
-        *cx.status = format!("{label}: scaled by {s}");
-    }
-}
-
-impl Tool for UnitsTool {
-    fn survives_scene_change(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &'static str {
-        "Units / Dimensions"
-    }
-
-    fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
-        ui_util::section(ui, "Units / Dimensions");
-        let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else {
-            ui.label("No active object.");
-            return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
-        };
-        let b = o.bounds();
-        let e = b.extents();
-        egui::Grid::new("dims").num_columns(2).show(ui, |ui| {
-            for (i, n) in ["Width (X)", "Height (Y)", "Depth (Z)"].iter().enumerate() {
-                ui.label(*n);
-                ui.label(format!("{:.4}", e[i]));
-                ui.end_row();
-            }
-            ui.label("Min");
-            ui.label(format!("{:.3}, {:.3}, {:.3}", b.min.x, b.min.y, b.min.z));
-            ui.end_row();
-            ui.label("Max");
-            ui.label(format!("{:.3}, {:.3}, {:.3}", b.max.x, b.max.y, b.max.z));
-            ui.end_row();
-        });
-        ui.small("Mesh files carry no units; medical exports are usually millimetres.");
-        ui_util::section(ui, "Scale to size");
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("axis").selected_text(["X", "Y", "Z"][self.target_axis]).show_ui(ui, |ui| {
-                for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-                    ui.selectable_value(&mut self.target_axis, i, *n);
-                }
-            });
-            ui.add(egui::DragValue::new(&mut self.target_value).speed(0.1).max_decimals(4));
-        });
-        let cur = e[self.target_axis];
-        if ui.add_enabled(cur > 0.0 && self.target_value > 0.0, egui::Button::new("Apply uniform scale")).clicked() {
-            let s = self.target_value / cur;
-            self.scale_by(cx, s, "Scale to size");
-        }
-        ui_util::section(ui, "Convert units");
-        ui.horizontal_wrapped(|ui| {
-            for (label, s) in [("m → mm", 1000.0), ("cm → mm", 10.0), ("in → mm", 25.4), ("mm → m", 0.001), ("mm → in", 1.0 / 25.4)] {
-                if ui.button(label).clicked() {
-                    self.scale_by(cx, s, label);
-                }
-            }
-        });
-        ui.add_space(8.0);
-        if ui.button("Done").clicked() {
-            return ToolOutcome::Close;
-        }
-        ToolOutcome::Continue
     }
 }
 

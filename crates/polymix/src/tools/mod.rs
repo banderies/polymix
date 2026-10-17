@@ -14,6 +14,7 @@ pub mod add_tube;
 pub mod align;
 pub mod mesh_query;
 pub mod surface_lasso;
+pub mod units;
 pub mod warp;
 pub mod transform;
 pub mod inspector;

@@ -71,7 +71,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "aligntotarget" => Box::new(tools::ops::AlignToTargetTool::new(cx)),
         "fitprimitive" => Box::new(tools::ops::FitPrimitiveTool::new(cx)),
         "addtube" => Box::new(tools::add_tube::AddTubeTool::new(cx)),
-        "units" => Box::new(tools::transform::UnitsTool::new(cx)),
+        "units" => Box::new(tools::units::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
