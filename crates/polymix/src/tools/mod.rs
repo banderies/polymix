@@ -10,6 +10,7 @@ use mm_core::{Mesh, Ray};
 
 pub mod select;
 pub mod lasso;
+pub mod surface_lasso;
 pub mod transform;
 pub mod inspector;
 pub mod ops;

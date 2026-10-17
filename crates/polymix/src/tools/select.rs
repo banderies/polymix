@@ -45,6 +45,10 @@ pub struct SelectTool {
     stroke: Option<Stroke>,
     /// Screen curve being drawn (lasso or laser).
     curve: Option<Vec<egui::Pos2>>,
+    /// Lasso Mode: finished curves on the surface (object, curves of (triangle, point)).
+    surface: Option<(ObjectId, Vec<Vec<(u32, DVec3)>>)>,
+    /// Lasso Mode: the curve being drawn on the surface, and its last screen position.
+    surface_curve: Option<(Vec<(u32, DVec3)>, egui::Pos2)>,
     hover_brush: Option<(DVec3, f64)>,
     /// Selection before the latest click, so a double-click can undo its two brush dabs.
     before_click: Option<(ObjectId, TriSelection, f64)>,
@@ -181,6 +185,8 @@ impl Default for SelectTool {
             exterior: None,
             stroke: None,
             curve: None,
+            surface: None,
+            surface_curve: None,
             hover_brush: None,
             before_click: None,
             expand: None,
@@ -379,6 +385,50 @@ impl SelectTool {
         *cx.status = format!("{} triangles selected", o.selection.len());
     }
 
+    /// Add a finished surface curve; close the loop when it ends near the first curve's start.
+    fn finish_surface_curve(&mut self, cx: &mut ToolCx, pts: Vec<(u32, DVec3)>, deselect: bool) {
+        let Some(id) = cx.scene.active else { return };
+        let (_, curves) = self.surface.get_or_insert((id, Vec::new()));
+        curves.push(pts);
+        let first = curves[0][0].1;
+        let last = curves.last().and_then(|c| c.last()).map(|p| p.1).unwrap_or(first);
+        let n: usize = curves.iter().map(|c| c.len()).sum();
+        let near = match (cx.project(first), cx.project(last)) {
+            (Some(a), Some(b)) => a.distance(b) < 15.0,
+            _ => false,
+        };
+        if n >= 6 && near {
+            self.close_surface_loop(cx, deselect);
+        } else {
+            *cx.status = "Lasso: keep drawing (turn the view as needed); end near the start or press Enter to close".into();
+        }
+    }
+
+    /// Join the surface curves into a loop and select (or deselect) the faces it encloses.
+    fn close_surface_loop(&mut self, cx: &mut ToolCx, deselect: bool) {
+        let Some((id, curves)) = self.surface.take() else { return };
+        let Some(o) = cx.scene.get(id) else { return };
+        let mesh = o.mesh.clone();
+        let waypoints: Vec<u32> = curves.iter().flatten().filter(|(t, _)| mesh.is_triangle(*t)).map(|&(t, p)| surface_lasso::nearest_corner(&mesh, t, p)).collect();
+        let faces = surface_lasso::close_loop(&mesh, &waypoints).map(|lp| surface_lasso::enclosed_faces(&mesh, &lp)).unwrap_or_default();
+        if faces.is_empty() {
+            *cx.status = "The lasso loop does not enclose a region.".into();
+            return;
+        }
+        cx.snapshot("Lasso select");
+        let o = cx.scene.get_mut(id).unwrap();
+        o.selection.sync(&mesh);
+        for t in faces {
+            if deselect {
+                o.selection.remove(t);
+            } else {
+                o.selection.insert(t);
+            }
+        }
+        o.touch_selection();
+        *cx.status = format!("{} triangles selected", o.selection.len());
+    }
+
     /// Add every triangle of the active object that is visible in the current view
     /// (Meshmixer: Modify > Select Visible).
     fn select_visible(&mut self, cx: &mut ToolCx) {
@@ -517,7 +567,18 @@ impl Tool for SelectTool {
                 ui.add(egui::Slider::new(&mut self.crease_deg, 0.0..=180.0).suffix("°").text("Crease angle threshold"))
                     .on_hover_text("The brush and right-drag growth stop at edges sharper than this (0 = off)");
             }
-            SelectMode::Lasso => {}
+            SelectMode::Lasso => {
+                let curves = self.surface.as_ref().map(|(_, c)| c.len()).unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.label(format!("{curves} curve(s)"));
+                    if ui.add_enabled(curves > 0, egui::Button::new("Close loop")).on_hover_text("Enter").clicked() {
+                        self.close_surface_loop(cx, false);
+                    }
+                    if ui.add_enabled(curves > 0, egui::Button::new("Clear")).on_hover_text("Esc").clicked() {
+                        self.surface = None;
+                    }
+                });
+            }
         }
         ui.checkbox(&mut self.through, "Lasso selects through the model")
             .on_hover_text("Include faces hidden behind the visible surface (Meshmixer's laser always cuts through). Turn off to select only what you can see.");
@@ -525,7 +586,7 @@ impl Tool for SelectTool {
         ui.label(format!("{} / {} triangles selected", ui_util::format_count(n_sel), ui_util::format_count(n_tri)));
         ui.small(match self.mode {
             SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation)",
-            SelectMode::Lasso => "Draw a closed loop to select inside, or an open curve across the model to select the smaller side · Shift: deselect",
+            SelectMode::Lasso => "Draw curves on the surface, turning the view between them; end near the start (or press Enter) to select the enclosed faces · A drag from the background is the laser lasso · Shift: deselect",
         });
         ui.small("Double-click: hole border (on an open edge) or connected part · Right-drag: grow / shrink · S: clear");
 
@@ -632,13 +693,29 @@ impl Tool for SelectTool {
                     cx.snapshot("Brush select");
                     self.stroke = Some(Stroke { object: id, deselect, last: None });
                 }
-                // Lasso mode, or a brush drag starting on the background: draw a curve.
+                // Lasso mode on the model: a curve on the surface (part of a multi-curve loop).
+                (SelectMode::Lasso, Some((id, h))) => {
+                    if self.surface.as_ref().is_some_and(|(o, _)| *o != id) {
+                        self.surface = None;
+                    }
+                    cx.scene.active = Some(id);
+                    self.surface_curve = Some((vec![(h.tid, h.point)], pos));
+                }
+                // A drag from the background (either mode): screen lasso / laser.
                 _ => self.curve = Some(vec![pos]),
             }
         }
         if input.down {
             if self.stroke.is_some() {
                 self.paint_at(cx, pos);
+            }
+            if let Some((pts, last)) = &mut self.surface_curve {
+                if last.distance(pos) > 3.0 {
+                    if let Some((_, h)) = cx.pick(pos, cx.scene.active) {
+                        pts.push((h.tid, h.point));
+                        *last = pos;
+                    }
+                }
             }
             if let Some(c) = &mut self.curve {
                 if c.last().map(|l| l.distance(pos) > 2.0).unwrap_or(true) {
@@ -654,6 +731,9 @@ impl Tool for SelectTool {
             }
             if self.curve.is_some() {
                 self.finish_curve(cx, deselect);
+            }
+            if let Some((pts, _)) = self.surface_curve.take() {
+                self.finish_surface_curve(cx, pts, deselect);
             }
         }
         // Hover cursor (brush mode, not while drawing a curve).
@@ -710,6 +790,13 @@ impl Tool for SelectTool {
     }
 
     fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
+        let col = Vec4::new(1.0, 0.85, 0.2, 1.0);
+        let drawing = self.surface_curve.as_ref().map(|(p, _)| p);
+        for c in self.surface.iter().flat_map(|(_, cs)| cs.iter()).chain(drawing) {
+            for w in c.windows(2) {
+                ov.line(w[0].1, w[1].1, col);
+            }
+        }
         if let Some((c, r)) = self.hover_brush {
             ov.brush = Some((c.as_vec3(), r as f32));
         }
@@ -792,8 +879,19 @@ impl Tool for SelectTool {
         true
     }
 
+    fn accept(&mut self, cx: &mut ToolCx) -> bool {
+        // Enter closes a Lasso Mode loop in progress.
+        if self.surface.is_some() {
+            self.close_surface_loop(cx, false);
+        }
+        false
+    }
+
     fn cancel(&mut self, cx: &mut ToolCx) -> bool {
-        // Esc in the select tool clears the selection first, then exits.
+        // Esc drops lasso curves in progress, then clears the selection, then exits.
+        if self.surface.take().is_some() {
+            return false;
+        }
         if cx.scene.active().map(|o| !o.selection.is_empty()).unwrap_or(false) {
             let mut c = CmdCx { scene: cx.scene, history: cx.history, status: cx.status };
             commands::selection_command(&mut c, SelectCmd::Clear);

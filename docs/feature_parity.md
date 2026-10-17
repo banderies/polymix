@@ -132,7 +132,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Wheel in Meshmixer navigation, Shift+wheel in Fusion 360 navigation |
 | RMB-drag expands / contracts the selection | ✅ | With a selection; geodesic distance (other expand modes: ROADMAP M2.5) |
 | Laser Lasso (curve from background; closed = inside, open = smaller side, through the model) | ✅ | |
-| Lasso Mode (multi-curve loop drawn *on the surface*, rotate between curves) | ❌ | |
+| Lasso Mode (multi-curve loop drawn *on the surface*, rotate between curves) | ✅ | Closes when a curve ends near the start, or Enter; Esc clears |
 | Double-click: connected part | ✅ | |
 | Double-click an open-edge triangle: hole-border ring | ✅ | Polymix addition (requested) |
 | S inside Select clears the selection | ✅ | Polymix addition (requested) |
