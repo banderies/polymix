@@ -45,10 +45,10 @@ pub struct SelectTool {
     stroke: Option<Stroke>,
     /// Screen curve being drawn (lasso or laser).
     curve: Option<Vec<egui::Pos2>>,
-    /// Lasso Mode: finished curves on the surface (object, curves of (triangle, point)).
-    surface: Option<(ObjectId, Vec<Vec<(u32, DVec3)>>)>,
+    /// Lasso Mode: finished curves on the surface, per object.
+    surface: Option<(ObjectId, Vec<SurfaceCurve>)>,
     /// Lasso Mode: the curve being drawn on the surface, and its last screen position.
-    surface_curve: Option<(Vec<(u32, DVec3)>, egui::Pos2)>,
+    surface_curve: Option<(SurfaceCurve, egui::Pos2)>,
     hover_brush: Option<(DVec3, f64)>,
     /// Selection before the latest click, so a double-click can undo its two brush dabs.
     before_click: Option<(ObjectId, TriSelection, f64)>,
@@ -215,6 +215,9 @@ impl ExteriorCache {
         e
     }
 }
+
+/// A curve drawn on the surface: (triangle, point) samples.
+type SurfaceCurve = Vec<(u32, DVec3)>;
 
 /// Clicks closer together than this (seconds) may form a double-click.
 const DOUBLE_CLICK_WINDOW: f64 = 0.6;
@@ -386,7 +389,7 @@ impl SelectTool {
     }
 
     /// Add a finished surface curve; close the loop when it ends near the first curve's start.
-    fn finish_surface_curve(&mut self, cx: &mut ToolCx, pts: Vec<(u32, DVec3)>, deselect: bool) {
+    fn finish_surface_curve(&mut self, cx: &mut ToolCx, pts: SurfaceCurve, deselect: bool) {
         let Some(id) = cx.scene.active else { return };
         let (_, curves) = self.surface.get_or_insert((id, Vec::new()));
         curves.push(pts);
