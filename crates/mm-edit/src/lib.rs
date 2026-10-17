@@ -37,7 +37,7 @@ pub use cut::{
     IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,
 };
 pub use extrude::{
-    extrude_selection, offset_selection, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
+    extract_solid, extrude_selection, offset_selection, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
 };
 pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
 pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};

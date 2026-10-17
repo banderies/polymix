@@ -9,11 +9,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Result of running an operation on a copy of the mesh.
+#[derive(Default)]
 pub struct OpOutput {
     pub mesh: Mesh,
     /// Triangles to select afterwards (e.g. the remeshed region).
     pub selection: Option<Vec<u32>>,
     pub message: String,
+    /// Objects to add to the scene on accept (e.g. Extract), as (name suffix, mesh).
+    pub new_objects: Vec<(String, Mesh)>,
+    /// What to show while previewing, when it differs from `mesh` (e.g. the object plus the
+    /// objects it will add).
+    pub preview: Option<Mesh>,
 }
 
 /// Context shown to operation panels.
@@ -158,6 +164,7 @@ impl<S: OpSpec> OpTool<S> {
         let Some((_, out)) = self.result.take() else { return false };
         cx.history.push(S::NAME, cx.scene);
         let Some(o) = cx.scene.get_mut(self.object) else { return true };
+        let base_name = o.name.clone();
         o.set_mesh(out.mesh);
         if let Some(sel) = out.selection {
             let m = o.mesh.clone();
@@ -167,6 +174,10 @@ impl<S: OpSpec> OpTool<S> {
                 }
             }
             o.touch_selection();
+        }
+        for (suffix, mesh) in out.new_objects {
+            let id = cx.scene.add(format!("{base_name} {suffix}"), mesh);
+            cx.scene.active = Some(id);
         }
         *cx.status = format!("{}: {}", S::NAME, out.message);
         true
@@ -264,7 +275,7 @@ impl<S: OpSpec> Tool for OpTool<S> {
     }
 
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {
-        self.result.as_ref().map(|(_, out)| (self.object, &out.mesh))
+        self.result.as_ref().map(|(_, out)| (self.object, out.preview.as_ref().unwrap_or(&out.mesh)))
     }
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
@@ -316,16 +327,37 @@ pub enum ExtrudeMode {
     Extrude,
     /// Move the region with a soft transition, no new walls (Meshmixer Offset, Ctrl+D).
     Offset,
+    /// Copy the region into a new, thickened solid object (Meshmixer Extract, Shift+D).
+    Extract,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExtrudeDir {
+    Normal,
+    /// The region's average normal.
+    Constant,
+    Axis(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ExtrudeParamsUi {
     pub mode: ExtrudeMode,
     pub distance: f64,
-    pub along_normals: bool,
-    pub axis: usize,
+    pub direction: ExtrudeDir,
+    /// End type: flatten the moved region (Flat) or keep its shape (Offset).
+    pub flat_end: bool,
+    /// 0..100: rows of side-wall triangles.
+    pub density: f64,
+    /// 0..100: > 0 gives the side walls their own group (a crease).
+    pub harden: f64,
+    /// Keep the region's face groups (otherwise it becomes a new group).
+    pub preserve_groups: bool,
+    /// Offset: width of the soft transition.
     pub falloff: f64,
-    pub harden: bool,
+    /// Offset: open-boundary vertices stay put.
+    pub preserve_boundary: bool,
+    /// Offset: 0..100, relax the moved triangles afterwards.
+    pub regularity: f64,
 }
 
 pub struct ExtrudeSpec;
@@ -333,29 +365,63 @@ impl OpSpec for ExtrudeSpec {
     type Params = ExtrudeParamsUi;
     const NAME: &'static str = "Extrude / Offset";
     fn defaults(info: &OpInfo) -> Self::Params {
-        ExtrudeParamsUi { mode: ExtrudeMode::Extrude, distance: (info.avg_edge * 3.0).max(1e-4), along_normals: true, axis: 1, falloff: 0.0, harden: true }
+        ExtrudeParamsUi {
+            mode: ExtrudeMode::Extrude,
+            distance: (info.avg_edge * 3.0).max(1e-4),
+            direction: ExtrudeDir::Normal,
+            flat_end: false,
+            density: 20.0,
+            harden: 0.0,
+            preserve_groups: false,
+            falloff: 0.0,
+            preserve_boundary: false,
+            regularity: 25.0,
+        }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut p.mode, ExtrudeMode::Extrude, "Extrude");
-            ui.selectable_value(&mut p.mode, ExtrudeMode::Offset, "Offset");
+            ui.selectable_value(&mut p.mode, ExtrudeMode::Extrude, "Extrude").on_hover_text("D");
+            ui.selectable_value(&mut p.mode, ExtrudeMode::Offset, "Offset").on_hover_text("Cmd+D");
+            ui.selectable_value(&mut p.mode, ExtrudeMode::Extract, "Extract").on_hover_text("Shift+D: a new solid object from the selection");
         });
         let span = (info.bbox_diag * 0.25).max(info.avg_edge * 10.0);
-        ui.add(egui::Slider::new(&mut p.distance, -span..=span).text("distance"));
-        if p.mode == ExtrudeMode::Extrude {
-            ui.horizontal(|ui| {
-                ui.label("Direction");
-                ui.selectable_value(&mut p.along_normals, true, "Normals");
-                ui.selectable_value(&mut p.along_normals, false, "Axis");
-                if !p.along_normals {
-                    for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-                        ui.selectable_value(&mut p.axis, i, *n);
+        ui.add(egui::Slider::new(&mut p.distance, -span..=span).text(if p.mode == ExtrudeMode::Offset { "Distance" } else { "Offset" }));
+        if p.mode != ExtrudeMode::Offset {
+            egui::ComboBox::from_label("Direction")
+                .selected_text(match p.direction {
+                    ExtrudeDir::Normal => "Normal",
+                    ExtrudeDir::Constant => "Constant",
+                    ExtrudeDir::Axis(0) => "X Axis",
+                    ExtrudeDir::Axis(1) => "Y Axis",
+                    ExtrudeDir::Axis(_) => "Z Axis",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut p.direction, ExtrudeDir::Normal, "Normal").on_hover_text("Each vertex along its normal");
+                    ui.selectable_value(&mut p.direction, ExtrudeDir::Constant, "Constant").on_hover_text("The region's average normal");
+                    for (i, n) in ["X Axis", "Y Axis", "Z Axis"].iter().enumerate() {
+                        ui.selectable_value(&mut p.direction, ExtrudeDir::Axis(i), *n);
                     }
-                }
+                });
+            ui.horizontal(|ui| {
+                ui.label("End type");
+                ui.selectable_value(&mut p.flat_end, false, "Offset");
+                ui.selectable_value(&mut p.flat_end, true, "Flat");
             });
-            ui.checkbox(&mut p.harden, "Sharp side edges");
-        } else {
-            ui.add(egui::Slider::new(&mut p.falloff, 0.0..=span).text("soft transition"));
+        }
+        match p.mode {
+            ExtrudeMode::Extrude => {
+                ui.add(egui::Slider::new(&mut p.harden, 0.0..=100.0).text("Harden")).on_hover_text("> 0: side walls get their own face group (a crease)");
+                ui.add(egui::Slider::new(&mut p.density, 0.0..=100.0).text("Density")).on_hover_text("Rows of side-wall triangles");
+                ui.checkbox(&mut p.preserve_groups, "Preserve groups");
+            }
+            ExtrudeMode::Offset => {
+                ui.add(egui::Slider::new(&mut p.falloff, 0.0..=span).text("Soft transition"));
+                ui.add(egui::Slider::new(&mut p.regularity, 0.0..=100.0).text("Regularity")).on_hover_text("Relax the moved triangles");
+                ui.checkbox(&mut p.preserve_boundary, "Preserve boundary");
+            }
+            ExtrudeMode::Extract => {
+                ui.small("Creates a new object: the selection thickened into a closed solid. The original is unchanged.");
+            }
         }
         if info.selection.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select a region first.");
@@ -363,24 +429,59 @@ impl OpSpec for ExtrudeSpec {
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let tris = sel.ok_or_else(|| anyhow::anyhow!("select a region first"))?;
-        let mut m = mesh.clone();
+        let direction = match p.direction {
+            ExtrudeDir::Normal => mm_edit::ExtrudeDirection::Normal,
+            ExtrudeDir::Constant => mm_edit::ExtrudeDirection::Average,
+            ExtrudeDir::Axis(i) => {
+                let mut d = DVec3::ZERO;
+                d[i.min(2)] = 1.0;
+                mm_edit::ExtrudeDirection::Fixed(d)
+            }
+        };
         match p.mode {
             ExtrudeMode::Extrude => {
-                let mut dir = DVec3::ZERO;
-                dir[p.axis] = 1.0;
+                let mut m = mesh.clone();
                 let params = mm_edit::ExtrudeParams {
                     distance: p.distance,
-                    direction: if p.along_normals { mm_edit::ExtrudeDirection::Normal } else { mm_edit::ExtrudeDirection::Fixed(dir) },
-                    harden_sides: p.harden,
-                    ..Default::default()
+                    direction,
+                    side_segments: (1.0 + p.density / 20.0).round().max(1.0) as usize,
+                    harden_sides: p.harden > 0.0,
+                    flat_end: p.flat_end,
+                    new_region_group: !p.preserve_groups,
                 };
                 let r = mm_edit::extrude_selection(&mut m, tris, &params)?;
                 let n = r.side_tris.len();
-                Ok(OpOutput { mesh: m, selection: Some(r.new_region_tris), message: format!("extruded with {n} side triangles") })
+                Ok(OpOutput { mesh: m, selection: Some(r.new_region_tris), message: format!("extruded with {n} side triangles"), ..Default::default() })
             }
             ExtrudeMode::Offset => {
-                let n = mm_edit::offset_selection(&mut m, tris, p.distance, p.falloff)?;
-                Ok(OpOutput { mesh: m, selection: Some(tris.to_vec()), message: format!("moved {n} vertices") })
+                let mut m = mesh.clone();
+                let n = mm_edit::offset_selection_with(&mut m, tris, p.distance, p.falloff, p.preserve_boundary)?;
+                let mut selection = tris.to_vec();
+                let iterations = (p.regularity / 10.0).round() as usize;
+                if iterations > 0 {
+                    let params = mm_remesh::RemeshParams {
+                        iterations,
+                        preserve_group_boundaries: true,
+                        region: Some(tris.to_vec()),
+                        ..Default::default()
+                    };
+                    let r = mm_remesh::remesh(&mut m, &params, None)?;
+                    selection = r.region_triangles.unwrap_or(selection);
+                }
+                Ok(OpOutput { mesh: m, selection: Some(selection), message: format!("moved {n} vertices"), ..Default::default() })
+            }
+            ExtrudeMode::Extract => {
+                let solid = mm_edit::extract_solid(mesh, tris, p.distance, direction, p.flat_end)?;
+                let mut preview = mesh.clone();
+                preview.append_mesh(&solid, preview.max_group_id() + 1);
+                let n = solid.triangle_count();
+                Ok(OpOutput {
+                    mesh: mesh.clone(),
+                    selection: Some(tris.to_vec()),
+                    message: format!("extracted a solid of {n} triangles"),
+                    new_objects: vec![("extract".into(), solid)],
+                    preview: Some(preview),
+                })
             }
         }
     }
@@ -389,11 +490,9 @@ impl OpSpec for ExtrudeSpec {
 pub struct ExtrudeTool;
 impl ExtrudeTool {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(cx: &mut ToolCx, offset: bool) -> OpTool<ExtrudeSpec> {
+    pub fn new(cx: &mut ToolCx, mode: ExtrudeMode) -> OpTool<ExtrudeSpec> {
         let mut t: OpTool<ExtrudeSpec> = OpTool::new(cx);
-        if offset {
-            t.params.mode = ExtrudeMode::Offset;
-        }
+        t.params.mode = mode;
         t
     }
 }
@@ -435,7 +534,7 @@ impl OpSpec for MirrorSpec {
         let at = b.min[p.axis] + (b.max[p.axis] - b.min[p.axis]) * p.position;
         let mut m = mesh.clone();
         let r = mm_edit::mirror(&mut m, mm_core::Plane { normal: n, d: at }, p.weld)?;
-        Ok(OpOutput { mesh: m, selection: None, message: format!("{} triangles added, {} welded", r.new_triangles.len(), r.welded_vertices) })
+        Ok(OpOutput { mesh: m, selection: None, message: format!("{} triangles added, {} welded", r.new_triangles.len(), r.welded_vertices), ..Default::default() })
     }
 }
 pub type MirrorTool = OpTool<MirrorSpec>;
@@ -596,6 +695,7 @@ impl OpSpec for RemeshSpec {
                 r.edge_lengths.mean,
                 r.elapsed.as_secs_f32()
             ),
+            ..Default::default()
         })
     }
 }
@@ -708,7 +808,7 @@ impl OpSpec for SmoothBoundarySpec {
             let g = if p.create_new_groups { offset } else { m.tri_group(t) - offset };
             m.set_tri_group(t, g);
         }
-        Ok(OpOutput { message: format!("smoothed the border of {} triangles", selected.len()), mesh: m, selection: Some(selected) })
+        Ok(OpOutput { message: format!("smoothed the border of {} triangles", selected.len()), mesh: m, selection: Some(selected), ..Default::default() })
     }
 }
 pub type SmoothBoundaryTool = OpTool<SmoothBoundarySpec>;
@@ -811,6 +911,7 @@ impl OpSpec for ReduceSpec {
             mesh: m,
             selection: r.region_triangles,
             message: format!("{} → {} triangles{dev} ({:.2}s)", r.initial_triangles, r.final_triangles, r.elapsed.as_secs_f32()),
+            ..Default::default()
         })
     }
 }
@@ -926,6 +1027,7 @@ impl OpSpec for MakeSolidSpec {
             ),
             mesh: out,
             selection: None,
+            ..Default::default()
         })
     }
 }
@@ -970,7 +1072,7 @@ impl OpSpec for OffsetSolidSpec {
             mm_solid::offset_solid(mesh, p.distance, h, Some(&|f| progress(f)))
         }
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(OpOutput { message: format!("{} triangles", out.triangle_count()), mesh: out, selection: None })
+        Ok(OpOutput { message: format!("{} triangles", out.triangle_count()), mesh: out, selection: None, ..Default::default() })
     }
 }
 pub type OffsetSolidTool = OpTool<OffsetSolidSpec>;
@@ -1068,7 +1170,7 @@ impl OpSpec for EraseFillSpec {
             shape_patch(&mut m, lp, &r, p);
             new_tris.extend(r.new_triangles);
         }
-        Ok(OpOutput { message: format!("replaced {} triangles with {}", tris.len(), new_tris.len()), mesh: m, selection: Some(new_tris) })
+        Ok(OpOutput { message: format!("replaced {} triangles with {}", tris.len(), new_tris.len()), mesh: m, selection: Some(new_tris), ..Default::default() })
     }
 }
 
@@ -1247,7 +1349,7 @@ impl OpSpec for SmoothSpec {
         let vol0 = mm_core::measure::volume(mesh);
         let vol1 = mm_core::measure::volume(&m);
         let msg = if mesh.is_closed() && vol0.abs() > 0.0 { format!("volume change {:+.2}%", (vol1 / vol0 - 1.0) * 100.0) } else { "smoothed".into() };
-        Ok(OpOutput { mesh: m, selection: sel.map(|s| s.to_vec()), message: msg })
+        Ok(OpOutput { mesh: m, selection: sel.map(|s| s.to_vec()), message: msg, ..Default::default() })
     }
 }
 pub type SmoothTool = OpTool<SmoothSpec>;

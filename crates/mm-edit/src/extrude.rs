@@ -12,6 +12,8 @@ use std::collections::{BinaryHeap, HashMap};
 pub enum ExtrudeDirection {
     /// Per-vertex average of the selected faces' normals.
     Normal,
+    /// One direction for the whole region: its average normal (Meshmixer "Constant").
+    Average,
     /// A fixed direction (normalised; the magnitude is given by `distance`).
     Fixed(DVec3),
 }
@@ -27,11 +29,55 @@ pub struct ExtrudeParams {
     pub side_segments: usize,
     /// Give the side walls their own face group (a hard crease for group-aware tools).
     pub harden_sides: bool,
+    /// Flatten the moved region onto one plane across the extrusion direction (Meshmixer
+    /// EndType "Flat"); otherwise it keeps its shape ("Offset").
+    pub flat_end: bool,
+    /// Give the moved region a new face group instead of keeping its groups.
+    pub new_region_group: bool,
 }
 
 impl Default for ExtrudeParams {
     fn default() -> Self {
-        Self { distance: 1.0, direction: ExtrudeDirection::Normal, side_segments: 1, harden_sides: true }
+        Self { distance: 1.0, direction: ExtrudeDirection::Normal, side_segments: 1, harden_sides: true, flat_end: false, new_region_group: false }
+    }
+}
+
+/// Unit direction per region vertex for `dir` (`None`: invalid fixed direction).
+fn region_directions(mesh: &Mesh, region: &[u32], dir: ExtrudeDirection) -> Option<HashMap<u32, DVec3>> {
+    let mut acc: HashMap<u32, DVec3> = HashMap::new();
+    let mut total = DVec3::ZERO;
+    for &t in region {
+        let c = mesh.tri_cross(t);
+        total += c;
+        for v in mesh.triangle(t) {
+            *acc.entry(v).or_insert(DVec3::ZERO) += c;
+        }
+    }
+    let fixed = match dir {
+        ExtrudeDirection::Fixed(d) => {
+            if !(d.length() > 1e-300 && d.is_finite()) {
+                return None;
+            }
+            Some(d.normalize())
+        }
+        ExtrudeDirection::Average => Some(total.normalize_or_zero()),
+        ExtrudeDirection::Normal => None,
+    };
+    for d in acc.values_mut() {
+        *d = fixed.unwrap_or_else(|| d.normalize_or_zero());
+    }
+    Some(acc)
+}
+
+/// Flatten `pts` onto the plane through their mean, perpendicular to `n`.
+fn flatten(pts: &mut [(u32, DVec3)], n: DVec3) {
+    let n = n.normalize_or_zero();
+    if pts.is_empty() || n == DVec3::ZERO {
+        return;
+    }
+    let c = pts.iter().map(|p| p.1).sum::<DVec3>() / pts.len() as f64;
+    for p in pts.iter_mut() {
+        p.1 -= n * (p.1 - c).dot(n);
     }
 }
 
@@ -60,15 +106,6 @@ pub fn extrude_selection(mesh: &mut Mesh, tris: &[u32], params: &ExtrudeParams) 
     if !(params.distance.is_finite() && params.distance.abs() > 1e-300) {
         return Err(EditError::InvalidParameter("extrude distance must be non-zero".into()));
     }
-    let fixed = match params.direction {
-        ExtrudeDirection::Fixed(d) => {
-            if !(d.length() > 1e-300 && d.is_finite()) {
-                return Err(EditError::InvalidParameter("extrude direction must be non-zero".into()));
-            }
-            Some(d.normalize())
-        }
-        ExtrudeDirection::Normal => None,
-    };
     let segs = params.side_segments.max(1);
     let region_group = mesh.tri_group(region[0]);
     let mut in_r = vec![false; mesh.max_tid()];
@@ -89,17 +126,21 @@ pub fn extrude_selection(mesh: &mut Mesh, tris: &[u32], params: &ExtrudeParams) 
         }
     }
 
-    // Displacement per region vertex.
-    let mut disp: HashMap<u32, DVec3> = HashMap::new();
-    for &t in &region {
-        let c = mesh.tri_cross(t);
-        for v in mesh.triangle(t) {
-            *disp.entry(v).or_insert(DVec3::ZERO) += c;
+    // Displacement per region vertex (flattened end: onto one plane across the mean
+    // direction).
+    let dirs = region_directions(mesh, &region, params.direction).ok_or_else(|| EditError::InvalidParameter("extrude direction must be non-zero".into()))?;
+    let mut disp: HashMap<u32, DVec3> = dirs.iter().map(|(&v, &d)| (v, d * params.distance)).collect();
+    if params.flat_end {
+        let mean_dir: DVec3 = dirs.values().copied().sum();
+        let mut moved: Vec<(u32, DVec3)> = disp.iter().map(|(&v, &d)| (v, mesh.vertex(v) + d)).collect();
+        // Plane at the farthest moved point, so the end sits at the full extrusion distance.
+        let n = mean_dir.normalize_or_zero();
+        let far = moved.iter().map(|p| p.1.dot(n) * params.distance.signum()).fold(f64::MIN, f64::max) * params.distance.signum();
+        flatten(&mut moved, n);
+        for (v, p) in moved {
+            let p = p + n * (far - p.dot(n));
+            disp.insert(v, p - mesh.vertex(v));
         }
-    }
-    for d in disp.values_mut() {
-        let dir = fixed.unwrap_or_else(|| d.normalize_or_zero());
-        *d = dir * params.distance;
     }
 
     let mut is_border: HashMap<u32, u32> = HashMap::new();
@@ -135,6 +176,12 @@ pub fn extrude_selection(mesh: &mut Mesh, tris: &[u32], params: &ExtrudeParams) 
         let m = tv.map(|v| is_border.get(&v).copied().unwrap_or(v));
         new_region.push(mesh.append_triangle(m, g)?);
     }
+    if params.new_region_group {
+        let g = new_group(mesh);
+        for &t in &new_region {
+            mesh.set_tri_group(t, g);
+        }
+    }
 
     // Side walls with `segs` rows.
     let side_group = if params.harden_sides { new_group(mesh) } else { region_group };
@@ -166,6 +213,55 @@ pub fn extrude_selection(mesh: &mut Mesh, tris: &[u32], params: &ExtrudeParams) 
     })
 }
 
+/// Extract (Meshmixer *Edit > Extract*, Shift+D): a new closed solid made from the selected
+/// faces thickened by `distance` (top = the faces moved along `direction`, bottom = the
+/// original faces, side walls along the patch border). The input mesh is not changed.
+pub fn extract_solid(mesh: &Mesh, tris: &[u32], distance: f64, direction: ExtrudeDirection, flat_end: bool) -> EditResult<Mesh> {
+    let region = valid_unique_tris(mesh, tris);
+    if region.is_empty() {
+        return Err(EditError::EmptySelection);
+    }
+    if !(distance.is_finite() && distance.abs() > 1e-300) {
+        return Err(EditError::InvalidParameter("extract distance must be non-zero".into()));
+    }
+    let (patch, _) = mesh.submesh(&region);
+    let all: Vec<u32> = patch.triangle_ids().collect();
+    let dirs = region_directions(&patch, &all, direction).ok_or_else(|| EditError::InvalidParameter("extract direction must be non-zero".into()))?;
+    let mut top: Vec<(u32, DVec3)> = dirs.iter().map(|(&v, &d)| (v, patch.vertex(v) + d * distance)).collect();
+    if flat_end {
+        let n: DVec3 = dirs.values().copied().sum::<DVec3>().normalize_or_zero();
+        let far = top.iter().map(|p| p.1.dot(n) * distance.signum()).fold(f64::MIN, f64::max) * distance.signum();
+        flatten(&mut top, n);
+        for p in top.iter_mut() {
+            p.1 += n * (far - p.1.dot(n));
+        }
+    }
+    let top: HashMap<u32, DVec3> = top.into_iter().collect();
+    let mut out = Mesh::new();
+    let mut bottom_id: HashMap<u32, u32> = HashMap::new();
+    let mut top_id: HashMap<u32, u32> = HashMap::new();
+    for v in patch.vertex_ids() {
+        bottom_id.insert(v, out.append_vertex(patch.vertex(v)));
+        top_id.insert(v, out.append_vertex(top.get(&v).copied().unwrap_or(patch.vertex(v))));
+    }
+    for t in patch.triangle_ids() {
+        let [a, b, c] = patch.triangle(t);
+        let g = patch.tri_group(t);
+        out.append_triangle([top_id[&a], top_id[&b], top_id[&c]], g)?;
+        out.append_triangle([bottom_id[&a], bottom_id[&c], bottom_id[&b]], g)?;
+    }
+    // Walls: for a patch-boundary edge a→b (as in its triangle), (a, b, b') and (a, b', a').
+    for e in patch.boundary_edge_ids() {
+        let [a, b] = patch.oriented_edge_vertices(e);
+        let (a0, b0, a1, b1) = (bottom_id[&a], bottom_id[&b], top_id[&a], top_id[&b]);
+        out.append_triangle([a0, b0, b1], 0)?;
+        out.append_triangle([a0, b1, a1], 0)?;
+    }
+    // Inward extracts come out inside-out; orient to positive volume.
+    mm_core::topology::orient_consistently(&mut out);
+    Ok(out)
+}
+
 #[derive(PartialEq)]
 struct HeapItem(f64, u32);
 impl Eq for HeapItem {}
@@ -186,6 +282,12 @@ impl Ord for HeapItem {
 /// the full distance. A selection without border (a whole closed component) moves
 /// uniformly. Returns the number of vertices moved.
 pub fn offset_selection(mesh: &mut Mesh, tris: &[u32], distance: f64, falloff_width: f64) -> EditResult<usize> {
+    offset_selection_with(mesh, tris, distance, falloff_width, false)
+}
+
+/// [`offset_selection`]; with `keep_mesh_boundary`, open-boundary vertices of the region stay
+/// put too (and the soft transition ramps away from them).
+pub fn offset_selection_with(mesh: &mut Mesh, tris: &[u32], distance: f64, falloff_width: f64, keep_mesh_boundary: bool) -> EditResult<usize> {
     let region = valid_unique_tris(mesh, tris);
     if region.is_empty() {
         return Err(EditError::EmptySelection);
@@ -200,7 +302,7 @@ pub fn offset_selection(mesh: &mut Mesh, tris: &[u32], distance: f64, falloff_wi
     let border: Vec<u32> = verts
         .iter()
         .copied()
-        .filter(|&v| mesh.vertex_triangles(v).iter().any(|&t| !in_r[t as usize]))
+        .filter(|&v| mesh.vertex_triangles(v).iter().any(|&t| !in_r[t as usize]) || (keep_mesh_boundary && mesh.is_boundary_vertex(v)))
         .collect();
     let mut weight: HashMap<u32, f64> = verts.iter().map(|&v| (v, 1.0)).collect();
     if !border.is_empty() {

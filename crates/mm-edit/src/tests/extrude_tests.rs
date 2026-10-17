@@ -48,7 +48,7 @@ fn extrude_band_with_two_border_loops() {
     extrude_selection(
         &mut m,
         &sel,
-        &ExtrudeParams { distance: 0.15, direction: ExtrudeDirection::Normal, side_segments: 2, harden_sides: true },
+        &ExtrudeParams { distance: 0.15, direction: ExtrudeDirection::Normal, side_segments: 2, harden_sides: true, ..Default::default() },
     )
     .unwrap();
     assert_valid(&m);
@@ -118,7 +118,7 @@ fn random_extrudes_and_extensions() {
         let sel: Vec<u32> = ids.iter().copied().filter(|&t| m.tri_centroid(t).distance(c) < r).collect();
         let dist = if i % 2 == 0 { 0.05 + 0.3 * rnd() } else { -(0.05 + 0.2 * rnd()) };
         let dir = if i % 3 == 0 { ExtrudeDirection::Fixed(c) } else { ExtrudeDirection::Normal };
-        let p = ExtrudeParams { distance: dist, direction: dir, side_segments: 1 + i % 3, harden_sides: i % 2 == 0 };
+        let p = ExtrudeParams { distance: dist, direction: dir, side_segments: 1 + i % 3, harden_sides: i % 2 == 0, ..Default::default() };
         extrude_selection(&mut m, &sel, &p).unwrap();
         assert_valid(&m);
         assert!(m.is_closed());
@@ -150,5 +150,47 @@ fn random_extrudes_and_extensions() {
         assert_valid(&m);
         assert!(m.is_closed());
         assert!(volume(&m) > 0.0);
+    }
+}
+
+#[test]
+fn extract_makes_a_closed_solid() {
+    let m = mm_core::primitives::icosphere(1.0, 3);
+    let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.5).collect();
+    let area: f64 = cap.iter().map(|&t| m.tri_area(t)).sum();
+    for dist in [0.1, -0.1] {
+        let solid = extract_solid(&m, &cap, dist, ExtrudeDirection::Normal, false).unwrap();
+        solid.check_validity().unwrap();
+        assert!(solid.is_closed(), "extract is watertight");
+        assert!(solid.is_consistently_oriented());
+        let vol = mm_core::measure::volume(&solid);
+        assert!(vol > 0.0, "outward-facing");
+        assert!((vol / (area * 0.1) - 1.0).abs() < 0.25, "volume {vol} ≈ area × thickness {}", area * 0.1);
+    }
+    // The source mesh is untouched.
+    assert_eq!(m.triangle_count(), mm_core::primitives::icosphere(1.0, 3).triangle_count());
+}
+
+#[test]
+fn flat_end_and_constant_direction() {
+    let m = mm_core::primitives::icosphere(1.0, 3);
+    let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.5).collect();
+    // Flat end: the moved region lies in one plane across the extrusion direction (here +Z).
+    let mut a = m.clone();
+    let r = extrude_selection(&mut a, &cap, &ExtrudeParams { distance: 0.2, direction: ExtrudeDirection::Average, flat_end: true, ..Default::default() }).unwrap();
+    let zs: Vec<f64> = r.new_region_tris.iter().flat_map(|&t| a.tri_positions(t)).map(|p| p.z).collect();
+    let (lo, hi) = zs.iter().fold((f64::MAX, f64::MIN), |(l, h), &z| (l.min(z), h.max(z)));
+    assert!(hi - lo < 1e-6, "flat top (spread {})", hi - lo);
+    assert!(hi > 1.0 + 0.19, "at the full extrusion distance above the cap ({hi})");
+    // Constant direction: every moved vertex shifted by the same vector.
+    let mut b = m.clone();
+    let before: Vec<mm_core::DVec3> = m.positions().to_vec();
+    let r = extrude_selection(&mut b, &cap, &ExtrudeParams { distance: 0.2, direction: ExtrudeDirection::Average, ..Default::default() }).unwrap();
+    let interior: Vec<u32> = r.new_region_tris.iter().flat_map(|&t| b.triangle(t)).filter(|&v| (v as usize) < before.len()).collect();
+    for v in interior {
+        let d = b.vertex(v) - before[v as usize];
+        if d.length() > 1e-9 {
+            assert!((d - mm_core::DVec3::new(0.0, 0.0, 0.2)).length() < 1e-6, "constant +Z shift, got {d:?}");
+        }
     }
 }

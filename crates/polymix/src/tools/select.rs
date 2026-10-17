@@ -626,10 +626,13 @@ impl Tool for SelectTool {
                     self.request = Some(Box::new(ops::EraseFillTool::new(cx)));
                 }
                 if ui.button("Extrude").on_hover_text("D").clicked() {
-                    self.request = Some(Box::new(ops::ExtrudeTool::new(cx, false)));
+                    self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Extrude)));
+                }
+                if ui.button("Extract").on_hover_text("Shift+D: new solid object from the selection").clicked() {
+                    self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Extract)));
                 }
                 if ui.button("Offset").on_hover_text("Ctrl/Cmd+D").clicked() {
-                    self.request = Some(Box::new(ops::ExtrudeTool::new(cx, true)));
+                    self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Offset)));
                 }
                 if ui.button("Separate").clicked() {
                     self.cmd(cx, |x| commands::separate_selection(x, false));
@@ -861,9 +864,11 @@ impl Tool for SelectTool {
         } else if i.key_pressed(Key::F) && !cmd {
             self.request = Some(Box::new(ops::EraseFillTool::new(cx)));
         } else if i.key_pressed(Key::D) && !cmd && !shift {
-            self.request = Some(Box::new(ops::ExtrudeTool::new(cx, false)));
+            self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Extrude)));
+        } else if i.key_pressed(Key::D) && shift && !cmd {
+            self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Extract)));
         } else if i.key_pressed(Key::D) && cmd {
-            self.request = Some(Box::new(ops::ExtrudeTool::new(cx, true)));
+            self.request = Some(Box::new(ops::ExtrudeTool::new(cx, ops::ExtrudeMode::Offset)));
         } else if i.key_pressed(Key::R) && !cmd && shift {
             self.request = Some(Box::new(ops::ReduceTool::new(cx)));
         } else if i.key_pressed(Key::R) && !cmd {

@@ -148,9 +148,9 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Erase & Fill (F) | ✅ | Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth, Scale, Bulge, Create New Groups (Meshmixer's defaults) |
 | Edit: Flip Normals | ✅ | |
 | Edit: Create / Clear FaceGroup (Ctrl+G / Ctrl+Shift+G) | ✅ | |
-| Edit: Extrude (D) | ✅ | |
-| Edit: Extract (Shift+D) — offset copy into a new object | ❌ | |
-| Edit: Offset (Ctrl+D) | 🟡 | Distance ✅; Soft Transition, Connected ❌ |
+| Edit: Extrude (D) | ✅ | Harden, Density, Direction Normal / Constant / X / Y / Z, End type Offset / Flat, Preserve groups |
+| Edit: Extract (Shift+D) — offset copy into a new object | ✅ | New closed solid object; Direction and End type |
+| Edit: Offset (Ctrl+D) | 🟡 | Distance, Soft Transition, Preserve Boundary, Regularity ✅; Connected, Accuracy, Preserve Groups ❌ (meaning to confirm in Meshmixer) |
 | Edit: Remesh (R) / Reduce (Shift+R) on the selection | ✅ | In-tool D/F density ±10, T adaptive (Remesh), G preserve groups |
 | Edit: Bridge (two selected regions) | 🟡 | Polymix bridges two boundary loops |
 | Edit: Join (along boundary edges) | ❌ |  |

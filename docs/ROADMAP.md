@@ -51,9 +51,10 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       Threshold (drives RMB-drag expand and brush spread). Vertex Color mode comes with vertex
       colours (M6.2).
 - [x] **M2.6 Lasso Mode**: multi-curve loop drawn on the surface, rotating between curves.
-- [ ] **M2.7 Extract** (Shift+D) and Extrude/Offset parity (Harden, Density, Direction Normal /
+- [x] **M2.7 Extract** (Shift+D) and Extrude/Offset parity (Harden, Density, Direction Normal /
       Constant / Axis, EndType Offset / Flat, Soft Transition, Connected, Preserve Boundary /
-      Groups, Accuracy, Regularity).
+      Groups, Accuracy, Regularity). Offset's Connected / Accuracy / Preserve Groups wait for a
+      live check of their meaning in Meshmixer.
 - [ ] **M2.8 Magic wand** selection.
 
 ## M3 — Repair and topology
