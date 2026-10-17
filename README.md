@@ -61,6 +61,8 @@ for ParaView/VMTK), **Measure** (cross-section equivalent diameter, distances), 
 (signed distance to a reference with colour map, mean/RMS/95th percentile/Hausdorff — handy for
 reporting how much a cleanup changed the geometry), **Units/Dimensions**.
 
+Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs/feature_parity.md](docs/feature_parity.md).
+
 ## Navigation & hotkeys
 
 | Action | Mouse / key |

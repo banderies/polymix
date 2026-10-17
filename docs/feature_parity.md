@@ -4,8 +4,10 @@ Every user-facing feature found in Meshmixer 3.5 (macOS), with its status in Pol
 Sources: Meshmixer 3.5's menus, tool panels, help pages and hotkey sheet, as seen in the
 running application.
 
-**Status:** ✅ done · 🟡 partial (see notes) · ❌ missing · ⚪ low priority for the vessel/CFD
-workflow (3D printing, art, parts library); still in scope for a full replacement.
+**Status:** ✅ done · 🟡 partial (see notes) · ❌ missing · ⚪ low priority (art, parts library) ·
+⛔ out of scope (3D printing — modern slicers cover it; the Inspector stays).
+
+The ordered work queue is [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -24,7 +26,7 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Analysis | 🟡 | see §5 |
 | Shaders (materials) | 🟡 | see §6 |
 | Export | ✅ | |
-| Print (3D print prep) | ⚪ ❌ | |
+| Print (3D print prep) | ⛔ | |
 | Large icon buttons with labels (64/128 px, `*_center`, `*_highres`) | ❌ | Polymix uses text buttons; draw our own icons |
 
 ### File menu
@@ -43,8 +45,8 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Export: OBJ with per-vertex colour | ❌ | Colours are read on import but not shown or written |
 | Export: "Sequence, one file per region" (OBJ/STL) | 🟡 | One STL per face group via Boundary patches |
 | Export: AMF, COLLADA (.dae), VRML, SMESH | ❌ | |
-| Export SVG | ⚪ ❌ | |
-| Print / Send to printer | ⚪ ❌ | |
+| Export SVG | ⛔ | |
+| Print / Send to printer | ⛔ | |
 | Preferences (Alt+T / ⌘,) | 🟡 | View options persist; no Preferences window |
 | Pref: Flip Z-Y axis on import/export (on in your install) | ❌ | Polymix has a Z-up *view* but does not convert file axes |
 | Pref: Mesh Normal Mode Vertex / Face / Group normals | 🟡 | Smooth (+ sharp edges) and flat ✅; group normals ❌ |
@@ -75,7 +77,7 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Previous View / Next View | ❌ | |
 | Orthographic View | ✅ | |
 | Show Grid | ❌ | |
-| Show Printer Bed | ⚪ ❌ | |
+| Show Printer Bed | ⛔ | |
 | Transparent Target | ❌ | |
 | Show Wireframe | ✅ | W |
 | Show Boundaries | ✅ | |
@@ -194,13 +196,13 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Close Cracks | ❌ | Weld near-coincident open edges |
 | Generate Face Groups | ❌ | Segment by crease angle / region |
 | Make Solid | 🟡 | Blocky / Fast / Accurate, accuracy, density, min thickness, close boundaries ✅; Sharp Edge Preserve, offset, colour/group transfer ❌ |
-| Hollow | 🟡 | Hollow wall ✅; escape holes (generate / remove) ❌ |
+| Hollow | ✅ | Hollow wall ✅; escape holes ⛔ (printing) |
 | Make Pattern | ⚪ ❌ | |
 | Separate Shells (Shift+Y) | ✅ | |
 | Add Tube | ❌ | Possibly useful for vessel bypass/repair |
 | Unwrap / UV layout / SetUV | ⚪ ❌ | |
 | Generate / Filter / Split Complex, Convex Decomposition | ⚪ ❌ | |
-| Make Slices | ⚪ ❌ | |
+| Make Slices | ⛔ | |
 | Remesh (whole object) | 🟡 | Relative/Adaptive density, target edge length, Fixed/Refined/Free boundary, sharp edges, groups ✅; Linear Subdivision, Regularity, Transition ❌ |
 | Reduce | 🟡 | Percentage / triangle budget / max deviation ✅; Uniform vs Shape Preserving type ❌ |
 | Smooth (whole object) | 🟡 | Shape Preserving / Membrane / Max Smoothness ✅; Uniform Triangles, Per-Group Membranes ❌ |
@@ -213,11 +215,11 @@ workflow (3D printing, art, parts library); still in scope for a full replacemen
 | Units / Dimensions | ✅ | |
 | Measure | 🟡 | Distance, cross-section diameter ✅; point coords, normal, axis X/Y/Z, min/max interior/exterior, fit cylinder, snapping ❌ |
 | Mesh Query | 🟡 | Statistics panel (counts, size, area, volume, open edges) |
-| Thickness (identify / thicken thin regions) | ❌ | Relevant for vessel wall checks |
+| Thickness (identify / thicken thin regions) | ⛔ | 3D printing wall check |
 | Deviation | ✅ | Signed colour map + statistics |
 | Clearance | ❌ | |
-| Stability, Strength, Orientation, Overhangs/Support, Slicing, Layout/Packing | ⚪ ❌ | 3D printing |
-| Mass properties | 🟡 | Area, volume |
+| Stability, Strength, Orientation, Overhangs/Support, Slicing, Layout/Packing | ⛔ | 3D printing |
+| Mass properties | 🟡 | Area, volume (centre of mass ❌) |
 
 ## 6. Shaders / display
 
@@ -237,20 +239,4 @@ branch lengths/diameters (CSV/VTK) · Check for CFD (incl. self-intersections, t
 quality) · Boundary patches + multi-solid STL · Measure cross-section diameter ·
 crease-angle sharp-edge shading · laser selection on 1M+ triangle meshes · Z-up (RAS) mode ·
 free/turntable camera toggle.
-
----
-
-## Suggested next steps for the vessel workflow
-
-0. Navigation preference with a **Fusion 360 mode** (MMB pan, Shift+MMB tumble, wheel zoom) —
-   your Meshmixer is set to it.
-1. Mouse wheel = brush size in Select/Sculpt (zoom with Alt+RMB / Alt+⌘+LMB), `A` to accept.
-2. Smooth Boundary ("Smooth Loop", `B` with a selection) and Erase & Fill options (smoothness,
-   border rings).
-3. Lasso Mode (curves on the surface) and Select Visible.
-4. Close Cracks, Weld Boundaries, Join.
-5. Thickness analysis.
-6. Remesh: Linear Subdivision, Regularity; in-tool hotkeys D/F/T/G.
-7. Project save/load (`.mix` equivalent) and autosave.
-8. Optional Meshmixer-style light theme and icon palette.
 
