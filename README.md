@@ -65,12 +65,13 @@ reporting how much a cleanup changed the geometry), **Units/Dimensions**.
 
 | Action | Mouse / key |
 |---|---|
-| Tumble (unlimited, over the top and underneath) | Right-drag, or Alt + left-drag |
+| Tumble (free trackball in every direction; *View → Free rotation* off = turntable) | Right-drag, or Alt + left-drag |
 | Pan | Middle-drag, Shift + right-drag, or Alt + Shift + left-drag |
 | Zoom | Scroll / pinch, or Alt + Cmd + left-drag |
 | Focus / wireframe / hotbox | `F` / `W` / `Space` |
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |
+| Switching tools | Opening another tool (hotkey, palette, menu) accepts the current one, as in Meshmixer; only `Esc` / Cancel discards |
 | With a selection | `X` discard, `F` erase & fill, `D` extrude, `Cmd+D` offset, `R` remesh, `Shift+R` reduce, `B` smooth, `E` connected, `I` invert, `G` groups, `O` optimise boundary, `<` `>` shrink/grow, `[` `]` brush size, `S` clear selection |
 | Select tool | Drag on the model: paint · Drag from the background: lasso (closed loop selects inside) or laser cut (open curve selects the smaller side, through the model) · Double-click a triangle at an open edge: select the ring around that hole (then `F` to erase & fill it cleanly) · Double-click elsewhere: connected part · Shift: deselect |
 

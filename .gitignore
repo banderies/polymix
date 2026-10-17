@@ -6,3 +6,5 @@ dist/
 # Sample meshes (may contain patient data; never commit)
 /STLs/
 .vscode/
+# Local reference material (never commit)
+/reference/

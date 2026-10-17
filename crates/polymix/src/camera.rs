@@ -1,9 +1,13 @@
 //! Orbit camera with Meshmixer-style tumble / pan / zoom.
+//!
+//! Tumbling is a free trackball by default: drags rotate about the *view's* own axes, so the
+//! model can be turned to any orientation (including rolling it). A turntable mode that keeps
+//! the up axis vertical is available as an option.
 
 use glam::dcamera::rh::{proj::directx, view as camview};
 use glam::{DMat4, DQuat, DVec2, DVec3, Mat4};
 use mm_core::{Aabb, Ray};
-use std::f64::consts::{FRAC_PI_2, PI, TAU};
+use std::f64::consts::FRAC_PI_2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpAxis {
@@ -15,11 +19,10 @@ pub enum UpAxis {
 pub struct Camera {
     pub target: DVec3,
     pub distance: f64,
-    /// Rotation around the world up axis (radians).
-    pub yaw: f64,
-    /// Elevation above the horizon (radians), unbounded in effect: past ±90° the camera goes
-    /// over the top / underneath and ends up upside down. Kept in (-π, π].
-    pub pitch: f64,
+    /// Camera orientation relative to the up-axis frame (see [`Camera::rotation`]).
+    pub orient: DQuat,
+    /// Free trackball tumbling (true) or turntable around the up axis (false).
+    pub free_orbit: bool,
     pub fov_y: f64,
     pub orthographic: bool,
     pub up_axis: UpAxis,
@@ -32,8 +35,8 @@ impl Default for Camera {
         Self {
             target: DVec3::ZERO,
             distance: 5.0,
-            yaw: 0.6,
-            pitch: 0.35,
+            orient: view_orientation(0.6, 0.35),
+            free_orbit: true,
             fov_y: 35f64.to_radians(),
             orthographic: false,
             up_axis: UpAxis::Y,
@@ -50,14 +53,18 @@ impl Camera {
         }
     }
 
-    /// Camera orientation (camera-to-world rotation; camera looks down its local -Z).
-    pub fn rotation(&self) -> DQuat {
-        let base = match self.up_axis {
+    /// Frame whose Y axis is the world up axis.
+    fn base(&self) -> DQuat {
+        match self.up_axis {
             UpAxis::Y => DQuat::IDENTITY,
             // Map camera-space Y-up onto world Z-up, looking along +Y by default.
-            UpAxis::Z => DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2),
-        };
-        base * DQuat::from_rotation_y(self.yaw) * DQuat::from_rotation_x(-self.pitch)
+            UpAxis::Z => DQuat::from_rotation_x(FRAC_PI_2),
+        }
+    }
+
+    /// Camera orientation (camera-to-world rotation; camera looks down its local -Z).
+    pub fn rotation(&self) -> DQuat {
+        self.base() * self.orient
     }
 
     pub fn forward(&self) -> DVec3 {
@@ -129,12 +136,22 @@ impl Camera {
         2.0 * self.distance * (self.fov_y * 0.5).tan() / height_px.max(1.0)
     }
 
-    /// Free orbit: vertical drags rotate over the top and underneath without limit.
+    /// Rotate the view for a drag of (`dx`, `dy`) screen points.
     pub fn tumble(&mut self, dx: f64, dy: f64) {
-        // Upside down, horizontal drags turn the other way so the model still follows the cursor.
-        let upright = if self.pitch.cos() >= 0.0 { 1.0 } else { -1.0 };
-        self.yaw = wrap_angle(self.yaw - dx * 0.008 * upright);
-        self.pitch = wrap_angle(self.pitch + dy * 0.008);
+        const SPEED: f64 = 0.008;
+        let turn = DQuat::from_rotation_y(-dx * SPEED);
+        let tilt = DQuat::from_rotation_x(-dy * SPEED);
+        self.orient = if self.free_orbit {
+            // Trackball: both rotations about the current view axes, so nothing is locked.
+            self.orient * turn * tilt
+        } else {
+            // Turntable: turn about the up axis (reversed when upside down so the model still
+            // follows the cursor), tilt about the view's horizontal axis.
+            let upright = (self.orient * DVec3::Y).y >= 0.0;
+            let turn = if upright { turn } else { turn.inverse() };
+            turn * self.orient * tilt
+        }
+        .normalize();
     }
 
     pub fn pan(&mut self, dx: f64, dy: f64, viewport_h: f64) {
@@ -168,59 +185,107 @@ impl Camera {
         self.distance = r / (self.fov_y * 0.5).sin() * 1.1;
     }
 
-    /// Snap to the nearest axis-aligned view.
+    /// Snap to the nearest axis-aligned view (view direction and screen-up both along axes).
     pub fn snap_to_axis(&mut self) {
-        self.yaw = wrap_angle((self.yaw / FRAC_PI_2).round() * FRAC_PI_2);
-        self.pitch = wrap_angle((self.pitch / FRAC_PI_2).round() * FRAC_PI_2);
+        let back = nearest_axis(self.orient * DVec3::Z, None);
+        let up = nearest_axis(self.orient * DVec3::Y, Some(back));
+        let right = up.cross(back);
+        self.orient = DQuat::from_mat3(&glam::DMat3::from_cols(right, up, back)).normalize();
     }
 
+    /// Standard view from a heading `yaw` around the up axis and an elevation `pitch`.
     pub fn set_view(&mut self, yaw: f64, pitch: f64) {
-        self.yaw = wrap_angle(yaw);
-        self.pitch = wrap_angle(pitch);
+        self.orient = view_orientation(yaw, pitch);
     }
 }
 
-/// Wrap an angle into (-π, π].
-fn wrap_angle(a: f64) -> f64 {
-    let w = a.rem_euclid(TAU);
-    if w > PI {
-        w - TAU
-    } else {
-        w
+fn view_orientation(yaw: f64, pitch: f64) -> DQuat {
+    DQuat::from_rotation_y(yaw) * DQuat::from_rotation_x(-pitch)
+}
+
+/// The signed coordinate axis closest to `v`, optionally excluding the line of `not`.
+fn nearest_axis(v: DVec3, not: Option<DVec3>) -> DVec3 {
+    let mut best = DVec3::Y;
+    let mut best_dot = f64::MIN;
+    for a in [DVec3::X, DVec3::Y, DVec3::Z, -DVec3::X, -DVec3::Y, -DVec3::Z] {
+        if not.is_some_and(|n| n.dot(a).abs() > 0.5) {
+            continue;
+        }
+        if v.dot(a) > best_dot {
+            best_dot = v.dot(a);
+            best = a;
+        }
     }
+    best
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn orthonormal(c: &Camera) -> bool {
+        c.forward().dot(c.up()).abs() < 1e-9 && c.forward().dot(c.right()).abs() < 1e-9 && (c.up().length() - 1.0).abs() < 1e-9
+    }
+
     #[test]
     fn tumble_goes_over_the_top() {
-        let mut c = Camera { pitch: 0.0, yaw: 0.0, ..Default::default() };
+        let mut c = Camera::default();
+        c.set_view(0.0, 0.0);
         // Drag far enough to rotate 200 degrees vertically.
         let steps = (200f64.to_radians() / 0.008 / 10.0).ceil() as usize;
-        let mut max_pitch: f64 = 0.0;
         for _ in 0..steps {
             c.tumble(0.0, 10.0);
-            max_pitch = max_pitch.max(c.pitch);
-            // The view basis stays orthonormal the whole way round.
-            assert!(c.forward().dot(c.up()).abs() < 1e-9);
+            assert!(orthonormal(&c));
             assert!(c.view().is_finite());
         }
-        assert!(max_pitch > FRAC_PI_2, "pitch must pass straight up");
         // Now upside down: the camera's up points against the world up.
         assert!(c.up().dot(c.world_up()) < 0.0);
     }
 
     #[test]
+    fn free_orbit_can_roll_the_view() {
+        // A turntable can never tilt the horizon; the trackball must, so the model can be
+        // turned to any orientation.
+        let mut c = Camera::default();
+        c.set_view(0.0, 0.0);
+        // Up, right, down, left: a closed loop of drags leaves a net roll about the view axis.
+        for (dx, dy) in [(0.0, 100.0), (100.0, 0.0), (0.0, -100.0), (-100.0, 0.0)] {
+            for _ in 0..10 {
+                c.tumble(dx / 10.0, dy / 10.0);
+            }
+        }
+        assert!(orthonormal(&c));
+        assert!(c.right().dot(c.world_up()).abs() > 0.05, "horizon must tilt in free orbit");
+        // Turntable keeps the horizon level for the same drags.
+        let mut t = Camera { free_orbit: false, ..Default::default() };
+        t.set_view(0.0, 0.0);
+        for (dx, dy) in [(0.0, 100.0), (100.0, 0.0), (0.0, -100.0), (-100.0, 0.0)] {
+            for _ in 0..10 {
+                t.tumble(dx / 10.0, dy / 10.0);
+            }
+        }
+        assert!(t.right().dot(t.world_up()).abs() < 1e-9);
+    }
+
+    #[test]
     fn straight_down_views_are_valid() {
         let mut c = Camera::default();
-        for pitch in [FRAC_PI_2, -FRAC_PI_2, PI] {
+        for pitch in [FRAC_PI_2, -FRAC_PI_2, std::f64::consts::PI] {
             c.set_view(0.3, pitch);
             assert!(c.view().is_finite());
-            assert!(c.forward().dot(c.up()).abs() < 1e-9);
+            assert!(orthonormal(&c));
         }
-        c.set_view(0.0, 3.0 * PI);
-        assert!((c.pitch - PI).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snap_aligns_to_axes() {
+        let mut c = Camera::default();
+        c.tumble(37.0, -12.0);
+        c.tumble(5.0, 80.0);
+        c.snap_to_axis();
+        assert!(orthonormal(&c));
+        for v in [c.forward(), c.up(), c.right()] {
+            assert!((v.abs().max_element() - 1.0).abs() < 1e-9, "{v:?} is not an axis");
+        }
     }
 }

@@ -41,6 +41,46 @@ impl Default for ViewOptions {
 
 const DEFAULT_CREASE_DEG: f32 = 40.0;
 
+/// Destination of a tool switch.
+#[derive(Clone, Debug)]
+enum SwitchTo {
+    /// Open a tool by its script name (see [`make_tool`]).
+    Tool(String),
+    /// Show a category palette (or nothing).
+    Category(Option<Category>),
+}
+
+/// Create a tool by name. Shared by the palette, hotkeys, menus and test scripts.
+fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
+    Some(match name {
+        "select" => Box::new(tools::select::SelectTool::default()),
+        "inspector" => Box::new(tools::inspector::InspectorTool::new(cx)),
+        "transform" => Box::new(tools::transform::TransformTool::new(cx)),
+        "units" => Box::new(tools::transform::UnitsTool::new(cx)),
+        "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
+        "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
+        "remesh" => Box::new(tools::ops::RemeshTool::new(cx)),
+        "reduce" => Box::new(tools::ops::ReduceTool::new(cx)),
+        "smooth" => Box::new(tools::ops::SmoothTool::new(cx)),
+        "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
+        "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
+        "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
+        "flowext" => Box::new(tools::vessel::FlowExtensionTool::new(cx)),
+        "cap" => Box::new(tools::vessel::CapTool::new(cx)),
+        "patches" => Box::new(tools::patches::PatchesTool::new(cx)),
+        "erasefill" => Box::new(tools::ops::EraseFillTool::new(cx)),
+        "extrude" => Box::new(tools::ops::ExtrudeTool::new(cx, false)),
+        "mirror" => Box::new(tools::ops::MirrorTool::new(cx)),
+        "offset" => Box::new(tools::ops::OffsetSolidTool::new(cx)),
+        "boolean" => Box::new(tools::ops::BooleanTool::new(cx)),
+        "bridge" => Box::new(tools::ops::BridgeTool::new(cx)),
+        "deviation" => Box::new(tools::deviation::DeviationTool::new(cx)),
+        "cfdcheck" => Box::new(tools::cfd_check::CfdCheckTool::new(cx)),
+        "centerline" => Box::new(tools::centerline_tool::CenterlineTool::new(cx)),
+        _ => return None,
+    })
+}
+
 type ImportResult = Vec<(String, Mesh, String)>;
 type BoundaryKey = (ObjectId, u64, usize);
 
@@ -55,6 +95,8 @@ pub struct PolymixApp {
     /// Tool stack: the top tool is active; closing a sub-tool returns to the one below.
     tools: Vec<Box<dyn Tool>>,
     category: Option<Category>,
+    /// Tool switch waiting for the current tool to finish computing (then it is accepted).
+    pending_switch: Option<SwitchTo>,
     status: String,
     import_job: Option<Job<ImportResult>>,
     export_job: Option<Job<String>>,
@@ -98,6 +140,7 @@ impl PolymixApp {
             view: ViewOptions::default(),
             tools: Vec::new(),
             category: None,
+            pending_switch: None,
             status: "Welcome to Polymix. Import a mesh to begin (Ctrl/Cmd+O, or drag a file onto the window).".into(),
             import_job: None,
             export_job: None,
@@ -128,6 +171,7 @@ impl PolymixApp {
             app.view.crease_deg = st.get_string("crease_deg").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CREASE_DEG);
             app.show_objects = flag("show_objects", true);
             app.camera.orthographic = flag("orthographic", false);
+            app.camera.free_orbit = flag("free_orbit", true);
             if st.get_string("up_axis").as_deref() == Some("z") {
                 app.camera.up_axis = UpAxis::Z;
             }
@@ -267,19 +311,61 @@ impl PolymixApp {
     // Tools
     // ------------------------------------------------------------------
 
-    fn open_tool(&mut self, tool: Box<dyn Tool>, ctx: &egui::Context, vp: Viewport, replace: bool) {
-        // Tools never commit until accepted, so replacing one simply drops it.
-        if replace {
-            self.close_all_tools(ctx, vp);
+    /// Switch tools the Meshmixer way: leaving a tool for another one (hotkey, palette, menu)
+    /// *accepts* it; only Cancel / Esc discards. A tool that is still computing finishes
+    /// first and the switch happens when its result has been accepted.
+    fn switch_to(&mut self, to: SwitchTo, ctx: &egui::Context, vp: Viewport) {
+        // Switching to Select returns to an open Select tool underneath the current sub-tool.
+        let keep = match &to {
+            SwitchTo::Tool(n) if n == "select" => self.tools.iter().position(|t| t.name() == "Select").map(|i| i + 1).unwrap_or(0),
+            _ => 0,
+        };
+        if !self.accept_tools(keep, ctx, vp) {
+            if self.pending_switch.is_none() {
+                self.status = "Finishing the current tool before switching…".into();
+            }
+            self.pending_switch = Some(to);
+            return;
         }
-        self.tools.push(tool);
+        self.pending_switch = None;
+        match to {
+            SwitchTo::Tool(name) => {
+                self.category = None;
+                if keep == 0 {
+                    let mut cx = self.tool_cx(ctx, vp);
+                    if let Some(t) = make_tool(&name, &mut cx) {
+                        self.tools.push(t);
+                    }
+                }
+            }
+            SwitchTo::Category(c) => self.category = c,
+        }
     }
 
-    fn close_all_tools(&mut self, ctx: &egui::Context, vp: Viewport) {
-        while let Some(mut t) = self.tools.pop() {
+    /// Accept and close tools from the top of the stack until `keep` remain. Returns false
+    /// while a tool is still computing (it is accepted once its result is ready).
+    fn accept_tools(&mut self, keep: usize, ctx: &egui::Context, vp: Viewport) -> bool {
+        while self.tools.len() > keep {
+            let mut t = self.tools.pop().unwrap();
             let mut cx = self.tool_cx(ctx, vp);
+            // `accept` may start computing an out-of-date result; wait for it in that case.
+            if t.busy().is_some() || (!t.accept(&mut cx) && t.busy().is_some()) {
+                self.tools.push(t);
+                return false;
+            }
             t.on_close(&mut cx);
         }
+        true
+    }
+
+    /// Accept the open tools before a command that changes the scene (menu actions). False
+    /// (with a status message) while a tool is still computing.
+    fn accept_tools_for_command(&mut self, ctx: &egui::Context, vp: Viewport) -> bool {
+        if self.accept_tools(0, ctx, vp) {
+            return true;
+        }
+        self.status = "Wait for the current tool to finish (or cancel it with Esc).".into();
+        false
     }
 
     /// The scene changed underneath the tools (undo/redo, object added/removed/merged):
@@ -393,17 +479,23 @@ impl PolymixApp {
                 ui.separator();
                 if ui.button("Duplicate object").clicked() {
                     ui.close();
-                    commands::duplicate_object(&mut self.cmd_cx());
+                    if self.accept_tools_for_command(&ctx, vp) {
+                        commands::duplicate_object(&mut self.cmd_cx());
+                    }
                 }
                 if ui.button("Combine visible objects").clicked() {
                     ui.close();
-                    commands::combine_visible(&mut self.cmd_cx());
-                    self.scene_changed(&ctx, vp);
+                    if self.accept_tools_for_command(&ctx, vp) {
+                        commands::combine_visible(&mut self.cmd_cx());
+                        self.scene_changed(&ctx, vp);
+                    }
                 }
                 if ui.button("Separate shells").clicked() {
                     ui.close();
-                    commands::separate_shells(&mut self.cmd_cx());
-                    self.scene_changed(&ctx, vp);
+                    if self.accept_tools_for_command(&ctx, vp) {
+                        commands::separate_shells(&mut self.cmd_cx());
+                        self.scene_changed(&ctx, vp);
+                    }
                 }
             });
             ui.menu_button("View", |ui| {
@@ -415,6 +507,8 @@ impl PolymixApp {
                 ui.checkbox(&mut self.view.group_colors, "Face group colors");
                 ui.checkbox(&mut self.view.boundaries, "Show open boundaries");
                 ui.checkbox(&mut self.camera.orthographic, "Orthographic");
+                ui.checkbox(&mut self.camera.free_orbit, "Free rotation")
+                    .on_hover_text("On: tumble freely in every direction (trackball). Off: turntable that keeps the up axis vertical.");
                 ui.checkbox(&mut self.show_objects, "Object browser");
                 ui.checkbox(&mut self.view.show_stats, "Statistics");
                 ui.separator();
@@ -467,17 +561,12 @@ impl PolymixApp {
         }
         let sel_active = self.tools.first().map(|t| t.name() == "Select").unwrap_or(false);
         if big(ui, "Select", sel_active).on_hover_text("S").clicked() {
-            self.category = None;
-            self.open_tool(Box::new(tools::select::SelectTool::default()), &ctx, vp, true);
+            self.switch_to(SwitchTo::Tool("select".into()), &ctx, vp);
         }
         for (cat, label) in [(Category::Sculpt, "Sculpt"), (Category::Edit, "Edit"), (Category::Vessel, "Vessel"), (Category::Analysis, "Analysis")] {
             if big(ui, label, self.category == Some(cat) && self.tools.is_empty()).clicked() {
-                if self.category == Some(cat) && self.tools.is_empty() {
-                    self.category = None;
-                } else {
-                    self.category = Some(cat);
-                    self.open_tool_replace_none(&ctx, vp);
-                }
+                let to = if self.category == Some(cat) && self.tools.is_empty() { None } else { Some(cat) };
+                self.switch_to(SwitchTo::Category(to), &ctx, vp);
             }
         }
         if big(ui, "Export", false).on_hover_text("⌘E").clicked() {
@@ -485,48 +574,44 @@ impl PolymixApp {
         }
     }
 
-    fn open_tool_replace_none(&mut self, ctx: &egui::Context, vp: Viewport) {
-        self.close_all_tools(ctx, vp);
-    }
-
     fn category_panel(&mut self, ui: &mut egui::Ui, cat: Category, vp: Viewport) {
         let ctx = ui.ctx().clone();
         let has_obj = self.scene.active().is_some();
-        let mut open: Option<Box<dyn Tool>> = None;
+        let mut open: Option<&str> = None;
         match cat {
             Category::Edit => {
                 ui_util::section(ui, "Edit");
                 ui.add_enabled_ui(has_obj, |ui| {
-                    let mut cx = self.tool_cx(&ctx, vp);
+                    let cx = self.tool_cx(&ctx, vp);
                     if ui.button("Transform  (T)").clicked() {
-                        open = Some(Box::new(tools::transform::TransformTool::new(&mut cx)));
+                        open = Some("transform");
                     }
                     if ui.button("Plane Cut").clicked() {
-                        open = Some(Box::new(tools::plane_cut::PlaneCutTool::new(&mut cx)));
+                        open = Some("planecut");
                     }
                     if ui.button("Mirror").clicked() {
-                        open = Some(Box::new(tools::ops::MirrorTool::new(&mut cx)));
+                        open = Some("mirror");
                     }
                     if ui.button("Make Solid").clicked() {
-                        open = Some(Box::new(tools::ops::MakeSolidTool::new(&mut cx)));
+                        open = Some("makesolid");
                     }
                     if ui.button("Remesh").clicked() {
-                        open = Some(Box::new(tools::ops::RemeshTool::new(&mut cx)));
+                        open = Some("remesh");
                     }
                     if ui.button("Reduce").clicked() {
-                        open = Some(Box::new(tools::ops::ReduceTool::new(&mut cx)));
+                        open = Some("reduce");
                     }
                     if ui.button("Smooth").clicked() {
-                        open = Some(Box::new(tools::ops::SmoothTool::new(&mut cx)));
+                        open = Some("smooth");
                     }
                     if ui.button("Offset / Hollow").clicked() {
-                        open = Some(Box::new(tools::ops::OffsetSolidTool::new(&mut cx)));
+                        open = Some("offset");
                     }
                     if ui.button("Boolean").clicked() {
-                        open = Some(Box::new(tools::ops::BooleanTool::new(&mut cx)));
+                        open = Some("boolean");
                     }
                     if ui.button("Bridge boundaries").clicked() {
-                        open = Some(Box::new(tools::ops::BridgeTool::new(&mut cx)));
+                        open = Some("bridge");
                     }
                     ui.separator();
                     if ui.button("Separate Shells  (Shift+Y)").clicked() {
@@ -546,27 +631,26 @@ impl PolymixApp {
             Category::Vessel => {
                 ui_util::section(ui, "Vessel / CFD prep");
                 ui.add_enabled_ui(has_obj, |ui| {
-                    let mut cx = self.tool_cx(&ctx, vp);
                     if ui.button("Trim branch (square cut)").on_hover_text("Click a vessel to cut it perpendicular to its axis and cap it").clicked() {
-                        open = Some(Box::new(tools::vessel::TrimTool::new(&mut cx)));
+                        open = Some("trim");
                     }
                     if ui.button("Flow extensions").on_hover_text("Extrude straight extensions from open (cut) ends").clicked() {
-                        open = Some(Box::new(tools::vessel::FlowExtensionTool::new(&mut cx)));
+                        open = Some("flowext");
                     }
                     if ui.button("Cap open ends").on_hover_text("Flat-cap every open boundary").clicked() {
-                        open = Some(Box::new(tools::vessel::CapTool::new(&mut cx)));
+                        open = Some("cap");
                     }
                     if ui.button("Measure diameter").clicked() {
-                        open = Some(Box::new(tools::measure::MeasureTool::new(&mut cx)));
+                        open = Some("measure");
                     }
                     if ui.button("Centerline").on_hover_text("Vessel centerline tree with branch lengths and diameters; export CSV/VTK").clicked() {
-                        open = Some(Box::new(tools::centerline_tool::CenterlineTool::new(&mut cx)));
+                        open = Some("centerline");
                     }
                     if ui.button("Boundary patches / CFD export").on_hover_text("Name wall/inlet/outlet patches and export multi-solid STL").clicked() {
-                        open = Some(Box::new(tools::patches::PatchesTool::new(&mut cx)));
+                        open = Some("patches");
                     }
                     if ui.button("Check for CFD").on_hover_text("Watertight, manifold, self-intersections, triangle quality, patches").clicked() {
-                        open = Some(Box::new(tools::cfd_check::CfdCheckTool::new(&mut cx)));
+                        open = Some("cfdcheck");
                     }
                 });
                 ui.small("Typical workflow: Inspector → Separate shells (delete fragments) → Smooth → Trim branches → Flow extensions → Remesh → Check for CFD → Boundary patches / export.");
@@ -574,36 +658,34 @@ impl PolymixApp {
             Category::Analysis => {
                 ui_util::section(ui, "Analysis");
                 ui.add_enabled_ui(has_obj, |ui| {
-                    let mut cx = self.tool_cx(&ctx, vp);
                     if ui.button("Inspector  (I)").clicked() {
-                        open = Some(Box::new(tools::inspector::InspectorTool::new(&mut cx)));
+                        open = Some("inspector");
                     }
                     if ui.button("Measure").clicked() {
-                        open = Some(Box::new(tools::measure::MeasureTool::new(&mut cx)));
+                        open = Some("measure");
                     }
                     if ui.button("Units / Dimensions").clicked() {
-                        open = Some(Box::new(tools::transform::UnitsTool::new(&mut cx)));
+                        open = Some("units");
                     }
                     if ui.button("Check for CFD").clicked() {
-                        open = Some(Box::new(tools::cfd_check::CfdCheckTool::new(&mut cx)));
+                        open = Some("cfdcheck");
                     }
                     if ui.button("Deviation (compare to reference)").on_hover_text("Colour map of the distance to another object, e.g. the original segmentation").clicked() {
-                        open = Some(Box::new(tools::deviation::DeviationTool::new(&mut cx)));
+                        open = Some("deviation");
                     }
                 });
             }
             Category::Sculpt => {
                 ui_util::section(ui, "Sculpt");
                 ui.add_enabled_ui(has_obj, |ui| {
-                    let mut cx = self.tool_cx(&ctx, vp);
                     if ui.button("Surface brushes").clicked() {
-                        open = Some(Box::new(tools::sculpt::SculptTool::new(&mut cx)));
+                        open = Some("sculpt");
                     }
                 });
             }
         }
-        if let Some(t) = open {
-            self.open_tool(t, &ctx, vp, true);
+        if let Some(name) = open {
+            self.switch_to(SwitchTo::Tool(name.into()), &ctx, vp);
         }
     }
 
@@ -708,14 +790,18 @@ impl PolymixApp {
                 o.visible = true;
             }
         }
+        let ctx = ui.ctx().clone();
         if let Some(id) = duplicate {
-            self.scene.active = Some(id);
-            commands::duplicate_object(&mut self.cmd_cx());
+            if self.accept_tools_for_command(&ctx, self.vp_prev(&ctx)) {
+                self.scene.active = Some(id);
+                commands::duplicate_object(&mut self.cmd_cx());
+            }
         }
         if let Some(id) = delete {
-            commands::delete_object(&mut self.cmd_cx(), id);
-            let ctx = ui.ctx().clone();
-            self.scene_changed(&ctx, self.vp_prev(&ctx));
+            if self.accept_tools_for_command(&ctx, self.vp_prev(&ctx)) {
+                commands::delete_object(&mut self.cmd_cx(), id);
+                self.scene_changed(&ctx, self.vp_prev(&ctx));
+            }
         }
         if self.scene.objects.is_empty() {
             ui.weak("(empty scene)");
@@ -764,6 +850,7 @@ impl PolymixApp {
                 ui.set_width(300.0);
                 ui.strong("Camera");
                 ui.horizontal(|ui| {
+                    ui.toggle_value(&mut self.camera.free_orbit, "Free").on_hover_text("Free rotation (trackball) instead of a turntable");
                     if ui.button("Snap").on_hover_text("Snap to nearest axis view").clicked() {
                         self.camera.snap_to_axis();
                     }
@@ -1208,6 +1295,15 @@ impl PolymixApp {
                 }
             }
             "zup" => self.camera.up_axis = UpAxis::Z,
+            "tumble" => {
+                // tumble:dx,dy — rotate as if dragged by (dx, dy) points.
+                let v: Vec<f64> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 2 {
+                    for _ in 0..10 {
+                        self.camera.tumble(v[0] / 10.0, v[1] / 10.0);
+                    }
+                }
+            }
             "select_all" => commands::selection_command(&mut self.cmd_cx(), commands::SelectCmd::All),
             "duplicate" => commands::duplicate_object(&mut self.cmd_cx()),
             "activate" => {
@@ -1240,14 +1336,14 @@ impl PolymixApp {
                 }
             }
             "category" => {
-                self.close_all_tools(ctx, vp);
-                self.category = match arg.as_str() {
+                let c = match arg.as_str() {
                     "edit" => Some(Category::Edit),
                     "vessel" => Some(Category::Vessel),
                     "analysis" => Some(Category::Analysis),
                     "sculpt" => Some(Category::Sculpt),
                     _ => None,
                 };
+                self.switch_to(SwitchTo::Category(c), ctx, vp);
             }
             "toolcmd" => {
                 if let Some(mut t) = self.tools.pop() {
@@ -1264,40 +1360,7 @@ impl PolymixApp {
                     }
                 }
             }
-            "tool" => {
-                let mut cx = self.tool_cx(ctx, vp);
-                let t: Option<Box<dyn Tool>> = match arg.as_str() {
-                    "select" => Some(Box::new(tools::select::SelectTool::default())),
-                    "inspector" => Some(Box::new(tools::inspector::InspectorTool::new(&mut cx))),
-                    "transform" => Some(Box::new(tools::transform::TransformTool::new(&mut cx))),
-                    "units" => Some(Box::new(tools::transform::UnitsTool::new(&mut cx))),
-                    "measure" => Some(Box::new(tools::measure::MeasureTool::new(&mut cx))),
-                    "sculpt" => Some(Box::new(tools::sculpt::SculptTool::new(&mut cx))),
-                    "remesh" => Some(Box::new(tools::ops::RemeshTool::new(&mut cx))),
-                    "reduce" => Some(Box::new(tools::ops::ReduceTool::new(&mut cx))),
-                    "smooth" => Some(Box::new(tools::ops::SmoothTool::new(&mut cx))),
-                    "makesolid" => Some(Box::new(tools::ops::MakeSolidTool::new(&mut cx))),
-                    "planecut" => Some(Box::new(tools::plane_cut::PlaneCutTool::new(&mut cx))),
-                    "trim" => Some(Box::new(tools::vessel::TrimTool::new(&mut cx))),
-                    "flowext" => Some(Box::new(tools::vessel::FlowExtensionTool::new(&mut cx))),
-                    "cap" => Some(Box::new(tools::vessel::CapTool::new(&mut cx))),
-                    "patches" => Some(Box::new(tools::patches::PatchesTool::new(&mut cx))),
-                    "erasefill" => Some(Box::new(tools::ops::EraseFillTool::new(&mut cx))),
-                    "extrude" => Some(Box::new(tools::ops::ExtrudeTool::new(&mut cx, false))),
-                    "mirror" => Some(Box::new(tools::ops::MirrorTool::new(&mut cx))),
-                    "offset" => Some(Box::new(tools::ops::OffsetSolidTool::new(&mut cx))),
-                    "boolean" => Some(Box::new(tools::ops::BooleanTool::new(&mut cx))),
-                    "bridge" => Some(Box::new(tools::ops::BridgeTool::new(&mut cx))),
-                    "deviation" => Some(Box::new(tools::deviation::DeviationTool::new(&mut cx))),
-                    "cfdcheck" => Some(Box::new(tools::cfd_check::CfdCheckTool::new(&mut cx))),
-                    "centerline" => Some(Box::new(tools::centerline_tool::CenterlineTool::new(&mut cx))),
-                    _ => None,
-                };
-                if let Some(t) = t {
-                    self.close_all_tools(ctx, vp);
-                    self.tools.push(t);
-                }
-            }
+            "tool" => self.switch_to(SwitchTo::Tool(arg.clone()), ctx, vp),
             other => log::warn!("unknown script step {other}"),
         }
     }
@@ -1385,25 +1448,22 @@ impl PolymixApp {
         if i.key_pressed(Key::F) && !cmd {
             self.camera.focus(&self.scene.bounds());
         }
-        if self.tools.is_empty() && self.scene.active().is_some() {
-            let mut open: Option<Box<dyn Tool>> = None;
-            {
-                let mut cx = self.tool_cx(ctx, vp);
-                if i.key_pressed(Key::S) && !cmd {
-                    open = Some(Box::new(tools::select::SelectTool::default()));
-                } else if i.key_pressed(Key::I) && !cmd {
-                    open = Some(Box::new(tools::inspector::InspectorTool::new(&mut cx)));
-                } else if i.key_pressed(Key::T) && !cmd {
-                    open = Some(Box::new(tools::transform::TransformTool::new(&mut cx)));
-                }
-            }
-            if i.key_pressed(Key::Y) && i.modifiers.shift {
+        if self.scene.active().is_some() && !cmd {
+            // Tool hotkeys work from inside other tools too: the open tool is accepted first.
+            let to = if i.key_pressed(Key::S) {
+                Some("select")
+            } else if i.key_pressed(Key::I) {
+                Some("inspector")
+            } else if i.key_pressed(Key::T) && !i.modifiers.shift {
+                Some("transform")
+            } else {
+                None
+            };
+            if let Some(name) = to {
+                self.switch_to(SwitchTo::Tool(name.into()), ctx, vp);
+            } else if i.key_pressed(Key::Y) && i.modifiers.shift && self.accept_tools_for_command(ctx, vp) {
                 commands::separate_shells(&mut self.cmd_cx());
                 self.scene_changed(ctx, vp);
-            }
-            if let Some(t) = open {
-                self.category = None;
-                self.tools.push(t);
             }
         }
     }
@@ -1424,6 +1484,7 @@ impl eframe::App for PolymixApp {
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));
         st.set_string("orthographic", b(self.camera.orthographic));
+        st.set_string("free_orbit", b(self.camera.free_orbit));
         st.set_string("up_axis", if self.camera.up_axis == UpAxis::Z { "z".into() } else { "y".into() });
         st.set_string("export_ascii", b(self.export_ascii));
         st.set_string("recent", self.recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
@@ -1444,6 +1505,11 @@ impl eframe::App for PolymixApp {
         // The viewport rect is only known after the side panels are laid out; tools that need it
         // during panel drawing use the previous frame's value.
         let vp_prev = Viewport { rect: ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::NULL.with("vp_rect"))).unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))) };
+
+        if let Some(to) = self.pending_switch.clone() {
+            self.switch_to(to, &ctx, vp_prev);
+            ctx.request_repaint();
+        }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, vp_prev));
         egui::Panel::bottom("status").show(ui, |ui| {
