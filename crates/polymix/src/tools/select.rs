@@ -764,6 +764,26 @@ impl Tool for SelectTool {
                 }
             });
         });
+        ui_util::section(ui, "Convert To");
+        ui.add_enabled_ui(has_sel, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                use crate::parts::ConvertTo;
+                for (label, hint, what) in [
+                    ("Open Part", "Save the selection as a part that welds into surfaces along its border (Meshmix > My parts)", ConvertTo::OpenPart),
+                    ("Solid Part", "Save a closed selection (a whole shell) as a solid part", ConvertTo::SolidPart),
+                    ("Stamp", "Save the selection's outline as a Stamp stencil", ConvertTo::Stamp),
+                ] {
+                    if ui.button(label).on_hover_text(hint).clicked() {
+                        if let Some(o) = cx.scene.active() {
+                            *cx.status = match crate::parts::convert_selection(&o.mesh, &o.selection.to_vec(), what) {
+                                Ok(msg) => msg,
+                                Err(e) => format!("Convert To {label}: {e}"),
+                            };
+                        }
+                    }
+                }
+            });
+        });
         ui.add_space(10.0);
         if ui.button("Done").clicked() {
             return ToolOutcome::Close;

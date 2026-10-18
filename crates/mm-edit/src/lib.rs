@@ -28,6 +28,7 @@ pub mod face_groups;
 pub mod fit;
 pub mod flow;
 pub mod mirror;
+pub mod part;
 pub mod region;
 pub mod smooth;
 pub mod soft;
@@ -51,6 +52,7 @@ pub use extrude::{
 };
 pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
 pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};
+pub use part::{builtin_parts, drop_open_part, place_part, DropResult, Part, PartKind, Placement};
 pub use region::{discard, duplicate, flip_normals, separate};
 pub use smooth::smooth_boundary;
 pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion};

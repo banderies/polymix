@@ -8,6 +8,7 @@ mod icons;
 mod jobs;
 mod materials;
 mod navigation;
+mod parts;
 mod project;
 mod renderer;
 mod scene;

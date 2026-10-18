@@ -25,6 +25,7 @@ pub mod vessel;
 pub mod measure;
 pub mod sculpt;
 pub mod stamp;
+pub mod drop_part;
 pub mod patches;
 pub mod boolean;
 pub mod deviation;

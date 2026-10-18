@@ -6,6 +6,7 @@ use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Import,
+    Meshmix,
     Select,
     Sculpt,
     Edit,
@@ -69,6 +70,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Shaders => {
             painter.circle(p(0.5, 0.5), s * 0.4, color.gamma_multiply(0.3), stroke);
             painter.circle_filled(p(0.36, 0.36), s * 0.1, color);
+        }
+        Icon::Meshmix => {
+            // A ball with a part dropped on top.
+            painter.circle_stroke(p(0.5, 0.62), s * 0.32, stroke);
+            painter.circle_filled(p(0.5, 0.24), s * 0.15, color);
         }
     }
 }

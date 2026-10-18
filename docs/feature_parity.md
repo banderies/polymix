@@ -18,7 +18,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | Import | ✅ | Polymix palette: Import · Select · Sculpt · Edit · Vessel · Analysis · Export |
-| Meshmix (parts library: drop parts) | ⚪ ❌ | parts in Arms/Ears/Heads/… |
+| Meshmix (parts library: drop parts) | ⚪ 🟡 | Own generated parts — solid: Sphere, Cube, Cylinder, Cone, Capsule, Torus; open: Disc, Dome, Boss, Spike, Ring — plus My parts. Drop Part: open parts are welded into the surface (follow surface, blend width), solid parts Boolean Union / Difference / Append / New Object. Meshmixer's art library (Arms, Ears, Heads…) is Autodesk content and not included |
 | Select | ✅ | |
 | Sculpt | 🟡 | see §3 |
 | Stamp (4) | ⚪ 🟡 | Sculpt → Stamp: polygon stencils (Circle, Square, Triangle, Hexagon, Star, Arrow, Heart) cut into the surface facing the stamp, inside → new face group or hole; rotation, Snap Dimension. Meshmixer's stencil library and Convert To Stamp ❌ |
@@ -166,7 +166,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Deform: Transform selection (T) | ✅ | Face Transform: T in Select with a selection; frame along the selection normal; Shared Frame, Fixed Boundary |
 | Deform: Soft Transform (Shift+T) | ✅ | Linear / Nonlinear (ARAP) Deformation, Flat / Stretchy Transition; Boundary Continuity Boundaries / SoftPosition / SoftTangent; Falloff, Fixed Boundary, Ignore Groups, Shared Frame. Refine Mesh ❌ |
 | Deform: Warp | ✅ | Right-click adds/removes handles, drag to warp; smooth (biharmonic) or detail-preserving (ARAP); handle size |
-| **Convert To**: Open Part / Solid Part / Stamp | ⚪ ❌ | |
+| **Convert To**: Open Part / Solid Part / Stamp | ✅ | Saved to the user's library (data directory `parts/`, `stencils/`); open parts need one border loop, solid parts a closed shell |
 
 ## 3. Sculpt
 

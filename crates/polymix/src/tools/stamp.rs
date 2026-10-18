@@ -1,7 +1,8 @@
 //! Stamp (Meshmixer's Stamp tool, hotkey 4): pick a stencil, then drag on the model from
 //! where the stamp should be centred; the drag sets its size. On release the outline is cut
 //! into the surface and the inside becomes a new face group (ready for Extrude, Offset…) or
-//! is removed, leaving a hole of that shape.
+//! is removed, leaving a hole of that shape. Stencils made with Select > Convert To > Stamp
+//! appear after the built-in ones.
 
 use super::*;
 use crate::ui_util;
@@ -21,7 +22,9 @@ struct StampDrag {
 }
 
 pub struct StampTool {
-    stencil: Stencil,
+    /// Built-in and user stencils (name, outline in the unit circle).
+    stencils: Vec<(String, Vec<DVec2>)>,
+    choice: usize,
     mode: StampMode,
     /// Stencil rotation in the view, degrees.
     rotation: f64,
@@ -32,13 +35,19 @@ pub struct StampTool {
 
 impl StampTool {
     pub fn new(_cx: &mut ToolCx) -> Self {
-        Self { stencil: Stencil::Circle, mode: StampMode::FaceGroup, rotation: 0.0, snap: false, drag: None }
+        let mut stencils: Vec<(String, Vec<DVec2>)> = Stencil::ALL.iter().map(|s| (s.label().to_string(), s.outline())).collect();
+        stencils.extend(crate::parts::user_stencils());
+        Self { stencils, choice: 0, mode: StampMode::FaceGroup, rotation: 0.0, snap: false, drag: None }
+    }
+
+    fn name_of(&self) -> &str {
+        &self.stencils[self.choice].0
     }
 
     /// The stencil outline in the drag's plane coordinates.
     fn outline(&self, radius: f64) -> Vec<DVec2> {
         let (s, c) = self.rotation.to_radians().sin_cos();
-        self.stencil.outline().iter().map(|p| DVec2::new(p.x * c - p.y * s, p.x * s + p.y * c) * radius).collect()
+        self.stencils[self.choice].1.iter().map(|p| DVec2::new(p.x * c - p.y * s, p.x * s + p.y * c) * radius).collect()
     }
 
     fn snapped(&self, radius: f64) -> f64 {
@@ -69,11 +78,11 @@ impl StampTool {
                         "hole".to_string()
                     }
                 };
-                cx.history.push(format!("Stamp {}", self.stencil.label()), cx.scene);
+                cx.history.push(format!("Stamp {}", self.name_of()), cx.scene);
                 if let Some(o) = cx.scene.get_mut(d.object) {
                     o.set_mesh(mesh);
                 }
-                *cx.status = format!("Stamp {}: Ø {:.3}, {what} ({} triangles)", self.stencil.label(), 2.0 * d.radius, r.inside.len());
+                *cx.status = format!("Stamp {}: Ø {:.3}, {what} ({} triangles)", self.name_of(), 2.0 * d.radius, r.inside.len());
             }
             Err(e) => *cx.status = format!("Stamp: {e}"),
         }
@@ -81,16 +90,16 @@ impl StampTool {
 }
 
 /// Small drawing of a stencil, for its button.
-fn stencil_button(ui: &mut egui::Ui, stencil: Stencil, selected: bool) -> egui::Response {
+fn stencil_button(ui: &mut egui::Ui, name: &str, outline: &[DVec2], selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::click());
     let v = ui.visuals();
     let (bg, fg) = if selected { (v.selection.bg_fill, v.selection.stroke.color) } else if resp.hovered() { (v.widgets.hovered.bg_fill, v.text_color()) } else { (v.widgets.inactive.bg_fill, v.text_color()) };
     let p = ui.painter();
     p.rect_filled(rect, 4.0, bg);
     let r = rect.width() * 0.36;
-    let pts: Vec<egui::Pos2> = stencil.outline().iter().map(|q| rect.center() + egui::vec2(q.x as f32, -q.y as f32) * r).collect();
+    let pts: Vec<egui::Pos2> = outline.iter().map(|q| rect.center() + egui::vec2(q.x as f32, -q.y as f32) * r).collect();
     p.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.6, fg)));
-    resp.on_hover_text(stencil.label())
+    resp.on_hover_text(name)
 }
 
 impl Tool for StampTool {
@@ -109,9 +118,10 @@ impl Tool for StampTool {
     fn panel(&mut self, ui: &mut egui::Ui, _cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Stamp");
         ui.horizontal_wrapped(|ui| {
-            for s in Stencil::ALL {
-                if stencil_button(ui, s, self.stencil == s).clicked() {
-                    self.stencil = s;
+            for i in 0..self.stencils.len() {
+                let (name, outline) = &self.stencils[i];
+                if stencil_button(ui, name, outline, self.choice == i).clicked() {
+                    self.choice = i;
                 }
             }
         });
@@ -188,7 +198,7 @@ impl Tool for StampTool {
     fn script(&mut self, cmd: &str, _cx: &mut ToolCx) {
         // `stencil:Star`, `mode:hole`, `rotate:30`.
         match cmd.split_once(':') {
-            Some(("stencil", name)) => self.stencil = Stencil::ALL.into_iter().find(|s| s.label().eq_ignore_ascii_case(name)).unwrap_or(self.stencil),
+            Some(("stencil", name)) => self.choice = self.stencils.iter().position(|s| s.0.eq_ignore_ascii_case(name)).unwrap_or(self.choice),
             Some(("mode", m)) => self.mode = if m == "hole" { StampMode::Hole } else { StampMode::FaceGroup },
             Some(("rotate", a)) => self.rotation = a.parse().unwrap_or(self.rotation),
             _ => {}
@@ -202,7 +212,8 @@ mod tests {
 
     #[test]
     fn rotation_and_snapping() {
-        let mut t = StampTool { stencil: Stencil::Square, mode: StampMode::FaceGroup, rotation: 45.0, snap: false, drag: None };
+        let stencils = vec![("Square".to_string(), Stencil::Square.outline())];
+        let mut t = StampTool { stencils, choice: 0, mode: StampMode::FaceGroup, rotation: 45.0, snap: false, drag: None };
         // A square rotated by 45° has its corners on the axes.
         let p = t.outline(2.0);
         assert!(p.iter().any(|q| (q.x - 2.0).abs() < 1e-9 && q.y.abs() < 1e-9));

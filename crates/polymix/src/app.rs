@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Category {
+    Meshmix,
     Edit,
     Vessel,
     Analysis,
@@ -120,7 +121,11 @@ pub enum ExportScope {
 }
 
 /// Where autosaves and the session marker live (per user).
-fn data_dir() -> Option<PathBuf> {
+pub(crate) fn data_dir() -> Option<PathBuf> {
+    // Test runs point this elsewhere so they never touch the user's files.
+    if let Some(d) = std::env::var_os("POLYMIX_DATA_DIR") {
+        return Some(PathBuf::from(d));
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "macos") {
         return home.map(|h| h.join("Library/Application Support/Polymix"));
@@ -287,6 +292,8 @@ pub struct PolymixApp {
     /// Tool stack: the top tool is active; closing a sub-tool returns to the one below.
     tools: Vec<Box<dyn Tool>>,
     category: Option<Category>,
+    /// Meshmix parts (loaded when the category opens).
+    library: Option<crate::parts::Library>,
     /// Tool switch waiting for the current tool to finish computing (then it is accepted).
     pending_switch: Option<SwitchTo>,
     status: String,
@@ -356,6 +363,7 @@ impl PolymixApp {
             view: ViewOptions::default(),
             tools: Vec::new(),
             category: None,
+            library: None,
             pending_switch: None,
             status: "Welcome to Polymix. Import a mesh to begin (Ctrl/Cmd+O, or drag a file onto the window).".into(),
             script_prompts: false,
@@ -967,13 +975,25 @@ impl PolymixApp {
             SwitchTo::Tool(name) => {
                 self.category = None;
                 if keep == 0 {
+                    // `drop:<part name>` opens Drop Part with a library part.
+                    let part = name.strip_prefix("drop:").and_then(|p| self.library.get_or_insert_with(crate::parts::Library::load).find(p));
                     let mut cx = self.tool_cx(ctx, vp);
-                    if let Some(t) = make_tool(&name, &mut cx) {
+                    let tool: Option<Box<dyn Tool>> = match part {
+                        Some(p) => Some(Box::new(tools::drop_part::DropPartTool::new(&mut cx, p))),
+                        None => make_tool(&name, &mut cx),
+                    };
+                    if let Some(t) = tool {
                         self.tools.push(t);
                     }
                 }
             }
-            SwitchTo::Category(c) => self.category = c,
+            SwitchTo::Category(c) => {
+                if c == Some(Category::Meshmix) {
+                    // Pick up parts saved since the last look.
+                    self.library = None;
+                }
+                self.category = c;
+            }
         }
     }
 
@@ -1323,6 +1343,7 @@ impl PolymixApp {
             self.switch_to(SwitchTo::Tool("select".into()), &ctx, vp);
         }
         for (cat, icon, label) in [
+            (Category::Meshmix, Icon::Meshmix, "Meshmix"),
             (Category::Sculpt, Icon::Sculpt, "Sculpt"),
             (Category::Edit, Icon::Edit, "Edit"),
             (Category::Vessel, Icon::Vessel, "Vessel"),
@@ -1344,6 +1365,36 @@ impl PolymixApp {
         let has_obj = self.scene.active().is_some();
         let mut open: Option<&str> = None;
         match cat {
+            Category::Meshmix => {
+                let lib = self.library.get_or_insert_with(crate::parts::Library::load);
+                let mut drop: Option<String> = None;
+                for (title, user, kind) in [("Solid parts", false, mm_edit::PartKind::Solid), ("Open parts", false, mm_edit::PartKind::Open), ("My parts", true, mm_edit::PartKind::Solid)] {
+                    let items: Vec<&crate::parts::LibPart> = lib.parts.iter().filter(|p| p.file.is_some() == user && (user || p.part.kind == kind)).collect();
+                    if items.is_empty() {
+                        continue;
+                    }
+                    ui_util::section(ui, title);
+                    ui.horizontal_wrapped(|ui| {
+                        for p in items {
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(72.0, 86.0), egui::Sense::click());
+                            let v = ui.visuals();
+                            let bg = if resp.hovered() { v.widgets.hovered.bg_fill } else { v.widgets.inactive.bg_fill };
+                            ui.painter().rect_filled(rect, 4.0, bg);
+                            let img = egui::Rect::from_min_size(rect.min + egui::vec2(6.0, 4.0), egui::vec2(60.0, 60.0));
+                            crate::parts::paint_thumbnail(ui.painter(), img, &p.thumb);
+                            ui.painter().text(rect.center_bottom() - egui::vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, &p.part.name, egui::FontId::proportional(11.0), v.text_color());
+                            let kind = if p.part.kind == mm_edit::PartKind::Open { "open part: welded into the surface" } else { "solid part" };
+                            if resp.on_hover_text(format!("{} ({kind})", p.part.name)).clicked() && has_obj {
+                                drop = Some(format!("drop:{}", p.part.name));
+                            }
+                        }
+                    });
+                }
+                ui.small("Click a part, then press on the model where it goes and drag to size it. Make your own with Select > Convert To.");
+                if let Some(name) = drop {
+                    self.switch_to(SwitchTo::Tool(name), &ctx, vp);
+                }
+            }
             Category::Edit => {
                 ui_util::section(ui, "Edit");
                 ui.add_enabled_ui(has_obj, |ui| {
@@ -2633,6 +2684,7 @@ impl PolymixApp {
             }
             "category" => {
                 let c = match arg.as_str() {
+                    "meshmix" => Some(Category::Meshmix),
                     "edit" => Some(Category::Edit),
                     "vessel" => Some(Category::Vessel),
                     "analysis" => Some(Category::Analysis),
