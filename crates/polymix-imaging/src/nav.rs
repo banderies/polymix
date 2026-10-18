@@ -162,6 +162,11 @@ impl Nav {
             } else if !zoom_modifier {
                 for e in &events {
                     if let egui::Event::MouseWheel { unit, delta, .. } = e {
+                        // Only vertical scrolling moves slices (the signum of a sideways
+                        // scroll's 0 is 1).
+                        if delta.y == 0.0 {
+                            continue;
+                        }
                         match unit {
                             egui::MouseWheelUnit::Point => self.wheel += delta.y,
                             _ => self.wheel += delta.y.signum() * SCROLL_PER_SLICE * delta.y.abs().round().max(1.0),
