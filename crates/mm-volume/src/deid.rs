@@ -260,15 +260,43 @@ fn clean_text_header(bytes: &[u8], header_end: usize, drop: &dyn Fn(&str) -> boo
     out
 }
 
-/// De-identified copies of volume `v`'s files under `out_dir` (DICOM series in a folder of
-/// their own). Returns the files written and how many were skipped.
+/// The name for a de-identified copy of `original` (its extension, possibly `.nii.gz`).
+fn renamed(out_dir: &Path, name: &str, original: &Path) -> PathBuf {
+    let file = original.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let ext = [".nii.gz", ".hdr.gz", ".img.gz", ".raw.gz", ".nii", ".hdr", ".img", ".nrrd", ".nhdr", ".raw", ".zraw", ".mha", ".mhd", ".mgh", ".mgz", ".tiff", ".tif", ".png", ".jpg", ".jpeg", ".bmp"]
+        .into_iter()
+        .find(|e| file.ends_with(e))
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| original.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
+    out_dir.join(format!("{name}{ext}"))
+}
+
+/// A text header with the line starting `key` pointing at `file` instead.
+fn repoint(header: Vec<u8>, key: &str, sep: &str, file: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(&header).to_string();
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().to_lowercase().starts_with(&key.to_lowercase()) {
+            out.push_str(&format!("{key}{sep}{file}\n"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out.into_bytes()
+}
+
+/// De-identified copies of volume `v`'s files under `out_dir`, named after `name` (the
+/// original file names can hold a patient's name). DICOM series go in a folder of their own.
+/// Returns the files written and how many were skipped (screenshots).
 pub fn export(v: &Volume, out_dir: &Path, name: &str, o: &DeidOptions, progress: &dyn Fn(f32) -> bool) -> Result<(Vec<PathBuf>, usize)> {
     let mut written = Vec::new();
     let mut skipped = 0;
-    let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect();
+    let name: String = name.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect::<String>().trim().to_string();
+    let name = if name.is_empty() { "image".to_string() } else { name };
+    std::fs::create_dir_all(out_dir)?;
     match v.format {
         Format::Dicom => {
-            let dir = out_dir.join(safe.trim());
+            let dir = out_dir.join(&name);
             for (k, f) in v.files.iter().enumerate() {
                 let out = dir.join(format!("IM{:05}.dcm", k + 1));
                 if dicom_file(f, &out, o)? {
@@ -283,51 +311,55 @@ pub fn export(v: &Volume, out_dir: &Path, name: &str, o: &DeidOptions, progress:
         }
         Format::Nifti1 | Format::Nifti2 | Format::Analyze => {
             let single = v.files.len() == 1;
-            let first = &v.files[0];
-            let (bytes, gz) = read_maybe_gzip(first)?;
-            let out = out_dir.join(first.file_name().unwrap_or_default());
+            let (bytes, gz) = read_maybe_gzip(&v.files[0])?;
+            let out = renamed(out_dir, &name, &v.files[0]);
             write_maybe_gzip(&out, &clean_nifti(&bytes, single)?, gz)?;
             written.push(out);
             if let Some(img) = v.files.get(1) {
-                let out = out_dir.join(img.file_name().unwrap_or_default());
+                let out = renamed(out_dir, &name, img);
                 std::fs::copy(img, &out)?;
                 written.push(out);
             }
         }
-        Format::Nrrd => {
-            let (bytes, _) = (std::fs::read(&v.files[0])?, false);
-            let end = bytes.windows(2).position(|w| w == b"\n\n").map(|p| p + 2).unwrap_or(bytes.len());
-            // Comments and free text go; segment keys (names, colours) stay.
-            let drop = |l: &str| l.starts_with('#') || l.starts_with("content:") || (l.contains(":=") && !l.starts_with("Segment"));
-            let out = out_dir.join(v.files[0].file_name().unwrap_or_default());
-            std::fs::create_dir_all(out_dir)?;
-            std::fs::write(&out, clean_text_header(&bytes, end, &drop))?;
-            written.push(out);
-            for f in v.files.iter().skip(1) {
-                let out = out_dir.join(f.file_name().unwrap_or_default());
-                std::fs::copy(f, &out)?;
-                written.push(out);
-            }
-        }
-        Format::MetaImage => {
+        Format::Nrrd | Format::MetaImage => {
             let bytes = std::fs::read(&v.files[0])?;
-            let end = crate::metaimage::parse(&bytes).map(|h| h.data_offset as usize).unwrap_or(bytes.len());
-            let drop = |l: &str| l.starts_with("Comment") || l.starts_with("Name");
-            let out = out_dir.join(v.files[0].file_name().unwrap_or_default());
-            std::fs::create_dir_all(out_dir)?;
-            std::fs::write(&out, clean_text_header(&bytes, end, &drop))?;
-            written.push(out);
-            for f in v.files.iter().skip(1) {
-                let out = out_dir.join(f.file_name().unwrap_or_default());
-                std::fs::copy(f, &out)?;
-                written.push(out);
+            let nrrd = v.format == Format::Nrrd;
+            let end = if nrrd {
+                bytes.windows(2).position(|w| w == b"\n\n").map(|p| p + 2).unwrap_or(bytes.len())
+            } else {
+                crate::metaimage::parse(&bytes).map(|h| h.data_offset as usize).unwrap_or(bytes.len())
+            };
+            // Comments and free text go; NRRD segment keys (names, colours) stay.
+            let drop = |l: &str| {
+                if nrrd {
+                    l.starts_with('#') || l.starts_with("content:") || (l.contains(":=") && !l.starts_with("Segment"))
+                } else {
+                    l.starts_with("Comment") || l.starts_with("Name")
+                }
+            };
+            let mut cleaned = clean_text_header(&bytes, end, &drop);
+            if let Some(data) = v.files.get(1) {
+                let data_out = renamed(out_dir, &name, data);
+                let data_name = data_out.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let header_len = cleaned.len() - (bytes.len() - end);
+                let body = cleaned.split_off(header_len);
+                cleaned = if nrrd { repoint(cleaned, "data file", ": ", &data_name) } else { repoint(cleaned, "ElementDataFile", " = ", &data_name) };
+                cleaned.extend(body);
+                std::fs::copy(data, &data_out)?;
+                written.push(data_out);
             }
+            let out = renamed(out_dir, &name, &v.files[0]);
+            std::fs::write(&out, cleaned)?;
+            written.insert(0, out);
         }
         Format::Mgh | Format::Tiff | Format::ImageStack => {
-            // No identifying header fields (beyond file names, which the copy keeps).
-            std::fs::create_dir_all(out_dir)?;
-            for f in &v.files {
-                let out = out_dir.join(f.file_name().unwrap_or_default());
+            // No identifying header fields; files renamed.
+            let many = v.files.len() > 1;
+            let dir = if many { out_dir.join(&name) } else { out_dir.to_path_buf() };
+            std::fs::create_dir_all(&dir)?;
+            for (k, f) in v.files.iter().enumerate() {
+                let stem = if many { format!("{name}_{:04}", k + 1) } else { name.clone() };
+                let out = renamed(&dir, &stem, f);
                 std::fs::copy(f, &out)?;
                 written.push(out);
             }
@@ -396,6 +428,27 @@ mod tests {
         // The copy reads back through the scanner as an ordinary instance.
         let i = crate::dicom::read(&out).unwrap();
         assert_eq!(i.patient_name.trim(), "Subject 01");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copies_are_named_after_the_label() {
+        let dir = std::env::temp_dir().join(format!("mmv-deid-names-{}", std::process::id()));
+        let src = dir.join("in");
+        std::fs::create_dir_all(&src).unwrap();
+        let hdr = src.join("Doe_Jane_scan.nhdr");
+        std::fs::write(&hdr, "NRRD0004\n# patient Doe Jane\ntype: short\ndimension: 3\nsizes: 2 2 2\nencoding: raw\nendian: little\ndata file: Doe_Jane_scan.raw\n\n").unwrap();
+        std::fs::write(src.join("Doe_Jane_scan.raw"), [0u8; 16]).unwrap();
+        let h = crate::nrrd::read(&hdr, 1 << 16).unwrap();
+        let v = crate::nrrd::volume(&hdr, &h).unwrap();
+        let out = dir.join("out");
+        let (files, _) = export(&v, &out, "Subject 01 T1", &DeidOptions::default(), &|_| true).unwrap();
+        let names: Vec<String> = files.iter().map(|f| f.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["Subject 01 T1.nhdr", "Subject 01 T1.raw"]);
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(!text.contains("Doe") && text.contains("data file: Subject 01 T1.raw"), "{text}");
+        let h2 = crate::nrrd::read(&files[0], 1 << 16).unwrap();
+        assert!(crate::nrrd::volume(&files[0], &h2).unwrap().warnings.iter().all(|w| !w.contains("missing")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
