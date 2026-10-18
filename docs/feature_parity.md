@@ -173,8 +173,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | Volume brushes (3) vs Surface brushes (2), Smoothing brush (1) | 🟡 | One brush tool, surface-style |
-| Brushes: RobustSmooth, ShrinkSmooth (Smooth), BubbleSmooth, Inflate, Flatten, Drag | 🟡 | RobustSmooth, Smooth, Inflate, Flatten, Drag ✅; BubbleSmooth ❌ |
-| Brushes: Draw, Draw2, Draw3, DrawMax, Move, Push, Pinch, Spikes, Nudge, Zipper, Attract | ❌ | |
+| Brushes: RobustSmooth, ShrinkSmooth (Smooth), BubbleSmooth, Inflate, Flatten, Drag | ✅ | BubbleSmooth is a volume-keeping (Taubin) smooth |
+| Brushes: Draw, Draw2, Draw3, DrawMax, Move, Push, Pinch, Spikes, Nudge, Zipper, Attract | ✅ | Own brush definitions (hover a brush for what it does); Attract pulls onto the target surface |
 | Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ❌ | |
 | Brushes: PaintVertex, SmoothColor | ⚪ ❌ | |
 | Dynamic refinement while sculpting (Refinement, Adaptivity; R, T) | ❌ | |
