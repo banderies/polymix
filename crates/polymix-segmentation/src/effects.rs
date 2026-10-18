@@ -522,12 +522,8 @@ mod tests {
     #[test]
     fn otsu_splits_two_classes() {
         let mut bins = vec![0u32; 100];
-        for b in 10..20 {
-            bins[b] = 50;
-        }
-        for b in 70..80 {
-            bins[b] = 50;
-        }
+        bins[10..20].fill(50);
+        bins[70..80].fill(50);
         let h = Histogram { range: (0.0, 100.0), bins };
         let t = h.otsu().unwrap();
         assert!((20.0..=70.0).contains(&t), "{t}");

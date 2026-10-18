@@ -44,6 +44,13 @@ missing or uneven slices, gantry tilt, missing orientation and pixel formats not
 file names. Folders are remembered and rescans only read changed files. Images and folders
 can also be opened from the Finder (*Open With → Polymix*, or dropped on the Dock icon).
 
+*Prepare image* (under the slice) works on the selected image in the background: N4 bias
+correction, denoising, resampling, crop / pad, reorientation and header fixes, registration to
+another scan (rigid / affine, saved with a `.tfm` for 3D Slicer), subtraction, intensity
+normalisation, vessel enhancement (Frangi / Sato / Jerman), MIP / MinIP slabs, 4D time points,
+phase-contrast velocities, and de-identified copies for sharing. Results are saved as NIfTI
+images under *Derived images* and can be segmented like any other image.
+
 **Segmentation** shows the image selected in Volume: axial, sagittal and coronal planes with
 a shared crosshair, and a 3D view (maximum intensity projection, volume rendering, or the
 surface above a threshold).

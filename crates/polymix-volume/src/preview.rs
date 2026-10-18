@@ -123,7 +123,8 @@ impl Preview {
         self.dirty = false;
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, v: &Volume, hidden: bool) {
+    /// `crop`: a box of voxels (inclusive) to outline on the slice.
+    pub fn ui(&mut self, ui: &mut egui::Ui, v: &Volume, hidden: bool, crop: Option<([usize; 3], [usize; 3])>) {
         let ctx = ui.ctx().clone();
         if hidden {
             ui.weak("Thumbnail hidden with the identifiers (images can show names).");
@@ -146,6 +147,21 @@ impl Preview {
             let ev = self.nav.handle(ui, &r);
             let shown = self.nav.image_rect(rect, size);
             ui.painter_at(rect).image(tex, shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            if let (Some((lo, hi)), Some(g)) = (crop, v.geometry.as_ref()) {
+                // The box in the slice's screen layout (see slice::display_axes).
+                let ax = mm_volume::slice::display_axes(Some(g));
+                let (a, d) = (ax.across, 1 - ax.across);
+                let span = |axis: usize, flip: bool| {
+                    let n = g.dims[axis].max(1) as f32;
+                    let (u0, u1) = (lo[axis] as f32 / n, (hi[axis] + 1) as f32 / n);
+                    if flip { (1.0 - u1, 1.0 - u0) } else { (u0, u1) }
+                };
+                let ((x0, x1), (y0, y1)) = (span(a, ax.flip_across), span(d, ax.flip_down));
+                let r = egui::Rect::from_min_max(shown.lerp_inside(egui::vec2(x0, y0)), shown.lerp_inside(egui::vec2(x1, y1)));
+                let inside = (lo[2]..=hi[2]).contains(&self.slice);
+                let colour = if inside { egui::Color32::from_rgb(255, 196, 0) } else { egui::Color32::from_rgba_unmultiplied(255, 196, 0, 90) };
+                ui.painter_at(rect).rect_stroke(r, 0.0, egui::Stroke::new(1.5, colour), egui::StrokeKind::Middle);
+            }
             if let Some(d) = ev.window {
                 self.window = Some(drag_window(self.current_window(), d));
                 self.dirty = true;

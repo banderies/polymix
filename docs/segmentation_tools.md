@@ -123,20 +123,20 @@ crate), **UI** the Volume tab.
 
 | Tool | Engine | UI | Notes |
 |---|---|---|---|
-| **N4 bias field correction** — removes MR coil shading; mask (automatic Otsu, or a segment), shrink factor, iterations per level, B-spline control-point spacing, convergence; corrected volume and the bias field | ❌ | ❌ | Pure Rust: B-spline fit of the log bias with histogram sharpening, multi-resolution. Makes MR thresholds work across the whole brain |
-| **Denoising** — Gaussian, median, curvature / gradient anisotropic diffusion (edge-preserving), non-local means | ❌ | ❌ | |
-| **Resample** — isotropic or chosen spacing; linear, cubic or windowed-sinc interpolation | ❌ | ❌ | Upsampling helps thin vessels (Slicer's oversampling) |
-| **Crop** to a box drawn in the views; pad | ❌ | ❌ | Smaller volumes make every tool faster |
-| **Reorient** — to standard axes; flip / permute axes when a header is wrong | ❌ | ❌ | |
-| **Registration** — rigid / affine (deformable later) between series of a patient; resample one onto another's grid | ❌ | ❌ | TOF-MRA ↔ T1, pre ↔ post contrast |
-| **Subtraction** — post − pre contrast after registration | ❌ | ❌ | DSA-like vessel images |
-| **Intensity normalisation** — rescale, percentile clip, z-score, histogram matching | ❌ | ❌ | Same thresholds across scans |
-| **Vessel enhancement** — Frangi / Sato / Jerman vesselness, multi-scale (min / max diameter) | ❌ | ❌ | A volume to threshold; the vessel tools in §4 compute it too |
-| **MIP / MinIP slab volumes** | ❌ | ❌ | Also as a viewing option (§8) |
-| 4D: choose a time point or echo, average, split | ❌ | ❌ | ⚪ |
-| 4D flow MRI velocity fields (phase contrast) | ❌ | ❌ | ⚪ CFD boundary conditions and validation |
-| **Save derived volumes** (NIfTI / NRRD) | ❌ | ❌ | `write_nifti` / `write_seg_nrrd` write `u8` label maps only; needs a (small) float NIfTI writer. Where they are saved: to decide |
-| De-identified export (identifiers stripped, optional defacing) | ❌ | ❌ | ⚪ for sharing data |
+| **N4 bias field correction** — removes MR coil shading; mask (automatic Otsu, or a segment), shrink factor, iterations per level, B-spline control-point spacing, convergence; corrected volume and the bias field | ✅ | ✅ | `mm_image::n4` (Tustison 2010: Wiener histogram sharpening + B-spline fit, levels); automatic head mask; segment as mask ❌ |
+| **Denoising** — Gaussian, median, curvature / gradient anisotropic diffusion (edge-preserving), non-local means | ✅ | ✅ | `mm_image::{filter, denoise}`; noise σ estimate shown before / after |
+| **Resample** — isotropic or chosen spacing; linear, cubic or windowed-sinc interpolation | ✅ | ✅ | `mm_image::resample` (Catmull-Rom cubic, Lanczos-3 sinc; anti-aliased when shrinking) |
+| **Crop** to a box drawn in the views; pad | ✅ | 🟡 | Box by voxel ranges (outlined on the thumbnail) or *Fit to the head*; drawing it in the views ❌ |
+| **Reorient** — to standard axes; flip / permute axes when a header is wrong | ✅ | ✅ | `mm_image::grid`: any axis code (RAS, LPS, …), mirror across a patient axis, swap header axes |
+| **Registration** — rigid / affine (deformable later) between series of a patient; resample one onto another's grid | ✅ | ✅ | `mm_image::register` (mutual information or correlation, pyramid); ITK `.tfm` for Slicer; deformable ❌ |
+| **Subtraction** — post − pre contrast after registration | ✅ | ✅ | The other image is registered (optional) and resampled onto this one's grid |
+| **Intensity normalisation** — rescale, percentile clip, z-score, histogram matching | ✅ | ✅ | `mm_image::intensity`; statistics inside the head (optional) |
+| **Vessel enhancement** — Frangi / Sato / Jerman vesselness, multi-scale (min / max diameter) | ✅ | ✅ | `mm_image::vessel`; bright or dark vessels |
+| **MIP / MinIP slab volumes** | ✅ | ✅ | `mm_image::slab` (sliding, any plane, max / min / mean); as a viewing option (§8) ❌ |
+| 4D: choose a time point or echo, average, split | ✅ | ✅ | Every time point of DICOM 4D series is kept; pick / mean / max / min / save each |
+| 4D flow MRI velocity fields (phase contrast) | ✅ | ✅ | `mm_image::pc`: velocities, mean / peak speed, magnitude-weighted angiogram (VENC, phase range guessed, per-axis flip); flow through a plane ❌ |
+| **Save derived volumes** (NIfTI / NRRD) | ✅ | ✅ | `mm_volume::write::nifti` (u8 / i16 / f32); saved to `<data dir>/volume/derived`, listed as *Derived images* |
+| De-identified export (identifiers stripped, optional defacing) | ✅ | ✅ | `mm_volume::deid`: DICOM PS3.15 basic profile subset (UIDs replaced, dates shiftable, private tags dropped, screenshots skipped), NIfTI / Analyze / NRRD / MetaImage free text cleared, files named after the label; defacing ❌ |
 
 ## 8. Viewer features — Volume and Segmentation tabs (`polymix-imaging`)
 

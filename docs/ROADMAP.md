@@ -227,8 +227,13 @@ the Volume tab and the viewer features they share), with engine and UI status:
 - [ ] **M15.2 Tools in the Segmentation tab** (see the tracking doc).
 - [ ] **M15.3 Hand-off**: *Make mesh* sends the segment to the Mesh tab; save / load label
       maps.
-- [ ] **M15.4 Image preparation in the Volume tab** (N4 bias correction, denoising, resampling,
-      crop, registration, vesselness; §7 of the tracking doc).
+- [x] **M15.4 Image preparation in the Volume tab** (`mm-image`; Volume → *Prepare image*): N4
+      bias correction, denoising (Gaussian, median, gradient / curvature diffusion, non-local
+      means), resampling, crop / pad, reorientation and header fixes, rigid / affine
+      registration (mutual information, `.tfm` for Slicer), subtraction, intensity
+      normalisation and histogram matching, vesselness (Frangi / Sato / Jerman), MIP / MinIP
+      slabs, 4D time points, phase-contrast velocities, de-identified export. Results are
+      NIfTI images in `<data dir>/volume/derived`, listed and selectable like any image.
 
 ## Later
 

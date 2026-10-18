@@ -214,15 +214,32 @@ impl VolumeWorkspace {
                 }
             }
             "vol.search" => self.search = arg.to_string(),
-            // vol.n4:levels=2,iterations=10 — N4 on the previewed volume.
-            "vol.n4" => {
+            // vol.prepare:op=resample,spacing=1 (vol.n4:… is op=n4) — on the previewed volume.
+            "vol.prepare" | "vol.n4" => {
+                if cmd == "vol.n4" {
+                    self.prepare.set_options("op=n4");
+                }
                 self.prepare.set_options(arg);
                 let target = self.preview.as_ref().map(|p| p.volume).zip(self.catalog.clone());
                 match target {
-                    Some((k, c)) => self.prepare.start(&c.volumes[k], &c.volumes[k].name, ctx),
-                    None => println!("[volume] vol.n4: nothing selected"),
+                    Some((k, c)) => self.prepare.start(&c, k, &c.volumes[k].name, ctx),
+                    None => println!("[volume] {cmd}: nothing selected"),
                 }
             }
+            // vol.reference:<name> — the other image for registration, subtraction, matching.
+            "vol.reference" => {
+                if !self.catalog.as_ref().is_some_and(|c| self.prepare.set_reference(c, arg)) {
+                    println!("[volume] no volume named like {arg}");
+                }
+            }
+            // vol.phases:x,y,z[,magnitude] — phase-contrast inputs by name.
+            "vol.phases" => {
+                let names: Vec<&str> = arg.split(',').collect();
+                if !self.catalog.as_ref().is_some_and(|c| self.prepare.set_phases(c, &names)) {
+                    println!("[volume] phase images not found");
+                }
+            }
+            "vol.prepared" => println!("[volume] prepared: {}", self.prepare.last_message()),
             "vol.log" => {
                 // Counts only: never identifiers.
                 match &self.catalog {
@@ -588,7 +605,7 @@ impl VolumeWorkspace {
         });
     }
 
-    fn volume_details(&mut self, ui: &mut egui::Ui, c: &Catalog, k: usize) {
+    fn volume_details(&mut self, ui: &mut egui::Ui, c: &Arc<Catalog>, k: usize) {
         let v = &c.volumes[k];
         section(ui, &self.privacy.path(&v.name));
         ui.label(format!("{} · {}", kind_label(v.kind), v.format.label()));
@@ -596,12 +613,16 @@ impl VolumeWorkspace {
             ui.colored_label(WARN, format!("⚠ {w}"));
         }
         ui.add_space(4.0);
+        let crop = self.prepare.crop_box(v);
         if let Some(p) = &mut self.preview {
             if p.volume == k {
-                p.ui(ui, v, false);
+                p.ui(ui, v, false, crop);
             }
         }
         ui.add_space(6.0);
+        let privacy = self.privacy.clone();
+        self.prepare.ui(ui, c, k, &privacy);
+        ui.add_space(4.0);
         let groups = ["Patient", "Study", "Series", "Equipment", "Acquisition", "Geometry", "Pixel", "Segmentation", "File"];
         for g in groups {
             let rows: Vec<(String, String)> = v.fields.iter().filter(|f| f.group == g).map(|f| (f.name.clone(), self.privacy.field(f))).collect();
@@ -633,8 +654,6 @@ impl VolumeWorkspace {
                 ui.ctx().copy_text(format!("{}\n{}", self.privacy.path(&v.name), text));
             }
         });
-        let privacy = self.privacy.clone();
-        self.prepare.ui(ui, v, &privacy.path(&v.name), &|s| privacy.path(s));
     }
 }
 
@@ -722,14 +741,14 @@ impl Workspace for VolumeWorkspace {
                 p.poll(v, ctx);
             }
         }
-        // A derived image was saved: list it (its folder becomes a source) and select it.
-        if let Some(path) = self.prepare.poll() {
+        // Derived images were saved: list them (their folder becomes a source), select the first.
+        if let Some(paths) = self.prepare.poll().filter(|p| !p.is_empty()) {
             if let Some(dir) = prepare::derived_dir() {
                 if !self.roots.contains(&dir) {
                     self.roots.push(dir);
                 }
             }
-            self.open_select = Some(path);
+            self.open_select = paths.into_iter().next();
             self.start_scan(ctx);
         }
         if active && self.scan.is_none() && !self.prepare.busy() && !self.preview.as_ref().is_some_and(|p| p.busy()) {
