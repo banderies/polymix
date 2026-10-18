@@ -28,10 +28,12 @@ pub enum Brush {
     Refine,
     Reduce,
     AdaptiveReduce,
+    PaintVertex,
+    SmoothColor,
 }
 
 impl Brush {
-    pub const ALL: [Brush; 20] = [
+    pub const ALL: [Brush; 22] = [
         Brush::Draw,
         Brush::Draw2,
         Brush::Draw3,
@@ -52,6 +54,8 @@ impl Brush {
         Brush::Refine,
         Brush::Reduce,
         Brush::AdaptiveReduce,
+        Brush::PaintVertex,
+        Brush::SmoothColor,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -75,6 +79,8 @@ impl Brush {
             Brush::Refine => "Refine",
             Brush::Reduce => "Reduce",
             Brush::AdaptiveReduce => "AdaptiveReduce",
+            Brush::PaintVertex => "PaintVertex",
+            Brush::SmoothColor => "SmoothColor",
         }
     }
     fn hint(self) -> &'static str {
@@ -99,7 +105,13 @@ impl Brush {
             Brush::Refine => "Make the triangles under the brush smaller",
             Brush::Reduce => "Make the triangles under the brush larger and even",
             Brush::AdaptiveReduce => "Remove triangles where the surface is flat, keeping curved detail",
+            Brush::PaintVertex => "Paint vertex colours (Cmd/Ctrl paints the default grey back)",
+            Brush::SmoothColor => "Blend vertex colours with their neighbours",
         }
+    }
+    /// Colour brushes change vertex colours instead of the shape.
+    fn paints(self) -> bool {
+        matches!(self, Brush::PaintVertex | Brush::SmoothColor)
     }
     /// Mesh density brushes change the triangles instead of moving the surface.
     fn density(self) -> bool {
@@ -198,6 +210,40 @@ fn relax_interior(mesh: &mut Mesh, tris: &[u32], k: f64) {
         .collect();
     for (v, q) in moves {
         mesh.set_vertex(v, q);
+    }
+}
+
+/// One dab of a colour brush: blend toward `color` (PaintVertex) or the neighbours' average
+/// (SmoothColor) by strength × falloff.
+fn paint_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, color: [f32; 3], strength: f64) {
+    if brush == Brush::SmoothColor && !mesh.has_vertex_colors() {
+        return;
+    }
+    mesh.enable_vertex_colors();
+    let m: &Mesh = mesh;
+    let new: Vec<(u32, [f32; 3])> = verts
+        .iter()
+        .map(|&(v, w)| {
+            let c = m.vertex_color(v).unwrap_or(mm_core::mesh::DEFAULT_VERTEX_COLOR);
+            let to = if brush == Brush::PaintVertex {
+                color
+            } else {
+                let (mut sum, mut n) = ([0.0f32; 3], 0.0f32);
+                for u in m.vertex_neighbors(v) {
+                    let cu = m.vertex_color(u).unwrap_or(c);
+                    for i in 0..3 {
+                        sum[i] += cu[i];
+                    }
+                    n += 1.0;
+                }
+                if n > 0.0 { sum.map(|x| x / n) } else { c }
+            };
+            let k = (strength * w).clamp(0.0, 1.0) as f32;
+            (v, [0, 1, 2].map(|i| c[i] + (to[i] - c[i]) * k))
+        })
+        .collect();
+    for (v, c) in new {
+        mesh.set_vertex_color(v, c);
     }
 }
 
@@ -349,6 +395,8 @@ pub struct SculptTool {
     sym: SymPlane,
     /// Vertices that sat on the symmetry plane stay on it, so the halves stay joined.
     sym_snap: bool,
+    /// PaintVertex colour.
+    paint: [f32; 3],
     refinement: Refinement,
     /// Brush radius in percent of the model size.
     size_pct: f32,
@@ -407,6 +455,7 @@ impl SculptTool {
             symmetry: false,
             sym,
             sym_snap: false,
+            paint: [0.85, 0.25, 0.2],
             refinement: Refinement { enabled: volume, ..Refinement::default() },
             size_pct: 4.0,
             strength: 0.5,
@@ -456,6 +505,10 @@ impl SculptTool {
             }
             if brush.density() {
                 retriangulated |= density_dab(o.mesh_mut(), &verts, brush, r, self.strength);
+            } else if brush.paints() {
+                let color = if s.invert { mm_core::mesh::DEFAULT_VERTEX_COLOR } else { self.paint };
+                paint_dab(o.mesh_mut(), &verts, brush, color, self.strength);
+                o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
             } else {
                 let dab = Dab { center: c, r, strength: self.strength, invert: s.invert, view, motion, start, target };
                 apply_dab(o.mesh_mut(), &verts, brush, &dab);
@@ -684,7 +737,7 @@ fn apply_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, d: &Dab) {
                 })
                 .collect()
         }
-        Brush::Move | Brush::Refine | Brush::Reduce | Brush::AdaptiveReduce => Vec::new(),
+        Brush::Move | Brush::Refine | Brush::Reduce | Brush::AdaptiveReduce | Brush::PaintVertex | Brush::SmoothColor => Vec::new(),
     };
     let pos = mesh.positions_mut();
     for (v, p) in updates {
@@ -727,6 +780,12 @@ impl Tool for SculptTool {
                 ui.selectable_value(&mut self.brush, b, b.label()).on_hover_text(b.hint());
             }
         });
+        if self.brush.paints() {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut self.paint);
+                ui.label("Paint colour");
+            });
+        }
         egui::ComboBox::from_label("Secondary (Shift)").selected_text(self.secondary.label()).show_ui(ui, |ui| {
             for b in [Brush::BubbleSmooth, Brush::ShrinkSmooth, Brush::RobustSmooth] {
                 ui.selectable_value(&mut self.secondary, b, b.label());
@@ -975,6 +1034,11 @@ impl Tool for SculptTool {
         match cmd.split_once(':') {
             Some(("brush", name)) => self.brush = Brush::ALL.into_iter().find(|b| b.label().eq_ignore_ascii_case(name)).unwrap_or(self.brush),
             Some(("size", pct)) => self.size_pct = pct.parse().unwrap_or(self.size_pct),
+            Some(("color", hex)) => {
+                if let Ok(x) = u32::from_str_radix(hex.trim_start_matches('#'), 16) {
+                    self.paint = [(x >> 16) & 255, (x >> 8) & 255, x & 255].map(|c| c as f32 / 255.0);
+                }
+            }
             Some(("sym", axis)) => {
                 self.symmetry = axis != "off";
                 self.sym.axis = ["x", "y", "z"].iter().position(|a| *a == axis).unwrap_or(self.sym.axis);
@@ -1161,6 +1225,33 @@ mod tests {
         assert!(free > 1e-6, "{free}");
         assert!(snapped < 1e-12, "{snapped}");
         assert!(lifted > 0 && lifted_snapped == lifted);
+    }
+
+    #[test]
+    fn paint_and_smooth_vertex_colors() {
+        let m0 = primitives::icosphere(1.0, 4);
+        let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::PaintVertex), SymPlane { axis: 0, offset: 0.0 });
+        tool.strength = 1.0;
+        tool.paint = [1.0, 0.0, 0.0];
+        let bvh = o.bvh();
+        let h = bvh.nearest(&o.mesh, DVec3::Z, 1.0).unwrap();
+        let dab = |brush, invert| Stamp { brush, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert };
+        assert!(!tool.stamp(&mut o, &dab(Brush::PaintVertex, false), &mut Default::default(), None));
+        let m = &o.mesh;
+        let top = m.vertex_ids().max_by(|&a, &b| m.vertex(a).z.total_cmp(&m.vertex(b).z)).unwrap();
+        assert_eq!(m.vertex_color(top), Some([1.0, 0.0, 0.0]));
+        let far = m.vertex_ids().find(|&v| m.vertex(v).z < 0.0).unwrap();
+        assert_eq!(m.vertex_color(far), Some(mm_core::mesh::DEFAULT_VERTEX_COLOR));
+        assert!(o.mesh.vertex_ids().all(|v| o.mesh.vertex(v) == m0.vertex(v)), "painting leaves the shape alone");
+        // Smoothing blurs the painted edge: some rim vertex gets in-between red.
+        let rim_before: Vec<f32> = o.mesh.vertex_ids().map(|v| o.mesh.vertex_color(v).unwrap()[1]).collect();
+        tool.stamp(&mut o, &dab(Brush::SmoothColor, false), &mut Default::default(), None);
+        let rim_after: Vec<f32> = o.mesh.vertex_ids().map(|v| o.mesh.vertex_color(v).unwrap()[1]).collect();
+        assert!(rim_before.iter().zip(&rim_after).any(|(a, b)| (a - b).abs() > 0.01));
+        // Inverted paint restores the default colour.
+        tool.stamp(&mut o, &dab(Brush::PaintVertex, true), &mut Default::default(), None);
+        assert_eq!(o.mesh.vertex_color(top), Some(mm_core::mesh::DEFAULT_VERTEX_COLOR));
     }
 
     #[test]

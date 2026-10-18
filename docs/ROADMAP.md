@@ -130,5 +130,5 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M9.1 Stamp tool** (polygon stencils).
 - [x] **M9.2 Parts library** (Meshmix) and Drop Part; Convert To Open/Solid Part, Stamp.
 - [x] **M9.3 Make Pattern.**
-- [ ] **M9.4 Vertex painting** (PaintVertex, SmoothColor).
+- [x] **M9.4 Vertex painting** (PaintVertex, SmoothColor).
 - [ ] **M9.5 Unwrap / UV layout**, Generate Complex, Hair, Pivots.

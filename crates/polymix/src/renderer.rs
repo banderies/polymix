@@ -450,16 +450,18 @@ impl SceneRenderer {
         let crease = style.crease_deg.map(f64::from);
         let groups = style.group_normals;
         // Partial uploads are only valid on top of exactly the geometry the moves started from.
+        // Colours may differ (vertex painting reports its vertices as moved).
         let partial = geometry_changed
             && gpu.crease_deg == style.crease_deg
             && gpu.group_normals == groups_key
-            && gpu.colors_key == colors_key
+            && gpu.colors_key.is_some() == colors_key.is_some()
             && gpu.topo_version == mesh.topology_version()
             && gpu.shape_version == moved_from
             && !moved_vertices.is_empty();
         if partial {
             Self::partial_update(queue, gpu, mesh, moved_vertices, crease, groups, show_colors);
             gpu.shape_version = mesh.shape_version();
+            gpu.colors_key = colors_key;
         } else if geometry_changed {
             let tri_ids: Vec<u32> = mesh.triangle_ids().collect();
             let normals = ShadingNormals::new(mesh, crease, groups);
