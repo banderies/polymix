@@ -69,6 +69,14 @@ pub enum ExpandMode {
     /// Grow across edges flatter than an angle that increases with the drag: fills smooth
     /// regions up to their creases.
     CreaseAngle,
+    /// Grow into faces whose vertex colour is close to the selection's, with a tolerance
+    /// that increases with the drag (geodesic on meshes without colours).
+    VertexColor,
+}
+
+/// Mean vertex colour of triangle `t`.
+fn tri_color(m: &Mesh, t: u32) -> DVec3 {
+    m.triangle(t).iter().filter_map(|&v| m.vertex_color(v)).map(|c| DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64)).sum::<DVec3>() / 3.0
 }
 
 /// Right-drag grow/shrink (Meshmixer's right-click-drag Expand Mode): drag right to grow the
@@ -142,6 +150,22 @@ impl ExpandSession {
     /// Selection for a signed drag of `d` world units (positive grows).
     fn apply(&self, mesh: &Mesh, d: f64, out: &mut TriSelection) {
         *out = self.original.clone();
+        if d > 0.0 && self.mode == ExpandMode::VertexColor && mesh.has_vertex_colors() {
+            let n = self.original.len().max(1) as f64;
+            let seed = self.original.iter().map(|t| tri_color(mesh, t)).sum::<DVec3>() / n;
+            // RGB distance tolerance: 0.004 per screen point of drag.
+            let tol = (d / self.scale.max(1e-12) * 0.004).min(1.8);
+            let mut stack: Vec<u32> = self.original.iter().collect();
+            while let Some(t) = stack.pop() {
+                for n in mesh.tri_neighbors(t) {
+                    if n != mm_core::INVALID && !out.contains(n) && !mm_core::selection::is_crease(mesh, t, n, self.crease_cos) && tri_color(mesh, n).distance(seed) <= tol {
+                        out.insert(n);
+                        stack.push(n);
+                    }
+                }
+            }
+            return;
+        }
         if d > 0.0 && self.mode == ExpandMode::CreaseAngle {
             // 0.4 degrees per screen point of drag.
             let limit = (d / self.scale.max(1e-12) * 0.4).min(180.0).to_radians().cos();
@@ -584,10 +608,12 @@ impl Tool for SelectTool {
                     .selected_text(match self.expand_mode {
                         ExpandMode::Geodesic => "Geodesic Distance",
                         ExpandMode::CreaseAngle => "Crease Angle",
+                        ExpandMode::VertexColor => "Vertex Color",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.expand_mode, ExpandMode::Geodesic, "Geodesic Distance").on_hover_text("Grow by distance along the surface");
                         ui.selectable_value(&mut self.expand_mode, ExpandMode::CreaseAngle, "Crease Angle").on_hover_text("Grow across edges flatter than an angle that increases with the drag");
+                        ui.selectable_value(&mut self.expand_mode, ExpandMode::VertexColor, "Vertex Color").on_hover_text("Grow into faces coloured like the selection; the drag sets the tolerance");
                     });
                 ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush select faces turned away from you");
                 ui.checkbox(&mut self.restrict_exterior, "Restrict to exterior faces").on_hover_text("Skip faces buried inside other parts of the mesh (e.g. overlapping tubes)");
@@ -1115,6 +1141,29 @@ mod tests {
         let limited = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::Geodesic, Some(30f64.to_radians().cos()));
         limited.apply(&m, 100.0, &mut out);
         assert_eq!(out.len(), top.len());
+    }
+
+    #[test]
+    fn vertex_color_expand() {
+        // Left half red, right half blue.
+        let mut m = primitives::plane_grid(10.0, 4.0, 20, 8);
+        for v in m.vertex_ids().collect::<Vec<_>>() {
+            let c = if m.vertex(v).x < 0.0 { [0.9, 0.1, 0.1] } else { [0.1, 0.1, 0.9] };
+            m.set_vertex_color(v, c);
+        }
+        let seed = m.triangle_ids().find(|&t| m.tri_centroid(t).x < -3.0).unwrap();
+        let mut sel = TriSelection::new(&m);
+        sel.insert(seed);
+        let session = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::VertexColor, None);
+        let mut out = TriSelection::new(&m);
+        // A small tolerance fills the red half (triangles straddling x = 0 are mixed).
+        session.apply(&m, 20.0, &mut out);
+        assert!(out.len() > 10 && out.iter().all(|t| m.tri_centroid(t).x < 0.0));
+        let red = m.triangle_ids().filter(|&t| m.triangle(t).iter().all(|&v| m.vertex(v).x < 0.0)).count();
+        assert!(out.len() >= red, "{} >= {red}", out.len());
+        // A large one takes everything.
+        session.apply(&m, 450.0, &mut out);
+        assert_eq!(out.len(), m.triangle_count());
     }
 
     #[test]

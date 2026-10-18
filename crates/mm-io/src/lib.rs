@@ -258,11 +258,19 @@ fn finish(mut raw: Raw, format: Format, opts: &ReadOptions) -> Result<ImportedMe
         raw.triangles = w.triangles;
     }
 
-    let (mesh, report) = Mesh::from_triangles(&raw.positions, &raw.triangles, raw.groups.as_deref());
+    let (mut mesh, report) = Mesh::from_triangles(&raw.positions, &raw.triangles, raw.groups.as_deref());
     if mesh.triangle_count() == 0 {
         bail!("file contains no valid triangles ({} degenerate)", report.degenerate);
     }
     let colors = raw.colors.map(|c| colors_for_mesh(&mesh, &raw.positions, c));
+    // The mesh carries the colours too, so they follow later edits and are exported.
+    if let Some(c) = &colors {
+        for v in mesh.vertex_ids().collect::<Vec<_>>() {
+            if let Some(&col) = c.get(v as usize) {
+                mesh.set_vertex_color(v, col);
+            }
+        }
+    }
     Ok(ImportedMesh {
         mesh,
         name: "mesh".to_string(),
@@ -326,12 +334,14 @@ pub fn write_mesh_to<W: Write + Seek>(w: &mut W, mesh: &Mesh, format: Format, op
         bail!("mesh has no triangles");
     }
     let (pos, tris, groups) = mesh.to_arrays();
+    let colors = mesh.colors_compact();
+    let colors = colors.as_deref();
     let name = opts.name.as_deref().unwrap_or("mesh");
     match format {
         Format::Stl if opts.stl_ascii => stl::write_ascii(w, &pos, &tris, name, opts.double_precision)?,
         Format::Stl => stl::write_binary(w, &pos, &tris, name)?,
-        Format::Obj => obj::write(w, &pos, &tris, opts.obj_groups.then_some(&groups[..]), opts.double_precision)?,
-        Format::Ply => ply::write(w, &pos, &tris, opts.double_precision)?,
+        Format::Obj => obj::write(w, &pos, &tris, opts.obj_groups.then_some(&groups[..]), colors, opts.double_precision)?,
+        Format::Ply => ply::write(w, &pos, &tris, colors, opts.double_precision)?,
         Format::Off => off::write(w, &pos, &tris, opts.double_precision)?,
         Format::ThreeMf => threemf::write(w, &pos, &tris, name, opts.double_precision)?,
     }

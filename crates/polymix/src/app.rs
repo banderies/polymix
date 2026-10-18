@@ -56,10 +56,42 @@ impl NormalMode {
     }
 }
 
+/// What colours the surface (Meshmixer's Mesh Color Mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    /// The object colour.
+    Constant,
+    /// A colour per face group.
+    Group,
+    /// The mesh's vertex colours (the object colour when it has none).
+    Vertex,
+}
+
+impl ColorMode {
+    pub const ALL: [ColorMode; 3] = [ColorMode::Vertex, ColorMode::Group, ColorMode::Constant];
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorMode::Constant => "Constant color",
+            ColorMode::Group => "Group colors",
+            ColorMode::Vertex => "Vertex colors",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            ColorMode::Constant => "constant",
+            ColorMode::Group => "group",
+            ColorMode::Vertex => "vertex",
+        }
+    }
+    fn from_key(k: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key() == k)
+    }
+}
+
 pub struct ViewOptions {
     pub wireframe: bool,
     pub normals: NormalMode,
-    pub group_colors: bool,
+    pub colors: ColorMode,
     pub boundaries: bool,
     pub show_stats: bool,
     /// Keep edges sharper than `crease_deg` crisp in smooth shading (CAD parts).
@@ -74,7 +106,7 @@ pub struct ViewOptions {
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, group_colors: false, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true }
     }
 }
 
@@ -246,7 +278,11 @@ impl PolymixApp {
                 .and_then(|k| NormalMode::from_key(&k))
                 .unwrap_or(if flag("flat", false) { NormalMode::Face } else { NormalMode::Group });
             app.view.boundaries = flag("boundaries", true);
-            app.view.group_colors = flag("group_colors", false);
+            // Older settings only had a group-colours flag.
+            app.view.colors = st
+                .get_string("color_mode")
+                .and_then(|k| ColorMode::from_key(&k))
+                .unwrap_or(if flag("group_colors", false) { ColorMode::Group } else { ColorMode::Vertex });
             app.view.show_grid = flag("grid", false);
             app.view.transparent_target = flag("transparent_target", true);
             app.view.sharp_edges = flag("sharp_edges", true);
@@ -609,7 +645,11 @@ impl PolymixApp {
                 ui.checkbox(&mut self.view.sharp_edges, "Sharp edges")
                     .on_hover_text("Keep hard corners crisp instead of averaging normals across them (CAD parts). Edges bending more than the crease angle are shaded sharp.");
                 ui.add_enabled(self.view.sharp_edges, egui::Slider::new(&mut self.view.crease_deg, 5.0..=90.0).suffix("°").text("Crease angle"));
-                ui.checkbox(&mut self.view.group_colors, "Face group colors");
+                ui.horizontal(|ui| {
+                    for m in ColorMode::ALL {
+                        ui.selectable_value(&mut self.view.colors, m, m.label());
+                    }
+                });
                 ui.checkbox(&mut self.view.boundaries, "Show open boundaries");
                 ui.checkbox(&mut self.camera.orthographic, "Orthographic");
                 ui.checkbox(&mut self.camera.free_orbit, "Free rotation")
@@ -1039,7 +1079,11 @@ impl PolymixApp {
                 });
                 ui.horizontal(|ui| {
                     ui.toggle_value(&mut self.view.boundaries, "Boundaries");
-                    ui.toggle_value(&mut self.view.group_colors, "Group colors");
+                    egui::ComboBox::from_id_salt("hotbox_colors").selected_text(self.view.colors.label()).show_ui(ui, |ui| {
+                        for m in ColorMode::ALL {
+                            ui.selectable_value(&mut self.view.colors, m, m.label());
+                        }
+                    });
                     if let Some(o) = self.scene.active_mut() {
                         let mut c = [o.color.x, o.color.y, o.color.z];
                         if ui.color_edit_button_rgb(&mut c).changed() {
@@ -1559,11 +1603,12 @@ impl PolymixApp {
                 color,
                 wireframe: self.view.wireframe,
                 flat: self.view.normals == NormalMode::Face,
-                group_colors: self.view.group_colors || self.tools.last().is_some_and(|t| t.shows_groups()),
+                group_colors: self.view.colors == ColorMode::Group || self.tools.last().is_some_and(|t| t.shows_groups()),
                 dim: multiple && Some(o.id) != active,
                 cut_tint: matches!(cut_tint, Some(t) if t.is_none() || t == Some(o.id)),
                 crease_deg: self.view.sharp_edges.then_some(self.view.crease_deg),
                 group_normals: self.view.normals == NormalMode::Group,
+                vertex_colors: self.view.colors == ColorMode::Vertex,
             };
             if let Some((pid, pm)) = preview {
                 if pid == o.id {
@@ -1686,7 +1731,7 @@ impl PolymixApp {
                 Ok(d) => (self.view.sharp_edges, self.view.crease_deg) = (true, d),
                 Err(_) => self.view.sharp_edges = false,
             },
-            "groups" => self.view.group_colors = !self.view.group_colors,
+            "groups" => self.view.colors = if self.view.colors == ColorMode::Group { ColorMode::Vertex } else { ColorMode::Group },
             "focus" => self.camera.focus(&self.scene.bounds()),
             "zoom" => {
                 // zoom:x,y,factor — zoom toward the surface under a viewport-relative point.
@@ -1915,7 +1960,7 @@ impl eframe::App for PolymixApp {
         st.set_string("wireframe", b(self.view.wireframe));
         st.set_string("normals", self.view.normals.key().to_string());
         st.set_string("boundaries", b(self.view.boundaries));
-        st.set_string("group_colors", b(self.view.group_colors));
+        st.set_string("color_mode", self.view.colors.key().to_string());
         st.set_string("grid", b(self.view.show_grid));
         st.set_string("transparent_target", b(self.view.transparent_target));
         st.set_string("sharp_edges", b(self.view.sharp_edges));

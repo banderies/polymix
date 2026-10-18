@@ -479,12 +479,13 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
 }
 
 /// Binary little-endian PLY with `float` (or `double`) coordinates.
-pub(crate) fn write<W: Write + ?Sized>(w: &mut W, pos: &[DVec3], tris: &[[u32; 3]], double: bool) -> Result<()> {
+pub(crate) fn write<W: Write + ?Sized>(w: &mut W, pos: &[DVec3], tris: &[[u32; 3]], colors: Option<&[[f32; 3]]>, double: bool) -> Result<()> {
     let ty = if double { "double" } else { "float" };
+    let rgb = if colors.is_some() { "property uchar red\nproperty uchar green\nproperty uchar blue\n" } else { "" };
     write!(
         w,
         "ply\nformat binary_little_endian 1.0\ncomment Polymix export\nelement vertex {}\n\
-         property {ty} x\nproperty {ty} y\nproperty {ty} z\nelement face {}\n\
+         property {ty} x\nproperty {ty} y\nproperty {ty} z\n{rgb}element face {}\n\
          property list uchar int vertex_indices\nend_header\n",
         pos.len(),
         tris.len()
@@ -493,7 +494,7 @@ pub(crate) fn write<W: Write + ?Sized>(w: &mut W, pos: &[DVec3], tris: &[[u32; 3
         bail!("mesh too large for PLY int indices");
     }
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
-    for p in pos {
+    for (i, p) in pos.iter().enumerate() {
         if double {
             for c in p.to_array() {
                 buf.extend_from_slice(&c.to_le_bytes());
@@ -502,6 +503,9 @@ pub(crate) fn write<W: Write + ?Sized>(w: &mut W, pos: &[DVec3], tris: &[[u32; 3
             for c in p.as_vec3().to_array() {
                 buf.extend_from_slice(&c.to_le_bytes());
             }
+        }
+        if let Some(c) = colors.and_then(|c| c.get(i)) {
+            buf.extend(c.map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u8));
         }
         if buf.len() >= (1 << 16) - 32 {
             w.write_all(&buf)?;

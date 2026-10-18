@@ -135,6 +135,17 @@ pub struct Mesh {
     /// Incremented when a triangle's face group changes (only meaningful together with the
     /// shape version: a different mesh always has a different shape version).
     group_version: u64,
+    /// Optional per-vertex colours (RGB in 0..1, parallel to the positions).
+    vcolor: Option<Vec<[f32; 3]>>,
+    /// Incremented when colours are set, enabled or cleared (like `group_version`).
+    color_version: u64,
+}
+
+/// Colour given to new vertices of a coloured mesh when nothing better is known.
+pub const DEFAULT_VERTEX_COLOR: [f32; 3] = [0.8, 0.8, 0.8];
+
+fn lerp3(a: [f32; 3], b: [f32; 3], s: f32) -> [f32; 3] {
+    [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * s)
 }
 
 impl std::fmt::Debug for Mesh {
@@ -539,11 +550,17 @@ impl Mesh {
             self.vpos[i] = p;
             self.vedges[i].clear();
             self.vlive[i] = true;
+            if let Some(c) = &mut self.vcolor {
+                c[i] = DEFAULT_VERTEX_COLOR;
+            }
             v
         } else {
             self.vpos.push(p);
             self.vedges.push(EdgeList::new());
             self.vlive.push(true);
+            if let Some(c) = &mut self.vcolor {
+                c.push(DEFAULT_VERTEX_COLOR);
+            }
             (self.vpos.len() - 1) as u32
         }
     }
@@ -843,6 +860,9 @@ impl Mesh {
         let et = self.et[e as usize];
         let p = self.vpos[a as usize].lerp(self.vpos[b as usize], s);
         let f = self.alloc_vertex(p);
+        if let Some(c) = &mut self.vcolor {
+            c[f as usize] = lerp3(c[a as usize], c[b as usize], s as f32);
+        }
 
         // Edge e becomes (a, f); new edge (f, b).
         self.remove_vertex_edge(b, e);
@@ -1117,6 +1137,10 @@ impl Mesh {
         let p = self.vpos[a as usize] * bary.x + self.vpos[b as usize] * bary.y + self.vpos[c as usize] * bary.z;
         let g = self.tgroup[t as usize];
         let f = self.alloc_vertex(p);
+        if let Some(col) = &mut self.vcolor {
+            let (ca, cb, cc) = (col[a as usize], col[b as usize], col[c as usize]);
+            col[f as usize] = [0, 1, 2].map(|i| ca[i] * bary.x as f32 + cb[i] * bary.y as f32 + cc[i] * bary.z as f32);
+        }
         // t: (a, b, f), t1: (b, c, f), t2: (c, a, f)
         let t1 = self.alloc_triangle([b, c, f], [INVALID; 3], g);
         let t2 = self.alloc_triangle([c, a, f], [INVALID; 3], g);
@@ -1149,6 +1173,9 @@ impl Mesh {
         }
         let in_set = |t: u32| t != INVALID && tris.contains(&t);
         let nv = self.alloc_vertex(self.vpos[v as usize]);
+        if let Some(c) = &mut self.vcolor {
+            c[nv as usize] = c[v as usize];
+        }
         let edges: EdgeList = self.vedges[v as usize].clone();
         for e in edges {
             let [t0, t1] = self.et[e as usize];
@@ -1241,8 +1268,14 @@ impl Mesh {
     /// Returns the vertex map from `other` ids to new ids.
     pub fn append_mesh(&mut self, other: &Mesh, group_offset: i32) -> Vec<u32> {
         let mut vmap = vec![INVALID; other.max_vid()];
+        if other.vcolor.is_some() {
+            self.enable_vertex_colors();
+        }
         for v in other.vertex_ids() {
             vmap[v as usize] = self.alloc_vertex(other.vertex(v));
+            if let (Some(c), Some(oc)) = (&mut self.vcolor, &other.vcolor) {
+                c[vmap[v as usize] as usize] = oc[v as usize];
+            }
         }
         for t in other.triangle_ids() {
             let [a, b, c] = other.triangle(t);
@@ -1259,11 +1292,17 @@ impl Mesh {
     pub fn submesh(&self, tris: &[u32]) -> (Mesh, Vec<u32>) {
         let mut vmap = vec![INVALID; self.max_vid()];
         let mut m = Mesh::with_capacity(tris.len(), tris.len());
+        if self.vcolor.is_some() {
+            m.enable_vertex_colors();
+        }
         for &t in tris {
             let mut tv = [INVALID; 3];
             for (k, &v) in self.tv[t as usize].iter().enumerate() {
                 if vmap[v as usize] == INVALID {
                     vmap[v as usize] = m.alloc_vertex(self.vpos[v as usize]);
+                    if let (Some(c), Some(sc)) = (&mut m.vcolor, &self.vcolor) {
+                        c[vmap[v as usize] as usize] = sc[v as usize];
+                    }
                 }
                 tv[k] = vmap[v as usize];
             }
@@ -1276,6 +1315,48 @@ impl Mesh {
     pub fn compacted(&self) -> (Mesh, Vec<u32>) {
         let tris: Vec<u32> = self.triangle_ids().collect();
         self.submesh(&tris)
+    }
+
+    /// Whether the mesh carries per-vertex colours.
+    pub fn has_vertex_colors(&self) -> bool {
+        self.vcolor.is_some()
+    }
+    /// Colour of vertex `v` (when the mesh has colours).
+    pub fn vertex_color(&self, v: u32) -> Option<[f32; 3]> {
+        self.vcolor.as_ref().map(|c| c[v as usize])
+    }
+    /// Set the colour of `v`, giving the mesh colours (default grey) if it had none.
+    pub fn set_vertex_color(&mut self, v: u32, c: [f32; 3]) {
+        self.enable_vertex_colors();
+        if let Some(col) = &mut self.vcolor {
+            col[v as usize] = c;
+        }
+        self.color_version = self.color_version.wrapping_add(1);
+    }
+    pub fn color_version(&self) -> u64 {
+        self.color_version
+    }
+    /// Give the mesh per-vertex colours (all [`DEFAULT_VERTEX_COLOR`]) if it has none.
+    pub fn enable_vertex_colors(&mut self) {
+        if self.vcolor.is_none() {
+            self.vcolor = Some(vec![DEFAULT_VERTEX_COLOR; self.vpos.len()]);
+            self.color_version = self.color_version.wrapping_add(1);
+        }
+    }
+    pub fn clear_vertex_colors(&mut self) {
+        self.vcolor = None;
+        self.color_version = self.color_version.wrapping_add(1);
+    }
+    /// Colour at barycentric coordinates `bary` of triangle `t`.
+    pub fn color_at(&self, t: u32, bary: DVec3) -> Option<[f32; 3]> {
+        let c = self.vcolor.as_ref()?;
+        let [a, b, d] = self.tv[t as usize].map(|v| c[v as usize]);
+        Some([0, 1, 2].map(|i| a[i] * bary.x as f32 + b[i] * bary.y as f32 + d[i] * bary.z as f32))
+    }
+    /// Vertex colours in the order of [`Mesh::to_arrays`]' positions.
+    pub fn colors_compact(&self) -> Option<Vec<[f32; 3]>> {
+        let c = self.vcolor.as_ref()?;
+        Some(self.vertex_ids().map(|v| c[v as usize]).collect())
     }
 
     /// Flat arrays (compacted) suitable for export / GPU upload.

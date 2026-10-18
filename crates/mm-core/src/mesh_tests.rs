@@ -286,3 +286,37 @@ fn clearance_between_spheres() {
     let c = crate::measure::clearance(&a, &ba, &near, &crate::Bvh::build(&near), false);
     assert!(c.intersecting && c.min == 0.0);
 }
+
+#[test]
+fn vertex_colors_follow_edits() {
+    let mut m = crate::primitives::plane_grid(2.0, 2.0, 2, 2);
+    assert!(!m.has_vertex_colors());
+    for v in m.vertex_ids().collect::<Vec<_>>() {
+        let p = m.vertex(v);
+        m.set_vertex_color(v, [(p.x as f32 + 1.0) / 2.0, 0.0, 0.0]);
+    }
+    // Splitting an edge interpolates.
+    let e = m.edge_ids().find(|&e| {
+        let [a, b] = m.edge_vertices(e);
+        (m.vertex(a).x - m.vertex(b).x).abs() > 0.5 && (m.vertex(a).y - m.vertex(b).y).abs() < 1e-9
+    }).unwrap();
+    let [a, b] = m.edge_vertices(e);
+    let want = (m.vertex_color(a).unwrap()[0] + m.vertex_color(b).unwrap()[0]) / 2.0;
+    let s = m.split_edge(e).unwrap();
+    assert!((m.vertex_color(s.v_new).unwrap()[0] - want).abs() < 1e-6);
+    // Poking a triangle blends its corners.
+    let t = m.triangle_ids().next().unwrap();
+    let corners = m.triangle(t).map(|v| m.vertex_color(v).unwrap()[0]);
+    let p = m.poke_triangle(t, DVec3::splat(1.0 / 3.0)).unwrap();
+    assert!((m.vertex_color(p.v_new).unwrap()[0] - corners.iter().sum::<f32>() / 3.0).abs() < 1e-6);
+    // Copies keep colours.
+    let (c, map) = m.compacted();
+    for v in m.vertex_ids() {
+        assert_eq!(c.vertex_color(map[v as usize]), m.vertex_color(v));
+    }
+    let mut host = crate::primitives::cube(1.0, 1);
+    let vm = host.append_mesh(&m, 1);
+    assert!(host.has_vertex_colors());
+    assert_eq!(host.vertex_color(vm[a as usize]), m.vertex_color(a));
+    assert_eq!(host.vertex_color(0), Some(DEFAULT_VERTEX_COLOR));
+}

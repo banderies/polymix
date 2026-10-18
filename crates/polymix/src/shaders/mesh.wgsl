@@ -19,7 +19,7 @@ struct Globals {
 struct Object {
     color: vec4<f32>,
     // x: wireframe, y: flat shading, z: color mode (0 object, 1 face groups, 2 scalar field,
-    // 3 per-triangle RGB),
+    // 3 per-triangle RGB, 4 vertex colours),
     // w: bit 0 dim (non-active object), bit 1 show cut-plane tint
     flags: vec4<u32>,
 };
@@ -32,6 +32,7 @@ struct VsIn {
     @builtin(vertex_index) vid: u32,
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) color: u32,
 };
 
 struct VsOut {
@@ -40,6 +41,7 @@ struct VsOut {
     @location(1) normal: vec3<f32>,
     @location(2) bary: vec3<f32>,
     @location(3) @interpolate(flat) tflags: u32,
+    @location(4) vcolor: vec3<f32>,
 };
 
 @vertex
@@ -51,6 +53,7 @@ fn vs_main(in: VsIn) -> VsOut {
     let c = in.vid % 3u;
     out.bary = vec3<f32>(f32(c == 0u), f32(c == 1u), f32(c == 2u));
     out.tflags = tri_flags[in.vid / 3u];
+    out.vcolor = vec3<f32>(f32((in.color >> 16u) & 0xffu), f32((in.color >> 8u) & 0xffu), f32(in.color & 0xffu)) / 255.0;
     return out;
 }
 
@@ -102,6 +105,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     } else if (object.flags.z == 3u) {
         let rgb = in.tflags >> 8u;
         base = vec3<f32>(f32((rgb >> 16u) & 0xffu), f32((rgb >> 8u) & 0xffu), f32(rgb & 0xffu)) / 255.0;
+    } else if (object.flags.z == 4u) {
+        base = in.vcolor;
     }
     if (selected) {
         base = vec3<f32>(1.0, 0.45, 0.08);

@@ -130,12 +130,17 @@ pub(crate) fn write<W: Write + ?Sized>(
     pos: &[DVec3],
     tris: &[[u32; 3]],
     groups: Option<&[i32]>,
+    colors: Option<&[[f32; 3]]>,
     double: bool,
 ) -> Result<()> {
     writeln!(w, "# Polymix OBJ export\n# {} vertices, {} triangles", pos.len(), tris.len())?;
-    write_parallel(w, pos, |b, _, &p| {
+    write_parallel(w, pos, |b, i, &p| {
         b.extend_from_slice(b"v ");
         put_xyz(b, p, double, b" ");
+        // Vertex colours as the widely read `v x y z r g b` extension.
+        if let Some(c) = colors.and_then(|c| c.get(i)) {
+            let _ = write!(b, " {:.4} {:.4} {:.4}", c[0], c[1], c[2]);
+        }
         b.push(b'\n');
     })?;
     write_parallel(w, tris, |b, i, t| {

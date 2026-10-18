@@ -72,6 +72,9 @@ pub struct MakeSolidParams {
     pub transfer_groups: bool,
     /// Crease angle (degrees) that [`SolidMode::SharpEdges`] treats as a sharp edge.
     pub sharp_angle_deg: f64,
+    /// Give the output the input's vertex colours (sampled at the nearest input point),
+    /// when the input has any ("Color Transfer Mode: Vertex-to-Vertex").
+    pub transfer_colors: bool,
 }
 
 impl Default for MakeSolidParams {
@@ -88,6 +91,7 @@ impl Default for MakeSolidParams {
             improve_quality: true,
             transfer_groups: false,
             sharp_angle_deg: 30.0,
+            transfer_colors: true,
         }
     }
 }
@@ -238,9 +242,34 @@ pub fn make_solid(mesh: &Mesh, params: &MakeSolidParams, progress: Progress) -> 
     if params.transfer_groups {
         transfer_face_groups_with(&mut out, mesh, sdf.bvh());
     }
-    let out = compact(out);
+    let mut out = compact(out);
+    if params.transfer_colors && mesh.has_vertex_colors() {
+        transfer_vertex_colors_with(&mut out, mesh, sdf.bvh());
+    }
     prog.report(1.0)?;
     Ok(out)
+}
+
+/// Give each vertex of `out` the colour of `input` at its nearest point (interpolated from
+/// the input's vertex colours). Does nothing when the input has no colours.
+pub fn transfer_vertex_colors(out: &mut Mesh, input: &Mesh) {
+    if input.has_vertex_colors() {
+        transfer_vertex_colors_with(out, input, &Bvh::build(input));
+    }
+}
+
+fn transfer_vertex_colors_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
+    let ids: Vec<u32> = out.vertex_ids().collect();
+    let snapshot: &Mesh = out;
+    let cols: Vec<Option<[f32; 3]>> = ids
+        .par_iter()
+        .map(|&v| bvh.nearest(input, snapshot.vertex(v), f64::INFINITY).and_then(|h| input.color_at(h.tid, h.bary)))
+        .collect();
+    for (&v, c) in ids.iter().zip(cols) {
+        if let Some(c) = c {
+            out.set_vertex_color(v, c);
+        }
+    }
 }
 
 /// Give each triangle of `out` the face group of the nearest triangle of `input` (measured

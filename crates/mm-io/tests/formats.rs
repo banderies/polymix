@@ -642,3 +642,26 @@ fn fuzz_no_panics() {
         }
     }
 }
+
+#[test]
+fn vertex_colors_round_trip() {
+    let mut m = mm_core::primitives::icosphere(1.0, 2);
+    for v in m.vertex_ids().collect::<Vec<_>>() {
+        let p = m.vertex(v);
+        m.set_vertex_color(v, [(p.x as f32 + 1.0) / 2.0, (p.y as f32 + 1.0) / 2.0, 0.25]);
+    }
+    for format in [mm_io::Format::Ply, mm_io::Format::Obj] {
+        let bytes = mm_io::write_mesh_to_bytes(&m, format, &Default::default()).unwrap();
+        let back = mm_io::read_mesh_from_bytes(&bytes, format).unwrap().mesh;
+        assert!(back.has_vertex_colors(), "{format:?}: colours lost");
+        // Same vertex order after a round trip of a compact mesh.
+        for (v, w) in m.vertex_ids().zip(back.vertex_ids()) {
+            let (a, b) = (m.vertex_color(v).unwrap(), back.vertex_color(w).unwrap());
+            assert!((0..3).all(|i| (a[i] - b[i]).abs() < 1.0 / 255.0 + 1e-4), "{format:?}: {a:?} vs {b:?}");
+        }
+    }
+    // A mesh without colours writes none.
+    let plain = mm_core::primitives::cube(1.0, 1);
+    let bytes = mm_io::write_mesh_to_bytes(&plain, mm_io::Format::Ply, &Default::default()).unwrap();
+    assert!(!mm_io::read_mesh_from_bytes(&bytes, mm_io::Format::Ply).unwrap().mesh.has_vertex_colors());
+}

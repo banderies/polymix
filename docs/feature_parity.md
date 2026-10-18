@@ -42,7 +42,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Recent files | ✅ | |
 | Drag-and-drop import | ✅ | |
 | Export: OBJ, STL ASCII/binary, PLY, 3MF | ✅ | plus OFF |
-| Export: OBJ with per-vertex colour | ❌ | Colours are read on import but not shown or written |
+| Export: OBJ with per-vertex colour | ✅ | OBJ (`v x y z r g b`) and PLY (uchar RGB) read and write vertex colours |
 | Export: "Sequence, one file per region" (OBJ/STL) | 🟡 | One STL per face group via Boundary patches |
 | Export: AMF, COLLADA (.dae), VRML, SMESH | ❌ | |
 | Export SVG | ⛔ | |
@@ -50,7 +50,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Preferences (Alt+T / ⌘,) | 🟡 | View options persist; no Preferences window |
 | Pref: Flip Z-Y axis on import/export (on in your install) | ❌ | Polymix has a Z-up *view* but does not convert file axes |
 | Pref: Mesh Normal Mode Vertex / Face / Group normals | ✅ | View menu and hotbox; Group (default) keeps group borders crisp; Vertex still honours Sharp edges |
-| Pref: Mesh Color Mode Group / Vertex / Constant | 🟡 | Group and constant ✅; vertex ❌ |
+| Pref: Mesh Color Mode Group / Vertex / Constant | ✅ | View menu and hotbox; Vertex (default) shows vertex colours when the mesh has them |
 | Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | 🟡 | Export active object or all visible; OBJ groups ✅ |
 | Pref: Import dialogs (append/replace, scale models) | ❌ | |
 | Autosave + crash recovery | ❌ | |
@@ -106,7 +106,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Camera: Focus | ✅ | |
 | Camera: background Color | ❌ | |
 | Mesh → Normals: smooth / faceted / face-group normals | 🟡 | Smooth, Faceted ✅; per-group normals ❌ |
-| Mesh → Color: vertex colours / face-group colours | 🟡 | Group colours ✅; vertex colours ❌ |
+| Mesh → Color: vertex colours / face-group colours | ✅ | Colours follow edits (interpolated on splits) |
 | Brushes: Size, Strength sliders | ❌ | |
 | — | ✅ | Polymix extras: Y-up / Z-up |
 
@@ -136,7 +136,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Double-click: connected part | ✅ | |
 | Double-click an open-edge triangle: hole-border ring | ✅ | Polymix addition (requested) |
 | S inside Select clears the selection | ✅ | Polymix addition (requested) |
-| Expand Mode: Geodesic / Crease Angle / Vertex Color + Crease Angle Thresh | 🟡 | Geodesic, Crease Angle and the threshold ✅ (brush and growth stop at creases); Vertex Color with M6.2 |
+| Expand Mode: Geodesic / Crease Angle / Vertex Color + Crease Angle Thresh | ✅ | Brush and growth stop at creases; Vertex Color grows into similarly coloured faces |
 | Allow Back Faces | ✅ | Brush filter; the lasso has "selects through the model" |
 | Restrict To Exterior Faces | ✅ | Winding-number test: skips faces buried inside other parts |
 | Symmetry plane (Set / Reset) | 🟡 | Mirror across the object's centre on X/Y/Z; free plane placement ❌ |
@@ -197,7 +197,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Boolean Union / Difference / Intersection | ✅ | Fast Approximate (volumetric), Precise (exact, keeps triangles away from the seam; Auto-Reduce Result), Max Quality (seam band remesh: Target Edge Scale, Merge Border Rings). Precise needs closed meshes; coplanar faces are nudged automatically. Search Depth / Use Intersection Curves / Preview Iterations not exposed |
 | Close Cracks | ✅ | Welds coincident open boundaries incl. T-junctions; tolerance slider with live preview |
 | Generate Face Groups | ✅ | Edge Angle / Normal Angle, angle and size thresholds; shows group colours while open |
-| Make Solid | 🟡 | Blocky / Fast / Accurate / Sharp Edge Preserve, accuracy, density, offset, min thickness, Cull Edges Threshold, close boundaries, Transfer Groups ✅; Color Transfer Mode ❌ (needs vertex colours, M6.2) |
+| Make Solid | 🟡 | Blocky / Fast / Accurate / Sharp Edge Preserve, accuracy, density, offset, min thickness, Cull Edges Threshold, close boundaries, Transfer Groups, Color Transfer Mode (Automatic / No Colors / Vertex-to-Vertex) ✅; Material-to-Vertex ⚪ (no materials/textures) |
 | Hollow | ✅ | Hollow wall ✅; escape holes ⛔ (printing) |
 | Make Pattern | ⚪ ❌ | |
 | Separate Shells (Shift+Y) | ✅ | |

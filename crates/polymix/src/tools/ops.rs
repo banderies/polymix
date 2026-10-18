@@ -1337,6 +1337,16 @@ pub struct MakeSolidUi {
     pub transfer_groups: bool,
     /// "Cull Edges Threshold", 0..100: scales the short-edge collapse from none to full.
     pub cull_edges: f64,
+    pub color_transfer: ColorTransfer,
+}
+
+/// Make Solid's "Color Transfer Mode".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorTransfer {
+    /// Vertex-to-vertex when the input has vertex colours.
+    Automatic,
+    NoColors,
+    VertexToVertex,
 }
 
 impl MakeSolidUi {
@@ -1363,6 +1373,7 @@ impl OpSpec for MakeSolidSpec {
             remesh_result: true,
             transfer_groups: false,
             cull_edges: 100.0,
+            color_transfer: ColorTransfer::Automatic,
         }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
@@ -1393,6 +1404,17 @@ impl OpSpec for MakeSolidSpec {
         ui.checkbox(&mut p.remove_small, "Remove small floating parts");
         ui.checkbox(&mut p.remesh_result, "Remesh result (better triangles for CFD)");
         ui.checkbox(&mut p.transfer_groups, "Transfer groups").on_hover_text("Copy the face groups of the input onto the solid");
+        egui::ComboBox::from_label("Color transfer")
+            .selected_text(match p.color_transfer {
+                ColorTransfer::Automatic => "Automatic",
+                ColorTransfer::NoColors => "No Colors",
+                ColorTransfer::VertexToVertex => "Vertex-to-Vertex",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut p.color_transfer, ColorTransfer::Automatic, "Automatic").on_hover_text("Keep the vertex colours if the input has any");
+                ui.selectable_value(&mut p.color_transfer, ColorTransfer::NoColors, "No Colors");
+                ui.selectable_value(&mut p.color_transfer, ColorTransfer::VertexToVertex, "Vertex-to-Vertex");
+            });
         if p.cells() >= 512 {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "High accuracy: this can take a while and use a lot of memory.");
         }
@@ -1405,8 +1427,11 @@ impl OpSpec for MakeSolidSpec {
             SolidType::Accurate => mm_solid::SolidMode::Accurate,
             SolidType::SharpEdges => mm_solid::SolidMode::SharpEdges,
         };
-        // Groups go on after the remesh so its group constraints don't keep the raw borders.
+        // Groups and colours go on after the remesh so its group constraints don't keep the
+        // raw borders.
         params.transfer_groups = p.transfer_groups && !p.remesh_result;
+        let colors = p.color_transfer != ColorTransfer::NoColors && mesh.has_vertex_colors();
+        params.transfer_colors = colors && !p.remesh_result;
         params.offset = p.offset;
         params.min_edge_length = params.min_edge_length.map(|l| l * (p.cull_edges / 100.0).clamp(0.0, 1.0));
         params.min_thickness = p.use_min_thickness.then_some(p.min_thickness);
@@ -1425,6 +1450,9 @@ impl OpSpec for MakeSolidSpec {
             mm_remesh::remesh(&mut out, &rp, Some(&remesh_progress))?;
             if p.transfer_groups {
                 mm_solid::transfer_face_groups(&mut out, mesh);
+            }
+            if colors {
+                mm_solid::transfer_vertex_colors(&mut out, mesh);
             }
         }
         let shells = mm_core::topology::connected_components(&out).len();
@@ -2515,5 +2543,31 @@ mod fit_primitive_tests {
         let objects = FitPrimitiveSpec::run(&m, Some(&sel), &FitPrimitiveUi { create_new_objects: true, ..p }, &|_| true).unwrap();
         assert_eq!(objects.new_objects.len(), 2);
         assert_eq!(objects.mesh.triangle_count(), m.triangle_count());
+    }
+}
+
+#[cfg(test)]
+mod color_transfer_tests {
+    use super::*;
+
+    #[test]
+    fn make_solid_keeps_vertex_colors() {
+        let mut m = mm_core::primitives::icosphere(1.0, 3);
+        for v in m.vertex_ids().collect::<Vec<_>>() {
+            let z = m.vertex(v).z as f32;
+            m.set_vertex_color(v, [(z + 1.0) / 2.0, 0.2, 0.2]);
+        }
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let base = MakeSolidUi { accuracy: 0.0, ..MakeSolidSpec::defaults(&info) };
+        for remesh in [false, true] {
+            let out = MakeSolidSpec::run(&m, None, &MakeSolidUi { remesh_result: remesh, ..base }, &|_| true).unwrap().mesh;
+            assert!(out.has_vertex_colors());
+            for v in out.vertex_ids() {
+                let want = (out.vertex(v).z as f32 + 1.0) / 2.0;
+                assert!((out.vertex_color(v).unwrap()[0] - want).abs() < 0.05, "remesh {remesh}");
+            }
+        }
+        let none = MakeSolidSpec::run(&m, None, &MakeSolidUi { color_transfer: ColorTransfer::NoColors, ..base }, &|_| true).unwrap().mesh;
+        assert!(!none.has_vertex_colors());
     }
 }

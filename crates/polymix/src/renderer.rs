@@ -38,6 +38,18 @@ struct ObjectUniform {
 struct MeshVertex {
     position: [f32; 3],
     normal: [f32; 3],
+    /// Vertex colour as 0xRRGGBB (used in the vertex-colour mode).
+    color: u32,
+}
+
+/// Packed vertex colour of `v` (grey when the mesh has none).
+fn packed_color(mesh: &Mesh, v: u32, on: bool) -> u32 {
+    if !on {
+        return 0;
+    }
+    let c = mesh.vertex_color(v).unwrap_or(mm_core::mesh::DEFAULT_VERTEX_COLOR);
+    let b = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (b(c[0]) << 16) | (b(c[1]) << 8) | b(c[2])
 }
 
 #[repr(C)]
@@ -67,6 +79,8 @@ pub struct ObjectStyle {
     pub crease_deg: Option<f32>,
     /// Keep face-group borders crisp too (Group Normals).
     pub group_normals: bool,
+    /// Show the mesh's vertex colours (when it has any).
+    pub vertex_colors: bool,
 }
 
 /// Per-triangle display values (indexed by triangle id) shown instead of the object colour.
@@ -99,6 +113,8 @@ pub struct GpuMesh {
     crease_deg: Option<f32>,
     /// Group-normal setting and mesh group version the normals were built with.
     group_normals: Option<u64>,
+    /// Mesh colour version the vertex colours were uploaded from (when shown).
+    colors_key: Option<u64>,
     /// Mesh triangle id -> soup triangle index (u32::MAX if absent).
     soup_index: Vec<u32>,
 }
@@ -209,7 +225,7 @@ impl SceneRenderer {
         let mesh_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32],
         };
         let color_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<ColorVertex>() as u64,
@@ -367,6 +383,7 @@ impl SceneRenderer {
             scalar_stamp: None,
             crease_deg: None,
             group_normals: None,
+            colors_key: None,
             soup_index: Vec::new(),
         }
     }
@@ -415,18 +432,24 @@ impl SceneRenderer {
     ) {
         let (moved_vertices, moved_from) = moved;
         let groups_key = style.group_normals.then_some(mesh.group_version());
-        let geometry_changed = gpu.shape_version != mesh.shape_version() || gpu.crease_deg != style.crease_deg || gpu.group_normals != groups_key;
+        let show_colors = style.vertex_colors && mesh.has_vertex_colors();
+        let colors_key = show_colors.then_some(mesh.color_version());
+        let geometry_changed = gpu.shape_version != mesh.shape_version()
+            || gpu.crease_deg != style.crease_deg
+            || gpu.group_normals != groups_key
+            || gpu.colors_key != colors_key;
         let crease = style.crease_deg.map(f64::from);
         let groups = style.group_normals;
         // Partial uploads are only valid on top of exactly the geometry the moves started from.
         let partial = geometry_changed
             && gpu.crease_deg == style.crease_deg
             && gpu.group_normals == groups_key
+            && gpu.colors_key == colors_key
             && gpu.topo_version == mesh.topology_version()
             && gpu.shape_version == moved_from
             && !moved_vertices.is_empty();
         if partial {
-            Self::partial_update(queue, gpu, mesh, moved_vertices, crease, groups);
+            Self::partial_update(queue, gpu, mesh, moved_vertices, crease, groups, show_colors);
             gpu.shape_version = mesh.shape_version();
         } else if geometry_changed {
             let tri_ids: Vec<u32> = mesh.triangle_ids().collect();
@@ -438,6 +461,7 @@ impl SceneRenderer {
                     mesh.triangle(t).into_iter().enumerate().map(move |(j, v)| MeshVertex {
                         position: mesh.vertex(v).as_vec3().to_array(),
                         normal: normals.corner(t, j).as_vec3().to_array(),
+                        color: packed_color(mesh, v, show_colors),
                     })
                 })
                 .collect();
@@ -473,6 +497,7 @@ impl SceneRenderer {
             gpu.topo_version = mesh.topology_version();
             gpu.crease_deg = style.crease_deg;
             gpu.group_normals = groups_key;
+            gpu.colors_key = colors_key;
         }
         moved_vertices.clear();
         let scalar_stamp = scalars.map(|(s, _)| s);
@@ -504,7 +529,9 @@ impl SceneRenderer {
                 match scalars {
                     Some((_, TriField::Scalar(_))) => 2,
                     Some((_, TriField::Rgb(_))) => 3,
-                    None => style.group_colors as u32,
+                    None if style.group_colors => 1,
+                    None if show_colors => 4,
+                    None => 0,
                 },
                 style.dim as u32 | ((style.cut_tint as u32) << 1),
             ],
@@ -513,7 +540,7 @@ impl SceneRenderer {
     }
 
     /// Re-upload only the triangles around moved vertices (positions and normals).
-    fn partial_update(queue: &wgpu::Queue, gpu: &GpuMesh, mesh: &Mesh, moved: &[u32], crease: Option<f64>, groups: bool) {
+    fn partial_update(queue: &wgpu::Queue, gpu: &GpuMesh, mesh: &Mesh, moved: &[u32], crease: Option<f64>, groups: bool, colors: bool) {
         // Normals change on the one-ring of moved vertices, so refresh their triangles too.
         let mut verts: Vec<u32> = Vec::with_capacity(moved.len() * 7);
         for &v in moved {
@@ -545,6 +572,7 @@ impl SceneRenderer {
                     run.push(MeshVertex {
                         position: mesh.vertex(v).as_vec3().to_array(),
                         normal: corner_normal(mesh, t, j, crease, groups).as_vec3().to_array(),
+                        color: packed_color(mesh, v, colors),
                     });
                 }
                 j += 1;
