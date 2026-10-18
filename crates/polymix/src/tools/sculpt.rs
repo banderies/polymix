@@ -285,6 +285,48 @@ struct Footprint {
     hold_groups: bool,
 }
 
+/// Symmetry plane: normal along `axis`, through `offset` on that axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SymPlane {
+    axis: usize,
+    offset: f64,
+}
+
+impl SymPlane {
+    /// Plane through the centre of the object's bounding box.
+    fn centered(mesh: &Mesh, axis: usize) -> Self {
+        Self { axis, offset: mesh.bounds().center()[axis] }
+    }
+    fn reflect(self, p: DVec3) -> DVec3 {
+        let mut q = p;
+        q[self.axis] = 2.0 * self.offset - p[self.axis];
+        q
+    }
+    fn reflect_dir(self, v: DVec3) -> DVec3 {
+        let mut q = v;
+        q[self.axis] = -v[self.axis];
+        q
+    }
+    fn distance(self, p: DVec3) -> f64 {
+        (p[self.axis] - self.offset).abs()
+    }
+}
+
+/// SymSnap tolerance, as a fraction of the brush radius.
+const SYM_SNAP_TOL: f64 = 0.03;
+
+/// Put back onto the plane the vertices of `verts` whose position when the stroke first
+/// reached them (`start`) was within `tol` of it.
+fn sym_snap(mesh: &mut Mesh, verts: impl Iterator<Item = u32>, start: &std::collections::HashMap<u32, DVec3>, sym: SymPlane, tol: f64) {
+    for v in verts {
+        if mesh.is_vertex(v) && start.get(&v).is_some_and(|&p| sym.distance(p) < tol) {
+            let mut p = mesh.vertex(v);
+            p[sym.axis] = sym.offset;
+            mesh.set_vertex(v, p);
+        }
+    }
+}
+
 pub struct SculptTool {
     brush: Brush,
     mode: SculptMode,
@@ -302,6 +344,11 @@ pub struct SculptTool {
     hold_groups: bool,
     /// Pull the stroked surface toward the target surface as well.
     attract: bool,
+    /// Mirror every dab across `sym` (Shift+S).
+    symmetry: bool,
+    sym: SymPlane,
+    /// Vertices that sat on the symmetry plane stay on it, so the halves stay joined.
+    sym_snap: bool,
     refinement: Refinement,
     /// Brush radius in percent of the model size.
     size_pct: f32,
@@ -318,10 +365,12 @@ pub struct SculptTool {
 struct SculptStroke {
     object: ObjectId,
     invert: bool,
-    // Move brush state.
+    // Move brush state (with the mirrored grab under symmetry).
     drag_verts: Vec<(u32, f64)>,
+    drag_mirror: Vec<(u32, f64)>,
     drag_origin: Option<(DVec3, egui::Pos2)>,
-    drag_start_pos: Vec<DVec3>,
+    drag_start_pos: std::collections::HashMap<u32, DVec3>,
+    drag_r: f64,
     /// Previous dab centre (for stroke-direction brushes).
     last_center: Option<DVec3>,
     /// Positions when the stroke first touched each vertex (Draw3's layer reference).
@@ -337,7 +386,12 @@ impl SculptTool {
     }
 
     /// Volume or surface brushes (Meshmixer hotkeys 3 and 2), optionally with a brush.
-    pub fn with_mode(_cx: &mut ToolCx, mode: SculptMode, brush: Option<Brush>) -> Self {
+    pub fn with_mode(cx: &mut ToolCx, mode: SculptMode, brush: Option<Brush>) -> Self {
+        let sym = cx.scene.active().map_or(SymPlane { axis: 0, offset: 0.0 }, |o| SymPlane::centered(&o.mesh, 0));
+        Self::build(mode, brush, sym)
+    }
+
+    fn build(mode: SculptMode, brush: Option<Brush>, sym: SymPlane) -> Self {
         let volume = mode == SculptMode::Volume;
         Self {
             brush: brush.unwrap_or(if volume { Brush::Draw } else { Brush::RobustSmooth }),
@@ -350,6 +404,9 @@ impl SculptTool {
             volumetric: volume,
             hold_groups: false,
             attract: false,
+            symmetry: false,
+            sym,
+            sym_snap: false,
             refinement: Refinement { enabled: volume, ..Refinement::default() },
             size_pct: 4.0,
             strength: 0.5,
@@ -359,6 +416,67 @@ impl SculptTool {
             hold_boundary: true,
             strength_drag: None,
         }
+    }
+}
+
+/// One dab of a stroke (before symmetry).
+struct Stamp {
+    brush: Brush,
+    center: DVec3,
+    /// Triangle under the brush centre.
+    seed: u32,
+    motion: DVec3,
+    view: DVec3,
+    r: f64,
+    invert: bool,
+}
+
+impl SculptTool {
+    fn footprint(&self) -> Footprint {
+        Footprint { falloff: self.falloff, volumetric: self.volumetric, hold_boundary: self.hold_boundary, hold_groups: self.hold_groups }
+    }
+
+    /// Apply a dab and, with symmetry on, its mirror image (the same operation reflected;
+    /// Meshmixer does not enforce strict mesh symmetry either). `start` collects where the
+    /// stroke first found each vertex. Returns whether the triangles changed.
+    fn stamp(&self, o: &mut crate::scene::SceneObject, s: &Stamp, start: &mut std::collections::HashMap<u32, DVec3>, target: Option<&crate::scene::TargetSurface>) -> bool {
+        let (brush, r, fp) = (s.brush, s.r, self.footprint());
+        let sym = self.symmetry.then_some(self.sym);
+        let mut dabs = vec![(s.center, s.motion, s.view, Some(s.seed))];
+        if let Some(sym) = sym {
+            dabs.push((sym.reflect(s.center), sym.reflect_dir(s.motion), sym.reflect_dir(s.view), None));
+        }
+        let mut retriangulated = false;
+        for (c, motion, view, seed) in dabs {
+            let bvh = o.bvh();
+            let Some(seed) = seed.or_else(|| bvh.nearest(&o.mesh, c, r).map(|n| n.tid)) else { continue };
+            let verts = brush_vertices(&o.mesh, &bvh, c, r, Some(seed), &fp);
+            for &(v, _) in &verts {
+                start.entry(v).or_insert_with(|| o.mesh.vertex(v));
+            }
+            if brush.density() {
+                retriangulated |= density_dab(o.mesh_mut(), &verts, brush, r, self.strength);
+            } else {
+                let dab = Dab { center: c, r, strength: self.strength, invert: s.invert, view, motion, start, target };
+                apply_dab(o.mesh_mut(), &verts, brush, &dab);
+                if self.attract && target.is_some() && brush != Brush::Attract {
+                    apply_dab(o.mesh_mut(), &verts, Brush::Attract, &Dab { strength: self.strength * 0.5, ..dab });
+                }
+                o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
+                if self.refinement.enabled {
+                    let bvh = o.bvh();
+                    retriangulated |= refine_region(o.mesh_mut(), &bvh, c, r, &self.refinement);
+                }
+            }
+        }
+        if let (Some(sym), true) = (sym, self.sym_snap) {
+            let bvh = o.bvh();
+            let mut near = brush_vertices(&o.mesh, &bvh, s.center, r, None, &Footprint::default());
+            near.extend(brush_vertices(&o.mesh, &bvh, sym.reflect(s.center), r, None, &Footprint::default()));
+            sym_snap(o.mesh_mut(), near.iter().map(|x| x.0), start, sym, r * SYM_SNAP_TOL);
+            o.moved_vertices.extend(near.iter().map(|x| x.0));
+        }
+        retriangulated
     }
 }
 
@@ -634,6 +752,29 @@ impl Tool for SculptTool {
             ui.checkbox(&mut self.flow, "Flow").on_hover_text("Keep sculpting while the pointer rests");
             ui.checkbox(&mut self.volumetric, "Volumetric").on_hover_text("Affect everything inside the brush, not only the stroked surface");
         });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.symmetry, "Symmetry (Shift+S)").on_hover_text("Mirror every dab across the symmetry plane");
+            if self.symmetry {
+                for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+                    if ui.selectable_label(self.sym.axis == i, *n).on_hover_text(format!("Plane across {n}")).clicked() && self.sym.axis != i {
+                        self.sym = cx.scene.active().map_or(SymPlane { axis: i, offset: 0.0 }, |o| SymPlane::centered(&o.mesh, i));
+                    }
+                }
+            }
+        });
+        if self.symmetry {
+            ui.horizontal(|ui| {
+                ui.label("Plane at");
+                let span = cx.scene.active().map_or(1.0, |o| o.bounds().diagonal());
+                ui.add(egui::DragValue::new(&mut self.sym.offset).speed(span * 0.002).max_decimals(3));
+                if ui.button("Reset").on_hover_text("Back to the centre of the object").clicked() {
+                    if let Some(o) = cx.scene.active() {
+                        self.sym = SymPlane::centered(&o.mesh, self.sym.axis);
+                    }
+                }
+            });
+        }
+        ui.add_enabled(self.symmetry, egui::Checkbox::new(&mut self.sym_snap, "SymSnap")).on_hover_text("Vertices on the symmetry plane stay on it, so the two halves stay joined");
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.hold_boundary, "Hold boundary (B)");
             ui.checkbox(&mut self.hold_groups, "Preserve groups (G)");
@@ -674,8 +815,10 @@ impl Tool for SculptTool {
                     object: id,
                     invert: input.command,
                     drag_verts: Vec::new(),
+                    drag_mirror: Vec::new(),
                     drag_origin: None,
-                    drag_start_pos: Vec::new(),
+                    drag_start_pos: Default::default(),
+                    drag_r: 0.0,
                     last_center: None,
                     start: Default::default(),
                     lazy: None,
@@ -691,14 +834,14 @@ impl Tool for SculptTool {
         if !input.down {
             return;
         }
+        let fp = self.footprint();
         let Some(stroke) = &mut self.stroke else { return };
         let brush = if input.shift && !self.brush.grabs() { self.secondary } else { self.brush };
-        let strength = self.strength;
-        let fp = Footprint { falloff: self.falloff, volumetric: self.volumetric, hold_boundary: self.hold_boundary, hold_groups: self.hold_groups };
         if !self.flow && stroke.last_pos == Some(pos) {
             return;
         }
         stroke.last_pos = Some(pos);
+        let sym = self.symmetry.then_some(self.sym);
         if brush.grabs() {
             if stroke.drag_origin.is_none() {
                 let Some((_, h)) = hover else { return };
@@ -706,8 +849,15 @@ impl Tool for SculptTool {
                 let Some(o) = cx.scene.get_mut(stroke.object) else { return };
                 let bvh = o.bvh();
                 stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
-                stroke.drag_start_pos = stroke.drag_verts.iter().map(|&(v, _)| o.mesh.vertex(v)).collect();
+                if let Some(sym) = sym {
+                    let mc = sym.reflect(h.point);
+                    if let Some(n) = bvh.nearest(&o.mesh, mc, r) {
+                        stroke.drag_mirror = brush_vertices(&o.mesh, &bvh, mc, r, Some(n.tid), &fp);
+                    }
+                }
+                stroke.drag_start_pos = stroke.drag_verts.iter().chain(&stroke.drag_mirror).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
                 stroke.drag_origin = Some((h.point, pos));
+                stroke.drag_r = r;
                 return;
             }
             let (p0, s0) = stroke.drag_origin.unwrap();
@@ -718,13 +868,26 @@ impl Tool for SculptTool {
             if o.moved_vertices.is_empty() {
                 o.moved_from = o.mesh.shape_version();
             }
+            // Mirrored grabs move by the mirrored offset; where the two overlap both apply.
+            let mut moved: std::collections::HashMap<u32, DVec3> = stroke.drag_start_pos.clone();
+            let mirrored = sym.map_or(DVec3::ZERO, |s| s.reflect_dir(delta));
+            for (verts, step) in [(&stroke.drag_verts, delta), (&stroke.drag_mirror, mirrored)] {
+                for &(v, w) in verts {
+                    if let Some(p) = moved.get_mut(&v) {
+                        *p += step * w;
+                    }
+                }
+            }
             let m = o.mesh_mut();
             let pos_arr = m.positions_mut();
-            for (k, &(v, w)) in stroke.drag_verts.iter().enumerate() {
-                pos_arr[v as usize] = stroke.drag_start_pos[k] + delta * w;
+            for (&v, &p) in &moved {
+                pos_arr[v as usize] = p;
             }
             m.bump_shape_version();
-            o.moved_vertices.extend(stroke.drag_verts.iter().map(|&(v, _)| v));
+            if let (Some(sym), true) = (sym, self.sym_snap) {
+                sym_snap(m, moved.keys().copied(), &stroke.drag_start_pos, sym, stroke.drag_r * SYM_SNAP_TOL);
+            }
+            o.moved_vertices.extend(moved.keys().copied());
             return;
         }
         let Some((_, h)) = hover else { return };
@@ -740,28 +903,15 @@ impl Tool for SculptTool {
         stroke.lazy = Some(center);
         let motion = stroke.last_center.map_or(DVec3::ZERO, |c| center - c);
         stroke.last_center = Some(center);
-        let bvh = o.bvh();
-        let verts = brush_vertices(&o.mesh, &bvh, center, r, Some(h.tid), &fp);
-        for &(v, _) in &verts {
-            stroke.start.entry(v).or_insert_with(|| o.mesh.vertex(v));
-        }
         if o.moved_vertices.is_empty() {
             o.moved_from = o.mesh.shape_version();
         }
-        let retriangulated = if brush.density() {
-            density_dab(o.mesh_mut(), &verts, brush, r, strength)
-        } else {
-            let dab = Dab { center, r, strength, invert: stroke.invert, view, motion, start: &stroke.start, target: target.as_ref() };
-            apply_dab(o.mesh_mut(), &verts, brush, &dab);
-            if self.attract && target.is_some() && brush != Brush::Attract {
-                apply_dab(o.mesh_mut(), &verts, Brush::Attract, &Dab { strength: strength * 0.5, ..dab });
-            }
-            o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
-            self.refinement.enabled && {
-                let bvh = o.bvh();
-                refine_region(o.mesh_mut(), &bvh, center, r, &self.refinement)
-            }
-        };
+        let stamp = Stamp { brush, center, seed: h.tid, motion, view, r, invert: stroke.invert };
+        let mut start = std::mem::take(&mut stroke.start);
+        let retriangulated = self.stamp(o, &stamp, &mut start, target.as_ref());
+        if let Some(stroke) = &mut self.stroke {
+            stroke.start = start;
+        }
         if retriangulated {
             // New triangles: the GPU copy and the selection are rebuilt.
             o.moved_vertices.clear();
@@ -771,9 +921,47 @@ impl Tool for SculptTool {
         }
     }
 
-    fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
+    fn overlay(&mut self, ov: &mut Overlay, cx: &mut ToolCx) {
         if let Some((c, r)) = self.hover {
             ov.brush = Some((c.as_vec3(), r as f32));
+        }
+        if !self.symmetry {
+            return;
+        }
+        // The plane, spanning the object's bounds (plus a margin).
+        let Some(b) = cx.scene.active().map(|o| o.bounds()) else { return };
+        let (k, (i, j)) = (self.sym.axis, [(1, 2), (0, 2), (0, 1)][self.sym.axis]);
+        let pad = b.extents() * 0.08;
+        let corner = |a: bool, c: bool| {
+            let mut p = DVec3::ZERO;
+            p[k] = self.sym.offset;
+            p[i] = if a { b.max[i] + pad[i] } else { b.min[i] - pad[i] };
+            p[j] = if c { b.max[j] + pad[j] } else { b.min[j] - pad[j] };
+            p
+        };
+        let q = [corner(false, false), corner(true, false), corner(true, true), corner(false, true)];
+        let (fill, edge) = (Vec4::new(0.3, 0.6, 1.0, 0.08), Vec4::new(0.3, 0.6, 1.0, 0.7));
+        ov.tri(q[0], q[1], q[2], fill);
+        ov.tri(q[0], q[2], q[3], fill);
+        for n in 0..4 {
+            ov.line(q[n], q[(n + 1) % 4], edge);
+        }
+        // Ring on the surface around the mirrored brush centre.
+        let Some((c, r)) = self.hover else { return };
+        let Some(o) = cx.scene.active.and_then(|id| cx.scene.get_mut(id)) else { return };
+        let bvh = o.bvh();
+        let Some(h) = bvh.nearest(&o.mesh, self.sym.reflect(c), r) else { return };
+        let n = o.mesh.tri_normal(h.tid);
+        let (u, v) = mm_core::geom::orthonormal_basis(n);
+        let ring: Vec<DVec3> = (0..=48)
+            .map(|k| {
+                let a = k as f64 / 48.0 * std::f64::consts::TAU;
+                let p = h.point + (u * a.cos() + v * a.sin()) * r;
+                bvh.nearest(&o.mesh, p, r).map_or(p, |q| q.point + o.mesh.tri_normal(q.tid) * (r * 0.02))
+            })
+            .collect();
+        for w in ring.windows(2) {
+            ov.line(w[0], w[1], Vec4::new(0.3, 0.6, 1.0, 0.9));
         }
     }
 
@@ -787,6 +975,10 @@ impl Tool for SculptTool {
         match cmd.split_once(':') {
             Some(("brush", name)) => self.brush = Brush::ALL.into_iter().find(|b| b.label().eq_ignore_ascii_case(name)).unwrap_or(self.brush),
             Some(("size", pct)) => self.size_pct = pct.parse().unwrap_or(self.size_pct),
+            Some(("sym", axis)) => {
+                self.symmetry = axis != "off";
+                self.sym.axis = ["x", "y", "z"].iter().position(|a| *a == axis).unwrap_or(self.sym.axis);
+            }
             _ => {}
         }
     }
@@ -830,6 +1022,9 @@ impl Tool for SculptTool {
         }
         if plain(egui::Key::A) {
             return toggle(&mut self.attract, "Attract", cx.status);
+        }
+        if i.key_pressed(egui::Key::S) && i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt {
+            return toggle(&mut self.symmetry, "Symmetry", cx.status);
         }
         if i.key_pressed(egui::Key::OpenBracket) {
             step_brush_size(&mut self.size_pct, false);
@@ -895,6 +1090,77 @@ mod tests {
         let target = crate::scene::TargetSurface { id: 7, bvh: std::sync::Arc::new(mm_core::Bvh::build(&tm)), mesh: std::sync::Arc::new(tm) };
         let (m0, m, v) = dab_on_sphere(Brush::Attract, DVec3::ZERO, Some(&target));
         assert!(mean_radius(&m, &v) < mean_radius(&m0, &v) && mean_radius(&m, &v) > 0.89);
+    }
+
+    #[test]
+    fn symmetric_strokes_stay_symmetric() {
+        // An icosphere is symmetric across x = 0; a mirrored stroke must keep it so.
+        let m0 = primitives::icosphere(1.0, 4);
+        let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), SymPlane::centered(&m0, 0));
+        tool.symmetry = true;
+        tool.strength = 0.8;
+        let mut start = Default::default();
+        let mut c = DVec3::new(0.6, 0.0, 0.8).normalize();
+        for _ in 0..6 {
+            let bvh = o.bvh();
+            let h = bvh.nearest(&o.mesh, c, 1.0).unwrap();
+            let s = Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::Y * 0.05, view: -c, r: 0.35, invert: false };
+            tool.stamp(&mut o, &s, &mut start, None);
+            c = (c + DVec3::Y * 0.05).normalize();
+        }
+        let m = &o.mesh;
+        let bvh0 = mm_core::Bvh::build(&m0);
+        let mut moved = 0;
+        for v in m.vertex_ids() {
+            let p = m.vertex(v);
+            if p.distance(m0.vertex(v)) > 1e-6 {
+                moved += 1;
+            }
+            // The mirror twin of every vertex moved the same way.
+            let twin = bvh0.nearest(&m0, SymPlane { axis: 0, offset: 0.0 }.reflect(m0.vertex(v)), 1e-6).map(|h| m0.triangle(h.tid).into_iter().min_by(|&a, &b| m0.vertex(a).distance(h.point).total_cmp(&m0.vertex(b).distance(h.point))).unwrap()).unwrap();
+            let q = m.vertex(twin);
+            assert!((p - DVec3::new(-q.x, q.y, q.z)).length() < 1e-9, "vertex {v}");
+        }
+        assert!(moved > 20);
+        // Without symmetry the other side stays put.
+        let mut o = crate::scene::SceneObject::new(2, "s", m0.clone());
+        tool.symmetry = false;
+        let bvh = o.bvh();
+        let h = bvh.nearest(&o.mesh, DVec3::new(0.6, 0.0, 0.8), 1.0).unwrap();
+        tool.stamp(&mut o, &Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.35, invert: false }, &mut Default::default(), None);
+        assert!(o.mesh.vertex_ids().filter(|&v| m0.vertex(v).x < -0.1).all(|v| o.mesh.vertex(v) == m0.vertex(v)));
+    }
+
+    #[test]
+    fn symsnap_keeps_the_seam_on_the_plane() {
+        // Inflate across the seam of a sphere moves seam vertices off x = 0 only through
+        // asymmetric normals; on a slightly perturbed sphere they drift unless snapped.
+        let mut m0 = primitives::icosphere(1.0, 4);
+        m0.transform(|p| p + DVec3::X * 0.02 * p.y * p.z);
+        let seam: Vec<u32> = m0.vertex_ids().filter(|&v| m0.vertex(v).x.abs() < 1e-9).collect();
+        assert!(!seam.is_empty());
+        let run = |snap: bool| {
+            let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
+            let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Inflate), SymPlane { axis: 0, offset: 0.0 });
+            tool.symmetry = true;
+            tool.sym_snap = snap;
+            let mut start = Default::default();
+            for _ in 0..5 {
+                let bvh = o.bvh();
+                let h = bvh.nearest(&o.mesh, DVec3::new(0.05, 0.3, 0.95), 1.0).unwrap();
+                tool.stamp(&mut o, &Stamp { brush: Brush::Inflate, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert: false }, &mut start, None);
+            }
+            o.mesh.check_validity().unwrap();
+            let drift = seam.iter().map(|&v| o.mesh.vertex(v).x.abs()).fold(0.0, f64::max);
+            let lifted = seam.iter().filter(|&&v| o.mesh.vertex(v).length() > m0.vertex(v).length() + 1e-4).count();
+            (drift, lifted)
+        };
+        let (free, lifted) = run(false);
+        let (snapped, lifted_snapped) = run(true);
+        assert!(free > 1e-6, "{free}");
+        assert!(snapped < 1e-12, "{snapped}");
+        assert!(lifted > 0 && lifted_snapped == lifted);
     }
 
     #[test]

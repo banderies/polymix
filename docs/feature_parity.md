@@ -182,7 +182,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Depth, Lazyness, Flow, Volumetric, Falloff curve | ✅ | Falloff Smooth / Linear / Sharp / Dome / Flat (own curve shapes) |
 | Spacing, AlignToStroke, Stencils, brush textures | ❌ | |
 | Primary / Secondary (Shift) / Invert (Ctrl/⌘) | ✅ | Secondary is a choice of smoothing brush; Invert for the draw brushes, Inflate, Push and Pinch |
-| Toggles: Symmetry (Shift+S), Hold boundary (B), Preserve groups (G), Attract (A) | 🟡 | B, G, A ✅ (Attract pulls toward the target after each dab); Symmetry ❌ (M8.5) |
+| Toggles: Symmetry (Shift+S), Hold boundary (B), Preserve groups (G), Attract (A) | ✅ | Attract pulls toward the target after each dab. Symmetry mirrors every dab (and Move grabs) across an X / Y / Z plane through the object's centre, with an offset and Reset; free plane placement ❌ |
+| SymSnap | ✅ | Own reading (Meshmixer has no help text for it): vertices that sat on the symmetry plane stay on it, so the halves stay joined |
 
 ## 4. Edit category
 
