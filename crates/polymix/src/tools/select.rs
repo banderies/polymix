@@ -608,7 +608,7 @@ impl Tool for SelectTool {
                     }
                 });
                 ui_util::section(ui, "Filters");
-                egui::ComboBox::from_label("Expand mode (right-drag)")
+                egui::ComboBox::from_label("Expand mode (Cmd+right-drag)")
                     .selected_text(match self.expand_mode {
                         ExpandMode::Geodesic => "Geodesic Distance",
                         ExpandMode::CreaseAngle => "Crease Angle",
@@ -622,7 +622,7 @@ impl Tool for SelectTool {
                 ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush select faces turned away from you");
                 ui.checkbox(&mut self.restrict_exterior, "Restrict to exterior faces").on_hover_text("Skip faces buried inside other parts of the mesh (e.g. overlapping tubes)");
                 ui.add(egui::Slider::new(&mut self.crease_deg, 0.0..=180.0).suffix("°").text("Crease angle threshold"))
-                    .on_hover_text("The brush and right-drag growth stop at edges sharper than this (0 = off)");
+                    .on_hover_text("The brush and Cmd+right-drag growth stop at edges sharper than this (0 = off)");
             }
             SelectMode::Wand => {
                 ui.add(egui::Slider::new(&mut self.wand_deg, 1.0..=90.0).suffix("°").text("Angle threshold"))
@@ -646,11 +646,11 @@ impl Tool for SelectTool {
         let (n_sel, n_tri) = cx.scene.active().map(|o| (o.selection.len(), o.mesh.triangle_count())).unwrap_or((0, 0));
         ui.label(format!("{} / {} triangles selected", ui_util::format_count(n_sel), ui_util::format_count(n_tri)));
         ui.small(match self.mode {
-            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation)",
+            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ] or Shift+scroll",
             SelectMode::Lasso => "Draw curves on the surface, turning the view between them; end near the start (or press Enter) to select the enclosed faces · A drag from the background is the laser lasso · Shift: deselect",
             SelectMode::Wand => "Click a face to select the connected faces facing the same way (within the angle) · Shift: deselect · A drag from the background is the laser lasso",
         });
-        ui.small("Double-click: hole border (on an open edge) or connected part · Right-drag: grow / shrink · S: clear");
+        ui.small("Double-click: hole border (on an open edge) or connected part · Cmd+right-drag: grow / shrink · S: clear");
 
         ui_util::section(ui, "Selection");
         ui.horizontal_wrapped(|ui| {

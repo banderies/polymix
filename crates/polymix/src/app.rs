@@ -344,6 +344,10 @@ pub struct PolymixApp {
     last_export_dir: Option<PathBuf>,
     export_ascii: bool,
     window_title: String,
+    /// Where the floating tool panel was last drawn (keeps viewport decorations clear of it).
+    tool_panel_rect: Option<egui::Rect>,
+    /// Width of the floating tool panel (drag its right edge).
+    tool_panel_width: f32,
     recent: Vec<PathBuf>,
     script: Option<Script>,
     /// Boundary-edge line vertices per object, keyed by (object, mesh version, mesh address).
@@ -404,6 +408,8 @@ impl PolymixApp {
             last_export_dir: None,
             export_ascii: false,
             window_title: String::new(),
+            tool_panel_rect: None,
+            tool_panel_width: 300.0,
             recent: Vec::new(),
             synthetic: Default::default(),
             boundary_cache: HashMap::new(),
@@ -1997,9 +2003,9 @@ impl PolymixApp {
                     ("Shift+Y", "Separate shells"),
                     ("Select: drag / Shift+drag", "Paint selection / deselect"),
                     ("Select: double-click", "Select connected part"),
-                    ("Select / Sculpt: [ ], wheel (Meshmixer nav) or Shift+wheel (Fusion 360 nav)", "Brush size"),
-                    ("Select: right-drag (with a selection)", "Grow / shrink the selection"),
-                    ("Sculpt: right-drag", "Brush strength"),
+                    ("Select / Sculpt: [ ] or Shift+scroll", "Brush size"),
+                    ("Select: Cmd/Ctrl+right-drag (with a selection)", "Grow / shrink the selection"),
+                    ("Sculpt: Cmd/Ctrl+right-drag", "Brush strength"),
                     ("Select: E / I / G / O / < >", "Connected / Invert / Groups / Optimize / Shrink-Grow"),
                     ("Select: X, F, D, Cmd+D", "Discard, Erase & Fill, Extrude, Offset"),
                     ("Select: R, Shift+R, Cmd+F, B, Y, J, Cmd+B", "Remesh, Reduce, Smooth, Smooth Boundary, Separate, Join, Bridge"),
@@ -2193,8 +2199,9 @@ impl PolymixApp {
         let in_rect = hover.map(|p| rect.contains(p)).unwrap_or(false) && (response.hovered() || response.dragged());
         let nav = self.view.nav_mode;
         let primary_nav = nav.starts_navigation(PointerButton::Primary, mods);
-        // Tools may own right-drags (selection expand, brush strength); Alt keeps navigation.
-        let tool_claims_rmb = !mods.alt && !mods.shift && self.tools.last().is_some_and(|t| t.claims_secondary_drag(&self.scene));
+        // A plain right-drag always turns the view; tools get Cmd/Ctrl+right-drag (selection
+        // grow / shrink, brush strength).
+        let tool_claims_rmb = mods.command && !mods.alt && !mods.shift && self.tools.last().is_some_and(|t| t.claims_secondary_drag(&self.scene));
         if response.drag_started_by(PointerButton::Secondary) && tool_claims_rmb {
             if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
                 self.tool_rmb = Some(p);
@@ -2243,12 +2250,8 @@ impl PolymixApp {
         if in_rect {
             // Shift+wheel arrives as horizontal scroll from a mouse wheel on macOS.
             let wheel = if scroll.y != 0.0 { scroll.y } else { scroll.x };
-            // Brush tools take the wheel for their size: the plain wheel in Meshmixer
-            // navigation, Shift+wheel in Fusion 360 navigation (where the wheel zooms).
-            let to_tool = match nav {
-                NavMode::Meshmixer => !mods.shift && !mods.command,
-                NavMode::Fusion360 => mods.shift,
-            };
+            // Shift+wheel sets brush tools' size; the plain wheel always zooms.
+            let to_tool = mods.shift;
             let mut scroll_y = scroll.y;
             if wheel != 0.0 && to_tool && self.tool_wheel(&ctx, vp, wheel) {
                 scroll_y = 0.0;
@@ -2482,7 +2485,11 @@ impl PolymixApp {
     }
 
     fn axis_gizmo(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let c = rect.left_bottom() + egui::vec2(40.0, -40.0);
+        let mut c = rect.left_bottom() + egui::vec2(40.0, -40.0);
+        // Beside the floating tool panel when that reaches down to it.
+        if let Some(r) = self.tool_panel_rect.filter(|r| r.bottom() > c.y - 40.0) {
+            c.x = r.right() + 40.0;
+        }
         let view = self.camera.view();
         for (axis, col, name) in [
             (DVec3::X, Color32::from_rgb(230, 80, 80), "X"),
@@ -3018,20 +3025,59 @@ impl eframe::App for PolymixApp {
         egui::Panel::left("palette").resizable(false).exact_size(118.0).show(ui, |ui| {
             ui.vertical_centered(|ui| self.palette(ui, vp_prev));
         });
+        // The tool panel and the object browser float over the viewport, so opening or
+        // closing them never resizes the view (the model stays where it is on screen).
+        let vr = vp_prev.rect;
+        let margin = 8.0;
         let show_tool_panel = !self.tools.is_empty() || self.category.is_some();
+        self.tool_panel_rect = None;
         if show_tool_panel {
-            egui::Panel::left("tool").resizable(true).default_size(300.0).size_range(240.0..=460.0).show(ui, |ui| {
-                if !self.tools.is_empty() {
-                    self.tool_panel(ui, vp_prev);
-                } else if let Some(cat) = self.category {
-                    self.category_panel(ui, cat, vp_prev);
-                }
+            let width = self.tool_panel_width;
+            let r = egui::Area::new(egui::Id::NULL.with("floating_tool_panel"))
+                .fixed_pos(vr.min + egui::vec2(margin, margin))
+                .order(egui::Order::Middle)
+                .show(&ctx, |ui| {
+                    egui::Frame::window(ui.style()).show(ui, |ui| {
+                        ui.set_width(width);
+                        // As tall as its content, scrolling once it reaches the bottom of the view.
+                        // (An area offers its content last frame's size; allow it to grow.)
+                        let max_h = (vr.height() - 2.0 * margin - 20.0).max(80.0);
+                        ui.set_max_height(max_h);
+                        egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+                            if !self.tools.is_empty() {
+                                self.tool_panel(ui, vp_prev);
+                            } else if let Some(cat) = self.category {
+                                self.category_panel(ui, cat, vp_prev);
+                            }
+                        });
+                    });
+                });
+            let rect = r.response.rect;
+            // Drag the right edge to change the width.
+            let edge = egui::Rect::from_min_max(egui::pos2(rect.right() - 4.0, rect.top()), egui::pos2(rect.right() + 4.0, rect.bottom()));
+            let handle = egui::Area::new(egui::Id::NULL.with("tool_panel_edge")).fixed_pos(edge.min).order(egui::Order::Middle).show(&ctx, |ui| {
+                ui.allocate_response(edge.size(), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
             });
+            if handle.inner.dragged() {
+                self.tool_panel_width = (self.tool_panel_width + handle.inner.drag_delta().x).clamp(240.0, 460.0);
+            }
+            self.tool_panel_rect = Some(rect);
         }
         if self.show_objects {
-            egui::Panel::right("objects").resizable(true).default_size(230.0).size_range(180.0..=400.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.objects_panel(ui));
-            });
+            // Under the view cube, at the right.
+            let top = if self.view.show_view_cube { 118.0 } else { margin };
+            egui::Area::new(egui::Id::NULL.with("floating_objects"))
+                .pivot(egui::Align2::RIGHT_TOP)
+                .fixed_pos(vr.right_top() + egui::vec2(-margin, top))
+                .order(egui::Order::Middle)
+                .show(&ctx, |ui| {
+                    egui::Frame::window(ui.style()).show(ui, |ui| {
+                        ui.set_width(230.0);
+                        let max_h = (vr.height() - top - margin - 20.0).max(80.0);
+                        ui.set_max_height(max_h);
+                        egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| self.objects_panel(ui));
+                    });
+                });
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();

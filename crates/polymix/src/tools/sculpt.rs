@@ -851,7 +851,7 @@ impl Tool for SculptTool {
                 ui.add_enabled(rf.adaptive, egui::Slider::new(&mut rf.adaptivity, 0.0..=100.0).text("adaptivity"));
             });
         });
-        ui.small("Drag on the surface. Shift uses the secondary brush; Cmd/Ctrl inverts the draw brushes, Inflate, Push and Pinch. Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation). Right-drag: strength.");
+        ui.small("Drag on the surface. Shift uses the secondary brush; Cmd/Ctrl inverts the draw brushes, Inflate, Push and Pinch. Size: [ ] or Shift+scroll. Cmd/Ctrl+right-drag: strength.");
         ui.add_space(8.0);
         if ui.button("Done").clicked() {
             return ToolOutcome::Close;

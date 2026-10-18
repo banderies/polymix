@@ -74,6 +74,7 @@ Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs
 | Pan | Middle-drag, Shift + right-drag, or Alt + Shift + left-drag |
 | Zoom | Scroll / pinch, Alt + right-drag (Meshmixer mode), or Alt + Cmd + left-drag |
 | Navigation scheme | *View → Navigation*: Fusion 360 (default) or Meshmixer, as in Meshmixer's preferences |
+| Brush size / strength (Select, Sculpt) | Shift + scroll or `[` `]` / Cmd + right-drag (a plain right-drag always turns the view) |
 | 3D mouse (3Dconnexion SpaceMouse, macOS) | Move the cap the way you want the model to move; Menu button = Hotbox, Fit = focus. Settings and a live readout under *View → 3D mouse…*; needs the 3DxWare driver |
 | Focus / wireframe / hotbox | `F` / `W` / `Space` |
 | Select / Inspector / Transform | `S` / `I` / `T` |

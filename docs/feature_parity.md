@@ -129,7 +129,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Paint Mode: sphere brush, Shift deselect | ✅ | Brush keeps its size on the model |
 | Brush types: Sphere, SphereDisc, Unwrap (geodesic) | ✅ | Unwrap is the default, as in your Meshmixer |
-| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Wheel in Meshmixer navigation, Shift+wheel in Fusion 360 navigation |
+| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Shift+wheel in every navigation mode (the plain wheel always zooms — your preference over Meshmixer's plain wheel) |
 | RMB-drag expands / contracts the selection | ✅ | With a selection; geodesic distance (other expand modes: ROADMAP M2.5) |
 | Laser Lasso (curve from background; closed = inside, open = smaller side, through the model) | ✅ | |
 | Lasso Mode (multi-curve loop drawn *on the surface*, rotate between curves) | ✅ | Closes when a curve ends near the start, or Enter; Esc clears |
@@ -178,7 +178,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ✅ | Refine / Reduce step the edge length per dab (Refine bounded by the brush size); AdaptiveReduce is a quadric reduction that thins flat areas first |
 | Brushes: PaintVertex, SmoothColor | ⚪ ✅ | Colour picker in the panel; Cmd/Ctrl paints the default grey back; strokes upload only the painted vertices |
 | Dynamic refinement while sculpting (Refinement, Adaptivity; R, T) | ✅ | Per dab: split / collapse / relax under the brush; Refine, Reduce, Smooth, Adaptive + Adaptivity; R and T toggle |
-| Size / Strength | ✅ | Size is a % of the model; wheel size, right-drag strength |
+| Size / Strength | ✅ | Size is a % of the model; Shift+wheel size, Cmd/Ctrl+right-drag strength (a plain right-drag always turns the view) |
 | Depth, Lazyness, Flow, Volumetric, Falloff curve | ✅ | Falloff Smooth / Linear / Sharp / Dome / Flat (own curve shapes) |
 | Spacing, AlignToStroke, Stencils, brush textures | ❌ | |
 | Primary / Secondary (Shift) / Invert (Ctrl/⌘) | ✅ | Secondary is a choice of smoothing brush; Invert for the draw brushes, Inflate, Push and Pinch |
