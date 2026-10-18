@@ -446,10 +446,13 @@ pub fn volume(path: &Path, gzip: bool, h: &Header) -> Result<Volume> {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let lower = name.to_lowercase();
     let n = h.dim[0] as usize;
+    let field_name = ["map", "warp", "def", "disp", "field"].iter().any(|w| lower.contains(w));
     let kind = if h.intent_code == 1002 || (dtype.is_some_and(|t| t.is_integer()) && LABEL_HINTS.iter().any(|w| lower.contains(w))) {
         Kind::LabelMap
-    } else if matches!(h.intent_code, 1006 | 1007) || (n >= 5 && h.dim[5] > 1) {
+    } else if matches!(h.intent_code, 1006 | 1007) || (n >= 5 && h.dim[5] > 1) || (n == 4 && h.dim[4] == 3 && field_name) {
         Kind::VectorField
+    } else if lower.contains("jacobian") {
+        Kind::Derived
     } else if n >= 4 && h.dim[4] > 1 {
         Kind::TimeSeries
     } else {

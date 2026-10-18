@@ -5,3 +5,6 @@ pub mod geometry;
 pub mod model;
 pub mod nifti;
 pub mod nrrd;
+pub mod dicom;
+pub mod organize;
+pub mod scan;

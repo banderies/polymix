@@ -128,7 +128,8 @@ impl Header {
         let s = self.get("space")?.to_lowercase();
         Some(match s.as_str() {
             "left-posterior-superior" | "lps" | "left-posterior-superior-time" | "lpst" => true,
-            "right-anterior-superior" | "ras" | "right-anterior-superior-time" | "rast" => false,
+            // A generic right-handed space is taken as RAS (what readers such as ITK do).
+            "right-anterior-superior" | "ras" | "right-anterior-superior-time" | "rast" | "3d-right-handed" | "3d-right-handed-time" => false,
             "left-anterior-superior" | "las" => {
                 // Rare; treat as LPS with y kept, handled by the caller as unknown.
                 return None;
@@ -224,8 +225,14 @@ pub fn volume(path: &Path, h: &Header) -> Result<Volume> {
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let lower = name.to_lowercase();
     let kinds = h.get("kinds").unwrap_or("").to_lowercase();
+    let colour = kinds.contains("rgb-color") || kinds.contains("rgba-color");
+    if colour {
+        warnings.push("Colour image (RGB)".into());
+    }
     let kind = if !segments.is_empty() || lower.ends_with(".seg.nrrd") {
         Kind::Segmentation
+    } else if colour {
+        Kind::Image
     } else if kinds.contains("vector") || kinds.contains("covariant") || kinds.contains("2-vector") || kinds.contains("3-vector") {
         Kind::VectorField
     } else if dims[3] > 1 {

@@ -1732,6 +1732,7 @@ dependencies = [
  "dicom-dictionary-std",
  "dicom-object",
  "dicom-pixeldata",
+ "dicom-transfer-syntax-registry",
  "flate2",
  "glam 0.34.1",
  "log",
