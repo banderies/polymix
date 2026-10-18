@@ -4,6 +4,7 @@ mod app;
 mod camera;
 mod centerline;
 mod commands;
+mod icons;
 mod jobs;
 mod materials;
 mod navigation;

@@ -106,11 +106,12 @@ pub struct ViewOptions {
     /// Background colour at the top of the view.
     pub background: [f32; 3],
     pub show_view_cube: bool,
+    pub theme: ui_util::Theme,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark }
     }
 }
 
@@ -232,7 +233,7 @@ struct Script {
 
 impl PolymixApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
-        ui_util::apply_theme(&cc.egui_ctx);
+        ui_util::apply_theme(&cc.egui_ctx, ui_util::Theme::Dark);
         let renderer = cc.wgpu_render_state.as_ref().map(SceneRenderer::new);
         let mut app = Self {
             scene: Scene::default(),
@@ -290,6 +291,10 @@ impl PolymixApp {
             app.view.show_grid = flag("grid", false);
             app.view.transparent_target = flag("transparent_target", true);
             app.view.show_view_cube = flag("view_cube", true);
+            if let Some(t) = st.get_string("theme").and_then(|k| ui_util::Theme::from_key(&k)) {
+                app.view.theme = t;
+                ui_util::apply_theme(&cc.egui_ctx, t);
+            }
             if let Some(c) = st.get_string("background") {
                 let v: Vec<f32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
                 if let [r, g, b] = v[..] {
@@ -705,6 +710,15 @@ impl PolymixApp {
                 }
                 ui.checkbox(&mut self.view.show_grid, "Show grid");
                 ui.checkbox(&mut self.view.show_view_cube, "Show view cube");
+                ui.horizontal(|ui| {
+                    ui.label("Theme");
+                    let before = self.view.theme;
+                    ui.selectable_value(&mut self.view.theme, ui_util::Theme::Dark, "Dark");
+                    ui.selectable_value(&mut self.view.theme, ui_util::Theme::Light, "Light");
+                    if self.view.theme != before {
+                        ui_util::apply_theme(ui.ctx(), self.view.theme);
+                    }
+                });
                 ui.checkbox(&mut self.view.transparent_target, "Transparent target").on_hover_text("Draw the target surface see-through");
                 ui.menu_button("Standard views", |ui| {
                     use std::f64::consts::{FRAC_PI_2, PI};
@@ -736,24 +750,38 @@ impl PolymixApp {
     fn palette(&mut self, ui: &mut egui::Ui, vp: Viewport) {
         let ctx = ui.ctx().clone();
         ui.add_space(6.0);
-        let big = |ui: &mut egui::Ui, label: &str, active: bool| {
-            let b = egui::Button::new(RichText::new(label).size(13.0)).min_size(egui::vec2(84.0, 30.0)).selected(active);
-            ui.add(b)
+        use crate::icons::{self, Icon};
+        let big = |ui: &mut egui::Ui, icon: Icon, label: &str, active: bool| {
+            // Leading space leaves room for the icon on the left.
+            let b = egui::Button::new(RichText::new(format!("       {label}")).size(13.0))
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .min_size(egui::vec2(108.0, 30.0))
+                .selected(active);
+            let r = ui.add(b);
+            let col = if active { ui.visuals().selection.stroke.color } else { ui.visuals().widgets.inactive.fg_stroke.color };
+            icons::paint(ui.painter(), egui::Rect::from_center_size(r.rect.left_center() + egui::vec2(16.0, 0.0), egui::vec2(16.0, 16.0)), icon, col);
+            r
         };
-        if big(ui, "Import", false).on_hover_text("⌘O").clicked() {
+        if big(ui, Icon::Import, "Import", false).on_hover_text("⌘O").clicked() {
             self.import_dialog(&ctx);
         }
         let sel_active = self.tools.first().map(|t| t.name() == "Select").unwrap_or(false);
-        if big(ui, "Select", sel_active).on_hover_text("S").clicked() {
+        if big(ui, Icon::Select, "Select", sel_active).on_hover_text("S").clicked() {
             self.switch_to(SwitchTo::Tool("select".into()), &ctx, vp);
         }
-        for (cat, label) in [(Category::Sculpt, "Sculpt"), (Category::Edit, "Edit"), (Category::Vessel, "Vessel"), (Category::Analysis, "Analysis"), (Category::Shaders, "Shaders")] {
-            if big(ui, label, self.category == Some(cat) && self.tools.is_empty()).clicked() {
+        for (cat, icon, label) in [
+            (Category::Sculpt, Icon::Sculpt, "Sculpt"),
+            (Category::Edit, Icon::Edit, "Edit"),
+            (Category::Vessel, Icon::Vessel, "Vessel"),
+            (Category::Analysis, Icon::Analysis, "Analysis"),
+            (Category::Shaders, Icon::Shaders, "Shaders"),
+        ] {
+            if big(ui, icon, label, self.category == Some(cat) && self.tools.is_empty()).clicked() {
                 let to = if self.category == Some(cat) && self.tools.is_empty() { None } else { Some(cat) };
                 self.switch_to(SwitchTo::Category(to), &ctx, vp);
             }
         }
-        if big(ui, "Export", false).on_hover_text("⌘E").clicked() {
+        if big(ui, Icon::Export, "Export", false).on_hover_text("⌘E").clicked() {
             self.export_dialog(&ctx, false);
         }
     }
@@ -980,7 +1008,7 @@ impl PolymixApp {
                     return;
                 }
                 let name = if target == Some(o.id) { format!("{}  ◎ target", o.name) } else { o.name.clone() };
-                let label = RichText::new(name).color(if active { ui_util::ACCENT } else { Color32::from_gray(210) });
+                let label = RichText::new(name).color(if active { ui_util::ACCENT } else { ui.visuals().text_color() });
                 let r = ui.selectable_label(active, label).on_hover_text("Click: make active · Double-click: rename · Right-click: more");
                 if r.clicked() {
                     make_active = Some(o.id);
@@ -1889,6 +1917,12 @@ impl PolymixApp {
                     }
                 }
             }
+            "theme" => {
+                if let Some(t) = ui_util::Theme::from_key(arg.as_str()) {
+                    self.view.theme = t;
+                    ui_util::apply_theme(ctx, t);
+                }
+            }
             "hotbox" => self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) },
             "target" => {
                 let id = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id);
@@ -2093,6 +2127,7 @@ impl eframe::App for PolymixApp {
         st.set_string("grid", b(self.view.show_grid));
         st.set_string("transparent_target", b(self.view.transparent_target));
         st.set_string("view_cube", b(self.view.show_view_cube));
+        st.set_string("theme", self.view.theme.key().to_string());
         let bg = self.view.background;
         st.set_string("background", format!("{},{},{}", bg[0], bg[1], bg[2]));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
@@ -2147,7 +2182,7 @@ impl eframe::App for PolymixApp {
                 });
             });
         });
-        egui::Panel::left("palette").resizable(false).exact_size(100.0).show(ui, |ui| {
+        egui::Panel::left("palette").resizable(false).exact_size(118.0).show(ui, |ui| {
             ui.vertical_centered(|ui| self.palette(ui, vp_prev));
         });
         let show_tool_panel = !self.tools.is_empty() || self.category.is_some();

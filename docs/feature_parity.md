@@ -232,7 +232,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Textured / textured-unlit / UV checker / X-ray | ⚪ ❌ | |
 | Wireframe | ✅ | |
 | Face group colours | ✅ | |
-| Light UI theme (warm greys: panels `#ede8e4`, text `#6b6864`, hover `#a5a19d`/`#b3afab`, scrollbar `#888480`, dark text `#444240`, disabled `#d0cac7`) | ❌ | Polymix is dark-themed; a "Meshmixer light" theme is easy to add |
+| Light UI theme (warm greys: panels `#ede8e4`, text `#6b6864`, hover `#a5a19d`/`#b3afab`, scrollbar `#888480`, dark text `#444240`, disabled `#d0cac7`) | ✅ | View → Theme: Dark (default) / Light; palette uses Polymix's own vector icons |
 
 ## 7. Polymix features Meshmixer does not have
 
