@@ -122,12 +122,14 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         let tint = vec3<f32>(0.55 + 0.4 * fract(in.uv.x), 0.6, 0.55 + 0.4 * fract(in.uv.y));
         base = select(tint, tint * 0.45, odd == 1);
     }
-    if (selected) {
-        base = vec3<f32>(1.0, 0.45, 0.08);
-    }
     if (!front) {
         // Back faces (holes, flipped normals) show as a muted blue-grey.
         base = vec3<f32>(0.32, 0.36, 0.48);
+    }
+    if (selected) {
+        // Selection shows on both sides (a deeper orange on the back, e.g. inside a vessel
+        // selected with Allow Back Faces).
+        base = select(vec3<f32>(0.78, 0.3, 0.05), vec3<f32>(1.0, 0.45, 0.08), front);
     }
 
     // Clay-style lighting in view space, shaped by the material.
