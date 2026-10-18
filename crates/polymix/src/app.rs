@@ -89,6 +89,24 @@ impl ColorMode {
     }
 }
 
+/// File and behaviour preferences (Preferences window).
+pub struct Prefs {
+    /// Frame the scene after every import (Meshmixer: Reset Camera on Scene Change).
+    pub reset_camera_on_import: bool,
+    /// ⌘E exports every visible object as one mesh instead of the active object.
+    pub export_whole_scene: bool,
+    /// OBJ export writes face groups as `g` groups.
+    pub obj_export_groups: bool,
+    /// OBJ import turns `g` / `o` groups into face groups.
+    pub obj_import_groups: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true }
+    }
+}
+
 pub struct ViewOptions {
     pub wireframe: bool,
     pub normals: NormalMode,
@@ -212,6 +230,9 @@ pub struct PolymixApp {
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
     hotbox: Option<egui::Pos2>,
     show_objects: bool,
+    prefs: Prefs,
+    show_prefs: bool,
+    prefs_tab: usize,
     last_export_dir: Option<PathBuf>,
     export_ascii: bool,
     window_title: String,
@@ -262,6 +283,9 @@ impl PolymixApp {
             show_space_window: false,
             hotbox: None,
             show_objects: true,
+            prefs: Prefs::default(),
+            show_prefs: false,
+            prefs_tab: 0,
             last_export_dir: None,
             export_ascii: false,
             window_title: String::new(),
@@ -315,6 +339,10 @@ impl PolymixApp {
             }
             app.last_export_dir = st.get_string("last_export_dir").map(PathBuf::from);
             app.export_ascii = flag("export_ascii", false);
+            app.prefs.reset_camera_on_import = flag("reset_camera_on_import", true);
+            app.prefs.export_whole_scene = flag("export_whole_scene", false);
+            app.prefs.obj_export_groups = flag("obj_export_groups", true);
+            app.prefs.obj_import_groups = flag("obj_import_groups", true);
             app.recent = st.get_string("recent").map(|r| r.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         }
         if !files.is_empty() {
@@ -337,6 +365,7 @@ impl PolymixApp {
         }
         self.recent.truncate(10);
         let n = files.len();
+        let obj_groups = self.prefs.obj_import_groups;
         self.import_job = Some(Job::spawn(format!("Importing {n} file(s)"), ctx.clone(), move |progress| {
             let mut out = Vec::new();
             for (i, f) in files.iter().enumerate() {
@@ -344,7 +373,12 @@ impl PolymixApp {
                     anyhow::bail!("cancelled");
                 }
                 let t0 = std::time::Instant::now();
-                let imported = mm_io::read_mesh(f).map_err(|e| anyhow::anyhow!("{}: {e:#}", f.display()))?;
+                let mut imported = mm_io::read_mesh(f).map_err(|e| anyhow::anyhow!("{}: {e:#}", f.display()))?;
+                if !obj_groups && imported.format == mm_io::Format::Obj {
+                    for t in imported.mesh.triangle_ids().collect::<Vec<_>>() {
+                        imported.mesh.set_tri_group(t, 0);
+                    }
+                }
                 let rep = &imported.report;
                 let mut notes = format!(
                     "{}: {} triangles, {} vertices ({:.2}s)",
@@ -381,7 +415,7 @@ impl PolymixApp {
                             notes.push(note);
                         }
                         self.status = notes.join("  |  ");
-                        if first_import {
+                        if first_import || self.prefs.reset_camera_on_import {
                             self.camera.scene_radius = 1e-6;
                             self.camera.focus(&self.scene.bounds());
                         }
@@ -438,7 +472,7 @@ impl PolymixApp {
             (*active.mesh).clone()
         };
         let p2 = path.clone();
-        let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, ..Default::default() };
+        let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, ..Default::default() };
         self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |_| {
             mm_io::write_mesh(&p2, &mesh, &opts)?;
             Ok(format!("Exported {} triangles to {}", mesh.triangle_count(), p2.display()))
@@ -569,7 +603,7 @@ impl PolymixApp {
                     ui.close();
                     self.import_dialog(&ctx);
                 }
-                if ui.button("Export active…   ⌘E").clicked() {
+                if ui.button("Export active…").clicked() {
                     ui.close();
                     self.export_dialog(&ctx, false);
                 }
@@ -594,6 +628,11 @@ impl PolymixApp {
                     }
                 });
                 ui.checkbox(&mut self.export_ascii, "Write STL as ASCII");
+                ui.separator();
+                if ui.button("Preferences…   ⌘,").clicked() {
+                    ui.close();
+                    self.show_prefs = true;
+                }
                 ui.separator();
                 if ui.button("Clear scene").clicked() {
                     ui.close();
@@ -782,7 +821,7 @@ impl PolymixApp {
             }
         }
         if big(ui, Icon::Export, "Export", false).on_hover_text("⌘E").clicked() {
-            self.export_dialog(&ctx, false);
+            self.export_dialog(&ctx, self.prefs.export_whole_scene);
         }
     }
 
@@ -1221,6 +1260,85 @@ impl PolymixApp {
         });
         if close {
             self.hotbox = None;
+        }
+    }
+
+    fn preferences_window(&mut self, ctx: &egui::Context) {
+        if !self.show_prefs {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Preferences").open(&mut open).resizable(false).collapsible(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (i, t) in ["General", "View", "File"].iter().enumerate() {
+                    ui.selectable_value(&mut self.prefs_tab, i, *t);
+                }
+            });
+            ui.separator();
+            match self.prefs_tab {
+                0 => {
+                    egui::Grid::new("prefs_general").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                        ui.label("Navigation mode");
+                        ui.horizontal(|ui| {
+                            for m in NavMode::ALL {
+                                ui.selectable_value(&mut self.view.nav_mode, m, m.label());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Mesh color mode");
+                        ui.horizontal(|ui| {
+                            for m in ColorMode::ALL {
+                                ui.selectable_value(&mut self.view.colors, m, m.label());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Mesh normal mode");
+                        ui.horizontal(|ui| {
+                            for m in NormalMode::ALL {
+                                ui.selectable_value(&mut self.view.normals, m, m.label());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Up axis");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.camera.up_axis, UpAxis::Y, "Y up");
+                            ui.selectable_value(&mut self.camera.up_axis, UpAxis::Z, "Z up (medical/RAS)");
+                        });
+                        ui.end_row();
+                    });
+                }
+                1 => {
+                    ui.checkbox(&mut self.camera.free_orbit, "Enable free rotate").on_hover_text("Trackball instead of turntable");
+                    ui.checkbox(&mut self.prefs.reset_camera_on_import, "Reset camera on scene change").on_hover_text("Frame the scene after every import");
+                    ui.checkbox(&mut self.view.show_view_cube, "Show view cube");
+                    ui.checkbox(&mut self.show_objects, "Show object browser");
+                    ui.checkbox(&mut self.view.show_grid, "Show grid");
+                    ui.checkbox(&mut self.view.sharp_edges, "Sharp edges (crease-angle shading)");
+                    ui.add_enabled(self.view.sharp_edges, egui::Slider::new(&mut self.view.crease_deg, 5.0..=90.0).suffix("°").text("crease angle"));
+                    ui.horizontal(|ui| {
+                        ui.label("Theme");
+                        let before = self.view.theme;
+                        ui.selectable_value(&mut self.view.theme, ui_util::Theme::Dark, "Dark");
+                        ui.selectable_value(&mut self.view.theme, ui_util::Theme::Light, "Light");
+                        if self.view.theme != before {
+                            ui_util::apply_theme(ui.ctx(), self.view.theme);
+                        }
+                    });
+                }
+                _ => {
+                    ui.label("Export (⌘E)");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.prefs.export_whole_scene, false, "Selection only (active object)");
+                        ui.selectable_value(&mut self.prefs.export_whole_scene, true, "Whole scene");
+                    });
+                    ui.checkbox(&mut self.export_ascii, "Write STL as ASCII");
+                    ui.checkbox(&mut self.prefs.obj_export_groups, "OBJ: export face groups as groups");
+                    ui.checkbox(&mut self.prefs.obj_import_groups, "Import OBJ: groups as face groups");
+                }
+            }
+        });
+        if !open {
+            self.show_prefs = false;
         }
     }
 
@@ -1923,6 +2041,10 @@ impl PolymixApp {
                     ui_util::apply_theme(ctx, t);
                 }
             }
+            "prefs" => {
+                self.show_prefs = true;
+                self.prefs_tab = arg.parse().unwrap_or(0);
+            }
             "hotbox" => self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) },
             "target" => {
                 let id = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id);
@@ -2026,7 +2148,11 @@ impl PolymixApp {
             return;
         }
         if i.key_pressed(Key::E) && cmd {
-            self.export_dialog(ctx, false);
+            self.export_dialog(ctx, self.prefs.export_whole_scene);
+            return;
+        }
+        if i.key_pressed(Key::Comma) && cmd {
+            self.show_prefs = !self.show_prefs;
             return;
         }
         if i.key_pressed(Key::Escape) {
@@ -2139,6 +2265,10 @@ impl eframe::App for PolymixApp {
         st.set_string("free_orbit", b(self.camera.free_orbit));
         st.set_string("up_axis", if self.camera.up_axis == UpAxis::Z { "z".into() } else { "y".into() });
         st.set_string("export_ascii", b(self.export_ascii));
+        st.set_string("reset_camera_on_import", b(self.prefs.reset_camera_on_import));
+        st.set_string("export_whole_scene", b(self.prefs.export_whole_scene));
+        st.set_string("obj_export_groups", b(self.prefs.obj_export_groups));
+        st.set_string("obj_import_groups", b(self.prefs.obj_import_groups));
         st.set_string("recent", self.recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
         if let Some(d) = &self.last_export_dir {
             st.set_string("last_export_dir", d.display().to_string());
@@ -2215,6 +2345,7 @@ impl eframe::App for PolymixApp {
         }
         self.handle_keys(&ctx, vp_prev);
         self.help_window(&ctx);
+        self.preferences_window(&ctx);
         self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);

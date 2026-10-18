@@ -47,11 +47,11 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Export: AMF, COLLADA (.dae), VRML, SMESH | ❌ | |
 | Export SVG | ⛔ | |
 | Print / Send to printer | ⛔ | |
-| Preferences (Alt+T / ⌘,) | 🟡 | View options persist; no Preferences window |
+| Preferences (Alt+T / ⌘,) | ✅ | ⌘, or File → Preferences: General (navigation, colour / normal modes, up axis), View (free rotate, reset camera on scene change, view cube, object browser, grid, sharp edges, theme), File (export scope, STL ASCII, OBJ groups) |
 | Pref: Flip Z-Y axis on import/export (on in your install) | ❌ | Polymix has a Z-up *view* but does not convert file axes |
 | Pref: Mesh Normal Mode Vertex / Face / Group normals | ✅ | View menu and hotbox; Group (default) keeps group borders crisp; Vertex still honours Sharp edges |
 | Pref: Mesh Color Mode Group / Vertex / Constant | ✅ | View menu and hotbox; Vertex (default) shows vertex colours when the mesh has them |
-| Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | 🟡 | Export active object or all visible; OBJ groups ✅ |
+| Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | ✅ | ⌘E follows the export scope; OBJ group export and import are switchable |
 | Pref: Import dialogs (append/replace, scale models) | ❌ | |
 | Autosave + crash recovery | ❌ | |
 
