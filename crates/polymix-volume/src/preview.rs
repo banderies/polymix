@@ -1,8 +1,9 @@
-//! The thumbnail of the selected volume: a slice with a slice slider and window / level
-//! (drag on the image: across for the width, up and down for the level; scroll for slices).
+//! The thumbnail of the selected volume: a slice with a slice slider and window / level, with
+//! the mouse controls of every image view (`polymix_imaging::nav`).
 
 use mm_volume::model::{Volume, Voxels};
-use mm_volume::slice::{dicom_slice, load_raw, raw_slice, slice_count, to_grey8, SliceImage, VolumeData};
+use mm_volume::slice::{file_slice, load_raw, raw_slice, slice_count, to_grey8, SliceImage, VolumeData};
+use polymix_imaging::{drag_window, Nav};
 use polymix_workspace::jobs::Job;
 use std::sync::Arc;
 
@@ -32,12 +33,13 @@ pub struct Preview {
     wanted: Option<usize>,
     error: Option<String>,
     dirty: bool,
+    nav: Nav,
 }
 
 impl Preview {
     pub fn new(index: usize, v: &Volume, ctx: &egui::Context) -> Self {
         let slices = slice_count(v);
-        let mut p = Self { volume: index, slice: slices / 2, slices, raw: None, image: None, texture: None, window: None, file_window: v.window, job: None, wanted: None, error: None, dirty: false };
+        let mut p = Self { volume: index, slice: slices / 2, slices, raw: None, image: None, texture: None, window: None, file_window: v.window, job: None, wanted: None, error: None, dirty: false, nav: Nav::default() };
         match &v.voxels {
             Voxels::Unsupported(why) => p.error = Some(format!("Pixels not readable yet: {why}")),
             _ if slices == 0 => p.error = Some("No slices".into()),
@@ -59,7 +61,7 @@ impl Preview {
                 let s = raw_slice(&v, &data, k)?;
                 Ok(Loaded::Raw(data, s))
             }),
-            _ => Job::spawn("Decoding slice", ctx.clone(), move |_| Ok(Loaded::Slice(k, dicom_slice(&v, k)?))),
+            _ => Job::spawn("Decoding slice", ctx.clone(), move |_| Ok(Loaded::Slice(k, file_slice(&v, k)?))),
         });
     }
 
@@ -139,28 +141,25 @@ impl Preview {
             let (pw, ph) = (s.width as f64 * s.mm_per_pixel[0], s.height as f64 * s.mm_per_pixel[1]);
             let scale = (width as f64 / pw).min(width as f64 * 1.1 / ph);
             let size = egui::vec2((pw * scale) as f32, (ph * scale) as f32);
-            let r = ui.add(egui::Image::new((t.id(), size)).sense(egui::Sense::click_and_drag()));
-            if r.dragged() {
-                let d = r.drag_delta();
-                let (c, w) = self.current_window();
-                let w2 = (w * (d.x as f64 * 0.01).exp()).max(1e-6);
-                let c2 = c - d.y as f64 * w * 0.004;
-                self.window = Some((c2, w2));
+            let tex = t.id();
+            let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            let ev = self.nav.handle(ui, &r);
+            let shown = self.nav.image_rect(rect, size);
+            ui.painter_at(rect).image(tex, shown, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            if let Some(d) = ev.window {
+                self.window = Some(drag_window(self.current_window(), d));
                 self.dirty = true;
             }
-            if r.double_clicked() {
+            if ev.double_clicked {
                 self.window = None;
+                self.nav.reset();
                 self.dirty = true;
             }
-            if r.hovered() {
-                // One slice per wheel notch, from the raw events.
-                let dy: f32 = ctx.input(|i| i.raw.events.iter().map(|e| if let egui::Event::MouseWheel { delta, .. } = e { delta.y } else { 0.0 }).sum());
-                if dy != 0.0 {
-                    let k = if dy > 0.0 { self.slice.saturating_add(1) } else { self.slice.saturating_sub(1) };
-                    self.go_to(k, v, &ctx);
-                }
+            if ev.slices != 0 {
+                let k = (self.slice as i64 + ev.slices as i64).clamp(0, self.slices.saturating_sub(1) as i64) as usize;
+                self.go_to(k, v, &ctx);
             }
-            r.on_hover_text("Drag: window (across) and level (up / down) · Double-click: automatic window · Scroll: slices");
+            r.on_hover_text("Left drag or wheel: slices · Right drag: pan · Middle drag: zoom · Left + right drag: window / level · Double-click: reset");
         } else if self.job.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();

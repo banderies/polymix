@@ -8,7 +8,7 @@
 
 use crate::dicom::{self, Instance};
 use crate::model::{Catalog, Problem, Recognised, Volume};
-use crate::{nifti, nrrd, organize};
+use crate::{metaimage, mgh, nifti, nrrd, organize, stack};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -45,7 +45,7 @@ impl Default for ScanOptions {
 pub enum Found {
     Dicom(Box<Instance>),
     DicomDir,
-    /// A NIfTI, Analyze or NRRD volume.
+    /// A NIfTI, Analyze, NRRD, MetaImage, MGH or multi-page TIFF volume.
     Volume(Box<Volume>),
     /// A volumetric format Polymix knows but cannot read yet.
     Recognised(String),
@@ -80,7 +80,7 @@ struct CachedFile {
 }
 
 /// Bump when what is stored per file changes.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 impl FileCache {
     /// Load a cache file (empty when missing, unreadable or from another version).
@@ -248,25 +248,28 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
         }
     }
     // Data files of header / image pairs and detached NRRD headers are part of a volume.
-    let claimed: HashSet<&PathBuf> = catalog.volumes.iter().flat_map(|v| v.files.iter().skip(1)).collect();
-    // Folders of many 2D images (a slice stack exported as JPEG, PNG, TIFF…) are noted as
-    // stacks, not counted file by file.
-    let mut stacks: std::collections::BTreeMap<(PathBuf, String), usize> = Default::default();
+    let claimed: HashSet<PathBuf> = catalog.volumes.iter().flat_map(|v| v.files.iter().skip(1).cloned()).collect();
+    // Folders of many 2D images (a slice stack exported as JPEG, PNG, TIFF…) are volumes.
+    let mut stacks: std::collections::BTreeMap<(PathBuf, String), Vec<PathBuf>> = Default::default();
     for p in &not_imaging {
         let ext = extension(p);
         if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff" | "bmp") {
             if let Some(dir) = p.parent() {
-                *stacks.entry((dir.to_path_buf(), ext)).or_default() += 1;
+                stacks.entry((dir.to_path_buf(), ext)).or_default().push(p.to_path_buf());
             }
         }
     }
-    stacks.retain(|_, n| *n >= STACK_MIN_IMAGES);
-    for ((dir, ext), n) in &stacks {
-        catalog.recognised.push(Recognised { path: dir.clone(), format: format!("Image stack ({n} {} files)", ext.to_uppercase()) });
+    stacks.retain(|_, files| files.len() >= STACK_MIN_IMAGES);
+    for ((dir, ext), files) in &stacks {
+        let n = files.len();
+        match std::panic::catch_unwind(|| stack::stack_volume(dir, files.clone())) {
+            Ok(Ok(v)) => catalog.volumes.push(v),
+            _ => catalog.recognised.push(Recognised { path: dir.clone(), format: format!("Image stack ({n} {} files, not readable)", ext.to_uppercase()) }),
+        }
     }
     for p in not_imaging {
         let ext = extension(p);
-        if claimed.contains(p) || p.parent().is_some_and(|d| stacks.contains_key(&(d.to_path_buf(), ext.clone()))) {
+        if claimed.contains(p.as_path()) || p.parent().is_some_and(|d| stacks.contains_key(&(d.to_path_buf(), ext.clone()))) {
             continue;
         }
         *catalog.skipped.by_extension.entry(ext).or_default() += 1;
@@ -330,7 +333,10 @@ pub fn classify(path: &Path, size: u64) -> Found {
     // gzip: NIfTI inside, or something else.
     if head.starts_with(&[0x1f, 0x8b]) {
         if ext == "mgz" {
-            return Found::Recognised("MGH / MGZ (FreeSurfer)".into());
+            return match nifti::read_head(path, true, mgh::HEADER_BYTES).and_then(|b| mgh::parse(&b)).and_then(|h| mgh::volume(path, true, &h)) {
+                Ok(v) => Found::Volume(Box::new(v)),
+                Err(e) => problem(e),
+            };
         }
         let inner = match nifti::read_head(path, true, nifti::HEADER_BYTES) {
             Ok(b) => b,
@@ -370,12 +376,29 @@ pub fn classify(path: &Path, size: u64) -> Found {
             Err(e) => problem(e),
         };
     }
+    // FreeSurfer MGH, ITK MetaImage, multi-page TIFF.
+    if ext == "mgh" && mgh::sniff(&head) {
+        return match mgh::parse(&head).and_then(|h| mgh::volume(path, false, &h)) {
+            Ok(v) => Found::Volume(Box::new(v)),
+            Err(e) => problem(e),
+        };
+    }
+    if matches!(ext.as_str(), "mha" | "mhd") && metaimage::sniff(&head) {
+        return match metaimage::read(path).and_then(|h| metaimage::volume(path, &h)) {
+            Ok(v) => Found::Volume(Box::new(v)),
+            Err(e) => problem(e),
+        };
+    }
+    if matches!(ext.as_str(), "tif" | "tiff") && (head.starts_with(b"II") || head.starts_with(b"MM")) {
+        // Single images join a folder's image stack; unreadable ones are not imaging data.
+        return match stack::tiff_volume(path) {
+            Ok(Some(v)) => Found::Volume(Box::new(v)),
+            Ok(None) | Err(_) => Found::NotImaging,
+        };
+    }
     // Volumetric formats Polymix knows but cannot read yet.
     let text_start = |s: &str| head.starts_with(s.as_bytes());
-    let contains = |s: &str| head.windows(s.len()).any(|w| w == s.as_bytes());
     let recognised = match ext.as_str() {
-        "mha" | "mhd" if contains("NDims") || contains("ObjectType") => Some("MetaImage (ITK)"),
-        "mgh" => Some("MGH (FreeSurfer)"),
         "mnc" if head.starts_with(b"\x89HDF\r\n\x1a\n") => Some("MINC 2"),
         "mnc" if head.starts_with(b"CDF\x01") || head.starts_with(b"CDF\x02") => Some("MINC 1"),
         "ims" if head.starts_with(b"\x89HDF\r\n\x1a\n") => Some("Imaris"),
@@ -506,8 +529,11 @@ mod tests {
         broken[40..42].copy_from_slice(&0i16.to_le_bytes());
         std::fs::write(mk("niftis/broken.nii"), broken).unwrap();
         std::fs::write(mk("niftis/fake.nii.gz"), gzip(b"hello")).unwrap();
-        for k in 0..20 {
-            std::fs::write(mk(&format!("export/INV2/slice{k:03}.jpg")), b"\xff\xd8\xff").unwrap();
+        for k in 0..20u8 {
+            image::GrayImage::from_pixel(8, 6, image::Luma([k])).save(mk(&format!("export/INV2/slice{k}.png"))).unwrap();
+        }
+        for k in 0..16 {
+            std::fs::write(mk(&format!("export/broken/slice{k:03}.jpg")), b"\xff\xd8\xff").unwrap();
         }
         root
     }
@@ -533,7 +559,8 @@ mod tests {
         assert!(others.contains(&("brain_mask.nii.gz", Format::Nifti1, Kind::LabelMap)), "{others:?}");
         assert!(others.contains(&("old.hdr", Format::Analyze, Kind::Image)), "{others:?}");
         assert!(others.contains(&("vol.nrrd", Format::Nrrd, Kind::Image)), "{others:?}");
-        assert_eq!(others.len(), 4);
+        assert!(others.contains(&("INV2", Format::ImageStack, Kind::Image)), "{others:?}");
+        assert_eq!(others.len(), 5);
         // Noise: the venv and .git were not opened; junk is counted, broken files reported.
         assert!(c.skipped.folders.iter().any(|f| f.ends_with("venv")));
         assert!(c.skipped.folders.iter().any(|f| f.ends_with(".git")));
@@ -542,8 +569,10 @@ mod tests {
         assert!(problems.contains(&"garbage.dcm".to_string()) && problems.contains(&"broken.nii".to_string()) && problems.contains(&"fake.nii.gz".to_string()), "{problems:?}");
         assert_eq!(c.skipped.by_extension.get("py"), Some(&1));
         assert!(!c.skipped.by_extension.contains_key("img"), "the Analyze data file belongs to its header");
-        assert!(c.recognised.iter().any(|r| r.format == "Image stack (20 JPG files)"));
-        assert!(!c.skipped.by_extension.contains_key("jpg"));
+        let stack = c.volumes.iter().find(|v| v.format == Format::ImageStack).unwrap();
+        assert_eq!(stack.geometry.as_ref().unwrap().dims, [8, 6, 20, 1]);
+        assert!(c.recognised.iter().any(|r| r.format == "Image stack (16 JPG files, not readable)"), "{:?}", c.recognised);
+        assert!(!c.skipped.by_extension.contains_key("jpg") && !c.skipped.by_extension.contains_key("png"));
 
         // A cached rescan gives the same catalog.
         let mut cache = FileCache::default();

@@ -1,0 +1,15 @@
+[package]
+name = "polymix-imaging"
+description = "Polymix image views shared by the Volume and Segmentation workspaces: mouse controls, slice views, 3D volume rendering"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mm-volume = { path = "../mm-volume" }
+egui.workspace = true
+eframe.workspace = true
+glam.workspace = true
+rayon.workspace = true
+log.workspace = true
+bytemuck = { version = "1.25", features = ["derive"] }

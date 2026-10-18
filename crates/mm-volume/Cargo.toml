@@ -10,8 +10,11 @@ dicom-core = "0.10"
 dicom-object = "0.10"
 dicom-dictionary-std = "0.10"
 dicom-transfer-syntax-registry = { version = "0.10", default-features = false }
-dicom-pixeldata = { version = "0.10", default-features = false, features = ["native"] }
+dicom-pixeldata = { version = "0.10", default-features = false, features = ["native", "openjp2"] }
 flate2 = "1"
+# 2D image stacks (JPEG, PNG, BMP) and multi-page TIFF volumes.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+tiff = "0.11"
 walkdir = "2.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

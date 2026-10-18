@@ -34,7 +34,7 @@ pub struct VolumeData {
 /// How many slices a volume has (along its third axis).
 pub fn slice_count(v: &Volume) -> usize {
     match &v.voxels {
-        Voxels::Dicom { slices } => slices.len(),
+        Voxels::Dicom { slices } | Voxels::Images { slices } => slices.len(),
         _ => v.geometry.as_ref().map(|g| g.dims[2]).unwrap_or(0),
     }
 }
@@ -53,7 +53,14 @@ pub fn load_raw(v: &Volume, max_voxels: usize) -> Result<VolumeData> {
     let mut f = std::fs::File::open(file).with_context(|| format!("cannot open {}", file.display()))?;
     use std::io::Seek;
     f.seek(std::io::SeekFrom::Start(*file_offset))?;
-    let mut reader: Box<dyn Read> = if *gzip { Box::new(flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f))) } else { Box::new(std::io::BufReader::new(f)) };
+    let mut buffered = std::io::BufReader::new(f);
+    let mut reader: Box<dyn Read> = if !*gzip {
+        Box::new(buffered)
+    } else if std::io::BufRead::fill_buf(&mut buffered)?.starts_with(&[0x1f, 0x8b]) {
+        Box::new(flate2::read::MultiGzDecoder::new(buffered))
+    } else {
+        Box::new(flate2::read::ZlibDecoder::new(buffered))
+    };
     if *skip > 0 {
         std::io::copy(&mut reader.by_ref().take(*skip), &mut std::io::sink())?;
     }
@@ -135,6 +142,67 @@ pub fn display_axes(g: Option<&Geometry>) -> DisplayAxes {
     DisplayAxes { across, flip_across: a.dot(right) < 0.0, flip_down: d.dot(up) > 0.0 }
 }
 
+/// The three standard views of a volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Plane {
+    Axial,
+    Coronal,
+    Sagittal,
+}
+
+impl Plane {
+    pub const ALL: [Plane; 3] = [Plane::Axial, Plane::Coronal, Plane::Sagittal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Plane::Axial => "Axial",
+            Plane::Coronal => "Coronal",
+            Plane::Sagittal => "Sagittal",
+        }
+    }
+}
+
+/// How one plane of a volume is shown: the voxel axis it slices, the voxel axes running
+/// across and down the screen, and whether each runs backwards (radiological convention, as
+/// for thumbnails).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneAxes {
+    pub slice: usize,
+    pub across: usize,
+    pub down: usize,
+    pub flip_across: bool,
+    pub flip_down: bool,
+}
+
+/// For each world axis (R, A, S), the voxel axis closest to it (each voxel axis used once).
+pub fn voxel_axis_of_world(g: &Geometry) -> [usize; 3] {
+    let dirs = g.directions();
+    let mut used = [false; 3];
+    let mut out = [0usize; 3];
+    let mut order: Vec<usize> = (0..3).collect();
+    order.sort_by(|&a, &b| dirs[b].abs().max_element().total_cmp(&dirs[a].abs().max_element()));
+    for j in order {
+        let d = dirs[j];
+        let Some(w) = (0..3).filter(|&w| !used[w]).max_by(|&x, &y| d[x].abs().total_cmp(&d[y].abs())) else { continue };
+        used[w] = true;
+        out[w] = j;
+    }
+    out
+}
+
+pub fn plane_axes(g: &Geometry, plane: Plane) -> PlaneAxes {
+    let v = voxel_axis_of_world(g);
+    let dirs = g.directions();
+    // (slice, across with the world axis screen-right is the negative of, down with the
+    // world axis that points up).
+    let (slice, across, across_world, down, up_world) = match plane {
+        Plane::Axial => (v[2], v[0], 0, v[1], 1),
+        Plane::Coronal => (v[1], v[0], 0, v[2], 2),
+        Plane::Sagittal => (v[0], v[1], 1, v[2], 2),
+    };
+    PlaneAxes { slice, across, down, flip_across: dirs[across][across_world] > 0.0, flip_down: dirs[down][up_world] > 0.0 }
+}
+
 /// Lay out slice values (`nx` × `ny`, x fastest) for the screen.
 fn orient(values: &[f32], nx: usize, ny: usize, axes: DisplayAxes, spacing: [f64; 2]) -> (usize, usize, Vec<f32>, [f64; 2]) {
     let (w, h) = if axes.across == 0 { (nx, ny) } else { (ny, nx) };
@@ -201,6 +269,26 @@ pub fn dicom_slice(v: &Volume, k: usize) -> Result<SliceImage> {
     Ok(SliceImage { width, height, values, mm_per_pixel, invert: v.photometric.as_deref() == Some("MONOCHROME1"), auto_window })
 }
 
+/// Decode slice `k` of a volume made of 2D images.
+pub fn image_slice(v: &Volume, k: usize) -> Result<SliceImage> {
+    let Voxels::Images { slices } = &v.voxels else { bail!("not an image stack") };
+    let (path, page) = slices.get(k).context("slice out of range")?;
+    let (nx, ny, grey) = crate::stack::read_plane(path, *page)?;
+    let g = v.geometry.as_ref();
+    let spacing = g.map(|g| [g.spacing[0], g.spacing[1]]).unwrap_or([1.0, 1.0]);
+    let (width, height, values, mm_per_pixel) = orient(&grey, nx, ny, display_axes(g), spacing);
+    let auto_window = auto_window(&values);
+    Ok(SliceImage { width, height, values, mm_per_pixel, invert: false, auto_window })
+}
+
+/// Decode slice `k` of a volume stored slice by slice (DICOM files or 2D images).
+pub fn file_slice(v: &Volume, k: usize) -> Result<SliceImage> {
+    match &v.voxels {
+        Voxels::Images { .. } => image_slice(v, k),
+        _ => dicom_slice(v, k),
+    }
+}
+
 /// Map a slice to 8-bit grey with a window (centre, width).
 pub fn to_grey8(s: &SliceImage, window: (f64, f64)) -> Vec<u8> {
     let (c, w) = window;
@@ -235,6 +323,25 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+        }
+    }
+
+    #[test]
+    fn plane_axes_match_the_thumbnails() {
+        // DICOM axial (LPS): the axial plane slices k with no flips, like the thumbnail.
+        let lps = Geometry::from_axes([3, 2, 4, 1], [1.0; 3], [-DVec3::X, -DVec3::Y, DVec3::Z], DVec3::ZERO);
+        assert_eq!(plane_axes(&lps, Plane::Axial), PlaneAxes { slice: 2, across: 0, down: 1, flip_across: false, flip_down: false });
+        // Coronal of the same: across i, down k flipped (superior up).
+        assert_eq!(plane_axes(&lps, Plane::Coronal), PlaneAxes { slice: 1, across: 0, down: 2, flip_across: false, flip_down: true });
+        // Sagittal PIR (i → P, j → I, k → R): slices k, anterior on the left, superior up.
+        let pir = Geometry::from_axes([3, 2, 4, 1], [1.0; 3], [-DVec3::Y, -DVec3::Z, DVec3::X], DVec3::ZERO);
+        assert_eq!(plane_axes(&pir, Plane::Sagittal), PlaneAxes { slice: 2, across: 0, down: 1, flip_across: false, flip_down: false });
+        let a = plane_axes(&pir, Plane::Axial);
+        assert_eq!((a.slice, a.across, a.down, a.flip_across, a.flip_down), (1, 2, 0, true, false));
+        for g in [&lps, &pir] {
+            let d = display_axes(Some(g));
+            let p = plane_axes(g, if g == &lps { Plane::Axial } else { Plane::Sagittal });
+            assert_eq!((d.across, d.flip_across, d.flip_down), (p.across, p.flip_across, p.flip_down));
         }
     }
 

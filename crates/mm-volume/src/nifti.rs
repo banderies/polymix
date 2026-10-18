@@ -427,7 +427,7 @@ pub fn sidecar_patient(path: &Path) -> Option<PatientKey> {
 }
 
 /// Names that mark integer images as label maps.
-const LABEL_HINTS: [&str; 11] = ["mask", "label", "seg", "aseg", "aparc", "parc", "atlas", "hemi", "lesion", "roi", "dseg"];
+pub(crate) const LABEL_HINTS: [&str; 11] = ["mask", "label", "seg", "aseg", "aparc", "parc", "atlas", "hemi", "lesion", "roi", "dseg"];
 
 /// Build the volume for a NIfTI / Analyze file. `path` is the `.nii(.gz)` or `.hdr(.gz)`.
 pub fn volume(path: &Path, gzip: bool, h: &Header) -> Result<Volume> {

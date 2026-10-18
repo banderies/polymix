@@ -14,6 +14,12 @@ pub enum Format {
     Nifti2,
     Analyze,
     Nrrd,
+    MetaImage,
+    Mgh,
+    /// A folder of 2D images (JPEG, PNG, BMP, TIFF).
+    ImageStack,
+    /// A multi-page TIFF file.
+    Tiff,
 }
 
 impl Format {
@@ -24,6 +30,10 @@ impl Format {
             Format::Nifti2 => "NIfTI-2",
             Format::Analyze => "Analyze 7.5",
             Format::Nrrd => "NRRD",
+            Format::MetaImage => "MetaImage",
+            Format::Mgh => "MGH / MGZ",
+            Format::ImageStack => "Image stack",
+            Format::Tiff => "Multi-page TIFF",
         }
     }
 }
@@ -123,12 +133,15 @@ impl DataType {
 pub enum Voxels {
     /// DICOM: the file and frame of every slice, in slice order (first volume of a 4D set).
     Dicom { slices: Vec<(PathBuf, u32)> },
-    /// A plain array of `dtype` (x fastest) in `file` (NIfTI, Analyze, NRRD): the data start
-    /// `file_offset` bytes into the file, then (after gzip decompression, if `gzip`) another
+    /// A plain array of `dtype` (x fastest) in `file` (NIfTI, Analyze, NRRD, MetaImage, MGH):
+    /// the data start `file_offset` bytes into the file, then (after decompression, if `gzip`:
+    /// gzip, or zlib as in MetaImage, told apart by the first bytes) another
     /// `skip` bytes. `interleave` > 1 when a component axis comes first (e.g. RGB, or the
     /// layers of a segmentation): component 0 is every `interleave`-th value. Values are
     /// scaled by `slope · v + intercept`.
     Raw { file: PathBuf, file_offset: u64, gzip: bool, skip: u64, interleave: usize, dtype: DataType, big_endian: bool, slope: f64, intercept: f64 },
+    /// 2D images (or TIFF pages), one per slice, in slice order.
+    Images { slices: Vec<(PathBuf, u32)> },
     /// Recognised but not readable yet (e.g. bzip2-compressed NRRD).
     Unsupported(String),
 }
