@@ -261,14 +261,85 @@ pub fn transfer_syntax_name(uid: &str) -> (&'static str, bool) {
         "1.2.840.10008.1.2.4.51" => ("JPEG Extended", true),
         "1.2.840.10008.1.2.4.57" => ("JPEG Lossless", true),
         "1.2.840.10008.1.2.4.70" => ("JPEG Lossless SV1", true),
-        "1.2.840.10008.1.2.4.80" => ("JPEG-LS Lossless", false),
-        "1.2.840.10008.1.2.4.81" => ("JPEG-LS Near-Lossless", false),
+        "1.2.840.10008.1.2.4.80" => ("JPEG-LS Lossless", true),
+        "1.2.840.10008.1.2.4.81" => ("JPEG-LS Near-Lossless", true),
         "1.2.840.10008.1.2.4.90" => ("JPEG 2000 Lossless", true),
         "1.2.840.10008.1.2.4.91" => ("JPEG 2000", true),
         "1.2.840.10008.1.2.4.201" | "1.2.840.10008.1.2.4.202" | "1.2.840.10008.1.2.4.203" => ("High-Throughput JPEG 2000", false),
         "1.2.840.10008.1.2.5" => ("RLE Lossless", true),
         _ => ("other", false),
     }
+}
+
+/// Whether a transfer syntax is JPEG-LS (decoded by [`crate::jpegls`], not dicom-rs).
+pub fn is_jpegls(ts: &str) -> bool {
+    matches!(ts.trim_end_matches(['\0', ' ']), "1.2.840.10008.1.2.4.80" | "1.2.840.10008.1.2.4.81")
+}
+
+/// The bytes of frame `frame` in encapsulated pixel data: by the basic offset table, one
+/// fragment per frame, or a new frame at each fragment starting a JPEG stream.
+fn frame_bytes(fragments: &[Vec<u8>], offsets: &[u32], frames: usize, frame: usize) -> Result<Vec<u8>> {
+    if frames <= 1 {
+        return Ok(fragments.concat());
+    }
+    if fragments.len() == frames {
+        return fragments.get(frame).cloned().context("frame out of range");
+    }
+    let mut starts = Vec::new();
+    if offsets.len() == frames {
+        let mut at = 0u64;
+        let mut first = vec![usize::MAX; frames];
+        for (i, f) in fragments.iter().enumerate() {
+            if let Some(k) = offsets.iter().rposition(|&o| o as u64 <= at) {
+                if first[k] == usize::MAX {
+                    first[k] = i;
+                }
+            }
+            at += f.len() as u64 + 8;
+        }
+        starts = first;
+    } else {
+        for (i, f) in fragments.iter().enumerate() {
+            if f.starts_with(&[0xff, 0xd8]) {
+                starts.push(i);
+            }
+        }
+    }
+    let s = *starts.get(frame).filter(|&&s| s != usize::MAX).context("cannot find the frame in the pixel data")?;
+    let e = starts.iter().skip(frame + 1).copied().find(|&e| e != usize::MAX).unwrap_or(fragments.len());
+    Ok(fragments[s..e].concat())
+}
+
+/// Grey values (modality LUT applied) of frame `frame` of a JPEG-LS compressed object, with
+/// its columns and rows.
+pub fn jpegls_frame(obj: &dicom_object::DefaultDicomObject, frame: u32) -> Result<(usize, usize, Vec<f32>)> {
+    use dicom_core::value::Value;
+    let px = obj.element(tags::PIXEL_DATA).context("no pixel data")?;
+    let Value::PixelSequence(seq) = px.value() else { anyhow::bail!("JPEG-LS pixel data are not encapsulated") };
+    let int = |tag: Tag| obj.element_opt(tag).ok().flatten().and_then(|e| e.to_int::<i64>().ok());
+    let float = |tag: Tag| obj.element_opt(tag).ok().flatten().and_then(|e| e.to_float64().ok());
+    let frames = int(tags::NUMBER_OF_FRAMES).unwrap_or(1).max(1) as usize;
+    let bytes = frame_bytes(seq.fragments(), seq.offset_table(), frames, frame as usize)?;
+    let img = crate::jpegls::decode(&bytes)?;
+    let bits = int(tags::BITS_STORED).unwrap_or(img.bits as i64).clamp(1, 16) as u32;
+    let signed = int(tags::PIXEL_REPRESENTATION) == Some(1);
+    let slope = float(tags::RESCALE_SLOPE).filter(|s| *s != 0.0).unwrap_or(1.0);
+    let intercept = float(tags::RESCALE_INTERCEPT).unwrap_or(0.0);
+    let value = |s: u16| -> f32 {
+        let mut v = s as i32;
+        if signed {
+            let shift = 32 - bits;
+            v = (v << shift) >> shift;
+        }
+        (v as f64 * slope + intercept) as f32
+    };
+    let nc = img.components;
+    let grey = if nc >= 3 {
+        img.samples.chunks(nc).map(|p| 0.299 * value(p[0]) + 0.587 * value(p[1]) + 0.114 * value(p[2])).collect()
+    } else {
+        img.samples.iter().step_by(nc).map(|&s| value(s)).collect()
+    };
+    Ok((img.width, img.height, grey))
 }
 
 /// What a non-image (or not-a-volume) DICOM object is, by SOP class; `None` for images.
@@ -314,4 +385,46 @@ pub fn sniff_raw(b: &[u8]) -> bool {
     };
     let Some(n) = next else { return false };
     matches!((u16le(n), u16le(n + 2)), (Some(0x0008), Some(e1)) if e1 > e0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dicom_core::value::{PixelFragmentSequence, Value};
+    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_dictionary_std::uids;
+    use dicom_object::FileMetaTableBuilder;
+
+    #[test]
+    fn jpegls_frames_with_rescale() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/jpegls");
+        let jls = std::fs::read(dir.join("grey12.jls")).unwrap();
+        let raw: Vec<u16> = std::fs::read(dir.join("grey12.u16")).unwrap().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let mut o = InMemDicomObject::new_empty();
+        o.put(DataElement::new(tags::SOP_CLASS_UID, VR::UI, PrimitiveValue::from("1.2.840.10008.5.1.4.1.1.2")));
+        o.put(DataElement::new(tags::SOP_INSTANCE_UID, VR::UI, PrimitiveValue::from("1.2.3.4")));
+        o.put(DataElement::new(tags::NUMBER_OF_FRAMES, VR::IS, PrimitiveValue::from("2")));
+        o.put(DataElement::new(tags::RESCALE_SLOPE, VR::DS, PrimitiveValue::from("2")));
+        o.put(DataElement::new(tags::RESCALE_INTERCEPT, VR::DS, PrimitiveValue::from("-100")));
+        for (tag, v) in [(tags::ROWS, 30u16), (tags::COLUMNS, 40), (tags::BITS_ALLOCATED, 16), (tags::BITS_STORED, 12), (tags::HIGH_BIT, 11), (tags::PIXEL_REPRESENTATION, 0), (tags::SAMPLES_PER_PIXEL, 1)] {
+            o.put(DataElement::new(tag, VR::US, PrimitiveValue::from(v)));
+        }
+        // Two frames, the second split over two fragments, found through the offset table.
+        // (Fragments have even lengths: DICOM pads odd ones with a zero byte.)
+        let (a, b) = jls.split_at(jls.len() / 4 * 2);
+        let offsets = vec![0u32, jls.len().next_multiple_of(2) as u32 + 8];
+        let seq = PixelFragmentSequence::new(offsets, vec![jls.clone(), a.to_vec(), b.to_vec()]);
+        o.put(DataElement::new(tags::PIXEL_DATA, VR::OB, Value::PixelSequence(seq)));
+        let file = o.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::JPEGLS_LOSSLESS).media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2").media_storage_sop_instance_uid("1.2.3.4")).unwrap();
+        let p = std::env::temp_dir().join(format!("mmv-jls-{}.dcm", std::process::id()));
+        file.write_to_file(&p).unwrap();
+        let obj = dicom_object::open_file(&p).unwrap();
+        assert!(is_jpegls(obj.meta().transfer_syntax()));
+        for f in 0..2 {
+            let (w, h, v) = jpegls_frame(&obj, f).unwrap();
+            assert_eq!((w, h), (40, 30));
+            assert!(v.iter().zip(&raw).all(|(&x, &r)| x == r as f32 * 2.0 - 100.0), "frame {f}");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
 }

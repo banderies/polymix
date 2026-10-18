@@ -257,11 +257,15 @@ pub fn dicom_slice(v: &Volume, k: usize) -> Result<SliceImage> {
     let Voxels::Dicom { slices } = &v.voxels else { bail!("not a DICOM volume") };
     let (path, frame) = slices.get(k).context("slice out of range")?;
     let obj = dicom_object::open_file(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let px = obj.decode_pixel_data_frame(*frame).map_err(|e| anyhow::anyhow!("cannot decode the pixels: {e}"))?;
-    let (nx, ny) = (px.columns() as usize, px.rows() as usize);
-    let raw: Vec<f32> = px.to_vec_frame(0).map_err(|e| anyhow::anyhow!("cannot convert the pixels: {e}"))?;
-    let samples = (raw.len() / (nx * ny).max(1)).max(1);
-    let grey: Vec<f32> = if samples >= 3 { raw.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else { raw };
+    let (nx, ny, grey) = if crate::dicom::is_jpegls(obj.meta().transfer_syntax()) {
+        crate::dicom::jpegls_frame(&obj, *frame)?
+    } else {
+        let px = obj.decode_pixel_data_frame(*frame).map_err(|e| anyhow::anyhow!("cannot decode the pixels: {e}"))?;
+        let (nx, ny) = (px.columns() as usize, px.rows() as usize);
+        let raw: Vec<f32> = px.to_vec_frame(0).map_err(|e| anyhow::anyhow!("cannot convert the pixels: {e}"))?;
+        let samples = (raw.len() / (nx * ny).max(1)).max(1);
+        (nx, ny, if samples >= 3 { raw.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else { raw })
+    };
     let g = v.geometry.as_ref();
     let spacing = g.map(|g| [g.spacing[0], g.spacing[1]]).unwrap_or([1.0, 1.0]);
     let (width, height, values, mm_per_pixel) = orient(&grey, nx, ny, display_axes(g), spacing);

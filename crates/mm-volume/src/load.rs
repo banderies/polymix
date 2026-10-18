@@ -141,6 +141,9 @@ fn load_planes(slices: &[(PathBuf, u32)], dims: [usize; 3], progress: &(dyn Fn(f
 fn dicom_frames(path: &std::path::Path, frames: &[(usize, u32)]) -> Result<Planes> {
     use dicom_pixeldata::PixelDecoder;
     let obj = dicom_object::open_file(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if crate::dicom::is_jpegls(obj.meta().transfer_syntax()) {
+        return frames.iter().map(|&(k, f)| Ok((k, crate::dicom::jpegls_frame(&obj, f)?.2))).collect();
+    }
     let grey = |raw: Vec<f32>, n: usize| -> Vec<f32> {
         let samples = (raw.len() / n.max(1)).max(1);
         if samples >= 3 { raw.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else { raw }

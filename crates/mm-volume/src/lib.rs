@@ -9,6 +9,7 @@ pub mod metaimage;
 pub mod mgh;
 pub mod stack;
 pub mod dicom;
+pub mod jpegls;
 pub mod organize;
 pub mod scan;
 pub mod slice;
