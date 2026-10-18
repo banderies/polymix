@@ -94,8 +94,89 @@ impl Brush {
     }
 }
 
+/// Dynamic refinement: the surface under the brush is re-triangulated after every dab so
+/// detail can be added (Meshmixer's volume-brush Refinement).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Refinement {
+    pub enabled: bool,
+    /// 0..100: finer triangles relative to the brush size.
+    pub refine: f64,
+    /// 0..100: how eagerly short edges are collapsed.
+    pub reduce: f64,
+    /// 0..100: tangential relaxation of the new triangles.
+    pub smooth: f64,
+    /// Finer where the surface bends, coarser where it is flat.
+    pub adaptive: bool,
+    /// 0..100: strength of the adaptive variation.
+    pub adaptivity: f64,
+}
+
+impl Default for Refinement {
+    fn default() -> Self {
+        Self { enabled: false, refine: 25.0, reduce: 5.0, smooth: 5.0, adaptive: false, adaptivity: 50.0 }
+    }
+}
+
+impl Refinement {
+    /// Target edge length for a brush of radius `r` over `tris`.
+    fn target(&self, m: &Mesh, tris: &[u32], r: f64) -> f64 {
+        let mut l = r * 0.3 * 2f64.powf(-self.refine / 25.0);
+        if self.adaptive {
+            // Normal spread of the region: 0 on a plane, toward 1 where it bends sharply.
+            let (mut n, mut a) = (DVec3::ZERO, 0.0);
+            for &t in tris {
+                let ar = m.tri_area(t);
+                n += m.tri_normal(t) * ar;
+                a += ar;
+            }
+            let spread = if a > 0.0 { 1.0 - n.length() / a } else { 0.0 };
+            let k = self.adaptivity / 100.0;
+            l *= (1.0 + k) * (1.0 - (spread * 4.0).min(1.0) * k * 0.75);
+        }
+        l
+    }
+}
+
+/// Re-triangulate the surface within the brush: split long edges, collapse short ones, relax.
+/// Returns whether the topology changed.
+fn refine_region(mesh: &mut Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, p: &Refinement) -> bool {
+    let mut tris = Vec::new();
+    bvh.query_sphere(mesh, c, r * 1.15, |t| tris.push(t));
+    tris.sort_unstable();
+    tris.dedup();
+    if tris.is_empty() {
+        return false;
+    }
+    let target = p.target(mesh, &tris, r);
+    let Ok(split) = mm_remesh::refine_uniform(mesh, target * 1.33, Some(&tris), None) else { return false };
+    let tris = split.region_triangles.unwrap_or(tris);
+    let min = target * (0.2 + 0.6 * p.reduce / 100.0);
+    let Ok(col) = mm_remesh::collapse_short_edges(mesh, min, Some(&tris), None) else { return split.splits > 0 };
+    let tris = col.region_triangles.unwrap_or(tris);
+    if p.smooth > 0.0 {
+        let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+        let mut verts: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).filter(|&v| !mesh.is_boundary_vertex(v) && mesh.vertex_triangles(v).iter().all(|t| set.contains(t))).collect();
+        verts.sort_unstable();
+        verts.dedup();
+        let k = (p.smooth / 100.0).min(1.0);
+        let moves: Vec<(u32, DVec3)> = verts
+            .iter()
+            .map(|&v| {
+                let n = mesh.vertex_normal(v);
+                let l = laplacian(mesh, v);
+                (v, mesh.vertex(v) + (l - n * l.dot(n)) * k)
+            })
+            .collect();
+        for (v, q) in moves {
+            mesh.set_vertex(v, q);
+        }
+    }
+    split.splits + col.collapses > 0
+}
+
 pub struct SculptTool {
     brush: Brush,
+    refinement: Refinement,
     /// Brush radius in percent of the model size.
     size_pct: f32,
     strength: f64,
@@ -123,7 +204,17 @@ struct SculptStroke {
 
 impl SculptTool {
     pub fn new(_cx: &mut ToolCx) -> Self {
-        Self { brush: Brush::RobustSmooth, size_pct: 4.0, strength: 0.5, stroke: None, armed: false, hover: None, hold_boundary: true, strength_drag: None }
+        Self {
+            brush: Brush::RobustSmooth,
+            refinement: Refinement::default(),
+            size_pct: 4.0,
+            strength: 0.5,
+            stroke: None,
+            armed: false,
+            hover: None,
+            hold_boundary: true,
+            strength_drag: None,
+        }
     }
 }
 
@@ -354,6 +445,18 @@ impl Tool for SculptTool {
             ui.add(egui::Slider::new(&mut self.strength, 0.01..=1.0));
         });
         ui.checkbox(&mut self.hold_boundary, "Hold open boundaries");
+        ui_util::section(ui, "Refinement");
+        let rf = &mut self.refinement;
+        ui.checkbox(&mut rf.enabled, "Dynamic refinement (R)").on_hover_text("Re-triangulate under the brush so detail can be added");
+        ui.add_enabled_ui(rf.enabled, |ui| {
+            ui.add(egui::Slider::new(&mut rf.refine, 0.0..=100.0).text("refine"));
+            ui.add(egui::Slider::new(&mut rf.reduce, 0.0..=100.0).text("reduce"));
+            ui.add(egui::Slider::new(&mut rf.smooth, 0.0..=100.0).text("smooth"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut rf.adaptive, "Adaptive (T)");
+                ui.add_enabled(rf.adaptive, egui::Slider::new(&mut rf.adaptivity, 0.0..=100.0).text("adaptivity"));
+            });
+        });
         ui.small("Drag on the surface. Cmd/Ctrl inverts the draw brushes, Inflate, Push and Pinch. Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation). Right-drag: strength.");
         ui.add_space(8.0);
         if ui.button("Done").clicked() {
@@ -442,6 +545,16 @@ impl Tool for SculptTool {
         let dab = Dab { center: h.point, r, strength, invert: stroke.invert, view, motion, start: &stroke.start, target: target.as_ref() };
         apply_dab(o.mesh_mut(), &verts, brush, &dab);
         o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
+        if self.refinement.enabled {
+            let bvh = o.bvh();
+            if refine_region(o.mesh_mut(), &bvh, h.point, r, &self.refinement) {
+                // New triangles: the GPU copy and the selection are rebuilt.
+                o.moved_vertices.clear();
+                let m = o.mesh.clone();
+                o.selection.sync(&m);
+                o.touch_selection();
+            }
+        }
     }
 
     fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
@@ -469,7 +582,18 @@ impl Tool for SculptTool {
         }
     }
 
-    fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
+    fn keys(&mut self, i: &egui::InputState, cx: &mut ToolCx) -> bool {
+        let plain = |k| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.shift && !i.modifiers.alt;
+        if plain(egui::Key::R) {
+            self.refinement.enabled = !self.refinement.enabled;
+            *cx.status = format!("Refinement {}", if self.refinement.enabled { "on" } else { "off" });
+            return true;
+        }
+        if plain(egui::Key::T) {
+            self.refinement.adaptive = !self.refinement.adaptive;
+            *cx.status = format!("Adaptive refinement {}", if self.refinement.adaptive { "on" } else { "off" });
+            return true;
+        }
         if i.key_pressed(egui::Key::OpenBracket) {
             step_brush_size(&mut self.size_pct, false);
             return true;
@@ -534,5 +658,31 @@ mod tests {
         let target = crate::scene::TargetSurface { id: 7, bvh: std::sync::Arc::new(mm_core::Bvh::build(&tm)), mesh: std::sync::Arc::new(tm) };
         let (m0, m, v) = dab_on_sphere(Brush::Attract, DVec3::ZERO, Some(&target));
         assert!(mean_radius(&m, &v) < mean_radius(&m0, &v) && mean_radius(&m, &v) > 0.89);
+    }
+
+    #[test]
+    fn dynamic_refinement_adds_detail_under_the_brush() {
+        let mut m = primitives::icosphere(1.0, 2);
+        let n0 = m.triangle_count();
+        let p = Refinement { enabled: true, refine: 50.0, ..Default::default() };
+        for _ in 0..3 {
+            let bvh = mm_core::Bvh::build(&m);
+            assert!(refine_region(&mut m, &bvh, DVec3::Z, 0.5, &p) || m.triangle_count() > n0);
+        }
+        m.check_validity().unwrap();
+        assert!(m.is_closed());
+        assert!(m.triangle_count() > n0 * 2, "{} vs {n0}", m.triangle_count());
+        // Far from the brush nothing changed: the bottom keeps its coarse triangles.
+        let bottom = m.triangle_ids().filter(|&t| m.tri_centroid(t).z < -0.5).map(|t| m.tri_area(t)).fold(0.0, f64::max);
+        let top = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.9).map(|t| m.tri_area(t)).fold(0.0, f64::max);
+        assert!(top < bottom * 0.5);
+        // Adaptive: longer edges on a flat patch than on a curved one.
+        let flat = primitives::plane_grid(2.0, 2.0, 10, 10);
+        let ft: Vec<u32> = flat.triangle_ids().collect();
+        let sphere = primitives::icosphere(0.3, 3);
+        let st: Vec<u32> = sphere.triangle_ids().filter(|&t| sphere.tri_centroid(t).z > 0.0).collect();
+        let a = Refinement { adaptive: true, ..p };
+        assert!(a.target(&flat, &ft, 0.5) > a.target(&sphere, &st, 0.5));
+        assert!(a.target(&flat, &ft, 0.5) > p.target(&flat, &ft, 0.5));
     }
 }

@@ -119,7 +119,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 
 - [x] **M8.1 Brush set**: Draw, Draw2, Draw3, DrawMax, Move, Push, Pinch, Spikes, Nudge,
       ZipperEdge, Attract, BubbleSmooth, ShrinkSmooth.
-- [ ] **M8.2 Dynamic refinement** while sculpting (Refine, Reduce, Smooth, Adaptivity; R / T).
+- [x] **M8.2 Dynamic refinement** while sculpting (Refine, Reduce, Smooth, Adaptivity; R / T).
 - [ ] **M8.3 Volume vs Surface brushes**, Depth, Lazyness, Flow, Volumetric, falloff curves,
       secondary brush (Shift), toggles Shift+S / B / G / A, hotkeys 1 / 2 / 3.
 - [ ] **M8.4 Mesh density brushes**: Refine, Reduce, AdaptiveReduce.
