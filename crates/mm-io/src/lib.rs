@@ -12,6 +12,7 @@
 //!
 //! Malformed or truncated input always produces an `Err`, never a panic.
 
+mod amf;
 mod obj;
 mod off;
 mod parse;
@@ -44,11 +45,24 @@ pub enum Format {
     Off,
     /// 3D Manufacturing Format (zip package).
     ThreeMf,
+    /// Additive Manufacturing File Format (XML, optionally zipped).
+    Amf,
+    /// COLLADA (export only).
+    Dae,
+    /// VRML 2.0 (export only).
+    Wrl,
+    /// TetGen surface mesh with boundary markers (export only).
+    Smesh,
 }
 
 impl Format {
     /// All formats, in a stable order.
-    pub const ALL: [Format; 5] = [Format::Stl, Format::Obj, Format::Ply, Format::Off, Format::ThreeMf];
+    pub const ALL: [Format; 9] = [Format::Stl, Format::Obj, Format::Ply, Format::Off, Format::ThreeMf, Format::Amf, Format::Dae, Format::Wrl, Format::Smesh];
+
+    /// Whether files of this format can be read (the others are export only).
+    pub fn can_read(self) -> bool {
+        !matches!(self, Format::Dae | Format::Wrl | Format::Smesh)
+    }
 
     /// Format for a file extension (without the dot, case-insensitive).
     pub fn from_extension(ext: &str) -> Option<Format> {
@@ -58,6 +72,10 @@ impl Format {
             "ply" => Some(Format::Ply),
             "off" => Some(Format::Off),
             "3mf" => Some(Format::ThreeMf),
+            "amf" => Some(Format::Amf),
+            "dae" => Some(Format::Dae),
+            "wrl" | "vrml" => Some(Format::Wrl),
+            "smesh" => Some(Format::Smesh),
             _ => None,
         }
     }
@@ -75,6 +93,10 @@ impl Format {
             Format::Ply => "ply",
             Format::Off => "off",
             Format::ThreeMf => "3mf",
+            Format::Amf => "amf",
+            Format::Dae => "dae",
+            Format::Wrl => "wrl",
+            Format::Smesh => "smesh",
         }
     }
 }
@@ -87,6 +109,10 @@ impl std::fmt::Display for Format {
             Format::Ply => "PLY",
             Format::Off => "OFF",
             Format::ThreeMf => "3MF",
+            Format::Amf => "AMF",
+            Format::Dae => "COLLADA",
+            Format::Wrl => "VRML",
+            Format::Smesh => "TetGen SMESH",
         })
     }
 }
@@ -198,6 +224,8 @@ pub fn read_mesh_from_bytes_with(bytes: &[u8], format: Format, opts: &ReadOption
         Format::Ply => ply::read(bytes)?,
         Format::Off => off::read(bytes)?,
         Format::ThreeMf => threemf::read(bytes)?,
+        Format::Amf => amf::read(bytes)?,
+        Format::Dae | Format::Wrl | Format::Smesh => bail!("{format} files can only be exported"),
     };
     finish(raw, format, opts)
 }
@@ -344,6 +372,10 @@ pub fn write_mesh_to<W: Write + Seek>(w: &mut W, mesh: &Mesh, format: Format, op
         Format::Ply => ply::write(w, &pos, &tris, colors, opts.double_precision)?,
         Format::Off => off::write(w, &pos, &tris, opts.double_precision)?,
         Format::ThreeMf => threemf::write(w, &pos, &tris, name, opts.double_precision)?,
+        Format::Amf => amf::write(w, &pos, &tris, &groups, colors, opts.double_precision)?,
+        Format::Dae => amf::write_dae(w, &pos, &tris, name)?,
+        Format::Wrl => amf::write_wrl(w, &pos, &tris, colors)?,
+        Format::Smesh => amf::write_smesh(w, &pos, &tris, &groups, opts.double_precision)?,
     }
     w.flush()?;
     Ok(())

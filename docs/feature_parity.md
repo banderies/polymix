@@ -34,17 +34,17 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | Open / Save / Save As scene (`.mix`) | ✅ | Own `.polymix` project (zip: manifest + lossless meshes): objects, face groups, vertex colours, patch names, colours, materials, frames, visibility, active object, target, view. ⌘S / ⇧⌘S, File → Open project, drag & drop. `.mix` files are not read |
-| Import (OBJ, PLY, STL, AMF, 3MF, OFF, MIX) | 🟡 | OBJ, PLY, STL, OFF, 3MF ✅; AMF, MIX ❌ |
+| Import (OBJ, PLY, STL, AMF, 3MF, OFF, MIX) | ✅ / ⚪ | OBJ, PLY, STL, OFF, 3MF, AMF (plain or zipped, volumes → groups) ✅; Meshmixer's .mix ⚪ (Polymix projects instead) |
 | Import → *append or replace* prompt | ❌ | Polymix always appends |
 | Auto-fix prompt when an appended mesh is much smaller/larger/far away | ❌ | |
-| Import Bunny / Sphere / Plane | ❌ | Primitives exist in `mm_core::primitives`, not exposed |
+| Import Bunny / Sphere / Plane | ✅ / ⚪ | File → Add shape: Sphere, Plane, Cube, Cylinder; no bundled bunny |
 | Import Reference / Import Parts Folder | ⚪ ❌ | |
 | Recent files | ✅ | |
 | Drag-and-drop import | ✅ | |
 | Export: OBJ, STL ASCII/binary, PLY, 3MF | ✅ | plus OFF |
 | Export: OBJ with per-vertex colour | ✅ | OBJ (`v x y z r g b`) and PLY (uchar RGB) read and write vertex colours |
 | Export: "Sequence, one file per region" (OBJ/STL) | 🟡 | One STL per face group via Boundary patches |
-| Export: AMF, COLLADA (.dae), VRML, SMESH | ❌ | |
+| Export: AMF, COLLADA (.dae), VRML, SMESH | ✅ | AMF keeps groups (volumes) and colours; SMESH writes face groups as TetGen boundary markers; plus File → Export selected triangles |
 | Export SVG | ⛔ | |
 | Print / Send to printer | ⛔ | |
 | Preferences (Alt+T / ⌘,) | ✅ | ⌘, or File → Preferences: General (navigation, colour / normal modes, up axis), View (free rotate, reset camera on scene change, view cube, object browser, grid, sharp edges, theme), File (export scope, STL ASCII, OBJ groups) |

@@ -110,6 +110,15 @@ pub struct Prefs {
     pub autosave_minutes: u32,
 }
 
+/// What an export writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportScope {
+    Active,
+    AllVisible,
+    /// The active object's selected triangles.
+    Selection,
+}
+
 /// Where autosaves and the session marker live (per user).
 fn data_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -840,7 +849,7 @@ impl PolymixApp {
 
     fn import_dialog(&mut self, ctx: &egui::Context) {
         let files = rfd::FileDialog::new()
-            .add_filter("Meshes", &["stl", "obj", "ply", "off", "3mf"])
+            .add_filter("Meshes", &["stl", "obj", "ply", "off", "3mf", "amf", crate::project::EXTENSION])
             .add_filter("All files", &["*"])
             .pick_files();
         if let Some(files) = files {
@@ -848,31 +857,44 @@ impl PolymixApp {
         }
     }
 
-    fn export_dialog(&mut self, ctx: &egui::Context, all_visible: bool) {
+    fn export_dialog(&mut self, ctx: &egui::Context, scope: ExportScope) {
         let Some(active) = self.scene.active() else {
             self.status = "Nothing to export.".into();
             return;
         };
+        if scope == ExportScope::Selection && active.selection.is_empty() {
+            self.status = "Select the triangles to export first.".into();
+            return;
+        }
         let mut dlg = rfd::FileDialog::new()
             .add_filter("STL (binary)", &["stl"])
             .add_filter("OBJ", &["obj"])
             .add_filter("PLY", &["ply"])
             .add_filter("OFF", &["off"])
             .add_filter("3MF", &["3mf"])
+            .add_filter("AMF", &["amf"])
+            .add_filter("COLLADA", &["dae"])
+            .add_filter("VRML", &["wrl"])
+            .add_filter("TetGen SMESH (face groups as boundary markers)", &["smesh"])
             .set_file_name(format!("{}.stl", active.name));
         if let Some(d) = &self.last_export_dir {
             dlg = dlg.set_directory(d);
         }
         let Some(path) = dlg.save_file() else { return };
         self.last_export_dir = path.parent().map(|p| p.to_path_buf());
-        let mesh: Mesh = if all_visible {
-            let mut m = Mesh::new();
-            for o in self.scene.objects.iter().filter(|o| o.visible) {
-                m.append_mesh(&o.mesh, 0);
+        let mesh: Mesh = match scope {
+            ExportScope::AllVisible => {
+                let mut m = Mesh::new();
+                for o in self.scene.objects.iter().filter(|o| o.visible) {
+                    m.append_mesh(&o.mesh, 0);
+                }
+                m
             }
-            m
-        } else {
-            (*active.mesh).clone()
+            ExportScope::Active => (*active.mesh).clone(),
+            ExportScope::Selection => {
+                let tris: Vec<u32> = active.selection.iter().collect();
+                active.mesh.submesh(&tris).0
+            }
         };
         let mesh = if self.prefs.flip_zy {
             let mut m = mesh;
@@ -1028,12 +1050,41 @@ impl PolymixApp {
                 }
                 if ui.button("Export active…").clicked() {
                     ui.close();
-                    self.export_dialog(&ctx, false);
+                    self.export_dialog(&ctx, ExportScope::Active);
                 }
                 if ui.button("Export all visible as one…").clicked() {
                     ui.close();
-                    self.export_dialog(&ctx, true);
+                    self.export_dialog(&ctx, ExportScope::AllVisible);
                 }
+                if ui.button("Export selected triangles…").clicked() {
+                    ui.close();
+                    self.export_dialog(&ctx, ExportScope::Selection);
+                }
+                ui.menu_button("Add shape", |ui| {
+                    // Meshmixer's Import Sphere / Plane (no bunny: Polymix ships no sample scans).
+                    type Make = fn() -> Mesh;
+                    let shapes: [(&str, Make); 4] = [
+                        ("Sphere", || mm_core::primitives::icosphere(12.5, 4)),
+                        ("Plane", || mm_core::primitives::plane_grid(25.0, 25.0, 32, 32)),
+                        ("Cube", || mm_core::primitives::cube(25.0, 8)),
+                        ("Cylinder", || {
+                            let mut m = mm_core::primitives::cylinder(12.5, 25.0, 64, 16, true);
+                            m.transform(|p| glam::DVec3::new(p.x, p.z - 12.5, -p.y));
+                            m
+                        }),
+                    ];
+                    for (name, make) in shapes {
+                        if ui.button(name).clicked() {
+                            ui.close();
+                            self.history.push(format!("Add {name}"), &self.scene);
+                            let first = self.scene.is_empty();
+                            self.scene.add(name.to_lowercase(), make());
+                            if first || self.prefs.reset_camera_on_import {
+                                self.focus_scene();
+                            }
+                        }
+                    }
+                });
                 ui.menu_button("Open recent", |ui| {
                     if self.recent.is_empty() {
                         ui.weak("(none)");
@@ -1244,7 +1295,7 @@ impl PolymixApp {
             }
         }
         if big(ui, Icon::Export, "Export", false).on_hover_text("⌘E").clicked() {
-            self.export_dialog(&ctx, self.prefs.export_whole_scene);
+            self.export_dialog(&ctx, if self.prefs.export_whole_scene { ExportScope::AllVisible } else { ExportScope::Active });
         }
     }
 
@@ -2239,7 +2290,7 @@ impl PolymixApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop an STL / OBJ / PLY / OFF / 3MF file here\nor press ⌘O to import",
+                "Drop an STL / OBJ / PLY / OFF / 3MF / AMF file or a .polymix project here\nor press ⌘O to import",
                 egui::FontId::proportional(18.0),
                 Color32::from_gray(150),
             );
@@ -2600,7 +2651,7 @@ impl PolymixApp {
             return;
         }
         if i.key_pressed(Key::E) && cmd {
-            self.export_dialog(ctx, self.prefs.export_whole_scene);
+            self.export_dialog(ctx, if self.prefs.export_whole_scene { ExportScope::AllVisible } else { ExportScope::Active });
             return;
         }
         if i.key_pressed(Key::S) && cmd {

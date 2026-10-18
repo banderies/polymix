@@ -665,3 +665,44 @@ fn vertex_colors_round_trip() {
     let bytes = mm_io::write_mesh_to_bytes(&plain, mm_io::Format::Ply, &Default::default()).unwrap();
     assert!(!mm_io::read_mesh_from_bytes(&bytes, mm_io::Format::Ply).unwrap().mesh.has_vertex_colors());
 }
+
+#[test]
+fn amf_and_export_only_formats() {
+    let mut m = primitives::icosphere(1.0, 2);
+    for t in m.triangle_ids().collect::<Vec<_>>() {
+        let g = (m.tri_centroid(t).z > 0.0) as i32;
+        m.set_tri_group(t, g);
+    }
+    m.set_vertex_color(0, [0.25, 0.5, 0.75]);
+    // AMF round trip: positions, volumes as groups, colours.
+    let bytes = write_mesh_to_bytes(&m, Format::Amf, &WriteOptions { double_precision: true, ..Default::default() }).unwrap();
+    let back = read_mesh_from_bytes(&bytes, Format::Amf).unwrap().mesh;
+    assert_eq!(back.triangle_count(), m.triangle_count());
+    let groups: std::collections::BTreeSet<i32> = back.triangle_ids().map(|t| back.tri_group(t)).collect();
+    assert_eq!(groups.len(), 2);
+    assert!(back.has_vertex_colors());
+    let vol = |x: &Mesh| mm_core::measure::volume(x);
+    assert!((vol(&back) - vol(&m)).abs() < 1e-9);
+    // Zipped AMF in inches.
+    let xml = String::from_utf8(bytes).unwrap().replace("unit=\"millimeter\"", "unit=\"inch\"");
+    let mut zipped = Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut zipped);
+        z.start_file("model.amf", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(xml.as_bytes()).unwrap();
+        z.finish().unwrap();
+    }
+    let inch = read_mesh_from_bytes(&zipped.into_inner(), Format::Amf).unwrap().mesh;
+    assert!((inch.bounds().extents().x - 25.4 * m.bounds().extents().x).abs() < 1e-6);
+    // Export-only formats write and refuse to read.
+    for f in [Format::Dae, Format::Wrl, Format::Smesh] {
+        assert!(!f.can_read());
+        let out = String::from_utf8(write_mesh_to_bytes(&m, f, &WriteOptions::default()).unwrap()).unwrap();
+        assert!(!out.is_empty());
+        assert!(read_mesh_from_bytes(out.as_bytes(), f).is_err());
+    }
+    let smesh = String::from_utf8(write_mesh_to_bytes(&m, Format::Smesh, &WriteOptions::default()).unwrap()).unwrap();
+    // Facets carry the face group as boundary marker.
+    assert!(smesh.lines().any(|l| l.starts_with("3 ") && l.ends_with(" 1")));
+    assert_eq!(Format::from_extension("SMESH"), Some(Format::Smesh));
+}
