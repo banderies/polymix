@@ -27,6 +27,7 @@ pub mod sculpt;
 pub mod stamp;
 pub mod drop_part;
 pub mod pattern;
+pub mod unwrap;
 pub mod patches;
 pub mod boolean;
 pub mod deviation;
@@ -274,6 +275,10 @@ pub trait Tool {
     }
     /// Show face-group colours while this tool is open (its result is about groups).
     fn shows_groups(&self) -> bool {
+        false
+    }
+    /// Show the UV checker while this tool is open.
+    fn shows_uvs(&self) -> bool {
         false
     }
     /// Whether the tool is computing something (shows a spinner, blocks other tools).

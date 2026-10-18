@@ -174,6 +174,8 @@ pub struct WriteOptions {
     /// Name stored in the file (STL solid name / header, 3MF object name). Defaults to the
     /// file stem in [`write_mesh`], `"mesh"` otherwise.
     pub name: Option<String>,
+    /// OBJ: texture coordinates of each triangle's corners, in triangle order.
+    pub uvs: Option<Vec<[[f32; 2]; 3]>>,
 }
 
 /// Parser output shared by all formats: an indexed triangle set.
@@ -368,7 +370,7 @@ pub fn write_mesh_to<W: Write + Seek>(w: &mut W, mesh: &Mesh, format: Format, op
     match format {
         Format::Stl if opts.stl_ascii => stl::write_ascii(w, &pos, &tris, name, opts.double_precision)?,
         Format::Stl => stl::write_binary(w, &pos, &tris, name)?,
-        Format::Obj => obj::write(w, &pos, &tris, opts.obj_groups.then_some(&groups[..]), colors, opts.double_precision)?,
+        Format::Obj => obj::write(w, &pos, &tris, opts.obj_groups.then_some(&groups[..]), colors, opts.uvs.as_deref().filter(|u| u.len() == tris.len()), opts.double_precision)?,
         Format::Ply => ply::write(w, &pos, &tris, colors, opts.double_precision)?,
         Format::Off => off::write(w, &pos, &tris, opts.double_precision)?,
         Format::ThreeMf => threemf::write(w, &pos, &tris, name, opts.double_precision)?,

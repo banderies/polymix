@@ -131,6 +131,7 @@ pub(crate) fn write<W: Write + ?Sized>(
     tris: &[[u32; 3]],
     groups: Option<&[i32]>,
     colors: Option<&[[f32; 3]]>,
+    uvs: Option<&[[[f32; 2]; 3]]>,
     double: bool,
 ) -> Result<()> {
     writeln!(w, "# Polymix OBJ export\n# {} vertices, {} triangles", pos.len(), tris.len())?;
@@ -143,13 +144,40 @@ pub(crate) fn write<W: Write + ?Sized>(
         }
         b.push(b'\n');
     })?;
+    // Texture coordinates: one `vt` per distinct value, faces as `v/vt`.
+    let mut vt_index: Vec<[u32; 3]> = Vec::new();
+    if let Some(uvs) = uvs {
+        let mut ids: std::collections::HashMap<[u32; 2], u32> = std::collections::HashMap::new();
+        let mut vts: Vec<[f32; 2]> = Vec::new();
+        vt_index = uvs
+            .iter()
+            .map(|c| {
+                c.map(|q| {
+                    *ids.entry([q[0].to_bits(), q[1].to_bits()]).or_insert_with(|| {
+                        vts.push(q);
+                        vts.len() as u32 - 1
+                    })
+                })
+            })
+            .collect();
+        write_parallel(w, &vts, |b, _, q| {
+            let _ = writeln!(b, "vt {} {}", q[0], q[1]);
+        })?;
+    }
     write_parallel(w, tris, |b, i, t| {
         if let Some(g) = groups {
             if i == 0 || g[i] != g[i - 1] {
                 let _ = writeln!(b, "g group_{}", g[i]);
             }
         }
-        let _ = writeln!(b, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1);
+        match vt_index.get(i) {
+            Some(u) => {
+                let _ = writeln!(b, "f {}/{} {}/{} {}/{}", t[0] + 1, u[0] + 1, t[1] + 1, u[1] + 1, t[2] + 1, u[2] + 1);
+            }
+            None => {
+                let _ = writeln!(b, "f {} {} {}", t[0] + 1, t[1] + 1, t[2] + 1);
+            }
+        }
     })?;
     Ok(())
 }

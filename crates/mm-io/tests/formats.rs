@@ -706,3 +706,19 @@ fn amf_and_export_only_formats() {
     assert!(smesh.lines().any(|l| l.starts_with("3 ") && l.ends_with(" 1")));
     assert_eq!(Format::from_extension("SMESH"), Some(Format::Smesh));
 }
+
+#[test]
+fn obj_writes_texture_coordinates() {
+    let m = primitives::cube(2.0, 1);
+    let uvs: Vec<[[f32; 2]; 3]> = (0..m.triangle_count()).map(|t| [[0.0, 0.0], [1.0, 0.0], [0.5, t as f32 / 16.0]]).collect();
+    let opts = WriteOptions { uvs: Some(uvs.clone()), ..Default::default() };
+    let text = String::from_utf8(write_mesh_to_bytes(&m, Format::Obj, &opts).unwrap()).unwrap();
+    // Shared values are written once.
+    let vts: Vec<&str> = text.lines().filter(|l| l.starts_with("vt ")).collect();
+    assert_eq!(vts.len(), 2 + m.triangle_count());
+    let faces: Vec<&str> = text.lines().filter(|l| l.starts_with("f ")).collect();
+    assert!(faces.iter().all(|f| f.split_whitespace().skip(1).all(|c| c.contains('/'))));
+    // The file still reads back as the same mesh.
+    let back = read_mesh_from_bytes(text.as_bytes(), Format::Obj).unwrap();
+    assert_same_triangles(&m, &back.mesh, 1e-6);
+}

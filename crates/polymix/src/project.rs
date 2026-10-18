@@ -25,6 +25,33 @@ pub struct ProjectObject {
     pub material: usize,
     pub frame: DQuat,
     pub group_names: Vec<(i32, String)>,
+    /// Corner UVs in triangle order (see [`crate::scene::UvSet`]).
+    pub uvs: Option<Vec<[[f32; 2]; 3]>>,
+}
+
+const UV_MAGIC: &[u8; 8] = b"PMXUV001";
+
+fn uvs_to_bytes(uvs: &[[[f32; 2]; 3]]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12 + uvs.len() * 24);
+    b.extend_from_slice(UV_MAGIC);
+    b.extend_from_slice(&(uvs.len() as u32).to_le_bytes());
+    for x in uvs.iter().flatten().flatten() {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
+fn uvs_from_bytes(b: &[u8]) -> Result<Vec<[[f32; 2]; 3]>> {
+    if b.len() < 12 || &b[..8] != UV_MAGIC {
+        bail!("not Polymix UVs");
+    }
+    let n = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    let data = &b[12..];
+    if data.len() != n * 24 {
+        bail!("truncated UVs");
+    }
+    let f = |i: usize| f32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
+    Ok((0..n).map(|t| [0, 1, 2].map(|c| [f(t * 6 + c * 2), f(t * 6 + c * 2 + 1)])).collect())
 }
 
 /// A loaded project.
@@ -151,6 +178,9 @@ fn manifest(p: &Project) -> String {
         for (g, n) in &o.group_names {
             s += &format!("group {g} {}\n", one_line(n));
         }
+        if o.uvs.is_some() {
+            s += &format!("uvs objects/{i}.uv\n");
+        }
         s += "end\n";
     }
     s
@@ -168,6 +198,10 @@ pub fn save(path: &Path, project: &Project) -> Result<()> {
         for (i, o) in project.objects.iter().enumerate() {
             zip.start_file(format!("objects/{i}.bin"), opts)?;
             zip.write_all(&mesh_to_bytes(&o.mesh))?;
+            if let Some(uvs) = &o.uvs {
+                zip.start_file(format!("objects/{i}.uv"), opts)?;
+                zip.write_all(&uvs_to_bytes(uvs))?;
+            }
         }
         zip.finish()?;
     }
@@ -189,6 +223,7 @@ pub fn load(path: &Path) -> Result<Project> {
     let nums = |rest: &str| -> Vec<f64> { rest.split_whitespace().filter_map(|x| x.parse().ok()).collect() };
     let mut project = Project::default();
     let mut cur: Option<(ProjectObject, String)> = None;
+    let mut uv_file: Option<String> = None;
     for line in lines {
         let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
         match (key, cur.as_mut()) {
@@ -208,8 +243,10 @@ pub fn load(path: &Path) -> Result<Project> {
                     material: 0,
                     frame: DQuat::IDENTITY,
                     group_names: Vec::new(),
+                    uvs: None,
                 };
                 cur = Some((o, String::new()));
+                uv_file = None;
             }
             ("name", Some((o, _))) => o.name = rest.to_string(),
             ("file", Some((_, f))) => *f = rest.trim().to_string(),
@@ -231,11 +268,19 @@ pub fn load(path: &Path) -> Result<Project> {
                     o.group_names.push((g, n.to_string()));
                 }
             }
+            ("uvs", Some(_)) => uv_file = Some(rest.trim().to_string()),
             ("end", Some(_)) => {
                 let (mut o, file) = cur.take().unwrap();
                 let mut bytes = Vec::new();
                 zip.by_name(&file).with_context(|| format!("project is missing {file}"))?.read_to_end(&mut bytes)?;
                 o.mesh = mesh_from_bytes(&bytes).with_context(|| format!("in {file}"))?;
+                if let Some(f) = uv_file.take() {
+                    let mut b = Vec::new();
+                    zip.by_name(&f).with_context(|| format!("project is missing {f}"))?.read_to_end(&mut b)?;
+                    let uvs = uvs_from_bytes(&b).with_context(|| format!("in {f}"))?;
+                    // UVs that don't match the triangles are dropped rather than misapplied.
+                    o.uvs = (uvs.len() == o.mesh.triangle_count()).then_some(uvs);
+                }
                 project.objects.push(o);
             }
             ("", _) => {}
@@ -268,6 +313,7 @@ mod tests {
                     material: 5,
                     frame: DQuat::from_rotation_z(0.3),
                     group_names: vec![(3, "wall".into()), (4, "inlet 1".into())],
+                    uvs: Some((0..a.triangle_count()).map(|t| [[t as f32, 0.5], [0.25, 0.125], [1.0, t as f32 * 0.001]]).collect()),
                 },
                 ProjectObject {
                     name: "box".into(),
@@ -277,6 +323,7 @@ mod tests {
                     material: 0,
                     frame: DQuat::IDENTITY,
                     group_names: Vec::new(),
+                    uvs: None,
                 },
             ],
             active: Some(0),
@@ -297,6 +344,8 @@ mod tests {
         assert_eq!(o.group_names, vec![(3, "wall".to_string()), (4, "inlet 1".to_string())]);
         assert!(o.frame.angle_between(DQuat::from_rotation_z(0.3)) < 1e-9);
         assert_eq!(o.mesh.triangle_count(), a.triangle_count());
+        assert_eq!(o.uvs, p.objects[0].uvs);
+        assert!(q.objects[1].uvs.is_none());
         // Positions are bit-exact, groups and colours kept.
         for (v, w) in a.vertex_ids().zip(o.mesh.vertex_ids()) {
             assert_eq!(a.vertex(v), o.mesh.vertex(w));

@@ -204,7 +204,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Make Pattern | ⚪ ✅ | All 10 pattern types (Edges, Dual Edges, Mesh + Delaunay variants, Tiled Tubes / Spheres, Lattice, Random Primitives Volume / Surface, FaceGroup Borders), Regular / Hex tiling, Subtract / Intersect, Clip To Surface, Grid Smoothing (joint fillets), Grid Resolution, Reduce, Line / Sphere gradient. Elements are balls and tubes (no Primitive Type choice); Mesh Resolution is folded into Reduce |
 | Separate Shells (Shift+Y) | ✅ | |
 | Add Tube | ✅ | Line / Spline (Inside, Outside), AutoRoute Minimal / Smooth (elastic band keeping the collision radius); Combine Boolean (union outside, difference inside) / Append / New Object; Direction Any / Face Normal; radius, end radius, tangent, length scale, solve steps; drag ends to move |
-| Unwrap / UV layout / SetUV | ⚪ ❌ | |
+| Unwrap / UV layout / SetUV | ⚪ 🟡 | Edit > Unwrap: By Groups / By Components (cut into discs automatically), Conformal (LSCM) / Rigid (ARAP), Stacked / Line / Optimized packing on a Width × Height sheet with Border; layout drawn in the panel; UVs exported with OBJ and kept in projects, dropped by topology edits. UV Layout editing and SetUV ❌ |
 | Generate / Filter / Split Complex, Convex Decomposition | ⚪ ❌ | |
 | Make Slices | ⛔ | |
 | Remesh (whole object) | ✅ | All four modes incl. Linear Subdivision; Density (%), Regularity, Threshold, Iterations, Transition, Preserve / Smooth group borders, sharp edges, boundary modes — Meshmixer's defaults |
@@ -231,7 +231,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Material library (clay variants, metals, glossy, resin…) | ✅ | Shaders palette: Clay, Soft clay, Satin, Glossy, Ceramic, Tissue, Resin, Gold, Silver, Copper (own lighting presets, per object, or apply to all) |
 | Vertex colour display | ✅ | |
-| Textured / textured-unlit / UV checker / X-ray | ⚪ ❌ | |
+| Textured / textured-unlit / UV checker / X-ray | ⚪ 🟡 | View > Color: UV checker ✅; textures and X-ray ❌ |
 | Wireframe | ✅ | |
 | Face group colours | ✅ | |
 | Light UI theme (warm greys: panels `#ede8e4`, text `#6b6864`, hover `#a5a19d`/`#b3afab`, scrollbar `#888480`, dark text `#444240`, disabled `#d0cac7`) | ✅ | View → Theme: Dark (default) / Light; palette uses Polymix's own vector icons |

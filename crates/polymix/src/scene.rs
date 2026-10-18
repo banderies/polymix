@@ -45,7 +45,24 @@ pub struct SceneObject {
     pub frame: glam::DQuat,
     /// Index into [`crate::materials::MATERIALS`].
     pub material: usize,
+    /// Texture coordinates (Unwrap); see [`SceneObject::uvs`].
+    pub uvs: Option<Arc<UvSet>>,
     bvh: Option<Arc<Bvh>>,
+}
+
+/// UVs of each triangle's corners (indexed by triangle id). They belong to one mesh
+/// topology: edits that move vertices keep them, edits that change triangles drop them.
+pub struct UvSet {
+    pub topo: u64,
+    pub corners: Vec<[[f32; 2]; 3]>,
+    /// Unique per set (GPU cache key).
+    pub stamp: u64,
+}
+
+impl UvSet {
+    pub fn new(mesh: &Mesh, corners: Vec<[[f32; 2]; 3]>) -> Self {
+        Self { topo: mesh.topology_version(), corners, stamp: next_stamp() }
+    }
 }
 
 impl SceneObject {
@@ -66,6 +83,7 @@ impl SceneObject {
             colors: None,
             frame: glam::DQuat::IDENTITY,
             material: 0,
+            uvs: None,
             bvh: None,
         }
     }
@@ -80,6 +98,11 @@ impl SceneObject {
         self.selection = TriSelection::new(&mesh);
         self.mesh = Arc::new(mesh);
         self.touch_selection();
+    }
+
+    /// The UVs, if they still match the mesh's triangles.
+    pub fn uvs(&self) -> Option<&UvSet> {
+        self.uvs.as_deref().filter(|u| u.topo == self.mesh.topology_version())
     }
 
     pub fn touch_selection(&mut self) {

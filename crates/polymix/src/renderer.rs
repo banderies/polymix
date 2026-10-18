@@ -48,6 +48,13 @@ struct MeshVertex {
     normal: [f32; 3],
     /// Vertex colour as 0xRRGGBB (used in the vertex-colour mode).
     color: u32,
+    /// Texture coordinate of this corner (UV checker mode).
+    uv: [f32; 2],
+}
+
+/// UV of corner `j` of triangle `t` (zero without UVs).
+fn corner_uv(uvs: Option<&[[[f32; 2]; 3]]>, t: u32, j: usize) -> [f32; 2] {
+    uvs.and_then(|u| u.get(t as usize)).map_or([0.0; 2], |c| c[j])
 }
 
 /// Packed vertex colour of `v` (grey when the mesh has none).
@@ -89,6 +96,8 @@ pub struct ObjectStyle {
     pub group_normals: bool,
     /// Show the mesh's vertex colours (when it has any).
     pub vertex_colors: bool,
+    /// Show a checker texture through the UVs (when there are any).
+    pub uv_checker: bool,
     pub material: crate::materials::Material,
 }
 
@@ -124,6 +133,7 @@ pub struct GpuMesh {
     group_normals: Option<u64>,
     /// Mesh colour version the vertex colours were uploaded from (when shown).
     colors_key: Option<u64>,
+    uv_key: Option<u64>,
     /// Mesh triangle id -> soup triangle index (u32::MAX if absent).
     soup_index: Vec<u32>,
 }
@@ -234,7 +244,7 @@ impl SceneRenderer {
         let mesh_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Uint32, 3 => Float32x2],
         };
         let color_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<ColorVertex>() as u64,
@@ -393,6 +403,7 @@ impl SceneRenderer {
             crease_deg: None,
             group_normals: None,
             colors_key: None,
+            uv_key: None,
             soup_index: Vec::new(),
         }
     }
@@ -438,15 +449,20 @@ impl SceneRenderer {
         style: &ObjectStyle,
         moved: (&mut Vec<u32>, u64),
         scalars: ScalarField,
+        uvs: Option<(u64, &[[[f32; 2]; 3]])>,
     ) {
         let (moved_vertices, moved_from) = moved;
         let groups_key = style.group_normals.then_some(mesh.group_version());
         let show_colors = style.vertex_colors && mesh.has_vertex_colors();
         let colors_key = show_colors.then_some(mesh.color_version());
+        let uvs = uvs.filter(|_| style.uv_checker);
+        let uv_key = uvs.map(|u| u.0);
+        let uv_slice = uvs.map(|u| u.1);
         let geometry_changed = gpu.shape_version != mesh.shape_version()
             || gpu.crease_deg != style.crease_deg
             || gpu.group_normals != groups_key
-            || gpu.colors_key != colors_key;
+            || gpu.colors_key != colors_key
+            || gpu.uv_key != uv_key;
         let crease = style.crease_deg.map(f64::from);
         let groups = style.group_normals;
         // Partial uploads are only valid on top of exactly the geometry the moves started from.
@@ -455,11 +471,12 @@ impl SceneRenderer {
             && gpu.crease_deg == style.crease_deg
             && gpu.group_normals == groups_key
             && gpu.colors_key.is_some() == colors_key.is_some()
+            && gpu.uv_key == uv_key
             && gpu.topo_version == mesh.topology_version()
             && gpu.shape_version == moved_from
             && !moved_vertices.is_empty();
         if partial {
-            Self::partial_update(queue, gpu, mesh, moved_vertices, crease, groups, show_colors);
+            Self::partial_update(queue, gpu, mesh, moved_vertices, crease, groups, show_colors, uv_slice);
             gpu.shape_version = mesh.shape_version();
             gpu.colors_key = colors_key;
         } else if geometry_changed {
@@ -473,6 +490,7 @@ impl SceneRenderer {
                         position: mesh.vertex(v).as_vec3().to_array(),
                         normal: normals.corner(t, j).as_vec3().to_array(),
                         color: packed_color(mesh, v, show_colors),
+                        uv: corner_uv(uv_slice, t, j),
                     })
                 })
                 .collect();
@@ -509,6 +527,7 @@ impl SceneRenderer {
             gpu.crease_deg = style.crease_deg;
             gpu.group_normals = groups_key;
             gpu.colors_key = colors_key;
+            gpu.uv_key = uv_key;
         }
         moved_vertices.clear();
         let scalar_stamp = scalars.map(|(s, _)| s);
@@ -541,6 +560,7 @@ impl SceneRenderer {
                     Some((_, TriField::Scalar(_))) => 2,
                     Some((_, TriField::Rgb(_))) => 3,
                     None if style.group_colors => 1,
+                    None if uv_key.is_some() => 5,
                     None if show_colors => 4,
                     None => 0,
                 },
@@ -553,7 +573,8 @@ impl SceneRenderer {
     }
 
     /// Re-upload only the triangles around moved vertices (positions and normals).
-    fn partial_update(queue: &wgpu::Queue, gpu: &GpuMesh, mesh: &Mesh, moved: &[u32], crease: Option<f64>, groups: bool, colors: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn partial_update(queue: &wgpu::Queue, gpu: &GpuMesh, mesh: &Mesh, moved: &[u32], crease: Option<f64>, groups: bool, colors: bool, uvs: Option<&[[[f32; 2]; 3]]>) {
         // Normals change on the one-ring of moved vertices, so refresh their triangles too.
         let mut verts: Vec<u32> = Vec::with_capacity(moved.len() * 7);
         for &v in moved {
@@ -586,6 +607,7 @@ impl SceneRenderer {
                         position: mesh.vertex(v).as_vec3().to_array(),
                         normal: corner_normal(mesh, t, j, crease, groups).as_vec3().to_array(),
                         color: packed_color(mesh, v, colors),
+                        uv: corner_uv(uvs, t, j),
                     });
                 }
                 j += 1;

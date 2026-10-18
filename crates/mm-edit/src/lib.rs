@@ -36,6 +36,7 @@ pub mod stamp;
 pub mod target;
 pub mod transform;
 pub mod tube;
+pub mod uv;
 pub mod vessel;
 
 pub use boolean::{mesh_boolean, BooleanOp, BooleanResult};
@@ -59,6 +60,7 @@ pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion}
 pub use stamp::{stamp_polygon, StampFrame, StampResult, Stencil};
 pub use target::{attract_to_target, icp_align, project_to_target, AttractParams, IcpParams, IcpResult};
 pub use tube::{add_tube, tube_mesh, tube_path, TubeEnd, TubeParams, TubePath};
+pub use uv::{unwrap, Packing, UnwrapElements, UnwrapParams, UnwrapType, UvLayout};
 pub use transform::{align_to_principal_axes, center_on_origin, drop_to_ground, transform_mesh};
 pub use vessel::{estimate_vessel_cross_section, suggest_cut_plane, VesselCrossSection};
 

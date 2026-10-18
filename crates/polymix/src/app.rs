@@ -67,15 +67,18 @@ pub enum ColorMode {
     Group,
     /// The mesh's vertex colours (the object colour when it has none).
     Vertex,
+    /// A checker texture through the UVs (Unwrap); the object colour without UVs.
+    UvChecker,
 }
 
 impl ColorMode {
-    pub const ALL: [ColorMode; 3] = [ColorMode::Vertex, ColorMode::Group, ColorMode::Constant];
+    pub const ALL: [ColorMode; 4] = [ColorMode::Vertex, ColorMode::Group, ColorMode::Constant, ColorMode::UvChecker];
     pub fn label(self) -> &'static str {
         match self {
             ColorMode::Constant => "Constant color",
             ColorMode::Group => "Group colors",
             ColorMode::Vertex => "Vertex colors",
+            ColorMode::UvChecker => "UV checker",
         }
     }
     fn key(self) -> &'static str {
@@ -83,6 +86,7 @@ impl ColorMode {
             ColorMode::Constant => "constant",
             ColorMode::Group => "group",
             ColorMode::Vertex => "vertex",
+            ColorMode::UvChecker => "uv",
         }
     }
     fn from_key(k: &str) -> Option<Self> {
@@ -260,6 +264,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "weldboundaries" => Box::new(tools::ops::WeldBoundariesTool::new(cx)),
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
         "makepattern" => Box::new(tools::pattern::MakePatternTool::new(cx)),
+        "unwrap" => Box::new(tools::unwrap::UnwrapTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
         "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
         "flowext" => Box::new(tools::vessel::FlowExtensionTool::new(cx)),
@@ -542,6 +547,7 @@ impl PolymixApp {
                 material: o.material,
                 frame: o.frame,
                 group_names: o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect(),
+                uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
             })
             .collect();
         let project = crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) };
@@ -818,6 +824,7 @@ impl PolymixApp {
                 so.material = o.material;
                 so.frame = o.frame;
                 so.group_names = o.group_names.into_iter().collect();
+                so.uvs = o.uvs.map(|c| std::sync::Arc::new(crate::scene::UvSet::new(&so.mesh, c)));
             }
             ids.push(id);
         }
@@ -871,6 +878,7 @@ impl PolymixApp {
                     material: o.material,
                     frame: o.frame,
                     group_names: groups,
+                    uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
                 }
             })
             .collect();
@@ -944,7 +952,12 @@ impl PolymixApp {
             mesh
         };
         let p2 = path.clone();
-        let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, ..Default::default() };
+        // UVs go out with the active object (OBJ).
+        let uvs = match scope {
+            ExportScope::Active => active.uvs().map(|u| active.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
+            _ => None,
+        };
+        let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, uvs, ..Default::default() };
         self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |_| {
             mm_io::write_mesh(&p2, &mesh, &opts)?;
             Ok(format!("Exported {} triangles to {}", mesh.triangle_count(), p2.display()))
@@ -1417,6 +1430,9 @@ impl PolymixApp {
                     }
                     if ui.button("Make Solid").clicked() {
                         open = Some("makesolid");
+                    }
+                    if ui.button("Unwrap").on_hover_text("Compute UVs (texture coordinates) for OBJ export").clicked() {
+                        open = Some("unwrap");
                     }
                     if ui.button("Make Pattern").on_hover_text("Turn the object into a frame of tubes, or perforate / fill it with tubes, balls or a lattice").clicked() {
                         open = Some("makepattern");
@@ -2474,12 +2490,13 @@ impl PolymixApp {
                 crease_deg: self.view.sharp_edges.then_some(self.view.crease_deg),
                 group_normals: self.view.normals == NormalMode::Group,
                 vertex_colors: self.view.colors == ColorMode::Vertex,
+                uv_checker: self.view.colors == ColorMode::UvChecker || self.tools.last().is_some_and(|t| t.shows_uvs()),
                 material: crate::materials::MATERIALS[o.material.min(crate::materials::MATERIALS.len() - 1)],
             };
             if let Some((pid, pm)) = preview {
                 if pid == o.id {
                     let g = self.preview_gpu.get_or_insert_with(|| renderer.create_mesh(&rs.device));
-                    renderer.sync_mesh(&rs.device, &rs.queue, g, pm, None, 0, &style, (&mut no_moves, 0), None);
+                    renderer.sync_mesh(&rs.device, &rs.queue, g, pm, None, 0, &style, (&mut no_moves, 0), None, None);
                     continue;
                 }
             }
@@ -2489,7 +2506,8 @@ impl PolymixApp {
                 (None, Some((stamp, v))) => Some((*stamp, renderer::TriField::Scalar(v.as_slice()))),
                 (None, None) => None,
             };
-            renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars);
+            let uvs = o.uvs.as_deref().filter(|u| u.topo == o.mesh.topology_version()).map(|u| (u.stamp, u.corners.as_slice()));
+            renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars, uvs);
         }
         if preview.is_none() {
             self.preview_gpu = None;

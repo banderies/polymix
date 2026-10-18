@@ -38,6 +38,7 @@ struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: u32,
+    @location(3) uv: vec2<f32>,
 };
 
 struct VsOut {
@@ -47,6 +48,7 @@ struct VsOut {
     @location(2) bary: vec3<f32>,
     @location(3) @interpolate(flat) tflags: u32,
     @location(4) vcolor: vec3<f32>,
+    @location(5) uv: vec2<f32>,
 };
 
 @vertex
@@ -59,6 +61,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.bary = vec3<f32>(f32(c == 0u), f32(c == 1u), f32(c == 2u));
     out.tflags = tri_flags[in.vid / 3u];
     out.vcolor = vec3<f32>(f32((in.color >> 16u) & 0xffu), f32((in.color >> 8u) & 0xffu), f32(in.color & 0xffu)) / 255.0;
+    out.uv = in.uv;
     return out;
 }
 
@@ -112,6 +115,12 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         base = vec3<f32>(f32((rgb >> 16u) & 0xffu), f32((rgb >> 8u) & 0xffu), f32(rgb & 0xffu)) / 255.0;
     } else if (object.flags.z == 4u) {
         base = in.vcolor;
+    } else if (object.flags.z == 5u) {
+        // UV checker: 32 squares across the sheet, tinted by position so stretch and seams show.
+        let c = floor(in.uv * 32.0);
+        let odd = (i32(c.x) + i32(c.y)) & 1;
+        let tint = vec3<f32>(0.55 + 0.4 * fract(in.uv.x), 0.6, 0.55 + 0.4 * fract(in.uv.y));
+        base = select(tint, tint * 0.45, odd == 1);
     }
     if (selected) {
         base = vec3<f32>(1.0, 0.45, 0.08);
