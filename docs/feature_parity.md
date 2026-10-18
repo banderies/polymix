@@ -27,7 +27,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Shaders (materials) | 🟡 | see §6 |
 | Export | ✅ | |
 | Print (3D print prep) | ⛔ | |
-| Large icon buttons with labels (64/128 px, `*_center`, `*_highres`) | ❌ | Polymix uses text buttons; draw our own icons |
+| Large icon buttons with labels (64/128 px, `*_center`, `*_highres`) | 🟡 | Palette buttons with Polymix's own drawn icons and labels (Meshmixer's artwork is not used) |
 
 ### File menu
 
@@ -35,8 +35,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Open / Save / Save As scene (`.mix`) | ✅ | Own `.polymix` project (zip: manifest + lossless meshes): objects, face groups, vertex colours, patch names, colours, materials, frames, visibility, active object, target, view. ⌘S / ⇧⌘S, File → Open project, drag & drop. `.mix` files are not read |
 | Import (OBJ, PLY, STL, AMF, 3MF, OFF, MIX) | ✅ / ⚪ | OBJ, PLY, STL, OFF, 3MF, AMF (plain or zipped, volumes → groups) ✅; Meshmixer's .mix ⚪ (Polymix projects instead) |
-| Import → *append or replace* prompt | ❌ | Polymix always appends |
-| Auto-fix prompt when an appended mesh is much smaller/larger/far away | ❌ | |
+| Import → *append or replace* prompt | ✅ | Asked when a scene is open; Preferences: Ask / Append / Replace |
+| Auto-fix prompt when an appended mesh is much smaller/larger/far away | ✅ | Models under 1 or over 10 000 units across: prompt to rescale; Preferences: Ask / Never / Always (factor) |
 | Import Bunny / Sphere / Plane | ✅ / ⚪ | File → Add shape: Sphere, Plane, Cube, Cylinder; no bundled bunny |
 | Import Reference / Import Parts Folder | ⚪ ❌ | |
 | Recent files | ✅ | |
