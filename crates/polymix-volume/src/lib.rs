@@ -21,6 +21,13 @@ impl VolumeWorkspace {
     }
 }
 
+/// DICOM files often have no extension (`IM_0001`, `DICOM`): look for "DICM" at byte 128.
+fn has_dicom_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 132];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head[128..132] == b"DICM"
+}
+
 impl Workspace for VolumeWorkspace {
     fn name(&self) -> &'static str {
         "Volume"
@@ -40,6 +47,7 @@ impl Workspace for VolumeWorkspace {
         path.is_dir()
             || path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("DICOMDIR"))
             || path.extension().and_then(|e| e.to_str()).is_some_and(|e| VOLUME_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+            || has_dicom_magic(path)
     }
 
     fn open(&mut self, paths: Vec<PathBuf>, _ctx: &egui::Context) {

@@ -48,24 +48,65 @@ thread_local! {
 static LAST: Mutex<Option<CrashReport>> = Mutex::new(None);
 static HOOK: Once = Once::new();
 
-/// Install the panic hook (once): it logs every panic with a backtrace, records panics in
-/// guarded workspace code for their crash card, then runs the default hook.
+/// Panic locations already logged this session (one log per location).
+static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Install the panic hook (once). It records panics in guarded workspace code for their crash
+/// card and logs them (and panics in background jobs) with a backtrace, once per location;
+/// panics elsewhere (e.g. a file reader failing on a corrupt file, caught by its caller) are
+/// only passed on to the default hook. The hook must never call into `egui::Context`: the
+/// panicking code may hold its lock.
 pub fn install_panic_hook() {
     HOOK.call_once(|| {
         let default = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             let workspace = CURRENT.with(|c| c.get());
+            let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
             let message = payload_message(info.payload());
             let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
-            let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
-            let backtrace = std::backtrace::Backtrace::force_capture();
-            let log = write_log(workspace.unwrap_or("background"), &thread, &message, &location, &backtrace);
+            let worth_logging = workspace.is_some() || thread.starts_with("polymix-job");
+            let first_time = worth_logging && {
+                let mut seen = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+                let new = !seen.contains(&location);
+                if new {
+                    seen.push(location.clone());
+                }
+                new
+            };
+            let log = if first_time {
+                let backtrace = std::backtrace::Backtrace::force_capture();
+                write_log(workspace.unwrap_or("background"), &thread, &scrub_paths(&message), &location, &backtrace)
+            } else {
+                None
+            };
             if let Some(ws) = workspace {
                 *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(CrashReport { workspace: ws, message, location, log });
             }
             default(info);
         }));
     });
+}
+
+/// Replace file paths in a message with `<path>`: file names can carry patient names, and logs
+/// get shared.
+fn scrub_paths(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let at_word_start = i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | '"' | '\'' | '(' | '`');
+        let unix = chars[i] == '/' || (chars[i] == '~' && chars.get(i + 1) == Some(&'/'));
+        let windows = chars[i].is_ascii_alphabetic() && chars.get(i + 1) == Some(&':') && chars.get(i + 2) == Some(&'\\');
+        if at_word_start && (unix || windows) {
+            let end = (i..chars.len()).find(|&j| matches!(chars[j], ' ' | '\t' | '\n' | '"' | '\'' | ')' | '`')).unwrap_or(chars.len());
+            out.push_str("<path>");
+            i = end;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn payload_message(p: &(dyn std::any::Any + Send)) -> String {
@@ -130,8 +171,12 @@ impl<W: Workspace> Slot<W> {
             Err(report) => {
                 log::error!("the {name} workspace stopped: {}", report.message);
                 let old = std::mem::replace(self, Slot::Crashed(report));
-                // Its state may be half-updated; dropping it must not take the app down.
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| drop(old)));
+                // Its state may be half-updated: saving what it can and dropping it must not
+                // take the app down.
+                if let Slot::Live(mut w) = old {
+                    let _ = run_guarded(name, || w.emergency_save());
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| drop(w)));
+                }
                 None
             }
         }
@@ -248,6 +293,12 @@ mod tests {
             w.calls += 1;
             w.calls
         }), Some(1));
+    }
+
+    #[test]
+    fn logs_never_carry_paths() {
+        assert_eq!(scrub_paths("cannot read \"/Users/x/MRI/DOE_JOHN.IMA\": bad"), "cannot read \"<path>\": bad");
+        assert_eq!(scrub_paths("index 3 out of range"), "index 3 out of range");
     }
 
     #[test]

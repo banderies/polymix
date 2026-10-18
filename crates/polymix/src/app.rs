@@ -564,6 +564,15 @@ impl MeshWorkspace {
         }
         auto.saved_generation = generation;
         auto.last_time = now;
+        let file = auto.file.clone();
+        let project = self.autosave_project();
+        if let Some(auto) = &mut self.autosave {
+            auto.job = Some(Job::spawn("Autosave", ctx.clone(), move |_| crate::project::save(&file, &project)));
+        }
+    }
+
+    /// The scene as an autosave project.
+    fn autosave_project(&self) -> crate::project::Project {
         let objects = self
             .scene
             .objects
@@ -580,9 +589,7 @@ impl MeshWorkspace {
                 pivots: o.pivots.clone(),
             })
             .collect();
-        let project = crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) };
-        let file = auto.file.clone();
-        auto.job = Some(Job::spawn("Autosave", ctx.clone(), move |_| crate::project::save(&file, &project)));
+        crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) }
     }
 
     /// Offer to restore the autosave of a session that crashed.
@@ -721,7 +728,7 @@ impl MeshWorkspace {
     /// Import prompts (Append / Replace, odd sizes), then add the meshes to the scene.
     fn finish_import(&mut self, ctx: &egui::Context) {
         // Test scripts never wait on prompts: they append and keep sizes.
-        let scripted = self.script.is_some() && !self.script_prompts;
+        let scripted = polymix_workspace::scripted() && !self.script_prompts;
         let Some(pending) = &mut self.pending_import else { return };
         if scripted && pending.placement.is_none() {
             pending.placement = Some(false);
@@ -3109,8 +3116,25 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     }
 
     fn script_idle(&self) -> bool {
-        let busy = self.import_job.is_some() || self.tool_busy() || !self.synthetic.is_empty();
+        let busy = self.import_job.is_some() || self.project_job.is_some() || self.export_job.is_some() || self.pending_import.is_some() || self.tool_busy() || !self.synthetic.is_empty();
         !busy && self.script.as_ref().is_none_or(|s| s.steps.is_empty() && s.wait == 0)
+    }
+
+    fn needs_attention(&self) -> bool {
+        // The recovery prompt is drawn by this workspace, and autosave waits for an answer.
+        self.recovery.is_some()
+    }
+
+    fn emergency_save(&mut self) {
+        // After a crash: keep unsaved work where the restarted workspace offers to recover it.
+        let Some(auto) = &self.autosave else { return };
+        if self.scene.is_empty() || self.history.generation() == auto.saved_generation || self.recovery.is_some() {
+            return;
+        }
+        let file = auto.file.clone();
+        if let Err(e) = crate::project::save(&file, &self.autosave_project()) {
+            log::error!("emergency save failed: {e:#}");
+        }
     }
 
     fn on_exit(&mut self) {

@@ -7,6 +7,7 @@
 
 pub mod guard;
 pub mod jobs;
+pub mod style;
 
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,14 @@ pub trait Workspace {
     fn script_idle(&self) -> bool {
         true
     }
+    /// Something the user must answer here (e.g. a recovery prompt): the shell shows this
+    /// workspace at startup.
+    fn needs_attention(&self) -> bool {
+        false
+    }
+    /// Called (under the crash guard) on a workspace that just crashed, before it is
+    /// dropped: save what can be saved for the restarted workspace to recover.
+    fn emergency_save(&mut self) {}
 }
 
 /// Where Polymix keeps per-user files (autosave, parts, logs, catalogs).

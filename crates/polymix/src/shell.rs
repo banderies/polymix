@@ -10,6 +10,7 @@
 use crate::app::MeshWorkspace;
 use polymix_volume::VolumeWorkspace;
 use polymix_workspace::guard::{self, CardAction, Slot};
+use polymix_workspace::style::{apply_theme, Theme};
 use polymix_workspace::Workspace;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -85,7 +86,11 @@ impl PolymixApp {
         let ctx = &cc.egui_ctx;
         let storage = cc.storage;
         let scripted = polymix_workspace::scripted();
-        let active = storage.filter(|_| !scripted).and_then(|s| s.get_string("shell.tab")).and_then(|k| Tab::from_key(&k)).unwrap_or(Tab::Mesh);
+        // The theme is app-wide: apply it here so every workspace starts with it, even if the
+        // Mesh workspace (whose preferences set it) fails to start.
+        let theme = storage.filter(|_| !scripted).and_then(|s| s.get_string("theme")).and_then(|k| Theme::from_key(&k)).unwrap_or(Theme::Dark);
+        apply_theme(ctx, theme);
+        let mut active = storage.filter(|_| !scripted).and_then(|s| s.get_string("shell.tab")).and_then(|k| Tab::from_key(&k)).unwrap_or(Tab::Mesh);
         let script = std::env::var("POLYMIX_SCRIPT").ok().map(|s| Script {
             steps: s.split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
             wait: 0,
@@ -95,6 +100,12 @@ impl PolymixApp {
         // Workspaces that fail to start are shown stopped, like a crash later on.
         let volume = slot("Volume", || VolumeWorkspace::new(ctx, storage));
         let mesh = slot("Mesh", || MeshWorkspace::new(ctx, cc.wgpu_render_state.as_ref(), storage));
+        // A recovery prompt (or similar) must be seen: show that workspace first.
+        if mesh.live().is_some_and(|w| w.needs_attention()) {
+            active = Tab::Mesh;
+        } else if volume.live().is_some_and(|w| w.needs_attention()) {
+            active = Tab::Volume;
+        }
         Self { active, volume, mesh, pending_open: files, script, crash_next: None, restart_next: None, title: String::new() }
     }
 
@@ -282,15 +293,16 @@ impl PolymixApp {
                 self.restart_next = Tab::from_key(arg);
                 script.wait = 2;
             }
-            _ => match self.active {
-                Tab::Volume => {
-                    self.volume.call(|w| w.script_push(step));
+            _ => {
+                let taken = match self.active {
+                    Tab::Volume => self.volume.call(|w| w.script_push(step.clone())),
+                    Tab::Mesh => self.mesh.call(|w| w.script_push(step.clone())),
+                    Tab::Segmentation => None,
+                };
+                if taken.is_none() {
+                    log::warn!("script step {step} dropped: the {} workspace is not running", self.active.label());
                 }
-                Tab::Mesh => {
-                    self.mesh.call(|w| w.script_push(step));
-                }
-                Tab::Segmentation => log::warn!("script step {step} has no workspace"),
-            },
+            }
         }
     }
 }
