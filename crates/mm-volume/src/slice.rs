@@ -34,13 +34,19 @@ pub struct VolumeData {
 /// How many slices a volume has (along its third axis).
 pub fn slice_count(v: &Volume) -> usize {
     match &v.voxels {
-        Voxels::Dicom { slices } | Voxels::Images { slices } => slices.len(),
+        Voxels::Dicom { slices } | Voxels::Images { slices } => v.geometry.as_ref().map(|g| g.dims[2]).unwrap_or(slices.len()).min(slices.len()),
         _ => v.geometry.as_ref().map(|g| g.dims[2]).unwrap_or(0),
     }
 }
 
 /// Load the first 3D volume of a raw-format volume (at most `max_voxels` voxels).
 pub fn load_raw(v: &Volume, max_voxels: usize) -> Result<VolumeData> {
+    load_raw_at(v, 0, max_voxels)
+}
+
+/// Load 3D volume `t` of a raw-format volume: the `t`-th component when components are
+/// interleaved per voxel, else the `t`-th block of a 4D file.
+pub fn load_raw_at(v: &Volume, t: usize, max_voxels: usize) -> Result<VolumeData> {
     let Voxels::Raw { file, file_offset, gzip, skip, interleave, dtype, big_endian, slope, intercept } = &v.voxels else { bail!("not a raw-format volume") };
     let g = v.geometry.as_ref().context("no geometry")?;
     let dims = [g.dims[0], g.dims[1], g.dims[2]];
@@ -50,6 +56,12 @@ pub fn load_raw(v: &Volume, max_voxels: usize) -> Result<VolumeData> {
     }
     let stride = (*interleave).max(1);
     let size = dtype.size();
+    let volumes = g.dims[3].max(1);
+    if t >= volumes {
+        bail!("there is no volume {} (of {volumes})", t + 1);
+    }
+    // Bytes before volume t's first value.
+    let before = if stride > 1 { t.min(stride - 1) * size } else { t * n * size };
     let mut f = std::fs::File::open(file).with_context(|| format!("cannot open {}", file.display()))?;
     use std::io::Seek;
     f.seek(std::io::SeekFrom::Start(*file_offset))?;
@@ -61,11 +73,14 @@ pub fn load_raw(v: &Volume, max_voxels: usize) -> Result<VolumeData> {
     } else {
         Box::new(flate2::read::ZlibDecoder::new(buffered))
     };
-    if *skip > 0 {
-        std::io::copy(&mut reader.by_ref().take(*skip), &mut std::io::sink())?;
+    let to_skip = *skip + before as u64;
+    if to_skip > 0 {
+        std::io::copy(&mut reader.by_ref().take(to_skip), &mut std::io::sink())?;
     }
+    // Interleaved: read whole voxels from component t on (the last voxel may stop short).
     let mut bytes = vec![0u8; n * stride * size];
-    reader.read_exact(&mut bytes).context("the file ends before its data does")?;
+    let want = if stride > 1 { n * stride * size - before } else { n * size };
+    reader.read_exact(&mut bytes[..want]).context("the file ends before its data does")?;
     let mut values = decode(&bytes, *dtype, *big_endian, stride);
     if *slope != 1.0 || *intercept != 0.0 {
         for x in &mut values {

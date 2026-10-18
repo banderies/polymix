@@ -15,3 +15,4 @@ pub mod scan;
 pub mod slice;
 pub mod load;
 pub mod write;
+pub mod deid;

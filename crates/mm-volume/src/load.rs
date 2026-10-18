@@ -5,7 +5,6 @@
 
 use crate::geometry::Geometry;
 use crate::model::{Volume, Voxels};
-use crate::slice::load_raw;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -64,6 +63,27 @@ fn sampled_window(v: &[f32]) -> (f64, f64) {
 /// Load the first 3D volume of `v` (at most `max_voxels` voxels). `progress` gets the
 /// fraction done now and then; returning `false` cancels.
 pub fn load_volume(v: &Volume, max_voxels: usize, progress: &(dyn Fn(f32) -> bool + Sync)) -> Result<LoadedVolume> {
+    load_volume_at(v, 0, max_voxels, progress)
+}
+
+/// How many 3D volumes `v` holds (time points, echoes, components).
+pub fn volume_count(v: &Volume) -> usize {
+    let t = v.geometry.as_ref().map(|g| g.dims[3]).unwrap_or(1).max(1);
+    match &v.voxels {
+        Voxels::Dicom { slices } => {
+            let n = v.geometry.as_ref().map(|g| g.dims[2]).unwrap_or(slices.len()).max(1);
+            (slices.len() / n).clamp(1, t)
+        }
+        Voxels::Images { .. } | Voxels::Unsupported(_) => 1,
+        Voxels::Raw { .. } => t,
+    }
+}
+
+/// Load 3D volume `t` (0-based) of a 4D `v`.
+pub fn load_volume_at(v: &Volume, t: usize, max_voxels: usize, progress: &(dyn Fn(f32) -> bool + Sync)) -> Result<LoadedVolume> {
+    if t >= volume_count(v) {
+        bail!("there is no volume {} (of {})", t + 1, volume_count(v));
+    }
     let g = v.geometry.clone().context("no geometry")?;
     let dims = [g.dims[0], g.dims[1], g.dims[2]];
     let n = dims.iter().product::<usize>();
@@ -76,15 +96,17 @@ pub fn load_volume(v: &Volume, max_voxels: usize, progress: &(dyn Fn(f32) -> boo
     let values = match &v.voxels {
         Voxels::Raw { .. } => {
             progress(0.1);
-            load_raw(v, max_voxels)?.values
+            crate::slice::load_raw_at(v, t, max_voxels)?.values
         }
-        Voxels::Dicom { slices } => load_planes(slices, dims, progress, true)?,
+        Voxels::Dicom { slices } => load_planes(&slices[(t * dims[2]).min(slices.len())..], dims, progress, true)?,
         Voxels::Images { slices } => load_planes(slices, dims, progress, false)?,
         Voxels::Unsupported(why) => bail!("pixels not readable yet: {why}"),
     };
     if values.len() != n {
         bail!("read {} values, expected {n}", values.len());
     }
+    let mut g = g;
+    g.dims[3] = 1;
     let mut out = LoadedVolume::from_values(&v.name, dims, values, g);
     out.file_window = v.window;
     out.invert = v.photometric.as_deref() == Some("MONOCHROME1");
@@ -209,6 +231,20 @@ mod tests {
         let l = load_volume(&v, 1000, &|_| true).unwrap();
         assert_eq!(l.values, (0..24).map(|x| x as f32).collect::<Vec<_>>());
         assert!(load_volume(&v, 1000, &|_| false).is_err());
+        // A 4D file: two volumes one after the other, and two interleaved components.
+        let p4 = dir.join("v4.raw");
+        std::fs::write(&p4, (0..48i16).flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let g4 = Geometry::from_axes([4, 3, 2, 2], [1.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        v.geometry = Some(g4);
+        v.voxels = Voxels::Raw { file: p4, file_offset: 0, gzip: false, skip: 0, interleave: 1, dtype: DataType::I16, big_endian: false, slope: 1.0, intercept: 0.0 };
+        assert_eq!(volume_count(&v), 2);
+        assert_eq!(load_volume_at(&v, 1, 1000, &|_| true).unwrap().values[0], 24.0);
+        assert!(load_volume_at(&v, 2, 1000, &|_| true).is_err());
+        if let Voxels::Raw { interleave, .. } = &mut v.voxels {
+            *interleave = 2;
+        }
+        let c1 = load_volume_at(&v, 1, 1000, &|_| true).unwrap();
+        assert_eq!((c1.values[0], c1.values[23]), (1.0, 47.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

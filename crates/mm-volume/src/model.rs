@@ -131,7 +131,8 @@ impl DataType {
 /// Where a volume's voxels are, so slices can be read.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Voxels {
-    /// DICOM: the file and frame of every slice, in slice order (first volume of a 4D set).
+    /// DICOM: the file and frame of every slice, in slice order; a 4D set lists its volumes one
+    /// after the other (`geometry.dims[2]` slices each).
     Dicom { slices: Vec<(PathBuf, u32)> },
     /// A plain array of `dtype` (x fastest) in `file` (NIfTI, Analyze, NRRD, MetaImage, MGH):
     /// the data start `file_offset` bytes into the file, then (after decompression, if `gzip`:

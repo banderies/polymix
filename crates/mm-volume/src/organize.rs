@@ -354,7 +354,10 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
         data_type,
         fields,
         warnings,
-        voxels: Voxels::Dicom { slices: slices.iter().map(|f| (f.inst.path.clone(), f.frame)).collect() },
+        // Every volume of a 4D set, one after the other (time point 0 first).
+        voxels: Voxels::Dicom {
+            slices: (0..t).flat_map(|v| positions.iter().map(move |(_, idx)| idx[v.min(idx.len() - 1)])).map(|k| (frames[k].inst.path.clone(), frames[k].frame)).collect(),
+        },
         window: first.window,
         photometric: Some(first.photometric.clone()),
         patient: None,
@@ -423,6 +426,28 @@ mod tests {
             photometric: "MONOCHROME2".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn time_series_keep_every_volume() {
+        // 3 slices × 2 time points: repeated positions become a 4D volume with all frames.
+        let mut list = Vec::new();
+        for t in 0..2 {
+            for k in 0..3 {
+                let mut i = axial("T", k as f64 * 2.0, (t * 3 + k + 1) as i64);
+                i.temporal_position = Some(t as i64 + 1);
+                list.push(i);
+            }
+        }
+        let mut vols = Vec::new();
+        organize(&list, &mut vols);
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].geometry.as_ref().unwrap().dims, [48, 64, 3, 2]);
+        let Voxels::Dicom { slices } = &vols[0].voxels else { panic!() };
+        let names: Vec<String> = slices.iter().map(|s| s.0.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["1.dcm", "2.dcm", "3.dcm", "4.dcm", "5.dcm", "6.dcm"]);
+        assert_eq!(crate::load::volume_count(&vols[0]), 2);
+        assert_eq!(crate::slice::slice_count(&vols[0]), 3);
     }
 
     #[test]
