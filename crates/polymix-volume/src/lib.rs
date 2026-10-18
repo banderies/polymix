@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 /// File extensions the Volume workspace opens when dropped on the window. (DICOM files
 /// often have none; folders are always accepted.)
-const VOLUME_EXTENSIONS: [&str; 12] = ["nii", "gz", "dcm", "ima", "nrrd", "nhdr", "hdr", "img", "mha", "mhd", "mgz", "mgh"];
+const VOLUME_EXTENSIONS: [&str; 14] = ["nii", "gz", "dcm", "ima", "nrrd", "nhdr", "hdr", "img", "mha", "mhd", "mgz", "mgh", "tif", "tiff"];
 const WARN: egui::Color32 = egui::Color32::from_rgb(240, 170, 90);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +59,8 @@ pub struct VolumeWorkspace {
     privacy: Privacy,
     preview: Option<Preview>,
     script: VecDeque<String>,
+    /// A file opened from outside (Finder, command line): select its volume after the scan.
+    open_select: Option<PathBuf>,
 }
 
 impl VolumeWorkspace {
@@ -81,6 +83,7 @@ impl VolumeWorkspace {
             privacy: Privacy::new(hide_ids, None),
             preview: None,
             script: VecDeque::new(),
+            open_select: None,
         }
     }
 
@@ -97,8 +100,12 @@ impl VolumeWorkspace {
     }
 
     fn add_roots(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if let [one] = paths.as_slice() {
+            self.open_select = one.is_file().then(|| one.clone());
+        }
         for p in paths {
-            if !self.roots.contains(&p) {
+            // Files and folders already under a source are found by its scan.
+            if !self.roots.iter().any(|r| p.starts_with(r)) {
                 self.roots.push(p);
             }
         }
@@ -684,6 +691,13 @@ impl Workspace for VolumeWorkspace {
         if let Some(r) = self.scan.as_ref().and_then(|s| s.poll()) {
             self.scan = None;
             self.finish_scan(r);
+            if let Some(p) = self.open_select.take() {
+                let found = self.catalog.as_ref().and_then(|c| c.volumes.iter().position(|v| v.files.contains(&p)));
+                if let Some(k) = found {
+                    self.selection = Selection::Volume(k);
+                    self.select_volume(k, ctx);
+                }
+            }
         }
         if let (Some(p), Some(c)) = (&mut self.preview, &self.catalog) {
             if let Some(v) = c.volumes.get(p.volume) {

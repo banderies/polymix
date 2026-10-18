@@ -88,6 +88,8 @@ impl PolymixApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
         guard::install_panic_hook();
         let ctx = &cc.egui_ctx;
+        #[cfg(target_os = "macos")]
+        crate::macos_open::set_context(ctx);
         let storage = cc.storage;
         let scripted = polymix_workspace::scripted();
         // The theme is app-wide: apply it here so every workspace starts with it, even if the
@@ -356,6 +358,8 @@ impl eframe::App for PolymixApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut open: Vec<PathBuf> = std::mem::take(&mut self.pending_open);
+        #[cfg(target_os = "macos")]
+        open.extend(crate::macos_open::take());
         open.extend(ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect::<Vec<_>>()));
         if !open.is_empty() {
             self.open_paths(open, &ctx);

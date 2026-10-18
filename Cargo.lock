@@ -2542,6 +2542,7 @@ dependencies = [
  "mm-remesh",
  "mm-repair",
  "mm-solid",
+ "objc2 0.6.5",
  "png",
  "polymix-segmentation",
  "polymix-volume",

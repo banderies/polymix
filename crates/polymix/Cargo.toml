@@ -37,3 +37,5 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 libloading = "0.8"
 # Scripted test runs open their window without activating the app.
 winit = "0.30"
+# Files opened from the Finder (Apple Events).
+objc2 = "0.6"

@@ -43,6 +43,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
       <key>CFBundleTypeExtensions</key>
       <array><string>stl</string><string>obj</string><string>ply</string><string>off</string><string>3mf</string></array>
     </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Medical image</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <!-- Listed under Open With without taking over these files from other viewers. -->
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array><string>nii</string><string>gz</string><string>dcm</string><string>ima</string><string>nrrd</string><string>nhdr</string><string>hdr</string><string>mha</string><string>mhd</string><string>mgh</string><string>mgz</string><string>tif</string><string>tiff</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Folder of images</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>public.folder</string></array>
+    </dict>
   </array>
 </dict>
 </plist>

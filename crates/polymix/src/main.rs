@@ -6,6 +6,8 @@ mod centerline;
 mod commands;
 mod icons;
 mod jobs;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod materials;
 mod navigation;
 mod parts;
@@ -52,6 +54,9 @@ fn main() -> eframe::Result {
             b.with_activate_ignoring_other_apps(false).with_activation_policy(ActivationPolicy::Accessory);
         }));
     }
+    // Files opened from the Finder arrive as Apple Events (see macos_open).
+    #[cfg(target_os = "macos")]
+    macos_open::install();
     eframe::run_native("Polymix", options, Box::new(move |cc| Ok(Box::new(shell::PolymixApp::new(cc, files)))))
 }
 
