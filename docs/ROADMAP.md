@@ -113,7 +113,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M7.5 Autosave and crash recovery.**
 - [x] **M7.6 Formats**: AMF import/export; COLLADA, VRML, SMESH export; export selection only;
       Import Bunny / Sphere / Plane.
-- [ ] **M7.7 History**: Discard Undo History, Copy.
+- [x] **M7.7 History**: Discard Undo History, Copy.
 
 ## M8 — Sculpting
 

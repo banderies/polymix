@@ -101,6 +101,12 @@ impl Tool for UnitsTool {
         "Units / Dimensions"
     }
 
+    fn copy_text(&self) -> Option<String> {
+        let mut lines: Vec<String> = self.measures.iter().map(|m| format!("measured {:.4} → {:.4}", m.length(), m.target)).collect();
+        lines.insert(0, format!("units {}", self.unit.label()));
+        Some(lines.join("\n"))
+    }
+
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Units / Dimensions");
         let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else {

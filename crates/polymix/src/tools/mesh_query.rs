@@ -159,6 +159,14 @@ impl Tool for MeshQueryTool {
         "Mesh Query"
     }
 
+    fn copy_text(&self) -> Option<String> {
+        let q = self.query.as_ref()?;
+        Some(format!(
+            "triangle {}\ngroup {}\naspect ratio {:.4}\nmin angle {:.3}\nmax angle {:.3}\nedge {}\nvertex {}\ngauss curvature {:.6}\nmean curvature {:.6}",
+            q.tri, q.group, q.aspect, q.min_angle, q.max_angle, q.edge, q.vertex, q.gauss, q.mean
+        ))
+    }
+
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Mesh Query");
         let Some(mesh) = self.object.and_then(|id| cx.scene.get(id)).map(|o| o.mesh.clone()) else {

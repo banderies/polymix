@@ -313,6 +313,10 @@ impl Tool for MeasureTool {
         true
     }
 
+    fn copy_text(&self) -> Option<String> {
+        (!self.items.is_empty()).then(|| self.items.iter().map(|m| m.label.clone()).collect::<Vec<_>>().join("\n"))
+    }
+
     fn name(&self) -> &'static str {
         "Measure"
     }

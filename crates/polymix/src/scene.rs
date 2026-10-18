@@ -215,6 +215,12 @@ impl History {
         self.generation
     }
 
+    /// Forget every undo and redo step (Meshmixer: Discard Undo History), freeing their memory.
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     pub fn push(&mut self, label: impl Into<String>, scene: &Scene) {
         self.generation += 1;
         self.undo.push((label.into(), scene.clone()));
@@ -320,5 +326,8 @@ mod history_tests {
         let g1 = h.generation();
         h.undo(&mut s);
         assert!(h.generation() > g1, "undo counts too");
+        assert!(h.can_redo());
+        h.clear();
+        assert!(!h.can_undo() && !h.can_redo());
     }
 }

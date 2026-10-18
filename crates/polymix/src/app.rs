@@ -469,6 +469,34 @@ impl PolymixApp {
         app
     }
 
+    /// Edit → Copy: the open tool's readout, or the active object's statistics, as text.
+    fn copy(&mut self, ctx: &egui::Context) {
+        let text = self.tools.last().and_then(|t| t.copy_text()).or_else(|| {
+            let o = self.scene.active()?;
+            let m = &o.mesh;
+            let e = m.bounds().extents();
+            let mut s = format!(
+                "{}\ntriangles {}\nvertices {}\nsize {:.4} x {:.4} x {:.4}\narea {:.4}\nopen edges {}",
+                o.name,
+                m.triangle_count(),
+                m.vertex_count(),
+                e.x,
+                e.y,
+                e.z,
+                mm_core::measure::surface_area(m),
+                m.boundary_edge_ids().count()
+            );
+            if m.is_closed() {
+                s += &format!("\nvolume {:.4}", mm_core::measure::volume(m));
+            }
+            Some(s)
+        });
+        if let Some(t) = text {
+            ctx.copy_text(t);
+            self.status = "Copied to the clipboard".into();
+        }
+    }
+
     /// Save a changed scene to the autosave file every few minutes (in the background).
     fn autosave_tick(&mut self, ctx: &egui::Context) {
         let minutes = self.prefs.autosave_minutes;
@@ -1126,6 +1154,15 @@ impl PolymixApp {
                 if ui.add_enabled(self.history.can_redo(), egui::Button::new(format!("{rl}   ⇧⌘Z"))).clicked() {
                     ui.close();
                     self.redo(&ctx);
+                }
+                if ui.button("Copy   ⌘C").on_hover_text("Copy the open tool's readout (measurements, query) or the object's statistics as text").clicked() {
+                    ui.close();
+                    self.copy(&ctx);
+                }
+                if ui.add_enabled(self.history.can_undo() || self.history.can_redo(), egui::Button::new("Discard undo history")).on_hover_text("Free the memory held by undo steps").clicked() {
+                    ui.close();
+                    self.history.clear();
+                    self.status = "Undo history discarded".into();
                 }
                 ui.separator();
                 if ui.button("Duplicate object").clicked() {
@@ -2656,6 +2693,10 @@ impl PolymixApp {
         }
         if i.key_pressed(Key::S) && cmd {
             self.save_project(ctx, i.modifiers.shift);
+            return;
+        }
+        if i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
+            self.copy(ctx);
             return;
         }
         if i.key_pressed(Key::Comma) && cmd {

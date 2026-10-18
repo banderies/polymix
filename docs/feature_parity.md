@@ -61,11 +61,11 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Undo / Redo (⌘Z, ⇧⌘Z, Ctrl+Y, Alt+←/→) | ✅ | |
 | Undo/Redo (Skip Tools) Alt+Shift+←/→ | ✅ | Same as undo/redo: Polymix tools add no history entries of their own |
-| Discard Undo History | ❌ | |
+| Discard Undo History | ✅ | Edit menu |
 | Accept (Enter **or A**) / Cancel (Esc) | ✅ | |
 | Switching tools accepts the current tool | ✅ | Hotkey, palette, menu; only Esc/Cancel discards |
 | Set as Target / Clear Target (target surface) | ✅ | Edit menu and object list; used by Attract / Align To Target and Project to Target |
-| Copy | ❌ | |
+| Copy | ✅ | ⌘C / Edit → Copy: the open tool's readout (Measure, Mesh Query, Units) or the active object's statistics as text |
 | Toggle visibility / Show all | ✅ | Object browser |
 
 ### View menu

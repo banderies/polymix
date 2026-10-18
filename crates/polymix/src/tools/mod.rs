@@ -235,6 +235,10 @@ pub trait Tool {
     fn secondary_drag(&mut self, _phase: DragPhase, _pos: egui::Pos2, _total: egui::Vec2, _cx: &mut ToolCx) {}
     /// A right-click (no drag) in the viewport.
     fn secondary_click(&mut self, _pos: egui::Pos2, _cx: &mut ToolCx) {}
+    /// Text for Edit → Copy (⌘C): the tool's readout, e.g. its measurements.
+    fn copy_text(&self) -> Option<String> {
+        None
+    }
     /// Brush size in percent of the object size (for the hotbox), for tools with a brush.
     fn brush_size(&mut self) -> Option<&mut f32> {
         None
