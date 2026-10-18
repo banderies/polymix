@@ -331,8 +331,9 @@ pub struct PolymixApp {
     brush_drag: bool,
     /// When the brush last took a wheel notch (its eased remainder must not zoom).
     brush_wheel_at: f64,
-    /// Point the current navigation drag orbits about (picked when it started).
-    orbit_pivot: Option<DVec3>,
+    /// Point the current navigation drag holds on to (picked when it started): orbits turn
+    /// about it, pans keep it under the cursor.
+    nav_anchor: Option<DVec3>,
     /// Centre of mass of an object, for the mesh version it was computed for.
     com_cache: Option<(ObjectId, u64, DVec3)>,
     /// Right-button drag owned by the active tool: press position.
@@ -409,7 +410,7 @@ impl PolymixApp {
             nav_drag: None,
             brush_drag: false,
             brush_wheel_at: f64::NEG_INFINITY,
-            orbit_pivot: None,
+            nav_anchor: None,
             com_cache: None,
             tool_rmb: None,
             view_history: ViewHistory::default(),
@@ -2111,9 +2112,10 @@ impl PolymixApp {
         Some(c)
     }
 
-    /// What an orbit started at `p` turns about: the point of the model under the cursor,
-    /// or, off the model, the object's centre of mass.
-    fn orbit_pivot_at(&mut self, p: Option<egui::Pos2>, vp: Viewport) -> DVec3 {
+    /// What a navigation drag started at `p` holds on to (orbits turn about it, pans move it
+    /// with the cursor): the point of the model under the cursor, or, off the model, the
+    /// object's centre of mass.
+    fn nav_anchor_at(&mut self, p: Option<egui::Pos2>, vp: Viewport) -> DVec3 {
         if let Some(p) = p {
             let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
             if let Some((_, h)) = tools::pick_ray(&mut self.scene, &ray, None) {
@@ -2306,7 +2308,7 @@ impl PolymixApp {
                 self.nav_drag = Some(btn);
                 self.remember_view();
                 let origin = ctx.input(|i| i.pointer.press_origin());
-                self.orbit_pivot = Some(self.orbit_pivot_at(origin, vp));
+                self.nav_anchor = Some(self.nav_anchor_at(origin, vp));
                 break;
             }
         }
@@ -2330,17 +2332,20 @@ impl PolymixApp {
                 let d = pointer_delta;
                 match nav.drag_action(btn, mods) {
                     Some(NavAction::Tumble) => {
-                        let pivot = self.orbit_pivot.unwrap_or(self.camera.target);
+                        let pivot = self.nav_anchor.unwrap_or(self.camera.target);
                         self.camera.tumble_about(d.x as f64, d.y as f64, pivot);
                     }
-                    Some(NavAction::Pan) => self.camera.pan(d.x as f64, d.y as f64, rect.height() as f64),
+                    Some(NavAction::Pan) => {
+                        let anchor = self.nav_anchor.unwrap_or(self.camera.target);
+                        self.camera.pan_at(d.x as f64, d.y as f64, rect.height() as f64, anchor);
+                    }
                     Some(NavAction::Zoom) => self.camera.zoom((1.0 + d.y as f64 * 0.005).max(0.05)),
                     None => {}
                 }
             }
             if response.drag_stopped_by(btn) || !ctx.input(|i| i.pointer.button_down(btn)) {
                 self.nav_drag = None;
-                self.orbit_pivot = None;
+                self.nav_anchor = None;
             }
         }
         if in_rect {
@@ -2523,7 +2528,7 @@ impl PolymixApp {
 
         // --- 2D overlays ------------------------------------------------------
         let painter = ui.painter_at(rect);
-        if let (Some(btn), Some(p)) = (self.nav_drag, self.orbit_pivot) {
+        if let (Some(btn), Some(p)) = (self.nav_drag, self.nav_anchor) {
             if nav.drag_action(btn, mods) == Some(NavAction::Tumble) {
                 if let Some(n) = self.camera.project(p, vp.aspect()) {
                     let c = vp.to_screen(n);

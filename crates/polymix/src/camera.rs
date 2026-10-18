@@ -259,7 +259,18 @@ impl Camera {
     }
 
     pub fn pan(&mut self, dx: f64, dy: f64, viewport_h: f64) {
-        let s = self.pixel_size_at_target(viewport_h);
+        self.pan_at(dx, dy, viewport_h, self.target);
+    }
+
+    /// Pan for a drag of (`dx`, `dy`) points, scaled at the depth of `anchor` so that a point
+    /// there follows the cursor exactly (the grabbed point, wherever the view target is).
+    pub fn pan_at(&mut self, dx: f64, dy: f64, viewport_h: f64, anchor: DVec3) {
+        let depth = (anchor - self.eye()).dot(self.forward());
+        let s = if self.orthographic || depth <= self.near_plane() {
+            self.pixel_size_at_target(viewport_h)
+        } else {
+            2.0 * depth * (self.fov_y * 0.5).tan() / viewport_h.max(1.0)
+        };
         self.target += (-self.right() * dx + self.up() * dy) * s;
     }
 
@@ -344,6 +355,27 @@ mod tests {
 
     fn orthonormal(c: &Camera) -> bool {
         c.forward().dot(c.up()).abs() < 1e-9 && c.forward().dot(c.right()).abs() < 1e-9 && (c.up().length() - 1.0).abs() < 1e-9
+    }
+
+    #[test]
+    fn pan_keeps_the_grabbed_point_under_the_cursor() {
+        let (w, h) = (800.0, 600.0);
+        let px = |c: &Camera, p: DVec3| {
+            let n = c.project(p, w / h).unwrap();
+            DVec2::new((n.x + 1.0) * 0.5 * w, (1.0 - n.y) * 0.5 * h)
+        };
+        for ortho in [false, true] {
+            let mut c = Camera { orthographic: ortho, ..Default::default() };
+            c.focus(&Aabb { min: DVec3::splat(-1.0), max: DVec3::splat(1.0) });
+            c.tumble(40.0, 15.0);
+            // Zoomed in close, looking at a point well behind the view target.
+            c.zoom(0.2);
+            let grabbed = c.target + c.forward() * 0.6 + c.right() * 0.05;
+            let before = px(&c, grabbed);
+            c.pan_at(37.0, -21.0, h, grabbed);
+            let moved = px(&c, grabbed) - before;
+            assert!((moved - DVec2::new(37.0, -21.0)).length() < 1e-6, "ortho {ortho}: moved {moved}");
+        }
     }
 
     #[test]
