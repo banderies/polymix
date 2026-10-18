@@ -164,10 +164,13 @@ fn on_buttons(buttons: u32) {
 
 
 /// Device axes (as reported by the driver: x right, y toward the user, z down, rotations
-/// about those) to the view frame (x right, y up, z toward the viewer).
+/// about those) to the view frame (x right, y up, z toward the viewer). Both frames are
+/// right-handed, so rotations map like the translations: about x as is, about view y
+/// (= −device z) negated, about view z (= device y) as is. (Checked on the user's
+/// SpaceMouse, 2026-10-17: the earlier, opposite signs turned the model backwards.)
 pub fn to_view(axis: [i16; 6]) -> Motion {
     let n = |v: i16| if v.abs() < DEAD_ZONE { 0.0 } else { (v as f32 / FULL_SCALE).clamp(-1.5, 1.5) };
-    Motion { t: [n(axis[0]), -n(axis[2]), n(axis[1])], r: [-n(axis[3]), n(axis[5]), -n(axis[4])] }
+    Motion { t: [n(axis[0]), -n(axis[2]), n(axis[1])], r: [n(axis[3]), -n(axis[5]), n(axis[4])] }
 }
 
 pub struct SpaceMouse {
@@ -428,6 +431,10 @@ mod tests {
         assert_eq!(m.t, [1.0, 0.0, 0.0]);
         assert_eq!(to_view([0, 0, -350, 0, 0, 0]).t, [0.0, 1.0, 0.0]);
         assert_eq!(to_view([0, 350, 0, 0, 0, 0]).t, [0.0, 0.0, 1.0]);
+        // Rotations follow the same frame change as the translations.
+        assert_eq!(to_view([0, 0, 0, 350, 0, 0]).r, [1.0, 0.0, 0.0]);
+        assert_eq!(to_view([0, 0, 0, 0, 0, -350]).r, [0.0, 1.0, 0.0]);
+        assert_eq!(to_view([0, 0, 0, 0, 350, 0]).r, [0.0, 0.0, 1.0]);
         // Dead zone.
         assert!(to_view([2, -3, 1, 0, 3, -2]).is_zero());
     }
