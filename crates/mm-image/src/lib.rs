@@ -8,8 +8,12 @@ pub mod image;
 pub mod intensity;
 pub mod n4;
 pub mod pc;
+pub mod register;
+pub mod resample;
 pub mod slab;
 pub mod time;
 
 pub use image::{no_progress, Progress};
 pub use n4::{auto_mask, n4, N4Output, N4Params};
+pub use register::{register, write_itk_transform, Metric, Motion, RegisterParams, Registration};
+pub use resample::{resample_onto, resample_to_spacing, Interpolation, Transform};
