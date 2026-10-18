@@ -110,7 +110,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M7.3 Import prompts**: Append / Replace, auto-fix scale / position of appended meshes,
       "remember my choice".
 - [x] **M7.4 Project files**: save/open a scene (objects, groups, patch names, view, history-free).
-- [ ] **M7.5 Autosave and crash recovery.**
+- [x] **M7.5 Autosave and crash recovery.**
 - [ ] **M7.6 Formats**: AMF import/export; COLLADA, VRML, SMESH export; export selection only;
       Import Bunny / Sphere / Plane.
 - [ ] **M7.7 History**: Discard Undo History, Copy.

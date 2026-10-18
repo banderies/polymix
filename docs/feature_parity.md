@@ -53,7 +53,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Pref: Mesh Color Mode Group / Vertex / Constant | ✅ | View menu and hotbox; Vertex (default) shows vertex colours when the mesh has them |
 | Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | ✅ | ⌘E follows the export scope; OBJ group export and import are switchable |
 | Pref: Import dialogs (append/replace, scale models) | ✅ | Append / Replace prompt (with Flip Z-Y and Remember my choice); size prompt for models under 1 or over 10 000 units (m / cm / in → mm, keep); Preferences → Dialogs. Models are never moved, so coordinates are kept |
-| Autosave + crash recovery | ❌ | |
+| Autosave + crash recovery | ✅ | Changed scenes autosave in the background every 5 min (Preferences → File; 0 = off) to the user data folder; after a crash the next launch offers Recover / Discard. Running two instances at once can show a false recovery offer |
 
 ### Actions menu
 

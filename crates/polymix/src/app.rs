@@ -106,6 +106,29 @@ pub struct Prefs {
     pub import_mode: ImportMode,
     /// Models of implausible size (under 1 or over 10 000 units across).
     pub scale_mode: ScaleMode,
+    /// Minutes between autosaves of a changed scene (0 = off).
+    pub autosave_minutes: u32,
+}
+
+/// Where autosaves and the session marker live (per user).
+fn data_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home.map(|h| h.join("Library/Application Support/Polymix"));
+    }
+    if cfg!(windows) {
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Polymix"));
+    }
+    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".local/share"))).map(|d| d.join("polymix"))
+}
+
+/// Autosave state: the files, what was saved last, and the job writing it.
+struct Autosave {
+    file: PathBuf,
+    marker: PathBuf,
+    saved_generation: u64,
+    last_time: f64,
+    job: Option<Job<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,7 +172,7 @@ pub fn flip_zy_out(p: glam::DVec3) -> glam::DVec3 {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true, flip_zy: true, import_mode: ImportMode::Ask, scale_mode: ScaleMode::Ask }
+        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true, flip_zy: true, import_mode: ImportMode::Ask, scale_mode: ScaleMode::Ask, autosave_minutes: 5 }
     }
 }
 
@@ -263,6 +286,9 @@ pub struct PolymixApp {
     /// Project being opened, and the file the scene was last saved to / opened from.
     project_job: Option<(PathBuf, Job<crate::project::Project>)>,
     project_path: Option<PathBuf>,
+    autosave: Option<Autosave>,
+    /// An autosave left by a session that did not exit cleanly.
+    recovery: Option<PathBuf>,
     nav_drag: Option<PointerButton>,
     /// Right-button drag owned by the active tool: press position.
     tool_rmb: Option<egui::Pos2>,
@@ -326,6 +352,8 @@ impl PolymixApp {
             export_job: None,
             project_job: None,
             project_path: None,
+            autosave: None,
+            recovery: None,
             nav_drag: None,
             tool_rmb: None,
             view_history: ViewHistory::default(),
@@ -400,6 +428,7 @@ impl PolymixApp {
             app.prefs.obj_export_groups = flag("obj_export_groups", true);
             app.prefs.obj_import_groups = flag("obj_import_groups", true);
             app.prefs.flip_zy = flag("flip_zy", true);
+            app.prefs.autosave_minutes = st.get_string("autosave_minutes").and_then(|v| v.parse().ok()).unwrap_or(5);
             app.prefs.import_mode = match st.get_string("import_mode").as_deref() {
                 Some("append") => ImportMode::Append,
                 Some("replace") => ImportMode::Replace,
@@ -415,7 +444,100 @@ impl PolymixApp {
         if !files.is_empty() {
             app.start_import(files, &cc.egui_ctx);
         }
+        // Autosave and crash recovery (never in scripted test runs).
+        if std::env::var_os("POLYMIX_SCRIPT").is_none() {
+            if let Some(dir) = data_dir().filter(|d| std::fs::create_dir_all(d).is_ok()) {
+                let file = dir.join(format!("autosave.{}", crate::project::EXTENSION));
+                let marker = dir.join("session.lock");
+                // A marker left behind means the last session did not exit cleanly.
+                if marker.exists() && file.exists() {
+                    app.recovery = Some(file.clone());
+                }
+                let _ = std::fs::write(&marker, std::process::id().to_string());
+                app.autosave = Some(Autosave { file, marker, saved_generation: 0, last_time: 0.0, job: None });
+            }
+        }
         app
+    }
+
+    /// Save a changed scene to the autosave file every few minutes (in the background).
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        let minutes = self.prefs.autosave_minutes;
+        let generation = self.history.generation();
+        let now = ctx.input(|i| i.time);
+        let busy = self.recovery.is_some();
+        let Some(auto) = &mut self.autosave else { return };
+        if let Some(job) = &auto.job {
+            if let Some(r) = job.poll() {
+                auto.job = None;
+                if let Err(e) = r {
+                    log::warn!("autosave failed: {e:#}");
+                }
+            }
+            return;
+        }
+        if busy || minutes == 0 || generation == auto.saved_generation || self.scene.is_empty() || now - auto.last_time < minutes as f64 * 60.0 {
+            return;
+        }
+        auto.saved_generation = generation;
+        auto.last_time = now;
+        let objects = self
+            .scene
+            .objects
+            .iter()
+            .map(|o| crate::project::ProjectObject {
+                name: o.name.clone(),
+                mesh: (*o.mesh).clone(),
+                visible: o.visible,
+                color: o.color,
+                material: o.material,
+                frame: o.frame,
+                group_names: o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect(),
+            })
+            .collect();
+        let project = crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) };
+        let file = auto.file.clone();
+        auto.job = Some(Job::spawn("Autosave", ctx.clone(), move |_| crate::project::save(&file, &project)));
+    }
+
+    /// Offer to restore the autosave of a session that crashed.
+    fn recovery_window(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.recovery.clone() else { return };
+        let when = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| format!("{} min ago", d.as_secs() / 60))
+            .unwrap_or_default();
+        let mut choice = None;
+        egui::Window::new("Recover unsaved work")
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Polymix did not close properly last time. Restore the scene it autosaved ({when})?"));
+                ui.horizontal(|ui| {
+                    if ui.button("Recover").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Discard").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        match choice {
+            Some(true) => {
+                self.recovery = None;
+                self.open_project(path, ctx);
+                // Recovered work is unsaved: Save asks for a file.
+                self.project_path = None;
+            }
+            Some(false) => {
+                self.recovery = None;
+                let _ = std::fs::remove_file(&path);
+            }
+            None => {}
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1657,6 +1779,8 @@ impl PolymixApp {
                     ui.checkbox(&mut self.export_ascii, "Write STL as ASCII");
                     ui.checkbox(&mut self.prefs.obj_export_groups, "OBJ: export face groups as groups");
                     ui.checkbox(&mut self.prefs.obj_import_groups, "Import OBJ: groups as face groups");
+                    ui.add(egui::Slider::new(&mut self.prefs.autosave_minutes, 0..=30).text("autosave every (min)"))
+                        .on_hover_text("Save a changed scene in the background for crash recovery (0 = off)");
                 }
             }
         });
@@ -2572,6 +2696,15 @@ impl PolymixApp {
 }
 
 impl eframe::App for PolymixApp {
+    fn on_exit(&mut self) {
+        if let Some(auto) = &self.autosave {
+            let _ = std::fs::remove_file(&auto.marker);
+            if self.recovery.is_none() {
+                let _ = std::fs::remove_file(&auto.file);
+            }
+        }
+    }
+
     fn save(&mut self, st: &mut dyn eframe::Storage) {
         // Scripted (test) sessions never overwrite the user's preferences.
         if std::env::var_os("POLYMIX_SCRIPT").is_some() {
@@ -2602,6 +2735,7 @@ impl eframe::App for PolymixApp {
         st.set_string("obj_export_groups", b(self.prefs.obj_export_groups));
         st.set_string("obj_import_groups", b(self.prefs.obj_import_groups));
         st.set_string("flip_zy", b(self.prefs.flip_zy));
+        st.set_string("autosave_minutes", self.prefs.autosave_minutes.to_string());
         st.set_string(
             "import_mode",
             match self.prefs.import_mode {
@@ -2698,6 +2832,8 @@ impl eframe::App for PolymixApp {
         self.help_window(&ctx);
         self.preferences_window(&ctx);
         self.finish_import(&ctx);
+        self.recovery_window(&ctx);
+        self.autosave_tick(&ctx);
         self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);

@@ -194,11 +194,13 @@ pub struct History {
     redo: Vec<(String, Scene)>,
     /// Rough memory budget for stored snapshots (bytes).
     budget: usize,
+    /// Bumped by every push, undo and redo: a cheap "the scene changed" signal (autosave).
+    generation: u64,
 }
 
 impl Default for History {
     fn default() -> Self {
-        Self { undo: Vec::new(), redo: Vec::new(), budget: 4 << 30 }
+        Self { undo: Vec::new(), redo: Vec::new(), budget: 4 << 30, generation: 0 }
     }
 }
 
@@ -209,7 +211,12 @@ fn mesh_bytes(m: &Mesh) -> usize {
 
 impl History {
     /// Record the scene state *before* an edit labelled `label`.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn push(&mut self, label: impl Into<String>, scene: &Scene) {
+        self.generation += 1;
         self.undo.push((label.into(), scene.clone()));
         self.redo.clear();
         self.enforce_budget();
@@ -249,6 +256,7 @@ impl History {
     }
 
     pub fn undo(&mut self, scene: &mut Scene) -> Option<String> {
+        self.generation += 1;
         let (label, prev) = self.undo.pop()?;
         let cur = std::mem::replace(scene, prev);
         scene.carry_metadata(&cur);
@@ -257,6 +265,7 @@ impl History {
     }
 
     pub fn redo(&mut self, scene: &mut Scene) -> Option<String> {
+        self.generation += 1;
         let (label, next) = self.redo.pop()?;
         let cur = std::mem::replace(scene, next);
         scene.carry_metadata(&cur);
@@ -293,5 +302,23 @@ impl Scene {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn generation_counts_changes() {
+        let mut h = History::default();
+        let mut s = Scene::default();
+        let g0 = h.generation();
+        h.push("a", &s);
+        s.add("x", mm_core::primitives::cube(1.0, 1));
+        assert!(h.generation() > g0);
+        let g1 = h.generation();
+        h.undo(&mut s);
+        assert!(h.generation() > g1, "undo counts too");
     }
 }
