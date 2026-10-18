@@ -48,7 +48,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Export SVG | ⛔ | |
 | Print / Send to printer | ⛔ | |
 | Preferences (Alt+T / ⌘,) | ✅ | ⌘, or File → Preferences: General (navigation, colour / normal modes, up axis), View (free rotate, reset camera on scene change, view cube, object browser, grid, sharp edges, theme), File (export scope, STL ASCII, OBJ groups) |
-| Pref: Flip Z-Y axis on import/export (on in your install) | ❌ | Polymix has a Z-up *view* but does not convert file axes |
+| Pref: Flip Z-Y axis on import/export (on in your install) | ✅ | On by default; a rotation, so a round trip keeps the file's coordinates |
 | Pref: Mesh Normal Mode Vertex / Face / Group normals | ✅ | View menu and hotbox; Group (default) keeps group borders crisp; Vertex still honours Sharp edges |
 | Pref: Mesh Color Mode Group / Vertex / Constant | ✅ | View menu and hotbox; Vertex (default) shows vertex colours when the mesh has them |
 | Pref: Export selection only vs whole scene; OBJ face groups ↔ groups | ✅ | ⌘E follows the export scope; OBJ group export and import are switchable |

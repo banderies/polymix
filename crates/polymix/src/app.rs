@@ -99,11 +99,24 @@ pub struct Prefs {
     pub obj_export_groups: bool,
     /// OBJ import turns `g` / `o` groups into face groups.
     pub obj_import_groups: bool,
+    /// Files are Z-up: turn them Y-up on import and back on export (Meshmixer's "Flip Z-Y
+    /// axis on Import-Export"), so a round trip keeps the file's coordinates.
+    pub flip_zy: bool,
+}
+
+/// File (Z-up) → scene (Y-up): a rotation about X, so handedness and normals are kept.
+pub fn flip_zy_in(p: glam::DVec3) -> glam::DVec3 {
+    glam::DVec3::new(p.x, p.z, -p.y)
+}
+
+/// Scene (Y-up) → file (Z-up), the inverse of [`flip_zy_in`].
+pub fn flip_zy_out(p: glam::DVec3) -> glam::DVec3 {
+    glam::DVec3::new(p.x, -p.z, p.y)
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true }
+        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true, flip_zy: true }
     }
 }
 
@@ -343,6 +356,7 @@ impl PolymixApp {
             app.prefs.export_whole_scene = flag("export_whole_scene", false);
             app.prefs.obj_export_groups = flag("obj_export_groups", true);
             app.prefs.obj_import_groups = flag("obj_import_groups", true);
+            app.prefs.flip_zy = flag("flip_zy", true);
             app.recent = st.get_string("recent").map(|r| r.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         }
         if !files.is_empty() {
@@ -366,6 +380,7 @@ impl PolymixApp {
         self.recent.truncate(10);
         let n = files.len();
         let obj_groups = self.prefs.obj_import_groups;
+        let flip = self.prefs.flip_zy;
         self.import_job = Some(Job::spawn(format!("Importing {n} file(s)"), ctx.clone(), move |progress| {
             let mut out = Vec::new();
             for (i, f) in files.iter().enumerate() {
@@ -374,6 +389,9 @@ impl PolymixApp {
                 }
                 let t0 = std::time::Instant::now();
                 let mut imported = mm_io::read_mesh(f).map_err(|e| anyhow::anyhow!("{}: {e:#}", f.display()))?;
+                if flip {
+                    imported.mesh.transform(flip_zy_in);
+                }
                 if !obj_groups && imported.format == mm_io::Format::Obj {
                     for t in imported.mesh.triangle_ids().collect::<Vec<_>>() {
                         imported.mesh.set_tri_group(t, 0);
@@ -470,6 +488,13 @@ impl PolymixApp {
             m
         } else {
             (*active.mesh).clone()
+        };
+        let mesh = if self.prefs.flip_zy {
+            let mut m = mesh;
+            m.transform(flip_zy_out);
+            m
+        } else {
+            mesh
         };
         let p2 = path.clone();
         let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, ..Default::default() };
@@ -1331,6 +1356,8 @@ impl PolymixApp {
                         ui.selectable_value(&mut self.prefs.export_whole_scene, false, "Selection only (active object)");
                         ui.selectable_value(&mut self.prefs.export_whole_scene, true, "Whole scene");
                     });
+                    ui.checkbox(&mut self.prefs.flip_zy, "Flip Z-Y axis on import/export")
+                        .on_hover_text("Z-up files (most CAD and medical exports) stand upright in the Y-up view; exported files get their original axes back");
                     ui.checkbox(&mut self.export_ascii, "Write STL as ASCII");
                     ui.checkbox(&mut self.prefs.obj_export_groups, "OBJ: export face groups as groups");
                     ui.checkbox(&mut self.prefs.obj_import_groups, "Import OBJ: groups as face groups");
@@ -2269,6 +2296,7 @@ impl eframe::App for PolymixApp {
         st.set_string("export_whole_scene", b(self.prefs.export_whole_scene));
         st.set_string("obj_export_groups", b(self.prefs.obj_export_groups));
         st.set_string("obj_import_groups", b(self.prefs.obj_import_groups));
+        st.set_string("flip_zy", b(self.prefs.flip_zy));
         st.set_string("recent", self.recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
         if let Some(d) = &self.last_export_dir {
             st.set_string("last_export_dir", d.display().to_string());
@@ -2397,4 +2425,21 @@ fn grid_lines(camera: &Camera, b: &mm_core::Aabb) -> Vec<ColorVertex> {
         out.push(ColorVertex::new(z.as_vec3(), col));
     }
     out
+}
+
+#[cfg(test)]
+mod flip_tests {
+    use super::*;
+
+    #[test]
+    fn flip_zy_round_trips_and_keeps_orientation() {
+        let p = glam::DVec3::new(1.0, 2.0, 3.0);
+        assert_eq!(flip_zy_out(flip_zy_in(p)), p);
+        // File +Z (up) becomes scene +Y.
+        assert_eq!(flip_zy_in(glam::DVec3::Z), glam::DVec3::Y);
+        let mut m = mm_core::primitives::icosphere(1.0, 2);
+        let v0 = mm_core::measure::volume(&m);
+        m.transform(flip_zy_in);
+        assert!((mm_core::measure::volume(&m) - v0).abs() < 1e-12, "a rotation keeps the outward orientation");
+    }
 }

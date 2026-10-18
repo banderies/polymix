@@ -32,9 +32,12 @@ cargo run -p polymix --example gen_test_meshes --release -- test_meshes
 
 ## Typical vessel → CFD workflow
 
-1. **Import** the segmentation (STL/OBJ/PLY/OFF/3MF; drag & drop works). For scanner (RAS)
-   coordinates use *View → Up axis → Z up*. Optionally *Edit → Duplicate object* first to keep
-   the original for a later deviation check.
+1. **Import** the segmentation (STL/OBJ/PLY/OFF/3MF; drag & drop works). As in Meshmixer,
+   *Preferences → File → Flip Z-Y axis on import/export* (on by default) turns Z-up files
+   (scanner / RAS, most CAD) upright in the Y-up view and turns them back on export, so the
+   exported file keeps its original coordinates. With the flip off, view Z-up data with
+   *View → Up axis → Z up*. Optionally *Edit → Duplicate object* first to keep the original
+   for a later deviation check.
 2. **Analysis → Inspector** (`I`): click markers to fix individual holes / non-manifold
    vertices / floating parts, or **Auto Repair All** (`Q`). Fill mode Minimal / Flat / Smooth.
 3. Remove unwanted pieces: **Edit → Separate Shells** (`Shift+Y`), or **Select** (`S`), paint
