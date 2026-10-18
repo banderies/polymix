@@ -9,8 +9,7 @@ license.workspace = true
 dicom-core = "0.10"
 dicom-object = "0.10"
 dicom-dictionary-std = "0.10"
-dicom-pixeldata = { version = "0.10", default-features = false }
-nifti = { version = "0.18", default-features = false }
+dicom-pixeldata = { version = "0.10", default-features = false, features = ["native"] }
 flate2 = "1"
 walkdir = "2.5"
 serde = { version = "1", features = ["derive"] }
@@ -19,3 +18,7 @@ glam.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+# Cross-checks the NIfTI header maths.
+nifti = { version = "0.18", default-features = false, features = ["nalgebra_affine"] }

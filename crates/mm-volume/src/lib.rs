@@ -2,3 +2,6 @@
 //! NRRD files. No GUI; the Volume workspace (`polymix-volume`) shows what this finds.
 
 pub mod geometry;
+pub mod model;
+pub mod nifti;
+pub mod nrrd;
