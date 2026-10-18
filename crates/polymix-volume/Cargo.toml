@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 polymix-workspace = { path = "../polymix-workspace" }
+mm-volume = { path = "../mm-volume" }
 egui.workspace = true
 eframe.workspace = true
 anyhow.workspace = true
 log.workspace = true
+rfd = "0.17"

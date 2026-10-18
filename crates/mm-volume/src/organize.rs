@@ -310,17 +310,17 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
     let mut fields = vec![
         Field::new("Patient", "Name", first.patient_name.replace('^', " ").trim().to_string()),
         Field::new("Patient", "ID", first.patient_id.clone()),
-        Field::new("Patient", "Birth date", first.birth_date.clone()),
+        Field::new("Patient", "Birth date", date_time(&first.birth_date, "")),
         Field::new("Patient", "Sex", first.sex.clone()),
         Field::new("Patient", "Age", first.age.clone()),
-        Field::new("Study", "Date", format!("{} {}", first.study_date, first.study_time).trim().to_string()),
+        Field::new("Study", "Date", date_time(&first.study_date, &first.study_time)),
         Field::new("Study", "Description", first.study_description.clone()),
         Field::new("Study", "Accession", first.accession.clone()),
         Field::new("Study", "Study ID", first.study_id.clone()),
         Field::new("Series", "Number", first.series_number.map(|n| n.to_string()).unwrap_or_default()),
         Field::new("Series", "Description", first.series_description.clone()),
         Field::new("Series", "Modality", first.modality.clone()),
-        Field::new("Series", "Date", format!("{} {}", first.series_date, first.series_time).trim().to_string()),
+        Field::new("Series", "Date", date_time(&first.series_date, &first.series_time)),
         Field::new("Series", "Image type", first.image_type.join(" \\ ")),
     ];
     fields.extend(first.fields.iter().cloned());
@@ -359,6 +359,13 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
         photometric: Some(first.photometric.clone()),
         patient: None,
     }])
+}
+
+/// DICOM date and time (`20250902`, `111146.2`) as `2025-09-02 11:11`.
+pub fn date_time(d: &str, t: &str) -> String {
+    let date = if d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()) { format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..]) } else { d.to_string() };
+    let time = if t.len() >= 4 && t.bytes().take(4).all(|b| b.is_ascii_digit()) { format!("{}:{}", &t[..2], &t[2..4]) } else { String::new() };
+    format!("{date} {time}").trim().to_string()
 }
 
 /// Readable name of an image SOP class.

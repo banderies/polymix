@@ -168,26 +168,26 @@ through a crash guard, so a bug in one cannot stop the others.
 
 The library behind the Volume workspace: no GUI, fully unit-tested.
 
-- [ ] **M12.1 Model and geometry**: catalog entries, DICOM patient / study / series tree,
+- [x] **M12.1 Model and geometry**: catalog entries, DICOM patient / study / series tree,
       geometry (dims, spacing, RAS affine, orientation codes, obliquity), kinds (image, label
       map, segmentation, derived, localizer, non-image).
-- [ ] **M12.2 NIfTI-1 / NIfTI-2 / Analyze 7.5 headers.**
-- [ ] **M12.3 NRRD** (`.nrrd`, `.nhdr` + data file, Slicer `.seg.nrrd`).
-- [ ] **M12.4 DICOM headers and organisation** like 3D Slicer's DICOM browser: Patient →
+- [x] **M12.2 NIfTI-1 / NIfTI-2 / Analyze 7.5 headers.**
+- [x] **M12.3 NRRD** (`.nrrd`, `.nhdr` + data file, Slicer `.seg.nrrd`).
+- [x] **M12.4 DICOM headers and organisation** like 3D Slicer's DICOM browser: Patient →
       Study → Series; series split into volumes (orientation, size, echo, time, …); slice
       order, spacing checks (missing / irregular / duplicate slices), gantry tilt, localizers,
       non-image objects; DICOMDIR.
-- [ ] **M12.5 Enhanced (multi-frame) DICOM** geometry from functional groups.
-- [ ] **M12.6 Folder scanner and catalog cache**: magic-byte detection, default skipped
+- [x] **M12.5 Enhanced (multi-frame) DICOM** geometry from functional groups.
+- [x] **M12.6 Folder scanner and catalog cache**: magic-byte detection, default skipped
       folders (venv, .git, …), parallel, cancellable, fault-tolerant; incremental rescans.
-- [ ] **M12.7 Slices** for thumbnails (NIfTI / Analyze / NRRD / DICOM, pure-Rust JPEG
+- [x] **M12.7 Slices** for thumbnails (NIfTI / Analyze / NRRD / DICOM, pure-Rust JPEG
       Lossless, RLE, deflate).
 
 ## M13 — Volume browser
 
-- [ ] **M13.1 Browser UI**: Add folder / Rescan / Cancel, sources, the DICOM tree and the
+- [x] **M13.1 Browser UI**: Add folder / Rescan / Cancel, sources, the DICOM tree and the
       other-files table, filters, search, details panel, Hide identifiers.
-- [ ] **M13.2 Thumbnail** with slice slider and window / level.
+- [x] **M13.2 Thumbnail** with slice slider and window / level.
 
 ## Later
 

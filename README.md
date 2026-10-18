@@ -20,6 +20,27 @@ Polymix has three workspaces, shown as tabs at the top of the window (⌘1 / ⌘
 - **Segmentation**: coming next.
 - **Mesh**: the mesh editor described below.
 
+**Volume** (*Add folder…*): Polymix looks through the folder and everything under it,
+recognising files by their contents rather than their names (DICOM files often have none), and
+skips tool folders (virtual environments, version control). It lists:
+
+- **DICOM** organised like 3D Slicer's DICOM browser: Patient → Study (date, description,
+  accession) → Series, with a series split into volumes where it mixes orientations, echoes or
+  sizes; localizers, derived images (reformats, projections, maps) and non-image objects
+  (screenshots, reports) are marked. Enhanced multi-frame and JPEG Lossless files work.
+- **NIfTI** (`.nii`, `.nii.gz`, NIfTI-2), **Analyze** (`.hdr` + `.img`) and **NRRD** (including
+  Slicer `.seg.nrrd` segmentations), by folder, marked as image, label map, segmentation, vector
+  field or time series.
+- What it recognised but cannot read yet (MetaImage, MGH, MINC, image stacks, …), what failed,
+  and what it skipped.
+
+Select a series or file for its header (grouped: patient, study, series, equipment,
+acquisition, geometry, pixel) and a slice (scroll for slices, drag for window / level, shown
+in the radiological convention). Warnings flag missing or uneven slices, gantry tilt, missing
+orientation and pixel formats not viewable yet (JPEG 2000, JPEG-LS). **Hide identifiers**
+masks names, IDs, birth dates and accession numbers, including inside file names. Folders are
+remembered and rescans only read changed files.
+
 Each workspace is independent: if one runs into an internal error it stops on its own (its
 tab shows what happened, with a Restart button and a log in the data folder) and the
 others keep working. Dropped files go to the workspace that opens them (meshes and
