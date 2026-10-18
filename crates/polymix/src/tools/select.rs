@@ -545,6 +545,10 @@ impl SelectTool {
 }
 
 impl Tool for SelectTool {
+    fn brush_size(&mut self) -> Option<&mut f32> {
+        Some(&mut self.size_pct)
+    }
+
     fn survives_scene_change(&self) -> bool {
         true
     }

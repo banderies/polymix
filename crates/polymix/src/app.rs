@@ -102,11 +102,13 @@ pub struct ViewOptions {
     pub show_grid: bool,
     /// Draw the target surface see-through.
     pub transparent_target: bool,
+    /// Background colour at the top of the view.
+    pub background: [f32; 3],
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND }
     }
 }
 
@@ -285,6 +287,12 @@ impl PolymixApp {
                 .unwrap_or(if flag("group_colors", false) { ColorMode::Group } else { ColorMode::Vertex });
             app.view.show_grid = flag("grid", false);
             app.view.transparent_target = flag("transparent_target", true);
+            if let Some(c) = st.get_string("background") {
+                let v: Vec<f32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
+                if let [r, g, b] = v[..] {
+                    app.view.background = [r, g, b];
+                }
+            }
             app.view.sharp_edges = flag("sharp_edges", true);
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
             if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
@@ -1058,6 +1066,28 @@ impl PolymixApp {
                 ui.set_width(300.0);
                 ui.strong("Camera");
                 ui.horizontal(|ui| {
+                    // Drag these buttons to move the camera (handy on a trackpad).
+                    let h = self.vp_prev(ctx).rect.height() as f64;
+                    let drag = |ui: &mut egui::Ui, label: &str, hint: &str| ui.add(egui::Button::new(label).sense(egui::Sense::drag())).on_hover_text(hint);
+                    let r = drag(ui, "⟲ Tumble", "Drag to tumble");
+                    if r.dragged() {
+                        let d = r.drag_delta();
+                        self.camera.tumble(d.x as f64, d.y as f64);
+                    }
+                    let r = drag(ui, "↔ Pan", "Drag to pan");
+                    if r.dragged() {
+                        let d = r.drag_delta();
+                        self.camera.pan(d.x as f64, d.y as f64, h);
+                    }
+                    let r = drag(ui, "🔍 Zoom", "Drag up / down to zoom");
+                    if r.dragged() {
+                        self.camera.zoom((1.0 + r.drag_delta().y as f64 * 0.005).max(0.05));
+                    }
+                    if ui.color_edit_button_rgb(&mut self.view.background).on_hover_text("Background colour").secondary_clicked() {
+                        self.view.background = renderer::DEFAULT_BACKGROUND;
+                    }
+                });
+                ui.horizontal(|ui| {
                     ui.toggle_value(&mut self.camera.free_orbit, "Free").on_hover_text("Free rotation (trackball) instead of a turntable");
                     if ui.button("Snap").on_hover_text("Snap to nearest axis view").clicked() {
                         self.remember_view();
@@ -1095,6 +1125,21 @@ impl PolymixApp {
                         }
                     }
                 });
+                if let Some(t) = self.tools.last_mut() {
+                    let has_size = t.brush_size().is_some();
+                    let has_strength = t.brush_strength().is_some();
+                    if has_size || has_strength {
+                        ui.strong("Brushes");
+                        ui.horizontal(|ui| {
+                            if let Some(s) = t.brush_size() {
+                                ui.add(egui::Slider::new(s, tools::BRUSH_SIZE_RANGE.0..=tools::BRUSH_SIZE_RANGE.1).logarithmic(true).text("size"));
+                            }
+                            if let Some(s) = t.brush_strength() {
+                                ui.add(egui::Slider::new(s, 0.0..=1.0).text("strength"));
+                            }
+                        });
+                    }
+                }
                 if ui.small_button("close (Space)").clicked() {
                     close = true;
                 }
@@ -1510,6 +1555,8 @@ impl PolymixApp {
                 overlay.brush,
                 size[1] as f32,
             );
+            let bg = self.view.background;
+            globals.background = [bg[0], bg[1], bg[2], 1.0];
             if let Some((pl, region)) = overlay.cut_plane {
                 globals.cut_plane = [pl.normal.x as f32, pl.normal.y as f32, pl.normal.z as f32, pl.d as f32];
                 if let Some((c, r)) = region {
@@ -1762,6 +1809,7 @@ impl PolymixApp {
             }
             "select_all" => commands::selection_command(&mut self.cmd_cx(), commands::SelectCmd::All),
             "duplicate" => commands::duplicate_object(&mut self.cmd_cx()),
+            "hotbox" => self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) },
             "target" => {
                 let id = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id);
                 commands::set_target(&mut self.cmd_cx(), id);
@@ -1963,6 +2011,8 @@ impl eframe::App for PolymixApp {
         st.set_string("color_mode", self.view.colors.key().to_string());
         st.set_string("grid", b(self.view.show_grid));
         st.set_string("transparent_target", b(self.view.transparent_target));
+        let bg = self.view.background;
+        st.set_string("background", format!("{},{},{}", bg[0], bg[1], bg[2]));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
         st.set_string("spacemouse", self.space_cfg.to_pref());

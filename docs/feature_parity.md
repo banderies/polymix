@@ -102,12 +102,12 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmixer | Polymix | Notes |
 |---|---|---|
 | Camera: Snap, Free | ✅ | |
-| Camera: Tumble / Pan / Zoom drag buttons | ❌ | |
+| Camera: Tumble / Pan / Zoom drag buttons | ✅ | |
 | Camera: Focus | ✅ | |
-| Camera: background Color | ❌ | |
-| Mesh → Normals: smooth / faceted / face-group normals | 🟡 | Smooth, Faceted ✅; per-group normals ❌ |
+| Camera: background Color | ✅ | Persisted; right-click the swatch to reset |
+| Mesh → Normals: smooth / faceted / face-group normals | ✅ | |
 | Mesh → Color: vertex colours / face-group colours | ✅ | Colours follow edits (interpolated on splits) |
-| Brushes: Size, Strength sliders | ❌ | |
+| Brushes: Size, Strength sliders | ✅ | For the open brush tool (Select: size; Sculpt: size and strength) |
 | — | ✅ | Polymix extras: Y-up / Z-up |
 
 ### Object browser — hotkeys.pdf page 4

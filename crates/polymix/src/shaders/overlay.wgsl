@@ -9,6 +9,8 @@ struct Globals {
     misc: vec4<f32>,
     cut_plane: vec4<f32>,
     cut_region: vec4<f32>,
+    // Background colour at the top of the view.
+    background: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -66,7 +68,7 @@ fn vs_background(@builtin(vertex_index) vid: u32) -> BgOut {
 
 @fragment
 fn fs_background(in: BgOut) -> @location(0) vec4<f32> {
-    let top = vec3<f32>(0.20, 0.21, 0.24);
-    let bottom = vec3<f32>(0.055, 0.058, 0.07);
+    let top = globals.background.rgb;
+    let bottom = top * 0.28;
     return vec4<f32>(mix(bottom, top, in.t), 1.0);
 }

@@ -14,6 +14,8 @@ struct Globals {
     cut_plane: vec4<f32>,
     // Optional sphere limiting the cut preview (xyz centre, w radius; w <= 0 = unlimited).
     cut_region: vec4<f32>,
+    // Background colour at the top of the view.
+    background: vec4<f32>,
 };
 
 struct Object {

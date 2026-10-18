@@ -235,6 +235,14 @@ pub trait Tool {
     fn secondary_drag(&mut self, _phase: DragPhase, _pos: egui::Pos2, _total: egui::Vec2, _cx: &mut ToolCx) {}
     /// A right-click (no drag) in the viewport.
     fn secondary_click(&mut self, _pos: egui::Pos2, _cx: &mut ToolCx) {}
+    /// Brush size in percent of the object size (for the hotbox), for tools with a brush.
+    fn brush_size(&mut self) -> Option<&mut f32> {
+        None
+    }
+    /// Brush strength in 0..1 (for the hotbox).
+    fn brush_strength(&mut self) -> Option<&mut f64> {
+        None
+    }
     /// Esc pressed. Return true to close the tool.
     fn cancel(&mut self, _cx: &mut ToolCx) -> bool {
         true

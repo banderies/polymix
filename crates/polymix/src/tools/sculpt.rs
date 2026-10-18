@@ -144,6 +144,14 @@ fn apply_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, strength: f64,
 }
 
 impl Tool for SculptTool {
+    fn brush_size(&mut self) -> Option<&mut f32> {
+        Some(&mut self.size_pct)
+    }
+
+    fn brush_strength(&mut self) -> Option<&mut f64> {
+        Some(&mut self.strength)
+    }
+
     fn survives_scene_change(&self) -> bool {
         true
     }

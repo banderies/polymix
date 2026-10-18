@@ -24,7 +24,12 @@ pub struct Globals {
     pub misc: [f32; 4],
     pub cut_plane: [f32; 4],
     pub cut_region: [f32; 4],
+    /// Background colour at the top of the view (rgb; the bottom is a darker shade).
+    pub background: [f32; 4],
 }
+
+/// Default background colour (top of the view).
+pub const DEFAULT_BACKGROUND: [f32; 3] = [0.20, 0.21, 0.24];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -731,5 +736,6 @@ pub fn globals(view_proj: Mat4, view: Mat4, eye: Vec3, brush: Option<(Vec3, f32)
         misc: [0.0, viewport_h, 0.0, 0.0],
         cut_plane: [0.0; 4],
         cut_region: [0.0; 4],
+        background: [DEFAULT_BACKGROUND[0], DEFAULT_BACKGROUND[1], DEFAULT_BACKGROUND[2], 1.0],
     }
 }
