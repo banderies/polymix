@@ -2,6 +2,7 @@
 //! Images are `LoadedVolume`s; see [`image`] for the conventions every operation follows.
 
 mod fft;
+pub mod denoise;
 pub mod filter;
 pub mod grid;
 pub mod image;
@@ -12,6 +13,7 @@ pub mod register;
 pub mod resample;
 pub mod slab;
 pub mod time;
+pub mod vessel;
 
 pub use image::{no_progress, Progress};
 pub use n4::{auto_mask, n4, N4Output, N4Params};
