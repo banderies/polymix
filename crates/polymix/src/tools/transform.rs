@@ -71,6 +71,12 @@ pub struct TransformTool {
     absolute: bool,
     snap_step: f64,
     pivot: DVec3,
+    /// Object pivot used as the centre (index into the object's pivots), else the box centre.
+    pivot_choice: Option<usize>,
+    /// The object's pivots when the tool opened.
+    object_pivots: Vec<crate::scene::Pivot>,
+    /// Transforms already baked into `source` (so pivots can follow on commit).
+    baked: DMat4,
     /// Current size along each gizmo axis.
     sizes: DVec3,
     dirty: bool,
@@ -169,12 +175,16 @@ impl TransformTool {
             absolute: false,
             snap_step: 1.0,
             pivot: DVec3::ZERO,
+            pivot_choice: None,
+            object_pivots: Vec::new(),
+            baked: DMat4::IDENTITY,
             sizes: DVec3::ZERO,
             dirty: true,
             drag: None,
             hover: None,
         };
         t.snap_step = nice_step(t.source.bounds().diagonal() / 100.0);
+        t.object_pivots = cx.scene.active().map(|o| o.pivots.clone()).unwrap_or_default();
         t.reset_pivot();
         t
     }
@@ -294,6 +304,9 @@ impl TransformTool {
         }
         let f = self.scale_frame();
         self.pivot = extents_along(&self.source, AXES.map(|a| f * a)).1;
+        if let Some(p) = self.pivot_choice.and_then(|i| self.object_pivots.get(i)) {
+            self.pivot = self.baked.transform_point3(p.position);
+        }
     }
 
     fn linear(&self) -> DMat3 {
@@ -358,6 +371,7 @@ impl TransformTool {
             self.rebuild();
         }
         if !self.is_identity() {
+            self.baked = self.matrix() * self.baked;
             self.frame = (self.rotation * self.frame).normalize();
             self.source = std::sync::Arc::new(self.preview.clone().unwrap_or_default());
             self.translate = DVec3::ZERO;
@@ -384,11 +398,18 @@ impl TransformTool {
         cx.history.push(self.name(), cx.scene);
         let frame = (self.rotation * self.frame).normalize();
         let whole = self.region.is_none();
+        let total = self.matrix() * self.baked;
         if let (Some(o), Some(m)) = (cx.scene.get_mut(id), self.preview.take()) {
             let sel = o.selection.clone();
             o.mesh = std::sync::Arc::new(m);
             if whole {
                 o.frame = frame;
+                // Pivots ride along with the object.
+                let (_, rot, _) = total.to_scale_rotation_translation();
+                for p in &mut o.pivots {
+                    p.position = total.transform_point3(p.position);
+                    p.frame = (rot * p.frame).normalize();
+                }
             }
             o.selection = sel;
             o.touch_selection();
@@ -693,6 +714,21 @@ impl Tool for TransformTool {
         }
         ui.add_space(4.0);
         let whole = self.region.is_none();
+        if whole && !self.object_pivots.is_empty() {
+            let label = |c: Option<usize>| c.map_or("Box centre".to_string(), |i| format!("Pivot {}", i + 1));
+            let before = self.pivot_choice;
+            egui::ComboBox::from_label("Centre").selected_text(label(self.pivot_choice)).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.pivot_choice, None, label(None));
+                for i in 0..self.object_pivots.len() {
+                    ui.selectable_value(&mut self.pivot_choice, Some(i), label(Some(i)));
+                }
+            });
+            if self.pivot_choice != before {
+                // Keep what has been done so far; turn and scale about the new centre from here.
+                self.bake();
+                changed = true;
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             let b = self.source.bounds();
             if !whole {
@@ -848,6 +884,9 @@ mod tests {
             absolute: false,
             snap_step: 0.5,
             pivot: DVec3::ZERO,
+            pivot_choice: None,
+            object_pivots: Vec::new(),
+            baked: DMat4::IDENTITY,
             sizes: DVec3::ZERO,
             dirty: true,
             drag: None,
@@ -935,6 +974,9 @@ mod face_tests {
             absolute: false,
             snap_step: 0.5,
             pivot: DVec3::ZERO,
+            pivot_choice: None,
+            object_pivots: Vec::new(),
+            baked: DMat4::IDENTITY,
             sizes: DVec3::ZERO,
             dirty: true,
             drag: None,

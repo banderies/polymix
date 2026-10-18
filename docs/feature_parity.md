@@ -119,7 +119,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Duplicate, Delete buttons | ✅ | |
 | Rename | ✅ | |
 | Show only this / Show all | ✅ | |
-| Pivots (show/hide) | ⚪ ❌ | |
+| Pivots (show/hide) | ⚪ ✅ | View > Show pivots: a ball with its frame axes, drawn on top of the model |
 
 ---
 
@@ -193,7 +193,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Duplicate | ✅ | |
 | Transform (T) | ✅ | Gizmo (move / rotate / per-axis + uniform scale), Local Frame (default; objects remember their frame) / World Frame, Translate / Rotate / Scale / Size X/Y/Z, Uniform Scaling, snapping (step; 15° rotations) with Absolute Coords/Sizes, center, drop to ground |
 | Align (N) — align surfaces/axes to world | ✅ | Source Center / Base / Surface Point / Surface Scribble (left-click); Destination World Origin X/Y/Z-up, Ground Plane, or a surface (shift-click); Translate Only / Translate and Rotate; Flip. Principal-axes alignment in Transform |
-| Create Pivot | ⚪ ❌ | |
+| Create Pivot | ⚪ 🟡 | Edit > Create Pivot: Placement Mode (Snap To Vertex / Edge / Edge Midpoint / Face Center / Group Center / Group Border Center / Boundary Center, First Midpoint Along Ray / Normal, Bounding Box), Frame Mode (Geometry / Eye Ray / World). Pivots move with Transform and can be its centre; kept in projects. Existing Pivot / From Last Tool, Create Symmetric, Link To Target and pivot-to-pivot Align ❌ |
 | Plane Cut | ✅ | Cut/Slice; No / Minimal / Fixed / Remeshed Fill (Remeshed also remeshes a band across the cut edge); Slice Groups; plus a vessel cross-section mode |
 | Combine | ✅ | |
 | Boolean Union / Difference / Intersection | ✅ | Fast Approximate (volumetric), Precise (exact, keeps triangles away from the seam; Auto-Reduce Result), Max Quality (seam band remesh: Target Edge Scale, Merge Border Rings). Precise needs closed meshes; coplanar faces are nudged automatically. Search Depth / Use Intersection Curves / Preview Iterations not exposed |

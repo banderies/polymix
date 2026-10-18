@@ -47,7 +47,16 @@ pub struct SceneObject {
     pub material: usize,
     /// Texture coordinates (Unwrap); see [`SceneObject::uvs`].
     pub uvs: Option<Arc<UvSet>>,
+    /// Pivots attached to the object (Create Pivot).
+    pub pivots: Vec<Pivot>,
     bvh: Option<Arc<Bvh>>,
+}
+
+/// A point with a coordinate frame attached to an object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pivot {
+    pub position: glam::DVec3,
+    pub frame: glam::DQuat,
 }
 
 /// UVs of each triangle's corners (indexed by triangle id). They belong to one mesh
@@ -84,6 +93,7 @@ impl SceneObject {
             frame: glam::DQuat::IDENTITY,
             material: 0,
             uvs: None,
+            pivots: Vec::new(),
             bvh: None,
         }
     }

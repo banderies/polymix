@@ -212,11 +212,13 @@ pub struct ViewOptions {
     pub background: [f32; 3],
     pub show_view_cube: bool,
     pub theme: ui_util::Theme,
+    /// Draw objects' pivots (Meshmixer's Hide/Show Pivots).
+    pub show_pivots: bool,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
     }
 }
 
@@ -267,6 +269,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "unwrap" => Box::new(tools::unwrap::UnwrapTool::new(cx)),
         "convex" => Box::new(tools::pattern::ConvexTool::new(cx)),
         "hair" => Box::new(tools::hair::HairTool::new(cx)),
+        "pivot" => Box::new(tools::pivot::PivotTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
         "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
         "flowext" => Box::new(tools::vessel::FlowExtensionTool::new(cx)),
@@ -427,6 +430,7 @@ impl PolymixApp {
             app.view.show_grid = flag("grid", false);
             app.view.transparent_target = flag("transparent_target", true);
             app.view.show_view_cube = flag("view_cube", true);
+            app.view.show_pivots = flag("pivots", true);
             if let Some(t) = st.get_string("theme").and_then(|k| ui_util::Theme::from_key(&k)) {
                 app.view.theme = t;
                 ui_util::apply_theme(&cc.egui_ctx, t);
@@ -550,6 +554,7 @@ impl PolymixApp {
                 frame: o.frame,
                 group_names: o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect(),
                 uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
+                pivots: o.pivots.clone(),
             })
             .collect();
         let project = crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) };
@@ -827,6 +832,7 @@ impl PolymixApp {
                 so.frame = o.frame;
                 so.group_names = o.group_names.into_iter().collect();
                 so.uvs = o.uvs.map(|c| std::sync::Arc::new(crate::scene::UvSet::new(&so.mesh, c)));
+                so.pivots = o.pivots;
             }
             ids.push(id);
         }
@@ -881,6 +887,7 @@ impl PolymixApp {
                     frame: o.frame,
                     group_names: groups,
                     uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
+                    pivots: o.pivots.clone(),
                 }
             })
             .collect();
@@ -1299,6 +1306,7 @@ impl PolymixApp {
                 }
                 ui.checkbox(&mut self.view.show_grid, "Show grid");
                 ui.checkbox(&mut self.view.show_view_cube, "Show view cube");
+                ui.checkbox(&mut self.view.show_pivots, "Show pivots");
                 ui.horizontal(|ui| {
                     ui.label("Theme");
                     let before = self.view.theme;
@@ -1432,6 +1440,9 @@ impl PolymixApp {
                     }
                     if ui.button("Make Solid").clicked() {
                         open = Some("makesolid");
+                    }
+                    if ui.button("Create Pivot").on_hover_text("Drop a point with a coordinate frame on the object (Transform can turn and scale about it)").clicked() {
+                        open = Some("pivot");
                     }
                     if ui.button("Unwrap").on_hover_text("Compute UVs (texture coordinates) for OBJ export").clicked() {
                         open = Some("unwrap");
@@ -2406,6 +2417,15 @@ impl PolymixApp {
 
         // --- 2D overlays ------------------------------------------------------
         let painter = ui.painter_at(rect);
+        if self.view.show_pivots {
+            let pivots: Vec<crate::scene::Pivot> = self.scene.objects.iter().filter(|o| o.visible).flat_map(|o| o.pivots.iter().copied()).collect();
+            if !pivots.is_empty() {
+                let cx = self.tool_cx(&ctx, vp);
+                for p in &pivots {
+                    tools::pivot::paint_pivot(&painter, &cx, p, false);
+                }
+            }
+        }
         if let Some(mut tool) = self.tools.pop() {
             let mut cx = self.tool_cx(&ctx, vp);
             tool.paint(&painter, &mut cx);
@@ -2916,6 +2936,7 @@ impl eframe::App for PolymixApp {
         st.set_string("grid", b(self.view.show_grid));
         st.set_string("transparent_target", b(self.view.transparent_target));
         st.set_string("view_cube", b(self.view.show_view_cube));
+        st.set_string("pivots", b(self.view.show_pivots));
         st.set_string("theme", self.view.theme.key().to_string());
         let bg = self.view.background;
         st.set_string("background", format!("{},{},{}", bg[0], bg[1], bg[2]));
