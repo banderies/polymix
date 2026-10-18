@@ -8,3 +8,4 @@ pub mod nrrd;
 pub mod dicom;
 pub mod organize;
 pub mod scan;
+pub mod slice;

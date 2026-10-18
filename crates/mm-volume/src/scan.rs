@@ -80,7 +80,7 @@ struct CachedFile {
 }
 
 /// Bump when what is stored per file changes.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 impl FileCache {
     /// Load a cache file (empty when missing, unreadable or from another version).

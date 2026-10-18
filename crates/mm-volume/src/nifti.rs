@@ -470,7 +470,11 @@ pub fn volume(path: &Path, gzip: bool, h: &Header) -> Result<Volume> {
     let slope = if h.scl_slope == 0.0 || !h.scl_slope.is_finite() { 1.0 } else { h.scl_slope };
     let intercept = if h.scl_inter.is_finite() && h.scl_slope != 0.0 { h.scl_inter } else { 0.0 };
     let voxels = match dtype {
-        Some(t) => Voxels::Raw { file: data_file.clone(), offset: if pair { h.vox_offset.max(0.0) as u64 } else { h.vox_offset.max(if format == Format::Nifti2 { 544.0 } else { 352.0 }) as u64 }, gzip: data_gzip, dtype: t, big_endian: h.big_endian, slope, intercept },
+        Some(t) => {
+            let at = if pair { h.vox_offset.max(0.0) as u64 } else { h.vox_offset.max(if format == Format::Nifti2 { 544.0 } else { 352.0 }) as u64 };
+            let (file_offset, skip) = if data_gzip { (0, at) } else { (at, 0) };
+            Voxels::Raw { file: data_file.clone(), file_offset, gzip: data_gzip, skip, interleave: 1, dtype: t, big_endian: h.big_endian, slope, intercept }
+        }
         None => Voxels::Unsupported(format!("data type code {}", h.datatype)),
     };
     let dimstr = (1..=n).map(|k| h.dim[k].to_string()).collect::<Vec<_>>().join(" × ");

@@ -123,9 +123,12 @@ impl DataType {
 pub enum Voxels {
     /// DICOM: the file and frame of every slice, in slice order (first volume of a 4D set).
     Dicom { slices: Vec<(PathBuf, u32)> },
-    /// A plain array of `dtype` (x fastest) at `offset` in `file` (NIfTI, Analyze, NRRD),
-    /// optionally gzip-compressed, values scaled by `slope · v + intercept`.
-    Raw { file: PathBuf, offset: u64, gzip: bool, dtype: DataType, big_endian: bool, slope: f64, intercept: f64 },
+    /// A plain array of `dtype` (x fastest) in `file` (NIfTI, Analyze, NRRD): the data start
+    /// `file_offset` bytes into the file, then (after gzip decompression, if `gzip`) another
+    /// `skip` bytes. `interleave` > 1 when a component axis comes first (e.g. RGB, or the
+    /// layers of a segmentation): component 0 is every `interleave`-th value. Values are
+    /// scaled by `slope · v + intercept`.
+    Raw { file: PathBuf, file_offset: u64, gzip: bool, skip: u64, interleave: usize, dtype: DataType, big_endian: bool, slope: f64, intercept: f64 },
     /// Recognised but not readable yet (e.g. bzip2-compressed NRRD).
     Unsupported(String),
 }

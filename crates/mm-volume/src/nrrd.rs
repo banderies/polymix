@@ -244,8 +244,14 @@ pub fn volume(path: &Path, h: &Header) -> Result<Volume> {
     };
     let voxels = match (dtype, encoding.as_str()) {
         (Some(t), "raw" | "gzip" | "gz") if byte_skip >= 0 => {
-            let offset = if detached.is_some() { byte_skip as u64 } else { h.data_offset + if gzip { 0 } else { byte_skip as u64 } };
-            Voxels::Raw { file: file.clone(), offset, gzip, dtype: t, big_endian: big, slope: 1.0, intercept: 0.0 }
+            // The data follow the text header (attached) or start the data file; byte skip
+            // counts decompressed bytes for gzip data.
+            let start = if detached.is_some() { 0 } else { h.data_offset };
+            let (file_offset, skip) = if gzip { (start, byte_skip as u64) } else { (start + byte_skip as u64, 0) };
+            // Non-spatial axes before the first spatial one are interleaved per voxel.
+            let interleave = (0..sizes.len()).take_while(|a| !spatial.contains(a)).map(|a| sizes[a]).product::<usize>().max(1);
+            let interleave = if spatial.is_empty() { 1 } else { interleave };
+            Voxels::Raw { file: file.clone(), file_offset, gzip, skip, interleave, dtype: t, big_endian: big, slope: 1.0, intercept: 0.0 }
         }
         (None, _) => Voxels::Unsupported(format!("type “{}”", h.get("type").unwrap_or(""))),
         (_, e) => Voxels::Unsupported(format!("{e} encoding")),
@@ -312,7 +318,7 @@ mod tests {
         assert_eq!(g.orientation(), "LPS");
         // LPS origin (-120, -110, -60) is RAS (120, 110, -60).
         assert!((g.world(DVec3::ZERO) - DVec3::new(120.0, 110.0, -60.0)).length() < 1e-9);
-        assert!(matches!(v.voxels, Voxels::Raw { gzip: true, dtype: DataType::I16, .. }));
+        assert!(matches!(v.voxels, Voxels::Raw { gzip: true, dtype: DataType::I16, file_offset, skip: 0, interleave: 1, .. } if file_offset as usize == SLICER.len()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -329,6 +335,7 @@ mod tests {
         assert_eq!(v.kind, Kind::Segmentation);
         let g = v.geometry.unwrap();
         assert_eq!(g.dims, [64, 64, 40, 2], "the list axis becomes the 4th dimension");
+        assert!(matches!(v.voxels, Voxels::Raw { interleave: 2, .. }), "and comes first in the data");
         assert_eq!(g.orientation(), "RAS");
         // Detached header + raw.gz data file.
         let nhdr = "NRRD0004\ntype: short\ndimension: 4\nspace: left-posterior-superior\nsizes: 128 128 30 5\nspace directions: (1.5,0,0) (0,1.5,0) (0,0,4) none\nkinds: domain domain domain list\nencoding: gzip\ndata file: run.raw.gz\n";
@@ -340,7 +347,7 @@ mod tests {
         assert_eq!(v.kind, Kind::TimeSeries);
         assert_eq!(v.geometry.unwrap().dims, [128, 128, 30, 5]);
         assert_eq!(v.files.len(), 2);
-        assert!(matches!(&v.voxels, Voxels::Raw { file, offset: 0, .. } if file.ends_with("run.raw.gz")));
+        assert!(matches!(&v.voxels, Voxels::Raw { file, file_offset: 0, interleave: 1, .. } if file.ends_with("run.raw.gz")));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(parse(b"P5 not nrrd").is_err());
     }
