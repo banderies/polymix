@@ -21,7 +21,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Meshmix (parts library: drop parts) | ⚪ ❌ | parts in Arms/Ears/Heads/… |
 | Select | ✅ | |
 | Sculpt | 🟡 | see §3 |
-| Stamp | ⚪ ❌ | |
+| Stamp (4) | ⚪ 🟡 | Sculpt → Stamp: polygon stencils (Circle, Square, Triangle, Hexagon, Star, Arrow, Heart) cut into the surface facing the stamp, inside → new face group or hole; rotation, Snap Dimension. Meshmixer's stencil library and Convert To Stamp ❌ |
 | Edit | 🟡 | see §4 |
 | Analysis | 🟡 | see §5 |
 | Shaders (materials) | 🟡 | see §6 |

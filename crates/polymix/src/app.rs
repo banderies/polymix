@@ -241,6 +241,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
         "clearance" => Box::new(tools::clearance::ClearanceTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
+        "stamp" => Box::new(tools::stamp::StampTool::new(cx)),
         "sculptvolume" => Box::new(tools::sculpt::SculptTool::with_mode(cx, tools::sculpt::SculptMode::Volume, None)),
         "sculptsmooth" => Box::new(tools::sculpt::SculptTool::with_mode(cx, tools::sculpt::SculptMode::Surface, Some(tools::sculpt::Brush::RobustSmooth))),
         "remesh" => Box::new(tools::ops::RemeshTool::new(cx)),
@@ -1514,6 +1515,9 @@ impl PolymixApp {
                     if ui.button("Smoothing brush  (1)").clicked() {
                         open = Some("sculptsmooth");
                     }
+                    if ui.button("Stamp  (4)").on_hover_text("Cut a stencil shape into the surface as a face group or hole").clicked() {
+                        open = Some("stamp");
+                    }
                 });
             }
         }
@@ -2756,7 +2760,7 @@ impl PolymixApp {
             if used {
                 return;
             }
-            let brush_key = [Key::Num1, Key::Num2, Key::Num3].iter().any(|&k| i.key_pressed(k));
+            let brush_key = [Key::Num1, Key::Num2, Key::Num3, Key::Num4].iter().any(|&k| i.key_pressed(k));
             if is_select && !brush_key {
                 // The select tool consumes most letter keys.
                 if i.key_pressed(Key::W) {
@@ -2789,6 +2793,8 @@ impl PolymixApp {
                 Some("sculpt")
             } else if i.key_pressed(Key::Num3) {
                 Some("sculptvolume")
+            } else if i.key_pressed(Key::Num4) {
+                Some("stamp")
             } else {
                 None
             };

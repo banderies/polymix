@@ -24,6 +24,7 @@ pub mod plane_cut;
 pub mod vessel;
 pub mod measure;
 pub mod sculpt;
+pub mod stamp;
 pub mod patches;
 pub mod boolean;
 pub mod deviation;
