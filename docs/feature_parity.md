@@ -227,8 +227,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 
 | Meshmixer | Polymix | Notes |
 |---|---|---|
-| Material library (clay variants, metals, glossy, resin…) | 🟡 | One clay material + per-object colour |
-| Vertex colour display | ❌ | |
+| Material library (clay variants, metals, glossy, resin…) | ✅ | Shaders palette: Clay, Soft clay, Satin, Glossy, Ceramic, Tissue, Resin, Gold, Silver, Copper (own lighting presets, per object, or apply to all) |
+| Vertex colour display | ✅ | |
 | Textured / textured-unlit / UV checker / X-ray | ⚪ ❌ | |
 | Wireframe | ✅ | |
 | Face group colours | ✅ | |

@@ -22,6 +22,7 @@ enum Category {
     Vessel,
     Analysis,
     Sculpt,
+    Shaders,
 }
 
 /// How shading normals are made (Meshmixer's Mesh Normal Mode).
@@ -743,7 +744,7 @@ impl PolymixApp {
         if big(ui, "Select", sel_active).on_hover_text("S").clicked() {
             self.switch_to(SwitchTo::Tool("select".into()), &ctx, vp);
         }
-        for (cat, label) in [(Category::Sculpt, "Sculpt"), (Category::Edit, "Edit"), (Category::Vessel, "Vessel"), (Category::Analysis, "Analysis")] {
+        for (cat, label) in [(Category::Sculpt, "Sculpt"), (Category::Edit, "Edit"), (Category::Vessel, "Vessel"), (Category::Analysis, "Analysis"), (Category::Shaders, "Shaders")] {
             if big(ui, label, self.category == Some(cat) && self.tools.is_empty()).clicked() {
                 let to = if self.category == Some(cat) && self.tools.is_empty() { None } else { Some(cat) };
                 self.switch_to(SwitchTo::Category(to), &ctx, vp);
@@ -875,6 +876,48 @@ impl PolymixApp {
                         open = Some("deviation");
                     }
                 });
+            }
+            Category::Shaders => {
+                ui_util::section(ui, "Shaders");
+                ui.small("Click a material for the active object.");
+                let current = self.scene.active().map(|o| o.material);
+                let mut chosen = None;
+                ui.add_enabled_ui(has_obj, |ui| {
+                    egui::Grid::new("materials").num_columns(2).show(ui, |ui| {
+                        for (i, m) in crate::materials::MATERIALS.iter().enumerate() {
+                            let swatch = m.color.map(|c| Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
+                            let text = match swatch {
+                                Some(c) => RichText::new(format!("● {}", m.name)).color(c),
+                                None => RichText::new(format!("○ {}", m.name)),
+                            };
+                            if ui.selectable_label(current == Some(i), text).clicked() {
+                                chosen = Some(i);
+                            }
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                });
+                let all = ui.add_enabled(has_obj, egui::Button::new("Apply to all objects")).clicked();
+                if let Some(i) = chosen.or(all.then_some(current).flatten()) {
+                    let m = crate::materials::MATERIALS[i];
+                    let ids: Vec<ObjectId> = if all { self.scene.objects.iter().map(|o| o.id).collect() } else { self.scene.active.into_iter().collect() };
+                    for id in ids {
+                        if let Some(o) = self.scene.get_mut(id) {
+                            let had_alpha = crate::materials::MATERIALS.get(o.material).and_then(|x| x.alpha).is_some();
+                            o.material = i;
+                            if let Some(c) = m.color {
+                                o.color = Vec4::new(c[0], c[1], c[2], o.color.w);
+                            }
+                            match m.alpha {
+                                Some(a) => o.color.w = a,
+                                None if had_alpha => o.color.w = 1.0,
+                                None => {}
+                            }
+                        }
+                    }
+                }
             }
             Category::Sculpt => {
                 ui_util::section(ui, "Sculpt");
@@ -1656,6 +1699,7 @@ impl PolymixApp {
                 crease_deg: self.view.sharp_edges.then_some(self.view.crease_deg),
                 group_normals: self.view.normals == NormalMode::Group,
                 vertex_colors: self.view.colors == ColorMode::Vertex,
+                material: crate::materials::MATERIALS[o.material.min(crate::materials::MATERIALS.len() - 1)],
             };
             if let Some((pid, pm)) = preview {
                 if pid == o.id {
@@ -1809,6 +1853,15 @@ impl PolymixApp {
             }
             "select_all" => commands::selection_command(&mut self.cmd_cx(), commands::SelectCmd::All),
             "duplicate" => commands::duplicate_object(&mut self.cmd_cx()),
+            "material" => {
+                if let (Ok(i), Some(o)) = (arg.parse::<usize>(), self.scene.active_mut()) {
+                    let m = crate::materials::MATERIALS[i.min(crate::materials::MATERIALS.len() - 1)];
+                    o.material = i;
+                    if let Some(c) = m.color {
+                        o.color = Vec4::new(c[0], c[1], c[2], m.alpha.unwrap_or(1.0));
+                    }
+                }
+            }
             "hotbox" => self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) },
             "target" => {
                 let id = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id);
@@ -1849,6 +1902,7 @@ impl PolymixApp {
                     "vessel" => Some(Category::Vessel),
                     "analysis" => Some(Category::Analysis),
                     "sculpt" => Some(Category::Sculpt),
+                    "shaders" => Some(Category::Shaders),
                     _ => None,
                 };
                 self.switch_to(SwitchTo::Category(c), ctx, vp);

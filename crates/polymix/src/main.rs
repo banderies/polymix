@@ -5,6 +5,7 @@ mod camera;
 mod centerline;
 mod commands;
 mod jobs;
+mod materials;
 mod navigation;
 mod renderer;
 mod scene;

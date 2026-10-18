@@ -36,6 +36,9 @@ pub const DEFAULT_BACKGROUND: [f32; 3] = [0.20, 0.21, 0.24];
 struct ObjectUniform {
     color: [f32; 4],
     flags: [u32; 4],
+    /// Material: (specular, shininess, rim, metal), (wrap, -, -, -).
+    material: [f32; 4],
+    material2: [f32; 4],
 }
 
 #[repr(C)]
@@ -86,6 +89,7 @@ pub struct ObjectStyle {
     pub group_normals: bool,
     /// Show the mesh's vertex colours (when it has any).
     pub vertex_colors: bool,
+    pub material: crate::materials::Material,
 }
 
 /// Per-triangle display values (indexed by triangle id) shown instead of the object colour.
@@ -540,6 +544,8 @@ impl SceneRenderer {
                 },
                 style.dim as u32 | ((style.cut_tint as u32) << 1),
             ],
+            material: style.material.uniform().0,
+            material2: style.material.uniform().1,
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&u));
     }

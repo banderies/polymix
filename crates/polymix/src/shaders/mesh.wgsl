@@ -24,6 +24,9 @@ struct Object {
     // 3 per-triangle RGB, 4 vertex colours),
     // w: bit 0 dim (non-active object), bit 1 show cut-plane tint
     flags: vec4<u32>,
+    // Material: x specular, y shininess, z rim, w metal; material2.x wrap.
+    material: vec4<f32>,
+    material2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -118,15 +121,30 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         base = vec3<f32>(0.32, 0.36, 0.48);
     }
 
-    // Clay-style lighting in view space.
+    // Clay-style lighting in view space, shaped by the material.
+    let spec_k = object.material.x;
+    let shininess = max(object.material.y, 1.0);
+    let rim_k = object.material.z;
+    let metal = object.material.w;
+    let wrap = object.material2.x;
     let key = normalize(vec3<f32>(-0.45, 0.65, 0.62));
     let fill = normalize(vec3<f32>(0.7, -0.2, 0.5));
-    let diff = max(dot(nv, key), 0.0);
-    let fdiff = max(dot(nv, fill), 0.0);
+    let diff = max((dot(nv, key) + wrap) / (1.0 + wrap), 0.0);
+    let fdiff = max((dot(nv, fill) + wrap) / (1.0 + wrap), 0.0);
     let hv = normalize(key + vv);
-    let spec = pow(max(dot(nv, hv), 0.0), 40.0);
+    let spec = pow(max(dot(nv, hv), 0.0), shininess);
     let rim = pow(1.0 - max(dot(nv, vv), 0.0), 3.0);
-    var col = base * (0.22 + 0.68 * diff + 0.22 * fdiff) + vec3<f32>(0.18 * spec) + base * rim * 0.25;
+    // Metals: tinted highlights, little diffuse light, and a studio reflection (bright sky,
+    // dark floor, a crisp horizon) that gives them their contrast.
+    let spec_col = mix(vec3<f32>(1.0), base, metal);
+    let spec2 = pow(max(dot(nv, normalize(fill + vv)), 0.0), shininess) * 0.5;
+    let refl = reflect(-vv, nv);
+    let horizon = smoothstep(-0.05, 0.2, refl.y);
+    let env = mix(vec3<f32>(0.06), mix(vec3<f32>(0.55), vec3<f32>(1.0), clamp(refl.y, 0.0, 1.0)), horizon);
+    var col = base * (0.22 + 0.68 * diff + 0.22 * fdiff) * (1.0 - 0.85 * metal)
+        + spec_col * (spec_k * (spec + spec2 * metal))
+        + base * env * (0.9 * metal)
+        + base * rim * rim_k;
 
     // Wireframe overlay.
     if (object.flags.x != 0u) {

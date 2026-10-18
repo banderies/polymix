@@ -43,6 +43,8 @@ pub struct SceneObject {
     /// Orientation of the object's local frame: the rotations applied by Transform so far
     /// (Transform's "Local Frame" axes).
     pub frame: glam::DQuat,
+    /// Index into [`crate::materials::MATERIALS`].
+    pub material: usize,
     bvh: Option<Arc<Bvh>>,
 }
 
@@ -63,6 +65,7 @@ impl SceneObject {
             scalars: None,
             colors: None,
             frame: glam::DQuat::IDENTITY,
+            material: 0,
             bvh: None,
         }
     }
@@ -283,6 +286,7 @@ impl Scene {
             if let Some(src) = from.get(o.id) {
                 o.name = src.name.clone();
                 o.color = src.color;
+                o.material = src.material;
                 o.visible = src.visible;
                 for (g, n) in &src.group_names {
                     o.group_names.insert(*g, n.clone());
