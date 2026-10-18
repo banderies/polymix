@@ -107,7 +107,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M7.1 Preferences window** (navigation, colour/normal modes, view, file and dialog
       options).
 - [x] **M7.2 Flip Z-Y axis on import/export** (on by default, as in the user's install).
-- [ ] **M7.3 Import prompts**: Append / Replace, auto-fix scale / position of appended meshes,
+- [x] **M7.3 Import prompts**: Append / Replace, auto-fix scale / position of appended meshes,
       "remember my choice".
 - [ ] **M7.4 Project files**: save/open a scene (objects, groups, patch names, view, history-free).
 - [ ] **M7.5 Autosave and crash recovery.**

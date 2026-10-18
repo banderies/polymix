@@ -102,6 +102,39 @@ pub struct Prefs {
     /// Files are Z-up: turn them Y-up on import and back on export (Meshmixer's "Flip Z-Y
     /// axis on Import-Export"), so a round trip keeps the file's coordinates.
     pub flip_zy: bool,
+    /// Importing into a non-empty scene.
+    pub import_mode: ImportMode,
+    /// Models of implausible size (under 1 or over 10 000 units across).
+    pub scale_mode: ScaleMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportMode {
+    Ask,
+    Append,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScaleMode {
+    Ask,
+    Never,
+    /// Always scale implausibly sized models by this factor.
+    Always(f64),
+}
+
+/// Imported meshes waiting for an answer to the import prompts.
+struct PendingImport {
+    meshes: Vec<(String, Mesh, String)>,
+    /// Append / Replace decided (or not needed).
+    placement: Option<bool /*replace*/>,
+    remember: bool,
+}
+
+/// Size outside the plausible range for millimetre models (bounding-box diagonal).
+fn odd_size(m: &Mesh) -> bool {
+    let d = m.bounds().diagonal();
+    d.is_finite() && (d < 1.0 || d > 10_000.0)
 }
 
 /// File (Z-up) → scene (Y-up): a rotation about X, so handedness and normals are kept.
@@ -116,7 +149,7 @@ pub fn flip_zy_out(p: glam::DVec3) -> glam::DVec3 {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true, flip_zy: true }
+        Self { reset_camera_on_import: true, export_whole_scene: false, obj_export_groups: true, obj_import_groups: true, flip_zy: true, import_mode: ImportMode::Ask, scale_mode: ScaleMode::Ask }
     }
 }
 
@@ -223,6 +256,9 @@ pub struct PolymixApp {
     pending_switch: Option<SwitchTo>,
     status: String,
     import_job: Option<Job<ImportResult>>,
+    pending_import: Option<PendingImport>,
+    /// Scripts normally skip the import prompts; `prompts:on` shows them (for screenshots).
+    script_prompts: bool,
     export_job: Option<Job<String>>,
     nav_drag: Option<PointerButton>,
     /// Right-button drag owned by the active tool: press position.
@@ -281,6 +317,8 @@ impl PolymixApp {
             category: None,
             pending_switch: None,
             status: "Welcome to Polymix. Import a mesh to begin (Ctrl/Cmd+O, or drag a file onto the window).".into(),
+            script_prompts: false,
+            pending_import: None,
             import_job: None,
             export_job: None,
             nav_drag: None,
@@ -357,6 +395,16 @@ impl PolymixApp {
             app.prefs.obj_export_groups = flag("obj_export_groups", true);
             app.prefs.obj_import_groups = flag("obj_import_groups", true);
             app.prefs.flip_zy = flag("flip_zy", true);
+            app.prefs.import_mode = match st.get_string("import_mode").as_deref() {
+                Some("append") => ImportMode::Append,
+                Some("replace") => ImportMode::Replace,
+                _ => ImportMode::Ask,
+            };
+            app.prefs.scale_mode = match st.get_string("scale_mode").as_deref() {
+                Some("never") => ScaleMode::Never,
+                Some(s) if s.starts_with("always:") => s[7..].parse().map(ScaleMode::Always).unwrap_or(ScaleMode::Ask),
+                _ => ScaleMode::Ask,
+            };
             app.recent = st.get_string("recent").map(|r| r.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
         }
         if !files.is_empty() {
@@ -380,7 +428,6 @@ impl PolymixApp {
         self.recent.truncate(10);
         let n = files.len();
         let obj_groups = self.prefs.obj_import_groups;
-        let flip = self.prefs.flip_zy;
         self.import_job = Some(Job::spawn(format!("Importing {n} file(s)"), ctx.clone(), move |progress| {
             let mut out = Vec::new();
             for (i, f) in files.iter().enumerate() {
@@ -389,9 +436,6 @@ impl PolymixApp {
                 }
                 let t0 = std::time::Instant::now();
                 let mut imported = mm_io::read_mesh(f).map_err(|e| anyhow::anyhow!("{}: {e:#}", f.display()))?;
-                if flip {
-                    imported.mesh.transform(flip_zy_in);
-                }
                 if !obj_groups && imported.format == mm_io::Format::Obj {
                     for t in imported.mesh.triangle_ids().collect::<Vec<_>>() {
                         imported.mesh.set_tri_group(t, 0);
@@ -423,20 +467,13 @@ impl PolymixApp {
                 self.import_job = None;
                 match res {
                     Ok(meshes) => {
-                        let first_import = self.scene.is_empty();
-                        if !meshes.is_empty() {
-                            self.history.push("Import", &self.scene);
-                        }
-                        let mut notes = Vec::new();
-                        for (name, mesh, note) in meshes {
-                            self.scene.add(name, mesh);
-                            notes.push(note);
-                        }
-                        self.status = notes.join("  |  ");
-                        if first_import || self.prefs.reset_camera_on_import {
-                            self.camera.scene_radius = 1e-6;
-                            self.camera.focus(&self.scene.bounds());
-                        }
+                        let placement = match self.prefs.import_mode {
+                            _ if self.scene.is_empty() => Some(false),
+                            ImportMode::Ask => None,
+                            ImportMode::Append => Some(false),
+                            ImportMode::Replace => Some(true),
+                        };
+                        self.pending_import = Some(PendingImport { meshes, placement, remember: false });
                     }
                     Err(e) => self.status = format!("Import failed: {e:#}"),
                 }
@@ -450,6 +487,113 @@ impl PolymixApp {
                     Err(e) => format!("Export failed: {e:#}"),
                 };
             }
+        }
+    }
+
+    /// Import prompts (Append / Replace, odd sizes), then add the meshes to the scene.
+    fn finish_import(&mut self, ctx: &egui::Context) {
+        // Test scripts never wait on prompts: they append and keep sizes.
+        let scripted = self.script.is_some() && !self.script_prompts;
+        let Some(pending) = &mut self.pending_import else { return };
+        if scripted && pending.placement.is_none() {
+            pending.placement = Some(false);
+        }
+        let center = |w: egui::Window<'static>| w.anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).collapsible(false).resizable(false);
+        if pending.placement.is_none() {
+            let mut choice = None;
+            center(egui::Window::new("Import")).show(ctx, |ui| {
+                ui.label("The scene already has objects. Append the imported mesh or replace the scene?");
+                ui.checkbox(&mut self.prefs.flip_zy, "Flip Z-Y axis on import/export");
+                ui.checkbox(&mut pending.remember, "Remember my choice");
+                ui.horizontal(|ui| {
+                    if ui.button("Append").clicked() {
+                        choice = Some(false);
+                    }
+                    if ui.button("Replace").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(false);
+                        pending.meshes.clear();
+                    }
+                });
+            });
+            if let Some(replace) = choice {
+                if pending.remember && !pending.meshes.is_empty() {
+                    self.prefs.import_mode = if replace { ImportMode::Replace } else { ImportMode::Append };
+                }
+                pending.placement = Some(replace);
+                pending.remember = false;
+            }
+            return;
+        }
+        let odd = pending.meshes.iter().any(|(_, m, _)| odd_size(m));
+        let factor = match self.prefs.scale_mode {
+            _ if !odd || scripted => Some(1.0),
+            ScaleMode::Never => Some(1.0),
+            ScaleMode::Always(k) => Some(k),
+            ScaleMode::Ask => {
+                let d = pending.meshes.iter().map(|(_, m, _)| m.bounds().diagonal()).fold(0.0, f64::max);
+                let mut pick = None;
+                center(egui::Window::new("Model size")).show(ctx, |ui| {
+                    ui.label(format!(
+                        "The model is {} ({d:.4} units across). Polymix works in millimetres; scale it?",
+                        if d < 1.0 { "very small" } else { "very large" }
+                    ));
+                    ui.checkbox(&mut pending.remember, "Remember my choice");
+                    ui.horizontal_wrapped(|ui| {
+                        let options: &[(&str, f64)] = if d < 1.0 {
+                            &[("× 1000 (m → mm)", 1000.0), ("× 10 (cm → mm)", 10.0), ("× 25.4 (in → mm)", 25.4)]
+                        } else {
+                            &[("× 0.001 (µm → mm)", 0.001), ("× 0.1", 0.1)]
+                        };
+                        for &(label, k) in options {
+                            if ui.button(label).clicked() {
+                                pick = Some(k);
+                            }
+                        }
+                        if ui.button("Keep size").clicked() {
+                            pick = Some(1.0);
+                        }
+                    });
+                });
+                if let Some(k) = pick {
+                    if pending.remember {
+                        self.prefs.scale_mode = if k == 1.0 { ScaleMode::Never } else { ScaleMode::Always(k) };
+                    }
+                }
+                pick
+            }
+        };
+        let Some(factor) = factor else { return };
+        let Some(pending) = self.pending_import.take() else { return };
+        if pending.meshes.is_empty() {
+            self.status = "Import cancelled".into();
+            return;
+        }
+        self.history.push("Import", &self.scene);
+        if pending.placement == Some(true) {
+            self.scene.objects.clear();
+            self.scene.active = None;
+            self.scene.target = None;
+        }
+        let first_import = self.scene.is_empty();
+        let mut notes = Vec::new();
+        for (name, mut mesh, mut note) in pending.meshes {
+            if self.prefs.flip_zy {
+                mesh.transform(flip_zy_in);
+            }
+            if factor != 1.0 && odd_size(&mesh) {
+                mesh.transform(|p| p * factor);
+                note += &format!(" — scaled × {factor}");
+            }
+            self.scene.add(name, mesh);
+            notes.push(note);
+        }
+        self.status = notes.join("  |  ");
+        if first_import || self.prefs.reset_camera_on_import {
+            self.camera.scene_radius = 1e-6;
+            self.camera.focus(&self.scene.bounds());
         }
     }
 
@@ -1295,7 +1439,7 @@ impl PolymixApp {
         let mut open = true;
         egui::Window::new("Preferences").open(&mut open).resizable(false).collapsible(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for (i, t) in ["General", "View", "File"].iter().enumerate() {
+                for (i, t) in ["General", "View", "File", "Dialogs"].iter().enumerate() {
                     ui.selectable_value(&mut self.prefs_tab, i, *t);
                 }
             });
@@ -1349,6 +1493,26 @@ impl PolymixApp {
                             ui_util::apply_theme(ui.ctx(), self.view.theme);
                         }
                     });
+                }
+                3 => {
+                    ui.label("Importing into a scene with objects");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.prefs.import_mode, ImportMode::Append, "Always append");
+                        ui.selectable_value(&mut self.prefs.import_mode, ImportMode::Replace, "Always replace");
+                        ui.selectable_value(&mut self.prefs.import_mode, ImportMode::Ask, "Always ask");
+                    });
+                    ui.label("Models of unusual size (under 1 or over 10 000 units)");
+                    ui.horizontal(|ui| {
+                        let always = matches!(self.prefs.scale_mode, ScaleMode::Always(_));
+                        if ui.selectable_label(always, "Always scale").clicked() && !always {
+                            self.prefs.scale_mode = ScaleMode::Always(1000.0);
+                        }
+                        ui.selectable_value(&mut self.prefs.scale_mode, ScaleMode::Never, "Don't scale");
+                        ui.selectable_value(&mut self.prefs.scale_mode, ScaleMode::Ask, "Always ask");
+                    });
+                    if let ScaleMode::Always(k) = &mut self.prefs.scale_mode {
+                        ui.add(egui::DragValue::new(k).speed(1.0).range(1e-6..=1e6).prefix("factor "));
+                    }
                 }
                 _ => {
                     ui.label("Export (⌘E)");
@@ -2068,6 +2232,7 @@ impl PolymixApp {
                     ui_util::apply_theme(ctx, t);
                 }
             }
+            "prompts" => self.script_prompts = arg == "on",
             "prefs" => {
                 self.show_prefs = true;
                 self.prefs_tab = arg.parse().unwrap_or(0);
@@ -2297,6 +2462,23 @@ impl eframe::App for PolymixApp {
         st.set_string("obj_export_groups", b(self.prefs.obj_export_groups));
         st.set_string("obj_import_groups", b(self.prefs.obj_import_groups));
         st.set_string("flip_zy", b(self.prefs.flip_zy));
+        st.set_string(
+            "import_mode",
+            match self.prefs.import_mode {
+                ImportMode::Ask => "ask",
+                ImportMode::Append => "append",
+                ImportMode::Replace => "replace",
+            }
+            .into(),
+        );
+        st.set_string(
+            "scale_mode",
+            match self.prefs.scale_mode {
+                ScaleMode::Ask => "ask".into(),
+                ScaleMode::Never => "never".into(),
+                ScaleMode::Always(k) => format!("always:{k}"),
+            },
+        );
         st.set_string("recent", self.recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
         if let Some(d) = &self.last_export_dir {
             st.set_string("last_export_dir", d.display().to_string());
@@ -2374,6 +2556,7 @@ impl eframe::App for PolymixApp {
         self.handle_keys(&ctx, vp_prev);
         self.help_window(&ctx);
         self.preferences_window(&ctx);
+        self.finish_import(&ctx);
         self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);
@@ -2441,5 +2624,15 @@ mod flip_tests {
         let v0 = mm_core::measure::volume(&m);
         m.transform(flip_zy_in);
         assert!((mm_core::measure::volume(&m) - v0).abs() < 1e-12, "a rotation keeps the outward orientation");
+    }
+
+    #[test]
+    fn odd_sizes() {
+        let mut m = mm_core::primitives::cube(0.05, 1);
+        assert!(odd_size(&m), "5 cm in metres");
+        m.transform(|p| p * 1000.0);
+        assert!(!odd_size(&m), "50 mm");
+        m.transform(|p| p * 1000.0);
+        assert!(odd_size(&m), "50 m in millimetres");
     }
 }
