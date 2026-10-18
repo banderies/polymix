@@ -72,6 +72,8 @@ pub struct OpTool<S: OpSpec> {
     job: Option<(S::Params, Job<OpOutput>)>,
     result: Option<(S::Params, OpOutput)>,
     error: Option<String>,
+    /// Params whose run failed (with `error`): running them again would fail again.
+    failed: Option<S::Params>,
     changed_at: Option<Instant>,
     pending_accept: bool,
     invalid: bool,
@@ -100,6 +102,7 @@ impl<S: OpSpec> OpTool<S> {
             job: None,
             result: None,
             error: None,
+            failed: None,
             changed_at: if S::LIVE { Some(Instant::now() - Duration::from_secs(1)) } else { None },
             pending_accept: false,
             invalid: false,
@@ -120,6 +123,7 @@ impl<S: OpSpec> OpTool<S> {
             job: None,
             result: None,
             error: Some("No active object.".into()),
+            failed: None,
             changed_at: None,
             pending_accept: false,
             invalid: true,
@@ -151,6 +155,7 @@ impl<S: OpSpec> OpTool<S> {
                 Err(e) => {
                     if e.to_string() != "cancelled" {
                         self.error = Some(format!("{e:#}"));
+                        self.failed = Some(p);
                     }
                 }
             }
@@ -302,6 +307,13 @@ impl<S: OpSpec> Tool for OpTool<S> {
     }
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
+        self.poll();
+        // The current settings already failed: there is nothing to apply, and running them
+        // again would only fail again (switching tools retries an accept until it succeeds).
+        if self.job.is_none() && self.failed.as_ref() == Some(&self.params) {
+            *cx.status = format!("{}: nothing applied ({})", S::NAME, self.error.as_deref().unwrap_or("failed"));
+            return true;
+        }
         if self.job.is_some() || !self.up_to_date() {
             self.pending_accept = true;
             if self.job.is_none() {
@@ -2204,6 +2216,32 @@ mod tests {
     }
 
     #[test]
+    fn accepting_a_failed_op_does_not_retry_it() {
+        // Erasing a whole closed sphere leaves no hole to fill, so Erase & Fill fails. Switching
+        // tools then accepts it: that must close it unchanged, not start the run again.
+        let m = primitives::icosphere(1.0, 2);
+        let mut scene = crate::scene::Scene::default();
+        let id = scene.add("ball", m.clone());
+        scene.get_mut(id).unwrap().selection = mm_core::TriSelection::all(&m);
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = EraseFillTool::new(&mut cx);
+        tool.start(&ctx);
+        let t0 = Instant::now();
+        while tool.job.is_some() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+            tool.poll();
+        }
+        assert!(tool.error.is_some() && tool.failed.is_some(), "the run fails");
+        assert!(tool.accept(&mut cx), "accepting closes the tool");
+        assert!(tool.busy().is_none(), "without starting another run");
+        assert!(cx.status.contains("nothing applied"));
+        assert_eq!(cx.scene.get(id).unwrap().mesh.triangle_count(), m.triangle_count());
+    }
+
+    #[test]
     fn erase_fill_leaves_no_fragments() {
         // A spike pulled out of a sphere at 45° to the view (looking down −z). The brush only
         // takes faces turned toward the eye, so the spike's far side stays unselected; erased
@@ -2221,6 +2259,16 @@ mod tests {
         assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "no floating fragments");
         assert!(out.mesh.is_closed());
         assert!(out.mesh.vertex_ids().all(|v| out.mesh.vertex(v).length() < 1.2), "the spike is gone");
+
+        // A lone triangle left unselected inside the selection used to fail the fill ("the loop
+        // bounds an isolated triangle"); it is a cut-off piece too.
+        let ball = mm_core::primitives::icosphere(1.0, 4);
+        let mut cap: Vec<u32> = ball.triangle_ids().filter(|&t| ball.tri_centroid(t).z > 0.5).collect();
+        let lone = *cap.iter().max_by(|&&a, &&b| ball.tri_centroid(a).z.total_cmp(&ball.tri_centroid(b).z)).unwrap();
+        cap.retain(|&t| t != lone);
+        let out = EraseFillSpec::run(&ball, Some(&cap), &p, &|_| true).unwrap();
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1);
+        assert!(out.mesh.is_closed());
 
         // A band erased around a tube cuts it in two; both halves reach outside the band and stay.
         let tube = mm_core::primitives::cylinder(1.0, 6.0, 32, 24, true);
