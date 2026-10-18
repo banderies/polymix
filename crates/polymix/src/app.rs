@@ -2849,7 +2849,7 @@ impl PolymixApp {
                 // Print scene statistics to stdout (automated checks).
                 for o in &self.scene.objects {
                     println!(
-                        "[polymix] {} {}: tris={} verts={} open_edges={} closed={} valid={} selected={} tool={}",
+                        "[polymix] {} {}: tris={} verts={} open_edges={} closed={} valid={} shells={} selected={} tool={}",
                         arg,
                         o.name,
                         o.mesh.triangle_count(),
@@ -2857,6 +2857,7 @@ impl PolymixApp {
                         o.mesh.boundary_edge_ids().count(),
                         o.mesh.is_closed(),
                         o.mesh.check_validity().is_ok(),
+                        mm_core::topology::connected_components(&o.mesh).len(),
                         o.selection.len(),
                         self.tools.last().map(|t| t.name()).unwrap_or("none")
                     );

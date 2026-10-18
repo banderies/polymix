@@ -1593,7 +1593,9 @@ impl OpSpec for EraseFillSpec {
         let border: std::collections::HashSet<u32> = selection.boundary_vertices(&m).into_iter().collect();
         let target = mm_remesh::edge_length_stats_in(&m, tris).mean * 2f64.powf((50.0 - p.refine) / 25.0);
         let new_group = m.max_group_id().max(0) + 1;
+        let erased = mm_core::Aabb::from_points(tris.iter().flat_map(|&t| m.tri_positions(t)));
         m.remove_triangles(tris.iter().copied());
+        let fragments = remove_cut_off_fragments(&mut m, &border, &erased);
         let loops: Vec<_> = mm_core::topology::boundary_loops(&m).into_iter().filter(|l| l.vertices.iter().any(|v| border.contains(v))).collect();
         if loops.is_empty() {
             anyhow::bail!("the selection did not leave a hole to fill (did it cover a whole part?)");
@@ -1619,8 +1621,36 @@ impl OpSpec for EraseFillSpec {
             let verts = interior_vertices(&m, &new_tris);
             mm_edit::project_to_target(&mut m, &verts, &t.mesh, &t.bvh, 0.0, None);
         }
-        Ok(OpOutput { message: format!("replaced {} triangles with {}", tris.len(), new_tris.len()), mesh: m, selection: Some(new_tris), ..Default::default() })
+        let mut message = format!("replaced {} triangles with {}", tris.len(), new_tris.len());
+        if fragments > 0 {
+            message += &format!(", removed {fragments} loose fragment{}", if fragments == 1 { "" } else { "s" });
+        }
+        Ok(OpOutput { message, mesh: m, selection: Some(new_tris), ..Default::default() })
     }
+}
+
+/// After erasing a selection, delete the pieces it cut loose: parts of the surface left
+/// within the erased region (`erased`, its bounding box) and attached to the rest only
+/// through it, such as the far side of a spike the brush did not reach (faces turned away
+/// from the eye). Filled, they would float in space as small closed blobs. The largest
+/// piece next to the hole is always kept, as is anything reaching outside the region (both
+/// halves of a tube cut through). Returns how many pieces were removed.
+fn remove_cut_off_fragments(m: &mut Mesh, border: &std::collections::HashSet<u32>, erased: &mm_core::Aabb) -> usize {
+    let mut pieces: Vec<Vec<u32>> = mm_core::topology::connected_components(m)
+        .into_iter()
+        .filter(|c| c.iter().any(|&t| m.triangle(t).iter().any(|v| border.contains(v))))
+        .collect();
+    if pieces.len() < 2 {
+        return 0;
+    }
+    let area = |c: &Vec<u32>| c.iter().map(|&t| m.tri_area(t)).sum::<f64>();
+    pieces.sort_by(|a, b| area(b).total_cmp(&area(a)));
+    let inside = erased.expanded(erased.diagonal() * 0.05);
+    let cut_off: Vec<Vec<u32>> = pieces.into_iter().skip(1).filter(|c| c.iter().flat_map(|&t| m.tri_positions(t)).all(|p| inside.contains(p))).collect();
+    for c in &cut_off {
+        m.remove_triangles(c.iter().copied());
+    }
+    cut_off.len()
 }
 
 /// Vertices whose triangles all belong to `tris` (the region's interior).
@@ -2171,6 +2201,33 @@ mod tests {
                 d1.dot(d2).clamp(-1.0, 1.0).acos()
             })
             .sum()
+    }
+
+    #[test]
+    fn erase_fill_leaves_no_fragments() {
+        // A spike pulled out of a sphere at 45° to the view (looking down −z). The brush only
+        // takes faces turned toward the eye, so the spike's far side stays unselected; erased
+        // around, it would float in space as a fragment.
+        let mut m = mm_core::primitives::icosphere(1.0, 4);
+        let dir = DVec3::new(1.0, 0.0, 1.0).normalize();
+        let tip = m.vertex_ids().max_by(|&a, &b| m.vertex(a).dot(dir).total_cmp(&m.vertex(b).dot(dir))).unwrap();
+        let base = m.vertex(tip);
+        m.set_vertex(tip, base * 2.5);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_normal(t).z > 0.0 && m.triangle(t).iter().any(|&v| m.vertex(v).distance(base) < 0.5 || v == tip)).collect();
+        let far_side = m.vertex_triangles(tip).iter().filter(|t| !sel.contains(t)).count();
+        assert!(far_side > 0, "part of the spike is left unselected");
+        let p = EraseFillSpec::defaults(&OpInfo { mesh: &m, selection: Some(&sel), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None });
+        let out = EraseFillSpec::run(&m, Some(&sel), &p, &|_| true).unwrap();
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "no floating fragments");
+        assert!(out.mesh.is_closed());
+        assert!(out.mesh.vertex_ids().all(|v| out.mesh.vertex(v).length() < 1.2), "the spike is gone");
+
+        // A band erased around a tube cuts it in two; both halves reach outside the band and stay.
+        let tube = mm_core::primitives::cylinder(1.0, 6.0, 32, 24, true);
+        let band: Vec<u32> = tube.triangle_ids().filter(|&t| (tube.tri_centroid(t).z - 2.0).abs() < 0.4).collect();
+        let out = EraseFillSpec::run(&tube, Some(&band), &p, &|_| true).unwrap();
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 2, "both halves kept");
+        assert!(out.mesh.is_closed());
     }
 
     #[test]

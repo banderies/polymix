@@ -146,7 +146,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Modify: Expand to Same Groups (non-connected) | ✅ | "Same groups"; `G` now expands through connected faces only, as in Meshmixer |
 | Modify: Select Visible | ✅ | |
 | **Edit** menu: Discard (X) | ✅ | |
-| Edit: Erase & Fill (F) | ✅ | Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth, Scale, Bulge, Create New Groups (Meshmixer's defaults) |
+| Edit: Erase & Fill (F) | ✅ | Flat Minimal / Flat Remeshed / Smooth MVC, Refine, Smooth, Scale, Bulge, Create New Groups (Meshmixer's defaults). Pieces the erase cuts loose inside the region (e.g. the far side of a spike the brush skipped) are removed instead of being filled into floating blobs |
 | Edit: Flip Normals | ✅ | |
 | Edit: Create / Clear FaceGroup (Ctrl+G / Ctrl+Shift+G) | ✅ | |
 | Edit: Extrude (D) | ✅ | Harden, Density, Direction Normal / Constant / X / Y / Z, End type Offset / Flat, Preserve groups |

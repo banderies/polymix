@@ -570,6 +570,8 @@ impl Tool for SelectTool {
             "unwrap" => self.brush_shape = mm_core::BrushShape::Unwrap,
             "wand" => self.mode = SelectMode::Wand,
             "backfaces" => self.allow_back_faces = true,
+            // `size:8` (percent of the model).
+            c if c.starts_with("size:") => self.size_pct = c[5..].parse().unwrap_or(self.size_pct),
             _ => {}
         }
     }
