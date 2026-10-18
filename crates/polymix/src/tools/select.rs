@@ -255,7 +255,9 @@ fn to_dvec(p: egui::Pos2) -> DVec2 {
     DVec2::new(p.x as f64, p.y as f64)
 }
 
-/// Is triangle `t` facing the camera and not hidden behind other surface?
+/// Is triangle `t` in view, not hidden behind other surface? Its orientation doesn't
+/// matter: the inside of a cut-open model is visible too (on a closed surface the far side
+/// is hidden anyway).
 #[derive(Clone, Copy)]
 struct ViewTest {
     eye: DVec3,
@@ -271,7 +273,8 @@ impl ViewTest {
     fn visible(&self, mesh: &Mesh, bvh: &mm_core::Bvh, t: u32) -> bool {
         let c = mesh.tri_centroid(t);
         let to_eye = if self.ortho { -self.fwd } else { (self.eye - c).normalize() };
-        if mesh.tri_normal(t).dot(to_eye) <= 0.0 {
+        // Edge-on triangles can't be seen.
+        if mesh.tri_normal(t).dot(to_eye).abs() < 1e-9 {
             return false;
         }
         // Occlusion: cast from the centroid toward the eye.
@@ -341,20 +344,25 @@ impl SelectTool {
         let crease_cos = self.crease_cos();
         let exterior = if self.restrict_exterior { self.exterior.as_mut() } else { None };
         let exterior = std::cell::RefCell::new(exterior);
-        let allow = |t: u32| {
-            if !allow_back {
-                let to_eye = if ortho { -fwd } else { eye - mesh.tri_centroid(t) };
-                if mesh.tri_normal(t).dot(to_eye) <= 0.0 {
-                    return false;
-                }
-            }
-            match exterior.borrow_mut().as_mut() {
-                Some(e) => e.is_exterior(&mesh, t),
-                None => true,
-            }
+        let faces_eye = |t: u32| {
+            let to_eye = if ortho { -fwd } else { eye - mesh.tri_centroid(t) };
+            mesh.tri_normal(t).dot(to_eye) > 0.0
         };
         let mut changed = 0;
         for (tid, p) in stamps {
+            // Without Allow Back Faces the brush keeps to faces turned the same way as the one
+            // under it: the outside as usual, or the inside where the model is cut open. Either
+            // way the far wall of a thin part (turned the other way) is left alone.
+            let side = faces_eye(tid);
+            let allow = |t: u32| {
+                if !allow_back && faces_eye(t) != side {
+                    return false;
+                }
+                match exterior.borrow_mut().as_mut() {
+                    Some(e) => e.is_exterior(&mesh, t),
+                    None => true,
+                }
+            };
             let stamp = mm_core::BrushStamp { shape, seed: tid, center: p, normal: mesh.tri_normal(tid), radius: r, crease_cos };
             changed += o.selection.paint_brush(&mesh, &bvh, &stamp, allow, deselect);
         }
@@ -561,6 +569,7 @@ impl Tool for SelectTool {
             "disc" => self.brush_shape = mm_core::BrushShape::SphereDisc,
             "unwrap" => self.brush_shape = mm_core::BrushShape::Unwrap,
             "wand" => self.mode = SelectMode::Wand,
+            "backfaces" => self.allow_back_faces = true,
             _ => {}
         }
     }
@@ -619,7 +628,7 @@ impl Tool for SelectTool {
                         ui.selectable_value(&mut self.expand_mode, ExpandMode::CreaseAngle, "Crease Angle").on_hover_text("Grow across edges flatter than an angle that increases with the drag");
                         ui.selectable_value(&mut self.expand_mode, ExpandMode::VertexColor, "Vertex Color").on_hover_text("Grow into faces coloured like the selection; the drag sets the tolerance");
                     });
-                ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush select faces turned away from you");
+                ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush also select faces turned the other way from the surface you are brushing (e.g. the far wall of a thin part)");
                 ui.checkbox(&mut self.restrict_exterior, "Restrict to exterior faces").on_hover_text("Skip faces buried inside other parts of the mesh (e.g. overlapping tubes)");
                 ui.add(egui::Slider::new(&mut self.crease_deg, 0.0..=180.0).suffix("°").text("Crease angle threshold"))
                     .on_hover_text("The brush and Cmd+right-drag growth stop at edges sharper than this (0 = off)");
@@ -1105,8 +1114,45 @@ mod tests {
         let n = m.triangle_ids().filter(|&t| view.visible(&m, &bvh, t)).count();
         let frac = n as f64 / m.triangle_count() as f64;
         assert!((0.3..0.5).contains(&frac), "visible fraction {frac}");
-        // Visible triangles face the eye.
+        // On a closed surface the visible triangles face the eye.
         assert!(m.triangle_ids().filter(|&t| view.visible(&m, &bvh, t)).all(|t| m.tri_normal(t).dot(cam.eye() - m.tri_centroid(t)) > 0.0));
+        // Cut open, the inside (turned away from the eye) is visible too.
+        let mut bowl = m.clone();
+        let front: Vec<u32> = bowl.triangle_ids().filter(|&t| bowl.tri_normal(t).dot(cam.eye() - bowl.tri_centroid(t)) > 0.0).collect();
+        bowl.remove_triangles(front);
+        let bvh = mm_core::Bvh::build(&bowl);
+        let inside = bowl.triangle_ids().filter(|&t| view.visible(&bowl, &bvh, t)).count();
+        assert!(inside as f64 > 0.3 * bowl.triangle_count() as f64, "{inside} of {}", bowl.triangle_count());
+    }
+
+    #[test]
+    fn brush_paints_the_inside_of_a_cut_open_model() {
+        // A bowl seen from its open side: every visible face is turned away from the eye.
+        let mut m = primitives::icosphere(1.0, 4);
+        let front: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.0).collect();
+        m.remove_triangles(front);
+        let mut scene = Scene::default();
+        let id = scene.add("bowl", m);
+        let mut history = crate::scene::History::default();
+        let mut camera = crate::camera::Camera::default();
+        // Looking down -z, into the opening.
+        camera.set_view(0.0, 0.0);
+        camera.focus(&scene.bounds());
+        let mut status = String::new();
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp };
+        let mut tool = SelectTool { size_pct: 10.0, ..Default::default() };
+        assert!(!tool.allow_back_faces);
+        let c = vp.rect.center();
+        tool.pointer(&PointerInput { pos: Some(c), pressed: true, down: true, ..Default::default() }, &mut cx);
+        tool.pointer(&PointerInput { pos: Some(c + egui::vec2(4.0, 0.0)), down: true, ..Default::default() }, &mut cx);
+        tool.pointer(&PointerInput { pos: Some(c + egui::vec2(4.0, 0.0)), released: true, ..Default::default() }, &mut cx);
+        let o = cx.scene.get(id).unwrap();
+        assert!(o.selection.len() > 20, "the whole brush footprint, not one face: {}", o.selection.len());
+        // Every selected face is on the inside (turned away from the eye), none on the far rim.
+        let eye = cx.camera.eye();
+        assert!(o.selection.iter().all(|t| o.mesh.tri_normal(t).dot(eye - o.mesh.tri_centroid(t)) < 0.0));
     }
 
     #[test]
