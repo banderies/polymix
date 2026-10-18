@@ -8,6 +8,7 @@ mod icons;
 mod jobs;
 mod materials;
 mod navigation;
+mod project;
 mod renderer;
 mod scene;
 mod spacemouse;

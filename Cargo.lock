@@ -2076,6 +2076,7 @@ dependencies = [
  "rayon",
  "rfd",
  "winit",
+ "zip",
 ]
 
 [[package]]

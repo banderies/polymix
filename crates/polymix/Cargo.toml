@@ -26,6 +26,8 @@ rfd = "0.17"
 log = "0.4"
 env_logger = "0.11"
 png = "0.18"
+# Project files (.polymix) are zip archives.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 3D mouse: the 3Dconnexion driver framework is loaded at run time.

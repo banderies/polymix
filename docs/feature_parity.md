@@ -33,7 +33,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 
 | Meshmixer | Polymix | Notes |
 |---|---|---|
-| Open / Save / Save As scene (`.mix`) | ❌ | No project file yet (objects, groups, patch names, view) |
+| Open / Save / Save As scene (`.mix`) | ✅ | Own `.polymix` project (zip: manifest + lossless meshes): objects, face groups, vertex colours, patch names, colours, materials, frames, visibility, active object, target, view. ⌘S / ⇧⌘S, File → Open project, drag & drop. `.mix` files are not read |
 | Import (OBJ, PLY, STL, AMF, 3MF, OFF, MIX) | 🟡 | OBJ, PLY, STL, OFF, 3MF ✅; AMF, MIX ❌ |
 | Import → *append or replace* prompt | ❌ | Polymix always appends |
 | Auto-fix prompt when an appended mesh is much smaller/larger/far away | ❌ | |

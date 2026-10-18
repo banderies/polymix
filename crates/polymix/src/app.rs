@@ -260,6 +260,9 @@ pub struct PolymixApp {
     /// Scripts normally skip the import prompts; `prompts:on` shows them (for screenshots).
     script_prompts: bool,
     export_job: Option<Job<String>>,
+    /// Project being opened, and the file the scene was last saved to / opened from.
+    project_job: Option<(PathBuf, Job<crate::project::Project>)>,
+    project_path: Option<PathBuf>,
     nav_drag: Option<PointerButton>,
     /// Right-button drag owned by the active tool: press position.
     tool_rmb: Option<egui::Pos2>,
@@ -321,6 +324,8 @@ impl PolymixApp {
             pending_import: None,
             import_job: None,
             export_job: None,
+            project_job: None,
+            project_path: None,
             nav_drag: None,
             tool_rmb: None,
             view_history: ViewHistory::default(),
@@ -418,6 +423,12 @@ impl PolymixApp {
     // ------------------------------------------------------------------
 
     fn start_import(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
+        let (projects, files): (Vec<PathBuf>, Vec<PathBuf>) =
+            files.into_iter().partition(|f| f.extension().is_some_and(|e| e.eq_ignore_ascii_case(crate::project::EXTENSION)));
+        if let Some(p) = projects.into_iter().next() {
+            self.open_project(p, ctx);
+            return;
+        }
         if files.is_empty() || self.import_job.is_some() {
             return;
         }
@@ -476,6 +487,16 @@ impl PolymixApp {
                         self.pending_import = Some(PendingImport { meshes, placement, remember: false });
                     }
                     Err(e) => self.status = format!("Import failed: {e:#}"),
+                }
+            }
+        }
+        if let Some((path, job)) = &self.project_job {
+            if let Some(res) = job.poll() {
+                let path = path.clone();
+                self.project_job = None;
+                match res {
+                    Ok(p) => self.apply_project(p, path),
+                    Err(e) => self.status = format!("Open failed: {e:#}"),
                 }
             }
         }
@@ -595,6 +616,104 @@ impl PolymixApp {
             self.camera.scene_radius = 1e-6;
             self.camera.focus(&self.scene.bounds());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Project files
+    // ------------------------------------------------------------------
+
+    fn open_project(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.project_job.is_some() {
+            return;
+        }
+        self.recent.retain(|r| r != &path);
+        self.recent.insert(0, path.clone());
+        self.recent.truncate(10);
+        let p = path.clone();
+        self.project_job = Some((path, Job::spawn("Opening project", ctx.clone(), move |_| crate::project::load(&p))));
+    }
+
+    fn apply_project(&mut self, p: crate::project::Project, path: PathBuf) {
+        self.history.push("Open project", &self.scene);
+        self.scene.objects.clear();
+        self.scene.active = None;
+        self.scene.target = None;
+        let mut ids = Vec::new();
+        for o in p.objects {
+            let id = self.scene.add(o.name, o.mesh);
+            if let Some(so) = self.scene.get_mut(id) {
+                so.visible = o.visible;
+                so.color = o.color;
+                so.material = o.material;
+                so.frame = o.frame;
+                so.group_names = o.group_names.into_iter().collect();
+            }
+            ids.push(id);
+        }
+        self.scene.active = p.active.and_then(|i| ids.get(i).copied()).or(ids.last().copied());
+        self.scene.target = p.target.and_then(|i| ids.get(i).copied());
+        match p.view {
+            Some(v) => self.camera.set_view_state(v),
+            None => self.focus_scene(),
+        }
+        self.status = format!("Opened {}", path.display());
+        self.project_path = Some(path);
+    }
+
+    fn open_project_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("Polymix project", &[crate::project::EXTENSION]).pick_file() {
+            self.open_project(path, ctx);
+        }
+    }
+
+    /// Save the scene as a project (asking for a file when there is none yet or `save_as`).
+    fn save_project(&mut self, ctx: &egui::Context, save_as: bool) {
+        if self.scene.is_empty() {
+            self.status = "Nothing to save.".into();
+            return;
+        }
+        let path = match (&self.project_path, save_as) {
+            (Some(p), false) => p.clone(),
+            _ => {
+                let name = self.scene.active().map(|o| o.name.clone()).unwrap_or_else(|| "scene".into());
+                let mut dlg = rfd::FileDialog::new().add_filter("Polymix project", &[crate::project::EXTENSION]).set_file_name(format!("{name}.{}", crate::project::EXTENSION));
+                if let Some(d) = self.project_path.as_ref().and_then(|p| p.parent()).or(self.last_export_dir.as_deref()) {
+                    dlg = dlg.set_directory(d);
+                }
+                let Some(p) = dlg.save_file() else { return };
+                p
+            }
+        };
+        let index = |id: Option<ObjectId>| id.and_then(|id| self.scene.objects.iter().position(|o| o.id == id));
+        let objects: Vec<crate::project::ProjectObject> = self
+            .scene
+            .objects
+            .iter()
+            .map(|o| {
+                let mut groups: Vec<(i32, String)> = o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect();
+                groups.sort();
+                crate::project::ProjectObject {
+                    name: o.name.clone(),
+                    mesh: (*o.mesh).clone(),
+                    visible: o.visible,
+                    color: o.color,
+                    material: o.material,
+                    frame: o.frame,
+                    group_names: groups,
+                }
+            })
+            .collect();
+        let project = crate::project::Project {
+            objects,
+            active: index(self.scene.active),
+            target: index(self.scene.target),
+            view: Some(self.camera.view_state()),
+        };
+        self.project_path = Some(path.clone());
+        self.export_job = Some(Job::spawn("Saving", ctx.clone(), move |_| {
+            crate::project::save(&path, &project)?;
+            Ok(format!("Saved {}", path.display()))
+        }));
     }
 
     fn import_dialog(&mut self, ctx: &egui::Context) {
@@ -768,6 +887,19 @@ impl PolymixApp {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("Open project…").clicked() {
+                    ui.close();
+                    self.open_project_dialog(&ctx);
+                }
+                if ui.button("Save project   ⌘S").clicked() {
+                    ui.close();
+                    self.save_project(&ctx, false);
+                }
+                if ui.button("Save project as…   ⇧⌘S").clicked() {
+                    ui.close();
+                    self.save_project(&ctx, true);
+                }
+                ui.separator();
                 if ui.button("Import…   ⌘O").clicked() {
                     ui.close();
                     self.import_dialog(&ctx);
@@ -2232,6 +2364,10 @@ impl PolymixApp {
                     ui_util::apply_theme(ctx, t);
                 }
             }
+            "save" => {
+                self.project_path = Some(PathBuf::from(arg));
+                self.save_project(ctx, false);
+            }
             "prompts" => self.script_prompts = arg == "on",
             "prefs" => {
                 self.show_prefs = true;
@@ -2341,6 +2477,10 @@ impl PolymixApp {
         }
         if i.key_pressed(Key::E) && cmd {
             self.export_dialog(ctx, self.prefs.export_whole_scene);
+            return;
+        }
+        if i.key_pressed(Key::S) && cmd {
+            self.save_project(ctx, i.modifiers.shift);
             return;
         }
         if i.key_pressed(Key::Comma) && cmd {
@@ -2545,9 +2685,10 @@ impl eframe::App for PolymixApp {
             ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("vp_rect"), rect));
             self.viewport(ui, frame);
         });
-        let title = match self.scene.active() {
-            Some(o) => format!("Polymix — {}", o.name),
-            None => "Polymix".to_string(),
+        let title = match (&self.project_path, self.scene.active()) {
+            (Some(p), _) => format!("Polymix — {}", p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
+            (None, Some(o)) => format!("Polymix — {}", o.name),
+            (None, None) => "Polymix".to_string(),
         };
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
