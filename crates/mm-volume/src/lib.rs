@@ -14,3 +14,4 @@ pub mod organize;
 pub mod scan;
 pub mod slice;
 pub mod load;
+pub mod write;

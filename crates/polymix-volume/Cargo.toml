@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 polymix-workspace = { path = "../polymix-workspace" }
 mm-volume = { path = "../mm-volume" }
+mm-image = { path = "../mm-image" }
 polymix-imaging = { path = "../polymix-imaging" }
 egui.workspace = true
 eframe.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "mm-image"
+description = "Image preparation for Polymix (no GUI): N4 bias field correction and other image → image operations"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mm-volume = { path = "../mm-volume" }
+mm-segment = { path = "../mm-segment" }
+glam.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

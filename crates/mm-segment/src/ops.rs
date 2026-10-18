@@ -12,6 +12,42 @@ pub fn threshold(vol: &LoadedVolume, lo: f32, hi: f32) -> Mask {
     Mask { dims: vol.dims, data: vol.values.par_iter().map(|&v| (v >= lo && v <= hi) as u8).collect() }
 }
 
+/// Otsu's threshold: the value splitting the finite `values` into two classes with the most
+/// variance between them (over a 256-bin histogram). `None` when they are all equal.
+pub fn otsu(values: &[f32]) -> Option<f32> {
+    let (lo, hi) = values.iter().filter(|v| v.is_finite()).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    if hi <= lo {
+        return None;
+    }
+    const BINS: usize = 256;
+    let scale = (BINS - 1) as f64 / (hi - lo) as f64;
+    let mut hist = [0u64; BINS];
+    for &v in values.iter().filter(|v| v.is_finite()) {
+        hist[((v - lo) as f64 * scale) as usize] += 1;
+    }
+    let total: u64 = hist.iter().sum();
+    let sum: f64 = hist.iter().enumerate().map(|(k, &c)| k as f64 * c as f64).sum();
+    // The best split, and how far it stays best (empty bins between the classes).
+    let (mut w0, mut sum0, mut best, mut first, mut last) = (0u64, 0.0f64, -1.0f64, 0usize, 0usize);
+    for (k, &c) in hist.iter().enumerate().take(BINS - 1) {
+        w0 += c;
+        sum0 += k as f64 * c as f64;
+        let w1 = total - w0;
+        if w0 == 0 || w1 == 0 {
+            continue;
+        }
+        let (m0, m1) = (sum0 / w0 as f64, (sum - sum0) / w1 as f64);
+        let between = w0 as f64 * w1 as f64 * (m0 - m1) * (m0 - m1);
+        if between > best * (1.0 + 1e-12) {
+            (best, first, last) = (between, k, k);
+        } else if between >= best * (1.0 - 1e-12) && last + 1 == k {
+            last = k;
+        }
+    }
+    // After bin `first`, or in the middle of a gap of empty bins.
+    Some(lo + ((first + last) as f64 * 0.5 + 1.0) as f32 / scale as f32)
+}
+
 /// Neighbours of voxel `n` inside the grid.
 fn neighbours(dims: [usize; 3], n: usize, offsets: &[[i64; 3]], mut f: impl FnMut(usize)) {
     let plane = dims[0] * dims[1];
@@ -358,6 +394,16 @@ mod tests {
         assert_eq!(i.count(), ball);
         island_at(&mut i, [1, 1, 1], true, Connectivity::Six);
         assert_eq!(i.count(), 0);
+    }
+
+    #[test]
+    fn otsu_splits_two_classes() {
+        let mut v: Vec<f32> = (0..1000).map(|k| 20.0 + (k % 7) as f32).collect();
+        v.extend((0..400).map(|k| 200.0 + (k % 11) as f32));
+        let t = otsu(&v).unwrap();
+        assert!(v.iter().all(|&x| (x < t) == (x < 100.0)), "{t}");
+        assert!(t > 60.0 && t < 160.0, "the middle of the gap: {t}");
+        assert_eq!(otsu(&[3.0; 10]), None);
     }
 
     #[test]

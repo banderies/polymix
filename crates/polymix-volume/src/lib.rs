@@ -6,6 +6,7 @@
 //! and a thumbnail. It depends only on `polymix-workspace` and `mm-volume`, never on the Mesh
 //! workspace, so the two cannot break each other.
 
+mod prepare;
 mod preview;
 mod privacy;
 mod scan_task;
@@ -61,6 +62,7 @@ pub struct VolumeWorkspace {
     script: VecDeque<String>,
     /// A file opened from outside (Finder, command line): select its volume after the scan.
     open_select: Option<PathBuf>,
+    prepare: prepare::Prepare,
 }
 
 impl VolumeWorkspace {
@@ -84,6 +86,7 @@ impl VolumeWorkspace {
             preview: None,
             script: VecDeque::new(),
             open_select: None,
+            prepare: prepare::Prepare::default(),
         }
     }
 
@@ -211,6 +214,15 @@ impl VolumeWorkspace {
                 }
             }
             "vol.search" => self.search = arg.to_string(),
+            // vol.n4:levels=2,iterations=10 — N4 on the previewed volume.
+            "vol.n4" => {
+                self.prepare.set_options(arg);
+                let target = self.preview.as_ref().map(|p| p.volume).zip(self.catalog.clone());
+                match target {
+                    Some((k, c)) => self.prepare.start(&c.volumes[k], &c.volumes[k].name, ctx),
+                    None => println!("[volume] vol.n4: nothing selected"),
+                }
+            }
             "vol.log" => {
                 // Counts only: never identifiers.
                 match &self.catalog {
@@ -301,7 +313,11 @@ impl VolumeWorkspace {
                 if ui.small_button("×").on_hover_text("Stop looking here").clicked() {
                     remove = Some(k);
                 }
-                let name = r.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| r.display().to_string());
+                let name = if prepare::derived_dir().as_ref() == Some(r) {
+                    "Derived images (made in Polymix)".to_string()
+                } else {
+                    r.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| r.display().to_string())
+                };
                 ui.label(self.privacy.path(&name)).on_hover_text(self.privacy.path(&r.display().to_string()));
             });
         }
@@ -617,6 +633,8 @@ impl VolumeWorkspace {
                 ui.ctx().copy_text(format!("{}\n{}", self.privacy.path(&v.name), text));
             }
         });
+        let privacy = self.privacy.clone();
+        self.prepare.ui(ui, v, &privacy.path(&v.name), &|s| privacy.path(s));
     }
 }
 
@@ -704,7 +722,17 @@ impl Workspace for VolumeWorkspace {
                 p.poll(v, ctx);
             }
         }
-        if active && self.scan.is_none() && !self.preview.as_ref().is_some_and(|p| p.busy()) {
+        // A derived image was saved: list it (its folder becomes a source) and select it.
+        if let Some(path) = self.prepare.poll() {
+            if let Some(dir) = prepare::derived_dir() {
+                if !self.roots.contains(&dir) {
+                    self.roots.push(dir);
+                }
+            }
+            self.open_select = Some(path);
+            self.start_scan(ctx);
+        }
+        if active && self.scan.is_none() && !self.prepare.busy() && !self.preview.as_ref().is_some_and(|p| p.busy()) {
             if let Some(step) = self.script.pop_front() {
                 self.run_script_step(step, ctx);
                 ctx.request_repaint();
@@ -751,7 +779,7 @@ impl Workspace for VolumeWorkspace {
     }
 
     fn script_idle(&self) -> bool {
-        self.script.is_empty() && self.scan.is_none() && !self.scan_soon && !self.preview.as_ref().is_some_and(|p| p.busy())
+        self.script.is_empty() && self.scan.is_none() && !self.scan_soon && !self.preview.as_ref().is_some_and(|p| p.busy()) && !self.prepare.busy()
     }
 }
 

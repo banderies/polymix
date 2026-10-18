@@ -216,15 +216,19 @@ Lives in the Segmentation tab, which shows the volume selected in Volume. Views 
 
 ## M15 — Segmentation
 
+Every tool, effect by effect against 3D Slicer's Segment Editor (plus image preparation in
+the Volume tab and the viewer features they share), with engine and UI status:
+[segmentation_tools.md](segmentation_tools.md).
+
 - [x] **M15.1 Engine** (`mm-segment`, no GUI): masks, threshold, region growing, islands,
       grow / shrink / open / close in mm (exact distance transforms), majority smoothing,
       hole filling; a mask to a closed, manifold mesh (smoothed distance field →
       `mm_solid::mesh_implicit`, LPS or RAS); NIfTI and Slicer `.seg.nrrd` label maps.
-- [ ] **M15.2 Tools in the Segmentation tab**: segments list (name, colour, visibility),
-      threshold, paint / erase (2D / 3D, threshold-limited), region growing, islands,
-      margin, smoothing, undo.
+- [ ] **M15.2 Tools in the Segmentation tab** (see the tracking doc).
 - [ ] **M15.3 Hand-off**: *Make mesh* sends the segment to the Mesh tab; save / load label
       maps.
+- [ ] **M15.4 Image preparation in the Volume tab** (N4 bias correction, denoising, resampling,
+      crop, registration, vesselness; §7 of the tracking doc).
 
 ## Later
 

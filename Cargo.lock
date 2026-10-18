@@ -1695,6 +1695,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-image"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam 0.34.1",
+ "image",
+ "mm-segment",
+ "mm-volume",
+ "rayon",
+]
+
+[[package]]
 name = "mm-io"
 version = "0.1.0"
 dependencies = [
@@ -2589,6 +2601,7 @@ dependencies = [
  "eframe",
  "egui",
  "log",
+ "mm-image",
  "mm-volume",
  "polymix-imaging",
  "polymix-workspace",
