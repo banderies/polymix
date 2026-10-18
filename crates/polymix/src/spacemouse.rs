@@ -237,8 +237,9 @@ impl SpaceMouse {
     }
 }
 
-/// Move the camera for `dt` seconds of cap deflection. Returns true if anything moved.
-pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: f64) -> bool {
+/// Move the camera for `dt` seconds of cap deflection, turning about `pivot`. Returns true if
+/// anything moved.
+pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: f64, pivot: glam::DVec3) -> bool {
     if m.is_zero() {
         return false;
     }
@@ -261,7 +262,7 @@ pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: 
     if !s.lock_rotation {
         // About 140°/s at full deflection.
         let rate = 2.5 * s.rotate_speed as f64 * k;
-        camera.rotate_view(m.r[0] as f64 * sign(3) * rate, m.r[1] as f64 * sign(4) * rate, m.r[2] as f64 * sign(5) * rate);
+        camera.rotate_view_about(m.r[0] as f64 * sign(3) * rate, m.r[1] as f64 * sign(4) * rate, m.r[2] as f64 * sign(5) * rate, pivot);
     }
     true
 }
@@ -451,17 +452,17 @@ mod tests {
         let mut c = Camera::default();
         let s = Settings::default();
         let t0 = c.target;
-        assert!(apply(&mut c, Motion { t: [1.0, 0.0, 0.0], r: [0.0; 3] }, &s, 0.1, 800.0));
+        assert!(apply(&mut c, Motion { t: [1.0, 0.0, 0.0], r: [0.0; 3] }, &s, 0.1, 800.0, glam::DVec3::ZERO));
         assert!(c.target.distance(t0) > 0.0);
         let d0 = c.distance;
-        apply(&mut c, Motion { t: [0.0, 0.0, 1.0], r: [0.0; 3] }, &s, 0.1, 800.0);
+        apply(&mut c, Motion { t: [0.0, 0.0, 1.0], r: [0.0; 3] }, &s, 0.1, 800.0, glam::DVec3::ZERO);
         assert!(c.distance < d0, "pulling the cap toward you zooms in");
         let f0 = c.forward();
-        apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 1.0, 0.0] }, &s, 0.1, 800.0);
+        apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 1.0, 0.0] }, &s, 0.1, 800.0, glam::DVec3::ZERO);
         assert!(c.forward().dot(f0) < 0.9999);
         let locked = Settings { lock_rotation: true, lock_translation: true, ..Default::default() };
         let before = (c.target, c.distance, c.forward());
-        apply(&mut c, Motion { t: [1.0; 3], r: [1.0; 3] }, &locked, 0.1, 800.0);
+        apply(&mut c, Motion { t: [1.0; 3], r: [1.0; 3] }, &locked, 0.1, 800.0, glam::DVec3::ZERO);
         assert_eq!(before, (c.target, c.distance, c.forward()));
     }
 }

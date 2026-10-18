@@ -236,6 +236,28 @@ impl Camera {
         .normalize();
     }
 
+    /// [`Camera::tumble`], turning about `pivot` instead of the view target (the pivot stays
+    /// where it is on screen).
+    pub fn tumble_about(&mut self, dx: f64, dy: f64, pivot: DVec3) {
+        let before = self.rotation();
+        self.tumble(dx, dy);
+        self.swing_target(before, pivot);
+    }
+
+    /// [`Camera::rotate_view`] about `pivot`.
+    pub fn rotate_view_about(&mut self, rx: f64, ry: f64, rz: f64, pivot: DVec3) {
+        let before = self.rotation();
+        self.rotate_view(rx, ry, rz);
+        self.swing_target(before, pivot);
+    }
+
+    /// After the orientation changed from `before`, move the target so the camera turned
+    /// about `pivot` rather than about the target.
+    fn swing_target(&mut self, before: DQuat, pivot: DVec3) {
+        let r = self.rotation() * before.inverse();
+        self.target = pivot + r * (self.target - pivot);
+    }
+
     pub fn pan(&mut self, dx: f64, dy: f64, viewport_h: f64) {
         let s = self.pixel_size_at_target(viewport_h);
         self.target += (-self.right() * dx + self.up() * dy) * s;
@@ -362,6 +384,25 @@ mod tests {
             }
         }
         assert!(t.right().dot(t.world_up()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tumbling_about_a_pivot_keeps_it_in_place() {
+        let mut c = Camera { distance: 10.0, ..Default::default() };
+        let pivot = DVec3::new(1.5, -0.5, 2.0);
+        let screen = |c: &Camera| c.project(pivot, 1.5).unwrap().truncate();
+        let s0 = screen(&c);
+        for (dx, dy) in [(40.0, 0.0), (0.0, -30.0), (25.0, 60.0)] {
+            c.tumble_about(dx, dy, pivot);
+            assert!((screen(&c) - s0).length() < 1e-9, "the pivot stays put on screen");
+        }
+        c.rotate_view_about(0.2, -0.4, 0.3, pivot);
+        assert!((screen(&c) - s0).length() < 1e-9);
+        assert!((c.eye().distance(pivot) - Camera { ..c.clone() }.eye().distance(pivot)).abs() < 1e-12);
+        // Plain tumbling turns about the target instead.
+        let t0 = c.target;
+        c.tumble(30.0, 10.0);
+        assert_eq!(c.target, t0);
     }
 
     #[test]

@@ -322,6 +322,10 @@ pub struct PolymixApp {
     nav_drag: Option<PointerButton>,
     /// Cmd/Ctrl+middle-drag resizing the brush.
     brush_drag: bool,
+    /// Point the current navigation drag orbits about (picked when it started).
+    orbit_pivot: Option<DVec3>,
+    /// Centre of mass of an object, for the mesh version it was computed for.
+    com_cache: Option<(ObjectId, u64, DVec3)>,
     /// Right-button drag owned by the active tool: press position.
     tool_rmb: Option<egui::Pos2>,
     /// Previous / Next view.
@@ -393,6 +397,8 @@ impl PolymixApp {
             recovery: None,
             nav_drag: None,
             brush_drag: false,
+            orbit_pivot: None,
+            com_cache: None,
             tool_rmb: None,
             view_history: ViewHistory::default(),
             view_anim: None,
@@ -1810,7 +1816,8 @@ impl PolymixApp {
                     let r = drag(ui, "⟲ Tumble", "Drag to tumble");
                     if r.dragged() {
                         let d = r.drag_delta();
-                        self.camera.tumble(d.x as f64, d.y as f64);
+                        let pivot = self.center_of_mass().unwrap_or(self.camera.target);
+                        self.camera.tumble_about(d.x as f64, d.y as f64, pivot);
                     }
                     let r = drag(ui, "↔ Pan", "Drag to pan");
                     if r.dragged() {
@@ -2055,6 +2062,32 @@ impl PolymixApp {
     }
 
     /// Glide the view's pivot to the surface point under `p` (Meshmixer: Recenter At Cursor).
+    /// Centre of mass of the active object (else the first visible one), cached per mesh.
+    fn center_of_mass(&mut self) -> Option<DVec3> {
+        let o = self.scene.active().filter(|o| o.visible).or_else(|| self.scene.objects.iter().find(|o| o.visible))?;
+        let key = (o.id, o.mesh.shape_version());
+        if let Some((id, v, c)) = self.com_cache {
+            if (id, v) == key {
+                return Some(c);
+            }
+        }
+        let c = mm_core::measure::center_of_mass(&o.mesh);
+        self.com_cache = Some((key.0, key.1, c));
+        Some(c)
+    }
+
+    /// What an orbit started at `p` turns about: the point of the model under the cursor,
+    /// or, off the model, the object's centre of mass.
+    fn orbit_pivot_at(&mut self, p: Option<egui::Pos2>, vp: Viewport) -> DVec3 {
+        if let Some(p) = p {
+            let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
+            if let Some((_, h)) = tools::pick_ray(&mut self.scene, &ray, None) {
+                return h.point;
+            }
+        }
+        self.center_of_mass().unwrap_or(self.camera.target)
+    }
+
     fn recenter_at(&mut self, p: egui::Pos2, vp: Viewport, now: f64) {
         let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
         if let Some((_, h)) = tools::pick_ray(&mut self.scene, &ray, None) {
@@ -2103,7 +2136,9 @@ impl PolymixApp {
             self.remember_view();
         }
         self.space_moving = moving;
-        if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64) {
+        // The 3D mouse turns the object about its centre of mass, wherever panning has put it.
+        let pivot = if motion.r.iter().any(|r| *r != 0.0) { self.center_of_mass().unwrap_or(self.camera.target) } else { self.camera.target };
+        if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64, pivot) {
             // Keep animating while the cap is deflected.
             ctx.request_repaint();
         }
@@ -2235,6 +2270,8 @@ impl PolymixApp {
             if response.drag_started_by(btn) && nav.starts_navigation(btn, mods) {
                 self.nav_drag = Some(btn);
                 self.remember_view();
+                let origin = ctx.input(|i| i.pointer.press_origin());
+                self.orbit_pivot = Some(self.orbit_pivot_at(origin, vp));
                 break;
             }
         }
@@ -2257,7 +2294,10 @@ impl PolymixApp {
             if response.dragged_by(btn) {
                 let d = pointer_delta;
                 match nav.drag_action(btn, mods) {
-                    Some(NavAction::Tumble) => self.camera.tumble(d.x as f64, d.y as f64),
+                    Some(NavAction::Tumble) => {
+                        let pivot = self.orbit_pivot.unwrap_or(self.camera.target);
+                        self.camera.tumble_about(d.x as f64, d.y as f64, pivot);
+                    }
                     Some(NavAction::Pan) => self.camera.pan(d.x as f64, d.y as f64, rect.height() as f64),
                     Some(NavAction::Zoom) => self.camera.zoom((1.0 + d.y as f64 * 0.005).max(0.05)),
                     None => {}
@@ -2265,6 +2305,7 @@ impl PolymixApp {
             }
             if response.drag_stopped_by(btn) || !ctx.input(|i| i.pointer.button_down(btn)) {
                 self.nav_drag = None;
+                self.orbit_pivot = None;
             }
         }
         if in_rect {
@@ -2441,6 +2482,14 @@ impl PolymixApp {
 
         // --- 2D overlays ------------------------------------------------------
         let painter = ui.painter_at(rect);
+        if let (Some(btn), Some(p)) = (self.nav_drag, self.orbit_pivot) {
+            if nav.drag_action(btn, mods) == Some(NavAction::Tumble) {
+                if let Some(n) = self.camera.project(p, vp.aspect()) {
+                    let c = vp.to_screen(n);
+                    painter.circle(c, 4.0, ui_util::ACCENT, egui::Stroke::new(1.5, Color32::from_gray(20)));
+                }
+            }
+        }
         if self.view.show_pivots {
             let pivots: Vec<crate::scene::Pivot> = self.scene.objects.iter().filter(|o| o.visible).flat_map(|o| o.pivots.iter().copied()).collect();
             if !pivots.is_empty() {
@@ -2495,7 +2544,8 @@ impl PolymixApp {
         let hover = resp.hover_pos().and_then(|p| crate::view_cube::region_at(orient, centre, scale, p));
         if resp.dragged() {
             let d = resp.drag_delta();
-            self.camera.tumble(d.x as f64, d.y as f64);
+            let pivot = self.center_of_mass().unwrap_or(self.camera.target);
+            self.camera.tumble_about(d.x as f64, d.y as f64, pivot);
         } else if resp.clicked() {
             if let Some(d) = hover {
                 let (yaw, pitch) = crate::view_cube::yaw_pitch(d);

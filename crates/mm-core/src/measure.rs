@@ -35,6 +35,27 @@ pub fn surface_centroid(m: &Mesh) -> DVec3 {
     }
 }
 
+/// Centre of mass: of the enclosed solid for a closed mesh, of the surface otherwise (an open
+/// or degenerate mesh has no well-defined volume).
+pub fn center_of_mass(m: &Mesh) -> DVec3 {
+    if m.is_closed() {
+        // Sum of signed tetrahedra (o, a, b, c) about a nearby origin, for precision.
+        let o = m.bounds().center();
+        let (mut c, mut v) = (DVec3::ZERO, 0.0);
+        for t in m.triangle_ids() {
+            let [a, b, d] = m.tri_positions(t).map(|p| p - o);
+            let vt = a.dot(b.cross(d)) / 6.0;
+            c += (a + b + d) * (vt / 4.0);
+            v += vt;
+        }
+        let scale = m.bounds().diagonal().powi(3);
+        if v.abs() > 1e-9 * scale {
+            return o + c / v;
+        }
+    }
+    surface_centroid(m)
+}
+
 /// Summary statistics for display.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MeshStats {
@@ -225,4 +246,41 @@ pub fn clearance(a: &Mesh, bvh_a: &crate::Bvh, b: &Mesh, bvh_b: &crate::Bvh, bot
         closest = (c, c);
     }
     Clearance { dist_a, dist_b, min, closest, intersecting: crossing.is_some() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives;
+
+    #[test]
+    fn center_of_mass_of_solids_and_surfaces() {
+        // A cube shifted off the origin: its centre.
+        let mut cube = primitives::cube(2.0, 3);
+        cube.transform(|p| p + DVec3::new(10.0, -4.0, 3.0));
+        assert!((center_of_mass(&cube) - DVec3::new(10.0, -4.0, 3.0)).length() < 1e-9);
+        // A solid cone (apex up, base at z = -1): the mass sits a quarter of the height above
+        // the base, below the surface centroid.
+        let pts: Vec<DVec3> = (0..64).map(|i| {
+            let a = std::f64::consts::TAU * i as f64 / 64.0;
+            DVec3::new(a.cos(), a.sin(), -1.0)
+        }).collect();
+        let mut pos = pts.clone();
+        pos.push(DVec3::new(0.0, 0.0, 3.0));
+        pos.push(DVec3::new(0.0, 0.0, -1.0));
+        let (apex, base) = (64u32, 65u32);
+        let mut tris = Vec::new();
+        for i in 0..64u32 {
+            let j = (i + 1) % 64;
+            tris.push([i, j, apex]);
+            tris.push([j, i, base]);
+        }
+        let cone = Mesh::from_triangles(&pos, &tris, None).0;
+        assert!(cone.is_closed() && volume(&cone) > 0.0);
+        let c = center_of_mass(&cone);
+        assert!(c.truncate().length() < 1e-9 && (c.z - 0.0).abs() < 0.01, "{c:?}");
+        // An open surface falls back to the surface centroid.
+        let plane = primitives::plane_grid(2.0, 2.0, 4, 4);
+        assert!(center_of_mass(&plane).length() < 1e-12);
+    }
 }
