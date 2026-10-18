@@ -427,4 +427,29 @@ mod tests {
         }
         let _ = std::fs::remove_file(&p);
     }
+
+    #[test]
+    fn jpeg2000_pixels_decode() {
+        use dicom_pixeldata::PixelDecoder;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        let j2k = std::fs::read(root.join("j2k/grey12.j2k")).unwrap();
+        let raw: Vec<u16> = std::fs::read(root.join("jpegls/grey12.u16")).unwrap().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let mut o = InMemDicomObject::new_empty();
+        o.put(DataElement::new(tags::SOP_CLASS_UID, VR::UI, PrimitiveValue::from("1.2.840.10008.5.1.4.1.1.2")));
+        o.put(DataElement::new(tags::SOP_INSTANCE_UID, VR::UI, PrimitiveValue::from("1.2.3.5")));
+        o.put(DataElement::new(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, PrimitiveValue::from("MONOCHROME2")));
+        for (tag, v) in [(tags::ROWS, 30u16), (tags::COLUMNS, 40), (tags::BITS_ALLOCATED, 16), (tags::BITS_STORED, 12), (tags::HIGH_BIT, 11), (tags::PIXEL_REPRESENTATION, 0), (tags::SAMPLES_PER_PIXEL, 1)] {
+            o.put(DataElement::new(tag, VR::US, PrimitiveValue::from(v)));
+        }
+        o.put(DataElement::new(tags::PIXEL_DATA, VR::OB, Value::PixelSequence(PixelFragmentSequence::new(vec![], vec![j2k]))));
+        let file = o.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::JPEG2000_LOSSLESS).media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2").media_storage_sop_instance_uid("1.2.3.5")).unwrap();
+        let p = std::env::temp_dir().join(format!("mmv-j2k-{}.dcm", std::process::id()));
+        file.write_to_file(&p).unwrap();
+        let obj = dicom_object::open_file(&p).unwrap();
+        let px = obj.decode_pixel_data_frame(0).unwrap();
+        let v: Vec<f32> = px.to_vec_frame(0).unwrap();
+        assert_eq!(v, raw.iter().map(|&r| r as f32).collect::<Vec<_>>());
+        assert!(transfer_syntax_name(uids::JPEG2000_LOSSLESS).1);
+        let _ = std::fs::remove_file(&p);
+    }
 }

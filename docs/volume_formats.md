@@ -9,19 +9,23 @@ sparse structure). Researched October 2026; crate versions as of then.
 
 | Format | Files | Notes |
 |---|---|---|
-| DICOM | `.dcm`, `.ima`, no extension, DICOMDIR | dicom-rs 0.10. Classic and Enhanced multi-frame; pixels in uncompressed, deflate, RLE and JPEG (baseline, extended, lossless) syntaxes, all pure Rust. Organised Patient → Study → Series like 3D Slicer |
+| DICOM | `.dcm`, `.ima`, no extension, DICOMDIR | dicom-rs 0.10. Classic and Enhanced multi-frame; pixels in uncompressed, deflate, RLE, JPEG (baseline, extended, lossless), JPEG 2000 (openjp2) and JPEG-LS (own decoder) syntaxes, all in Rust. Organised Patient → Study → Series like 3D Slicer |
 | NIfTI-1 / NIfTI-2 | `.nii`, `.nii.gz`, `.hdr` + `.img` | Own reader (both header sizes, both byte orders); sform → qform → voxel sizes |
 | Analyze 7.5 | `.hdr` + `.img` | No orientation in the format (flagged) |
 | NRRD | `.nrrd`, `.nhdr` + data file | Raw and gzip data; Slicer segmentations (`.seg.nrrd`) with segment names |
+| MetaImage | `.mha`, `.mhd` + `.raw` / `.zraw` | ITK's format; zlib-compressed data; LPS directions |
+| MGH / MGZ | `.mgh`, `.mgz` | FreeSurfer; label volumes (aseg, aparc, …) marked |
+| Image stacks | folders of ≥ 16 JPEG / PNG / BMP / TIFF slices | natural name order; 1 mm assumed |
+| Multi-page TIFF | `.tif`, `.tiff` | voxel sizes from ImageJ or OME metadata |
 
-Recognised but not read yet (listed as such by the scanner): MetaImage, MGH/MGZ, MINC, Imaris,
-DREAM3D, MRC/CCP4, FITS, VTK legacy, Interfile, ECAT 7, and folders of 2D images (image stacks).
+Recognised but not read yet (listed as such by the scanner): MINC, Imaris, DREAM3D, MRC/CCP4,
+FITS, VTK legacy, Interfile, ECAT 7.
 
 ## Next steps for the formats above
 
 | Gap | Approach | Effort |
 |---|---|---|
-| JPEG-LS and JPEG 2000 / HTJ2K DICOM pixels | Pure Rust first: `j2k-native` (8/12/16-bit, HTJ2K) or the codecs of `dicom-toolkit-rs`; otherwise `charls-sys` (C++) and `openjpeg-sys` (C) through dicom-rs features | medium |
+| High-Throughput JPEG 2000 DICOM pixels | `j2k-native` or a newer openjp2 | medium |
 | Siemens mosaics (fMRI, DTI) | Unpack the tiles; slice count from the CSA header | medium |
 | DICOM SEG, RT Structure Set | Segmentations and contours from DICOM (useful for the Segmentation workspace) | medium |
 | NRRD bzip2, multi-file NRRD | `bzip2` crate; `data file: LIST` | small |
@@ -98,13 +102,11 @@ DREAM3D, MRC/CCP4, FITS, VTK legacy, Interfile, ECAT 7, and folders of 2D images
 
 ## Suggested order
 
-1. **MetaImage** and **MGH/MGZ**: common in research pipelines, small readers.
-2. **Image stacks** (TIFF, PNG, JPEG, BMP) and **raw + header** industrial CT formats: one
-   reader covers many vendors; also reads exported slice folders like the reference data's
-   INV2 series.
-3. **JPEG 2000 / JPEG-LS** DICOM pixels, so every clinical DICOM previews.
-4. **OME-Zarr** and **MRC** for microscopy and cryo-EM.
-5. HDF5-based formats (MINC 2, Imaris, DREAM3D) once a pure-Rust HDF5 reader matures.
+1. ~~MetaImage and MGH/MGZ~~, ~~image stacks~~, ~~JPEG 2000 / JPEG-LS DICOM pixels~~: done.
+2. **Raw + header** industrial CT formats (Volume Graphics, Nikon, Waygate): one reader
+   pattern covers many vendors.
+3. **OME-Zarr** and **MRC** for microscopy and cryo-EM.
+4. HDF5-based formats (MINC 2, Imaris, DREAM3D) once a pure-Rust HDF5 reader matures.
 
 ## Sources
 

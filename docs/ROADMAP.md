@@ -182,18 +182,47 @@ The library behind the Volume workspace: no GUI, fully unit-tested.
       folders (venv, .git, …), parallel, cancellable, fault-tolerant; incremental rescans.
 - [x] **M12.7 Slices** for thumbnails (NIfTI / Analyze / NRRD / DICOM, pure-Rust JPEG
       Lossless, RLE, deflate).
+- [x] **M12.8 More formats and codecs**: MetaImage (`.mha`, `.mhd` + raw / zlib), FreeSurfer
+      MGH / MGZ, folders of 2D images (JPEG, PNG, BMP, TIFF, natural name order), multi-page
+      TIFF (ImageJ / OME voxel sizes); JPEG 2000 (openjp2) and JPEG-LS (own T.87 decoder,
+      checked against CharLS) DICOM pixels; whole volumes loaded in memory (`load`), DICOM
+      decoded in parallel.
 
 ## M13 — Volume browser
 
 - [x] **M13.1 Browser UI**: Add folder / Rescan / Cancel, sources, the DICOM tree and the
       other-files table, filters, search, details panel, Hide identifiers.
 - [x] **M13.2 Thumbnail** with slice slider and window / level.
+- [x] **M13.3 Open from the Finder**: Open With / double-click / Dock icon for images and
+      folders (Apple Event handler); the opened file is selected after its scan.
+
+## M14 — Volume viewer
+
+Lives in the Segmentation tab, which shows the volume selected in Volume. Views are shared
+(`polymix-imaging`) so every image view behaves the same.
+
+- [x] **M14.1 Mouse controls for image views**: left drag slices, right drag pan, middle drag
+      zoom, left + right drag window / level, wheel slices (captured over the view), click for
+      the crosshair, double-click resets.
+- [x] **M14.2 Three planes**: axial, sagittal and coronal (radiological convention) with a
+      shared crosshair, orientation letters, label overlays, value under the pointer.
+- [x] **M14.3 3D view**: GPU ray casting (MIP, shaded volume rendering, threshold surface)
+      with label surfaces in front.
+
+## M15 — Segmentation
+
+- [x] **M15.1 Engine** (`mm-segment`, no GUI): masks, threshold, region growing, islands,
+      grow / shrink / open / close in mm (exact distance transforms), majority smoothing,
+      hole filling; a mask to a closed, manifold mesh (smoothed distance field →
+      `mm_solid::mesh_implicit`, LPS or RAS); NIfTI and Slicer `.seg.nrrd` label maps.
+- [ ] **M15.2 Tools in the Segmentation tab**: segments list (name, colour, visibility),
+      threshold, paint / erase (2D / 3D, threshold-limited), region growing, islands,
+      margin, smoothing, undo.
+- [ ] **M15.3 Hand-off**: *Make mesh* sends the segment to the Mesh tab; save / load label
+      maps.
 
 ## Later
 
-- **M14 — Volume viewer**: three planes (MPR) and a 3D view.
-- **M15 — Segmentation workspace**: threshold, region growing, paint, islands; hand-off to
-  Mesh through `mm_solid::mesh_implicit` / `marching_tetrahedra`.
-- **Codecs**: JPEG-LS and JPEG 2000 (pure Rust first: `j2k-native`, `dicom-toolkit-rs`;
-  else `charls-sys` / `openjpeg-sys`).
+- **DICOM extras**: Siemens mosaics, DICOM SEG and RT structure sets, High-Throughput JPEG
+  2000, DICOMDIR records.
 - **More formats**: see [volume_formats.md](volume_formats.md).

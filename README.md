@@ -16,8 +16,9 @@ cleaning up medical segmentations (e.g. cerebral vessels from 3D Slicer) for CFD
 
 Polymix has three workspaces, shown as tabs at the top of the window (⌘1 / ⌘2 / ⌘3):
 
-- **Volume**: find, organise and preview medical images (DICOM, NIfTI, NRRD) in a folder.
-- **Segmentation**: coming next.
+- **Volume**: find, organise and preview medical images (DICOM, NIfTI, NRRD, …) in a folder.
+- **Segmentation**: the image selected in Volume in three planes and in 3D (segmentation
+  tools coming next).
 - **Mesh**: the mesh editor described below.
 
 **Volume** (*Add folder…*): Polymix looks through the folder and everything under it,
@@ -27,19 +28,30 @@ skips tool folders (virtual environments, version control). It lists:
 - **DICOM** organised like 3D Slicer's DICOM browser: Patient → Study (date, description,
   accession) → Series, with a series split into volumes where it mixes orientations, echoes or
   sizes; localizers, derived images (reformats, projections, maps) and non-image objects
-  (screenshots, reports) are marked. Enhanced multi-frame and JPEG Lossless files work.
-- **NIfTI** (`.nii`, `.nii.gz`, NIfTI-2), **Analyze** (`.hdr` + `.img`) and **NRRD** (including
-  Slicer `.seg.nrrd` segmentations), by folder, marked as image, label map, segmentation, vector
-  field or time series.
-- What it recognised but cannot read yet (MetaImage, MGH, MINC, image stacks, …), what failed,
-  and what it skipped.
+  (screenshots, reports) are marked. Enhanced multi-frame files work, and every common pixel
+  compression (JPEG baseline and lossless, JPEG-LS, JPEG 2000, RLE, deflate), all in Rust.
+- **NIfTI** (`.nii`, `.nii.gz`, NIfTI-2), **Analyze** (`.hdr` + `.img`), **NRRD** (including
+  Slicer `.seg.nrrd` segmentations), **MetaImage** (`.mha`, `.mhd`), **FreeSurfer MGH / MGZ**,
+  multi-page **TIFF** and folders of 2D images (JPEG, PNG, BMP, TIFF slices), by folder,
+  marked as image, label map, segmentation, vector field or time series.
+- What it recognised but cannot read yet (MINC, Imaris, MRC, …), what failed, and what it
+  skipped.
 
 Select a series or file for its header (grouped: patient, study, series, equipment,
-acquisition, geometry, pixel) and a slice (scroll for slices, drag for window / level, shown
-in the radiological convention). Warnings flag missing or uneven slices, gantry tilt, missing
-orientation and pixel formats not viewable yet (JPEG 2000, JPEG-LS). **Hide identifiers**
-masks names, IDs, birth dates and accession numbers, including inside file names. Folders are
-remembered and rescans only read changed files.
+acquisition, geometry, pixel) and a slice in the radiological convention. Warnings flag
+missing or uneven slices, gantry tilt, missing orientation and pixel formats not viewable yet.
+**Hide identifiers** masks names, IDs, birth dates and accession numbers, including inside
+file names. Folders are remembered and rescans only read changed files. Images and folders
+can also be opened from the Finder (*Open With → Polymix*, or dropped on the Dock icon).
+
+**Segmentation** shows the image selected in Volume: axial, sagittal and coronal planes with
+a shared crosshair, and a 3D view (maximum intensity projection, volume rendering, or the
+surface above a threshold).
+
+Every image view uses the same mouse: **left drag** scrolls through slices, **right drag**
+pans, **middle drag** zooms, **left + right drag** sets window / level, the **wheel** scrolls
+slices (⌘ + wheel zooms), a **click** moves the crosshair and a **double-click** resets. In the
+3D view, left drag rotates.
 
 Each workspace is independent: if one runs into an internal error it stops on its own (its
 tab shows what happened, with a Restart button and a log in the data folder) and the
