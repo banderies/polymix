@@ -39,43 +39,43 @@ needs the left button takes it (`SliceOptions::left_drag_scrolls = false` →
 
 | Slicer | Engine | UI | Notes |
 |---|---|---|---|
-| Segments in one segmentation: binary label maps, shared layers when they do not overlap | 🟡 | ❌ | `Mask` per segment, `write_label` into a `u8` label map (up to 255 segments, no overlap yet) |
-| Segment list: Add, Remove, rename, colour + terminology, visibility (eye), state flag (Not started / In progress / Completed / Flagged), layer column, filter bar, q / w = previous / next segment | ❌ | ❌ | |
-| Segments in the slice views: fill and outline, opacity per segment | — | 🟡 | `SliceView` draws a `LabelOverlay` fill with opacity; outline ❌ |
-| Show 3D: segment surfaces kept up to date while editing, smoothing factor (0 = none, 0.1 weak, ≥ 0.5 strong) | — | 🟡 | `VolumeView3d` draws smoothed label surfaces; the Segmentation tab does not pass labels yet; smoothing factor ❌ |
-| Undo / redo (z / y), last 10 states | ❌ | ❌ | |
-| Masking — Editable area: Everywhere, Inside / Outside all segments, Inside / Outside all visible segments, Inside / Outside one segment | ❌ | ❌ | `Mask` boolean ops make it cheap |
-| Masking — Editable intensity range (i toggles; preview with Threshold) | ❌ | ❌ | |
-| Masking — Modify other segments: Overwrite all (default), Overwrite visible, Allow overlap | 🟡 | ❌ | `write_label(overwrite)`; overlap needs layers |
-| Source volume and segmentation geometry: Specify geometry (oversampling, ROI extent, Pad output) | ❌ | ❌ | Labels currently follow the loaded volume's grid |
+| Segments in one segmentation: binary label maps, shared layers when they do not overlap | 🟡 | 🟡 | One `u8` label map (up to 255 segments); no overlapping segments yet |
+| Segment list: Add, Remove, rename, colour + terminology, visibility (eye), state flag (Not started / In progress / Completed / Flagged), layer column, filter bar, q / w = previous / next segment | — | 🟡 | Add, Remove, rename (double-click), colour, visibility, volume in mL; terminology, state flag, filter, q / w ❌ |
+| Segments in the slice views: fill and outline, opacity per segment | — | ✅ | Fill (opacity slider) and outline; one opacity for all segments |
+| Show 3D: segment surfaces kept up to date while editing, smoothing factor (0 = none, 0.1 weak, ≥ 0.5 strong) | — | 🟡 | Surfaces update after each edit / brush stroke; smoothing factor ❌ |
+| Undo / redo (z / y), last 10 states | ✅ | ✅ | ⌘Z / ⇧⌘Z and buttons; 10 run-length-encoded states; a brush stroke is one step |
+| Masking — Editable area: Everywhere, Inside / Outside all segments, Inside / Outside all visible segments, Inside / Outside one segment | ✅ | ✅ | |
+| Masking — Editable intensity range (i toggles; preview with Threshold) | ✅ | 🟡 | Threshold's Use for masking sets it; the i key ❌ |
+| Masking — Modify other segments: Overwrite all (default), Overwrite visible, Allow overlap | 🟡 | 🟡 | Overwrite all / visible, and Keep other segments in place of Allow overlap (needs layers) |
+| Source volume and segmentation geometry: Specify geometry (oversampling, ROI extent, Pad output) | ❌ | 🟡 | Labels follow the volume's grid; selecting a volume on the same grid (e.g. its N4-corrected copy) keeps the segments, another grid asks before discarding them |
 | Effects in the 3D view (Paint, Scissors, Islands clicks) | — | ❌ | needs picking in `VolumeView3d` |
-| Shortcuts: ← / → slice, Shift + move = scroll to the pointer, Ctrl + wheel zoom, Esc, Space = last two effects, 1–0 / Shift + 1–0 = effects, i = intensity masking | — | 🟡 | wheel, ⌘ / Ctrl + wheel zoom and Fit exist; the rest ❌ |
+| Shortcuts: ← / → slice, Shift + move = scroll to the pointer, Ctrl + wheel zoom, Esc, Space = last two effects, 1–0 / Shift + 1–0 = effects, i = intensity masking | — | 🟡 | Wheel, ⌘ / Ctrl + wheel zoom, Esc, Shift + wheel brush size; the rest ❌ |
 
 ## 2. Segment Editor effects (Slicer core)
 
 | Slicer effect and options | Engine | UI | Notes |
 |---|---|---|---|
-| **Threshold** — range slider over the histogram; live preview; Automatic threshold (Otsu, Huang, IsoData, Kittler-Illingworth, Li, Maximum entropy, Moments, Renyi entropy, Shanbhag, Triangle, Yen) and how it is used (lower, upper, or around the automatic value); range from a local histogram (box, circle or line drawn on a slice); Use for masking | 🟡 | ❌ | `threshold(vol, lo, hi)`; automatic methods and local histogram ❌ |
-| **Paint** — brush radius in mm or % of the view; click = one dab, drag = stroke (applied on release); Sphere brush (3D); Pixel mode; Edit in 3D views; Shift + wheel and − / + resize | ❌ | ❌ | Sphere dab is simple; brush preview in the views |
+| **Threshold** — range slider over the histogram; live preview; Automatic threshold (Otsu, Huang, IsoData, Kittler-Illingworth, Li, Maximum entropy, Moments, Renyi entropy, Shanbhag, Triangle, Yen) and how it is used (lower, upper, or around the automatic value); range from a local histogram (box, circle or line drawn on a slice); Use for masking | 🟡 | 🟡 | Histogram with draggable range, live preview of the result, Auto (Otsu), Use for masking; other automatic methods and local histogram ❌ |
+| **Paint** — brush radius in mm or % of the view; click = one dab, drag = stroke (applied on release); Sphere brush (3D); Pixel mode; Edit in 3D views; Shift + wheel and − / + resize | ✅ | 🟡 | Radius in mm, disc or sphere, brush outline in the views, Shift + wheel; applied live; % of view, Pixel mode, 3D views, − / + ❌ |
 | **Draw** — click points or drag a line on a slice; double-click / right click fills; x deletes the last point, a / Enter applies | ❌ | ❌ | Right click → Enter / double-click (right drag pans) |
-| **Erase** — Paint that removes; with Editable area = a segment, erased voxels move into that segment (split a segment) | ❌ | ❌ | Shares Paint's brush |
+| **Erase** — Paint that removes; with Editable area = a segment, erased voxels move into that segment (split a segment) | ✅ | ✅ | Shares Paint's brush; the split works |
 | **Level tracing** — moving the pointer outlines the same-intensity region under it on the slice; click applies | ❌ | ❌ | 2D flood fill on the slice |
 | **Grow from seeds** — fast GrowCut from ≥ 2 visible seed segments; Initialize / Update / Auto-update / Cancel / Apply; seed locality; preview | ❌ | ❌ | `region_grow` is a different (threshold flood) algorithm |
 | **Fill between slices** — morphological contour interpolation across any number of skipped slices; Initialize / Update / Auto-update / Cancel / Apply; shape only | ❌ | ❌ | |
-| **Margin** — grow or shrink by mm; Apply to visible segments | ✅ | ❌ | `grow` / `shrink` (exact Euclidean distance) |
+| **Margin** — grow or shrink by mm; Apply to visible segments | ✅ | 🟡 | Selected segment; Apply to visible segments ❌ |
 | **Hollow** — shell of a given thickness; current segment as the inside, medial or outside surface; Apply to visible segments | 🟡 | ❌ | Composes from `grow` / `shrink` / `subtract`; vessel walls |
-| **Smoothing** — Median, Opening, Closing (kernel in mm), Gaussian (σ), Joint smoothing (all visible segments together, watertight boundaries); Apply to all or brush a region | 🟡 | ❌ | `majority` (median), `open`, `close`, `fill_holes` (enclosed cavities) ✅; Gaussian, Joint, brush region ❌ |
+| **Smoothing** — Median, Opening, Closing (kernel in mm), Gaussian (σ), Joint smoothing (all visible segments together, watertight boundaries); Apply to all or brush a region | 🟡 | 🟡 | Median, Opening, Closing, Fill holes; Gaussian, Joint, brush region, Apply to visible segments ❌ |
 | **Scissors** — Erase inside / Erase outside / Fill inside / Fill outside; free-form, circle or rectangle (lines can snap horizontal / vertical); slice cut: Unlimited, Positive, Negative, Symmetric with thickness; slice or 3D views; Apply to visible segments | ❌ | ❌ | Lasso projected through the volume |
-| **Islands** — Keep largest; Remove small (minimum size); Split islands to segments; Keep selected; Remove selected; Add selected (click an empty region) | 🟡 | ❌ | `keep_largest`, `remove_small`, `island_at` (keep / remove), `components` ✅; Add selected ❌; split needs the segment list |
-| **Logical operators** — Copy, Add, Subtract, Intersect, Invert, Clear, Fill; Bypass masking | ✅ | ❌ | `union` / `subtract` / `intersect` / `invert`; Copy / Clear / Fill are trivial |
+| **Islands** — Keep largest; Remove small (minimum size); Split islands to segments; Keep selected; Remove selected; Add selected (click an empty region) | ✅ | ✅ | All six; island clicks in the slice views |
+| **Logical operators** — Copy, Add, Subtract, Intersect, Invert, Clear, Fill; Bypass masking | ✅ | 🟡 | All seven; Bypass masking ❌ (masking applies) |
 | **Mask volume** — Fill inside, Fill outside, or Fill inside and outside (binary) with fill values; Soft edge (Gaussian σ); output to a new or the same volume | ❌ | ❌ | Needs a scalar-volume writer |
 
 ## 3. SegmentEditorExtraEffects
 
 | Slicer effect and options | Engine | UI | Notes |
 |---|---|---|---|
-| **Local threshold** — ⌘ / Ctrl-click adds the structure under the pointer within a threshold range (set visually, from a local histogram, or a slider); Minimum diameter stops leaks through narrow necks; region of interest; algorithm GrowCut, Watershed or Masking, with feature size | 🟡 | ❌ | `region_grow` + `open` cover the Masking variant; the best one-click vessel tool |
-| **Flood filling** — similar-intensity voxels connected to the click (intensity tolerance, neighbourhood size) | ✅ | ❌ | `region_grow` with 6- / 26-connectivity |
+| **Local threshold** — ⌘ / Ctrl-click adds the structure under the pointer within a threshold range (set visually, from a local histogram, or a slider); Minimum diameter stops leaks through narrow necks; region of interest; algorithm GrowCut, Watershed or Masking, with feature size | 🟡 | 🟡 | As Flood fill with the threshold range and a minimum diameter (opening); ROI, GrowCut / Watershed variants ❌ |
+| **Flood filling** — similar-intensity voxels connected to the click (intensity tolerance, neighbourhood size) | ✅ | ✅ | Tolerance around the clicked value or the threshold range; minimum diameter stops leaks |
 | **Draw tube** — tube through clicked points with a radius (catheters, nerves, vessels) | ❌ | ❌ | Mesh tab has Add Tube; here as voxels |
 | **Fast marching** — grows the current segment, target size (% of volume) limits leaks | ❌ | ❌ | |
 | **Watershed** — complete segmentation from seeds, object scale smooths the result | ❌ | ❌ | |
@@ -97,13 +97,13 @@ needs the left button takes it (`SliceOptions::left_drag_scrolls = false` →
 
 | Slicer | Engine | UI | Notes |
 |---|---|---|---|
-| Export segments as a label map: NIfTI, `.seg.nrrd` with segment names and colours | ✅ | ❌ | `write_nifti`, `write_seg_nrrd`; Slicer and the Volume tab read them back |
+| Export segments as a label map: NIfTI, `.seg.nrrd` with segment names and colours | ✅ | ✅ | Save segmentation…; Slicer and the Volume tab read them back |
 | Import a label map / `.seg.nrrd` / NIfTI labels as segments | ❌ | ❌ | The Volume tab already finds them (kinds Label map, Segmentation) |
-| Export segments as models (STL / OBJ / PLY), closed-surface smoothing | ✅ | ❌ | `mask_to_mesh`: closed, manifold, outward, LPS like Slicer |
-| **Send to the Mesh tab** (Polymix) | 🟡 | ❌ | Needs `MeshWorkspace::add_mesh(name, Mesh)` reusing the import path |
+| Export segments as models (STL / OBJ / PLY), closed-surface smoothing | ✅ | 🟡 | Make mesh → Mesh tab (closed, manifold, LPS like Slicer), exported from there |
+| **Send to the Mesh tab** (Polymix) | ✅ | ✅ | Selected or every visible segment; arrives through Mesh's import (Append / Replace) |
 | Import a model as a segment (voxelise) | ❌ | ❌ | `mm-solid` voxelises meshes |
 | Copy / move segments between segmentations; convert representations | ❌ | ❌ | ⚪ |
-| **Segment statistics** — voxel count, volume (mm³, cm³), surface area, mean / SD / min / max / median intensity, centroid, bounding box, Feret diameter, roundness, elongation | 🟡 | ❌ | `count`, `bounds` |
+| **Segment statistics** — voxel count, volume (mm³, cm³), surface area, mean / SD / min / max / median intensity, centroid, bounding box, Feret diameter, roundness, elongation | 🟡 | 🟡 | Volume (mL) in the segment list; the rest ❌ |
 | Standard terminology (anatomical names and colours) | ❌ | ❌ | ⚪ |
 
 ## 6. AI-assisted segmentation (Slicer extensions)
@@ -156,7 +156,7 @@ crate), **UI** the Volume tab.
 
 | Feature | Status | Notes |
 |---|---|---|
-| Receive segment meshes (`MeshWorkspace::add_mesh`) | ❌ | See §5 Send to the Mesh tab |
+| Receive segment meshes (`MeshWorkspace::add_meshes`) | ✅ | Through the import prompts |
 | Image slices in the Mesh 3D view, to check the surface against the image | ❌ | |
 | Mesh → segment (voxelise; round trip for fixes) | ❌ | |
 | Aneurysm morphology: neck width, dome height, aspect and size ratios | ❌ | ⚪ on surface + centerline |

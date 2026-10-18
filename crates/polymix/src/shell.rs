@@ -350,6 +350,11 @@ impl eframe::App for PolymixApp {
                 self.segmentation.call(|w| w.show_volume(&catalog.volumes[k], &label, ctx));
             }
         }
+        // Meshes made in Segmentation go to Mesh, which is shown.
+        if let Some(meshes) = self.segmentation.call(|w| w.take_meshes()).filter(|m| !m.is_empty()) {
+            self.mesh.call(|w| w.add_meshes(meshes));
+            self.active = Tab::Mesh;
+        }
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
         self.segmentation.call(|w| w.tick(ctx, active == Tab::Segmentation));
         self.mesh.call(|w| w.tick(ctx, active == Tab::Mesh));

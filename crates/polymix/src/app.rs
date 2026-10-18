@@ -691,6 +691,30 @@ impl MeshWorkspace {
         }));
     }
 
+    /// Add meshes made in another workspace (Segmentation's Make mesh), in file coordinates
+    /// (LPS, Z up, like 3D Slicer's model files): they go through the import prompts like
+    /// imported files.
+    pub fn add_meshes(&mut self, meshes: Vec<(String, Mesh)>) {
+        let mut meshes: Vec<(String, Mesh, String)> = meshes
+            .into_iter()
+            .map(|(name, mesh)| {
+                let note = format!("{name}: {} triangles from Segmentation", mesh.triangle_count());
+                (name, mesh, note)
+            })
+            .collect();
+        if let Some(p) = &mut self.pending_import {
+            p.meshes.append(&mut meshes);
+            return;
+        }
+        let placement = match self.prefs.import_mode {
+            _ if self.scene.is_empty() => Some(false),
+            ImportMode::Ask => None,
+            ImportMode::Append => Some(false),
+            ImportMode::Replace => Some(true),
+        };
+        self.pending_import = Some(PendingImport { meshes, placement, remember: false });
+    }
+
     fn poll_jobs(&mut self) {
         if let Some(job) = &self.import_job {
             if let Some(res) = job.poll() {

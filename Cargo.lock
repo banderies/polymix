@@ -2588,9 +2588,13 @@ dependencies = [
  "egui",
  "glam 0.34.1",
  "log",
+ "mm-core",
+ "mm-segment",
  "mm-volume",
  "polymix-imaging",
  "polymix-workspace",
+ "rayon",
+ "rfd",
 ]
 
 [[package]]

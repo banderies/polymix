@@ -41,19 +41,23 @@ pub struct LabelOverlay<'a> {
     pub version: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SliceOptions {
-    /// Left drag scrolls slices; off while a tool (e.g. a brush) uses the left button.
+    /// Left drag scrolls slices and a click moves the crosshair; off while a tool (e.g. a
+    /// brush) uses the left button.
     pub left_drag_scrolls: bool,
     /// Lines where the other two planes cut this one.
     pub crosshair: bool,
     /// Interpolate between voxels (off: every voxel is a sharp square).
     pub smooth: bool,
+    /// A brush of this radius (mm) follows the pointer, and Shift + wheel sizes it
+    /// ([`SliceResponse::brush_wheel`]) instead of scrolling slices.
+    pub brush_mm: Option<f32>,
 }
 
 impl Default for SliceOptions {
     fn default() -> Self {
-        Self { left_drag_scrolls: true, crosshair: true, smooth: true }
+        Self { left_drag_scrolls: true, crosshair: true, smooth: true, brush_mm: None }
     }
 }
 
@@ -61,11 +65,14 @@ pub struct SliceResponse {
     pub response: egui::Response,
     /// The voxel under the pointer (over the image only).
     pub hover_voxel: Option<DVec3>,
-    /// The voxel left-clicked; the cursor has moved there.
+    /// The voxel left-clicked (the cursor has moved there, unless a tool has the left
+    /// button).
     pub clicked_voxel: Option<DVec3>,
     /// The voxel under a left drag, when the left button is a tool's (`left_drag_scrolls`
     /// off).
     pub left_drag_voxel: Option<DVec3>,
+    /// Shift + wheel over the view while a brush is shown, in notches (positive = up).
+    pub brush_wheel: f32,
 }
 
 /// View colours as in 3D Slicer: red axial, yellow sagittal, green coronal.
@@ -171,6 +178,29 @@ impl Grid {
     }
 }
 
+/// Take the wheel events of this frame from the input (so the slice controls do not see
+/// them) and return them in notches. macOS turns Shift + wheel into a horizontal scroll, so
+/// either direction counts.
+fn take_wheel(ctx: &egui::Context) -> f32 {
+    ctx.input_mut(|i| {
+        let mut notches = 0.0;
+        for e in &i.raw.events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = e {
+                let d = if delta.y != 0.0 { delta.y } else { delta.x };
+                notches += match unit {
+                    egui::MouseWheelUnit::Point => d / 24.0,
+                    _ => d,
+                };
+            }
+        }
+        let wheel = |e: &egui::Event| matches!(e, egui::Event::MouseWheel { .. });
+        i.raw.events.retain(|e| !wheel(e));
+        i.events.retain(|e| !wheel(e));
+        i.smooth_scroll_delta = Vec2::ZERO;
+        notches
+    })
+}
+
 /// Identifies a volume (by its voxel array) so a new one is noticed.
 type VolumeId = (usize, usize, [usize; 3]);
 
@@ -218,6 +248,7 @@ impl SliceView {
         let n = vol.dims[axes.slice];
         let (primary, secondary) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
         let tool_drag = !opts.left_drag_scrolls && primary && !secondary && response.is_pointer_button_down_on();
+        let brush_wheel = if opts.brush_mm.is_some() && response.hovered() && ui.input(|i| i.modifiers.shift) { take_wheel(ui.ctx()) } else { 0.0 };
         let ev = self.nav.handle(ui, &response);
         let img = self.nav.image_rect(rect, grid.content());
         // Pointer → voxel coordinates across and down (over the image only).
@@ -235,24 +266,22 @@ impl SliceView {
         if let Some(d) = ev.window {
             state.window = drag_window(state.window, d);
         }
-        let mut clicked_voxel = None;
-        if let Some((a, d)) = ev.clicked.and_then(on_image) {
-            state.cursor[axes.across] = a;
-            state.cursor[axes.down] = d;
-            clicked_voxel = Some(state.cursor);
+        let slice = nearest(state.cursor[axes.slice], n);
+        let at = |(a, d): (f64, f64)| grid.voxel(a, d, slice as f64);
+        let clicked_voxel = ev.clicked.and_then(on_image).map(at);
+        if let (Some(c), true) = (clicked_voxel, opts.left_drag_scrolls) {
+            state.cursor = c;
         }
         if ev.double_clicked {
             self.nav.reset();
             state.window = vol.auto_window;
         }
-        let slice = nearest(state.cursor[axes.slice], n);
-        let at = |(a, d): (f64, f64)| grid.voxel(a, d, slice as f64);
         let hover_voxel = ev.hover.and_then(on_image).map(at);
         let left_drag_voxel = if tool_drag { response.interact_pointer_pos().and_then(on_image).map(at) } else { None };
 
         self.update_texture(ui.ctx(), vol, &grid, slice, state.window, overlay, opts.smooth);
-        self.paint(ui, rect, img, vol, &grid, state, opts);
-        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel }
+        self.paint(ui, rect, img, vol, &grid, state, opts, ev.hover);
+        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel }
     }
 
     /// Re-make the texture when what it shows has changed.
@@ -283,19 +312,19 @@ impl SliceView {
         };
         let pixels: Vec<Color32> = match overlay {
             Some(o) => {
-                let alpha = o.opacity.clamp(0.0, 1.0);
-                self.values
-                    .iter()
-                    .zip(&self.labels)
-                    .map(|(&x, &l)| {
-                        let g = grey(x);
-                        match o.colours.get(l as usize).filter(|_| l != 0) {
-                            Some(col) => {
-                                let mix = |c: u8| (g as f32 + (c as f32 - g as f32) * alpha).round() as u8;
-                                Color32::from_rgb(mix(col.r()), mix(col.g()), mix(col.b()))
-                            }
-                            None => Color32::from_gray(g),
-                        }
+                // Segments as Slicer draws them: a see-through fill and a solid outline.
+                let fill = o.opacity.clamp(0.0, 1.0);
+                let [w, h] = grid.size;
+                let labels = &self.labels;
+                (0..w * h)
+                    .map(|p| {
+                        let (g, l) = (grey(self.values[p]), labels[p]);
+                        let Some(col) = o.colours.get(l as usize).filter(|c| l != 0 && c.a() > 0) else { return Color32::from_gray(g) };
+                        let (x, y) = (p % w, p / w);
+                        let edge = x == 0 || y == 0 || x + 1 == w || y + 1 == h || labels[p - 1] != l || labels[p + 1] != l || labels[p - w] != l || labels[p + w] != l;
+                        let alpha = if edge { 1.0 } else { fill };
+                        let mix = |c: u8| (g as f32 + (c as f32 - g as f32) * alpha).round() as u8;
+                        Color32::from_rgb(mix(col.r()), mix(col.g()), mix(col.b()))
                     })
                     .collect()
             }
@@ -311,11 +340,15 @@ impl SliceView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&self, ui: &egui::Ui, rect: Rect, img: Rect, vol: &LoadedVolume, grid: &Grid, state: &ViewState, opts: &SliceOptions) {
+    fn paint(&self, ui: &egui::Ui, rect: Rect, img: Rect, vol: &LoadedVolume, grid: &Grid, state: &ViewState, opts: &SliceOptions, pointer: Option<Pos2>) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
         if let Some(t) = &self.texture {
             painter.image(t.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        if let (Some(r), Some(p)) = (opts.brush_mm, pointer) {
+            let points_per_mm = img.width() / (grid.size[0] as f64 * grid.mm[0]) as f32;
+            painter.circle_stroke(p, (r * points_per_mm).max(1.5), Stroke::new(1.5, Color32::from_rgb(255, 230, 120)));
         }
         let axes = grid.axes;
         if opts.crosshair {

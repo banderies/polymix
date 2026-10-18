@@ -9,8 +9,12 @@ license.workspace = true
 polymix-workspace = { path = "../polymix-workspace" }
 polymix-imaging = { path = "../polymix-imaging" }
 mm-volume = { path = "../mm-volume" }
+mm-segment = { path = "../mm-segment" }
+mm-core = { path = "../mm-core" }
 egui.workspace = true
 eframe.workspace = true
 glam.workspace = true
 anyhow.workspace = true
 log.workspace = true
+rayon.workspace = true
+rfd = "0.17"
