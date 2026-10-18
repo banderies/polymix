@@ -132,3 +132,18 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
 - [x] **M9.3 Make Pattern.**
 - [x] **M9.4 Vertex painting** (PaintVertex, SmoothColor).
 - [x] **M9.5 Unwrap / UV layout**, Generate Complex, Hair, Pivots.
+
+## M10 — Loft (join two holes with a tube)
+
+Erase & Fill's *Loft* fill type, picked automatically when the selection is the edge rings of
+two holes (double-click each open edge, then `F`).
+
+- [x] **M10.1 Loft**: shapes Minimal / Straight / Smooth; End 1 / End 2 continuity G0
+      (position) or G1 (leaves along the surrounding wall, per boundary vertex) with tension;
+      twist, bulge, refine; End 1 / End 2 marked in the view; warning when the tube runs into
+      the surface.
+- [ ] **M10.2 G2 ends** (curvature from the rings behind each opening, higher-order curves)
+      and a fairing pass with 1 / 2 / 3 rings held fixed; *Round* option (circular middle
+      cross-section for vessels).
+- [ ] **M10.3 One loft for every tube join**: ⌘B Tube Handle and Vessel → Bridge boundaries use
+      the loft, so all three behave the same.

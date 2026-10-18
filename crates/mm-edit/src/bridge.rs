@@ -37,7 +37,7 @@ pub struct BridgeResult {
 /// Triangulate the band between chains `p` (edges used forward, p_i → p_{i+1}) and `q`
 /// (edges used backward, q_{j+1} → q_j), from the pair (p_0, q_0) to (p_m, q_k), minimising
 /// the total length of the new diagonals. Shared end vertices are handled.
-fn strip(mesh: &Mesh, p: &[u32], q: &[u32]) -> Option<Vec<[u32; 3]>> {
+pub(crate) fn strip(mesh: &Mesh, p: &[u32], q: &[u32]) -> Option<Vec<[u32; 3]>> {
     if p.len() < 2 && q.len() < 2 {
         return None;
     }
@@ -126,7 +126,7 @@ fn strip(mesh: &Mesh, p: &[u32], q: &[u32]) -> Option<Vec<[u32; 3]>> {
 }
 
 /// Band between two rows with equal counts (vertex i ↔ i), shorter diagonal per quad.
-fn quad_band(mesh: &Mesh, p: &[u32], q: &[u32]) -> Vec<[u32; 3]> {
+pub(crate) fn quad_band(mesh: &Mesh, p: &[u32], q: &[u32]) -> Vec<[u32; 3]> {
     let mut out = Vec::with_capacity(2 * p.len());
     for i in 0..p.len() - 1 {
         let da = mesh.vertex(p[i + 1]).distance_squared(mesh.vertex(q[i]));
@@ -142,14 +142,14 @@ fn quad_band(mesh: &Mesh, p: &[u32], q: &[u32]) -> Vec<[u32; 3]> {
     out
 }
 
-fn mean_edge(mesh: &Mesh, chain: &[u32], closed: bool) -> f64 {
+pub(crate) fn mean_edge(mesh: &Mesh, chain: &[u32], closed: bool) -> f64 {
     let n = chain.len();
     let segs = if closed { n } else { n - 1 };
     let total: f64 = (0..segs).map(|i| mesh.vertex(chain[i]).distance(mesh.vertex(chain[(i + 1) % n]))).sum();
     total / segs.max(1) as f64
 }
 
-fn commit(mesh: &mut Mesh, tris: Vec<[u32; 3]>, new_vertices: Vec<u32>, group: i32) -> EditResult<BridgeResult> {
+pub(crate) fn commit(mesh: &mut Mesh, tris: Vec<[u32; 3]>, new_vertices: Vec<u32>, group: i32) -> EditResult<BridgeResult> {
     let mut added = Vec::with_capacity(tris.len());
     let mut failure = None;
     for tv in tris {
@@ -232,9 +232,18 @@ pub fn bridge(mesh: &mut Mesh, span_a: &[u32], span_b: &[u32], params: &BridgePa
     commit(mesh, tris, new_vertices, group)
 }
 
-/// Join two whole boundary loops (either orientation) with a tube of triangles, e.g. to
-/// reconnect a vessel across a gap. The loops may have different vertex counts.
-pub fn join_loops(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &BridgeParams) -> EditResult<BridgeResult> {
+/// Two boundary loops oriented for a tube between them.
+pub(crate) struct AlignedLoops {
+    /// The loops in boundary orientation.
+    pub a: Vec<u32>,
+    pub b: Vec<u32>,
+    /// A against its boundary orientation, and B with it, rotated so its start best matches
+    /// A's start (the cyclic shift of the normalised shapes that untwists the tube).
+    pub p: Vec<u32>,
+    pub q: Vec<u32>,
+}
+
+pub(crate) fn aligned_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32]) -> EditResult<AlignedLoops> {
     let a = orient_boundary_loop(mesh, loop_a)?;
     let b = orient_boundary_loop(mesh, loop_b)?;
     if a.iter().any(|v| b.contains(v)) {
@@ -266,9 +275,15 @@ pub fn join_loops(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &Brid
         .unwrap_or(0);
     let mut q = b[best_j..].to_vec();
     q.extend_from_slice(&b[..best_j]);
+    Ok(AlignedLoops { a, b, p, q })
+}
 
+/// Join two whole boundary loops (either orientation) with a tube of triangles, e.g. to
+/// reconnect a vessel across a gap. The loops may have different vertex counts.
+pub fn join_loops(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &BridgeParams) -> EditResult<BridgeResult> {
+    let AlignedLoops { a, b, p, q } = aligned_loops(mesh, loop_a, loop_b)?;
     let group = new_group(mesh);
-    let gap = ca.distance(cb);
+    let gap = mean(&positions(mesh, &p)).distance(mean(&positions(mesh, &q)));
     let h = 0.5 * (mean_edge(mesh, &p, true) + mean_edge(mesh, &q, true));
     let segs = if params.segments == 0 {
         ((gap / h.max(1e-300)).round() as usize).clamp(1, 1000)

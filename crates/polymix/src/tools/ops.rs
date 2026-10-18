@@ -20,6 +20,8 @@ pub struct OpOutput {
     /// What to show while previewing, when it differs from `mesh` (e.g. the object plus the
     /// objects it will add).
     pub preview: Option<Mesh>,
+    /// Markers drawn in the view while previewing (e.g. a loft's End 1 / End 2).
+    pub labels: Vec<(DVec3, String)>,
 }
 
 /// Context shown to operation panels.
@@ -302,6 +304,16 @@ impl<S: OpSpec> Tool for OpTool<S> {
         ToolOutcome::Continue
     }
 
+    fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
+        let Some((_, out)) = &self.result else { return };
+        for (p, text) in &out.labels {
+            if let Some(c) = cx.project(*p) {
+                painter.circle(c, 9.0, ui_util::ACCENT, egui::Stroke::new(1.5, egui::Color32::from_gray(20)));
+                painter.text(c, egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+            }
+        }
+    }
+
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {
         self.result.as_ref().map(|(_, out)| (self.object, out.preview.as_ref().unwrap_or(&out.mesh)))
     }
@@ -516,6 +528,7 @@ impl OpSpec for ExtrudeSpec {
                     message: format!("extracted a solid of {n} triangles"),
                     new_objects: vec![("extract".into(), solid)],
                     preview: Some(preview),
+                    ..Default::default()
                 })
             }
         }
@@ -1540,14 +1553,19 @@ pub enum FillKind {
     FlatRemeshed,
     /// Curved patch continuing the surrounding surface (Meshmixer "Smooth MVC").
     SmoothMvc,
+    /// Join two openings with a tube (Polymix).
+    Loft,
 }
 
 impl FillKind {
+    const ALL: [FillKind; 4] = [FillKind::FlatMinimal, FillKind::FlatRemeshed, FillKind::SmoothMvc, FillKind::Loft];
+
     fn label(self) -> &'static str {
         match self {
             FillKind::FlatMinimal => "Flat Minimal",
             FillKind::FlatRemeshed => "Flat Remeshed",
             FillKind::SmoothMvc => "Smooth MVC",
+            FillKind::Loft => "Loft (join two holes)",
         }
     }
 }
@@ -1567,22 +1585,96 @@ pub struct EraseFillUi {
     pub create_new_groups: bool,
     /// Snap the patch onto the target surface.
     pub project_to_target: bool,
+    /// Loft: tube shape, End 1 / End 2 continuity and tension, extra twist (degrees).
+    pub loft_shape: mm_edit::LoftShape,
+    pub loft_ends: [mm_edit::LoftEnd; 2],
+    pub twist: f64,
+}
+
+/// Whether `sel` is the edge rings of two holes: two separate parts, each touching an open
+/// edge of the mesh (what double-clicking an open edge selects).
+fn is_two_hole_rings(mesh: &Mesh, sel: &[u32]) -> bool {
+    let set = mm_core::TriSelection::from_tris(mesh, sel.iter().copied());
+    let mut seen = std::collections::HashSet::new();
+    let mut parts = 0;
+    for &t in sel {
+        if seen.contains(&t) {
+            continue;
+        }
+        let part = mm_core::topology::flood_fill_triangles(mesh, &[t], |x| set.contains(x));
+        let open = part.iter().any(|&x| mesh.tri_edges(x).iter().any(|&e| mesh.is_boundary_edge(e)));
+        if !open {
+            return false;
+        }
+        seen.extend(part);
+        parts += 1;
+        if parts > 2 {
+            return false;
+        }
+    }
+    parts == 2
+}
+
+/// Pairs of triangles where `part` crosses the rest of the mesh or itself (neighbours
+/// sharing a vertex are not counted).
+fn crossings(m: &Mesh, part: &[u32]) -> usize {
+    if part.is_empty() {
+        return 0;
+    }
+    let bvh = mm_core::Bvh::build_subset(m, part);
+    let inside: std::collections::HashSet<u32> = part.iter().copied().collect();
+    let bounds = mm_core::Aabb::from_points(part.iter().flat_map(|&t| m.tri_positions(t)));
+    m.triangle_ids()
+        .filter(|&t| mm_core::Aabb::from_points(m.tri_positions(t)).intersects(&bounds))
+        .map(|t| {
+            let (tv, tp) = (m.triangle(t), m.tri_positions(t));
+            let mut n = 0;
+            bvh.query_aabb(&mm_core::Aabb::from_points(tp), |o| {
+                if (inside.contains(&t) && o <= t) || m.triangle(o).iter().any(|v| tv.contains(v)) {
+                    return;
+                }
+                if mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
+                    n += 1;
+                }
+            });
+            n
+        })
+        .sum()
 }
 
 pub struct EraseFillSpec;
 impl OpSpec for EraseFillSpec {
     type Params = EraseFillUi;
     const NAME: &'static str = "Erase & Fill";
-    fn defaults(_: &OpInfo) -> Self::Params {
-        // Meshmixer's defaults.
-        EraseFillUi { kind: FillKind::SmoothMvc, refine: 50.0, smooth: 100.0, scale: 1.0, bulge: 0.0, create_new_groups: false, project_to_target: false }
+    fn defaults(info: &OpInfo) -> Self::Params {
+        // Meshmixer's defaults; the edge rings of two holes are lofted together.
+        let loft = info.selection.is_some_and(|s| is_two_hole_rings(info.mesh, s));
+        EraseFillUi {
+            kind: if loft { FillKind::Loft } else { FillKind::SmoothMvc },
+            refine: 50.0,
+            smooth: 100.0,
+            scale: 1.0,
+            bulge: 0.0,
+            create_new_groups: false,
+            project_to_target: false,
+            loft_shape: mm_edit::LoftShape::Smooth,
+            loft_ends: [mm_edit::LoftEnd::default(); 2],
+            twist: 0.0,
+        }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         egui::ComboBox::from_label("Fill type").selected_text(p.kind.label()).show_ui(ui, |ui| {
-            for k in [FillKind::FlatMinimal, FillKind::FlatRemeshed, FillKind::SmoothMvc] {
+            for k in FillKind::ALL {
                 ui.selectable_value(&mut p.kind, k, k.label());
             }
         });
+        if p.kind == FillKind::Loft {
+            loft_ui(ui, p);
+            if info.selection.is_none() {
+                ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select the edge rings of two holes first (double-click an open edge).");
+            }
+            return;
+        }
         let patch = p.kind != FillKind::FlatMinimal;
         ui.add_enabled(patch, egui::Slider::new(&mut p.refine, 0.0..=100.0).text("Refine"));
         ui.add_enabled(p.kind == FillKind::SmoothMvc, egui::Slider::new(&mut p.smooth, 0.0..=100.0).text("Smooth"));
@@ -1612,24 +1704,58 @@ impl OpSpec for EraseFillSpec {
         if loops.is_empty() {
             anyhow::bail!("the selection did not leave a hole to fill (did it cover a whole part?)");
         }
+        let mut loops = loops;
+        let mut new_tris = Vec::new();
+        let mut labels = Vec::new();
+        let mut warning = String::new();
+        let surrounding_group = |m: &Mesh, lp: &mm_core::topology::EdgeLoop| lp.edges.first().map(|&e| m.tri_group(m.edge_triangles(e)[0])).unwrap_or(0);
+        if p.kind == FillKind::Loft {
+            if loops.len() < 2 {
+                anyhow::bail!("Loft joins two openings: select the edge rings of two holes (this selection leaves {})", loops.len());
+            }
+            // The two longest openings; End 1 is the one with the lowest vertex id, so the
+            // ends keep their numbers while the settings change.
+            loops.sort_by_key(|l| std::cmp::Reverse(l.vertices.len()));
+            let mut ends: Vec<mm_core::topology::EdgeLoop> = loops.drain(..2).collect();
+            ends.sort_by_key(|l| l.vertices.iter().min().copied());
+            for (k, lp) in ends.iter().enumerate() {
+                labels.push((lp.centroid(&m), format!("{}", k + 1)));
+            }
+            let group = if p.create_new_groups { new_group } else { surrounding_group(&m, &ends[0]) };
+            let params = mm_edit::LoftParams {
+                shape: p.loft_shape,
+                ends: p.loft_ends,
+                edge_length: Some(target),
+                twist_deg: p.twist,
+                bulge: (p.bulge / 100.0).max(-0.9),
+                group: Some(group),
+            };
+            let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &params)?;
+            let n = crossings(&m, &r.triangles);
+            if n > 0 {
+                warning = format!(" — warning: the tube runs into the surface ({n} crossing{}); try more tension or a twist", if n == 1 { "" } else { "s" });
+            }
+            new_tris.extend(r.triangles);
+        }
         let mode = match p.kind {
             FillKind::FlatMinimal => mm_repair::FillMode::Minimal,
             FillKind::FlatRemeshed => mm_repair::FillMode::Flat,
-            FillKind::SmoothMvc => mm_repair::FillMode::Smooth,
+            FillKind::SmoothMvc | FillKind::Loft => mm_repair::FillMode::Smooth,
         };
         let n = loops.len();
-        let mut new_tris = Vec::new();
         for (k, lp) in loops.iter().enumerate() {
             if !progress(k as f32 / n as f32) {
                 anyhow::bail!("cancelled");
             }
-            let group = if p.create_new_groups { new_group } else { lp.edges.first().map(|&e| m.tri_group(m.edge_triangles(e)[0])).unwrap_or(0) };
+            let group = if p.create_new_groups { new_group } else { surrounding_group(&m, lp) };
             let fp = mm_repair::FillParams { mode, target_edge_length: Some(target), group: Some(group), ..Default::default() };
             let r = mm_repair::fill_hole(&mut m, lp, &fp)?;
-            shape_patch(&mut m, lp, &r, p);
+            if p.kind != FillKind::Loft {
+                shape_patch(&mut m, lp, &r, p);
+            }
             new_tris.extend(r.new_triangles);
         }
-        if let (true, Some(t)) = (p.project_to_target, surface) {
+        if let (true, Some(t), false) = (p.project_to_target, surface, p.kind == FillKind::Loft) {
             let verts = interior_vertices(&m, &new_tris);
             mm_edit::project_to_target(&mut m, &verts, &t.mesh, &t.bvh, 0.0, None);
         }
@@ -1637,7 +1763,8 @@ impl OpSpec for EraseFillSpec {
         if fragments > 0 {
             message += &format!(", removed {fragments} loose fragment{}", if fragments == 1 { "" } else { "s" });
         }
-        Ok(OpOutput { message, mesh: m, selection: Some(new_tris), ..Default::default() })
+        message += &warning;
+        Ok(OpOutput { message, mesh: m, selection: Some(new_tris), labels, ..Default::default() })
     }
 }
 
@@ -1663,6 +1790,38 @@ fn remove_cut_off_fragments(m: &mut Mesh, border: &std::collections::HashSet<u32
         m.remove_triangles(c.iter().copied());
     }
     cut_off.len()
+}
+
+/// Erase & Fill's Loft settings.
+fn loft_ui(ui: &mut egui::Ui, p: &mut EraseFillUi) {
+    use mm_edit::{EndContinuity, LoftShape};
+    ui.horizontal(|ui| {
+        ui.label("Shape");
+        ui.selectable_value(&mut p.loft_shape, LoftShape::Minimal, "Minimal").on_hover_text("One band of triangles straight across, no new vertices");
+        ui.selectable_value(&mut p.loft_shape, LoftShape::Straight, "Straight").on_hover_text("Straight tube, like a cylinder, blending from one opening's shape to the other's");
+        ui.selectable_value(&mut p.loft_shape, LoftShape::Smooth, "Smooth").on_hover_text("Curved tube that meets each opening as set below");
+    });
+    let tube = p.loft_shape != LoftShape::Minimal;
+    let smooth = p.loft_shape == LoftShape::Smooth;
+    ui.add_enabled(tube, egui::Slider::new(&mut p.refine, 0.0..=100.0).text("Refine"));
+    egui::Grid::new("loft_ends").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+        for (k, end) in p.loft_ends.iter_mut().enumerate() {
+            ui.label(format!("End {}", k + 1)).on_hover_text("Marked with its number in the view");
+            ui.add_enabled_ui(smooth, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut end.continuity, EndContinuity::G0, "G0").on_hover_text("Position: the tube meets the opening (a crease may form)");
+                    ui.selectable_value(&mut end.continuity, EndContinuity::G1, "G1").on_hover_text("Tangent: the tube leaves along the surrounding wall");
+                });
+            });
+            ui.add_enabled(smooth && end.continuity == EndContinuity::G1, egui::Slider::new(&mut end.tension, 0.2..=3.0).text("tension"))
+                .on_hover_text("How far the tube keeps to the wall's direction before turning");
+            ui.end_row();
+        }
+    });
+    ui.add_enabled(tube, egui::Slider::new(&mut p.twist, -180.0..=180.0).suffix("°").text("Twist")).on_hover_text("Turn one end against the other (they are lined up automatically)");
+    ui.add_enabled(tube, egui::Slider::new(&mut p.bulge, -90.0..=100.0).suffix("%").text("Bulge")).on_hover_text("Widen (+) or narrow (−) the middle of the tube");
+    ui.checkbox(&mut p.create_new_groups, "Create new groups");
+    ui.small("Deletes the selection and joins the two openings it leaves with a tube.");
 }
 
 /// Vertices whose triangles all belong to `tris` (the region's interior).
@@ -2155,6 +2314,7 @@ impl OpSpec for FitPrimitiveSpec {
                 message,
                 new_objects: fits.into_iter().map(|f| (name.clone(), f.mesh)).collect(),
                 preview: Some(preview),
+                ..Default::default()
             });
         }
         for f in &fits {
@@ -2213,6 +2373,32 @@ mod tests {
                 d1.dot(d2).clamp(-1.0, 1.0).acos()
             })
             .sum()
+    }
+
+    #[test]
+    fn erase_fill_lofts_two_hole_rings() {
+        // Two tubes facing each other across a gap; the rings of triangles around the facing
+        // holes are selected, as double-clicking each open edge does.
+        let mut m = primitives::cylinder(0.5, 2.0, 24, 8, false);
+        let mut t2 = primitives::cylinder(0.6, 2.0, 30, 8, false);
+        t2.transform(|p| p + DVec3::new(0.7, 0.0, 3.5));
+        m.append_mesh(&t2, 1);
+        let ring = |z: f64| -> Vec<u32> { m.triangle_ids().filter(|&t| m.triangle(t).iter().any(|&v| (m.vertex(v).z - z).abs() < 1e-9)).collect() };
+        let rings: Vec<u32> = ring(2.0).into_iter().chain(ring(3.5)).collect();
+        let info = |sel| OpInfo { mesh: &m, selection: Some(sel), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let p = EraseFillSpec::defaults(&info(&rings));
+        assert_eq!(p.kind, FillKind::Loft, "two hole rings are lofted");
+        assert_eq!(EraseFillSpec::defaults(&info(&ring(2.0))).kind, FillKind::SmoothMvc, "one hole is filled");
+        for shape in [mm_edit::LoftShape::Minimal, mm_edit::LoftShape::Straight, mm_edit::LoftShape::Smooth] {
+            let out = EraseFillSpec::run(&m, Some(&rings), &EraseFillUi { loft_shape: shape, ..p }, &|_| true).unwrap();
+            assert!(out.mesh.check_validity().is_ok());
+            assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "{shape:?}: one tube");
+            assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 2, "{shape:?}: only the far ends stay open");
+            assert_eq!(out.labels.len(), 2);
+            assert!(!out.message.contains("warning"), "{shape:?}: {}", out.message);
+        }
+        let err = EraseFillSpec::run(&m, Some(&ring(2.0)), &p, &|_| true).err().unwrap().to_string();
+        assert!(err.contains("two openings"), "{err}");
     }
 
     #[test]

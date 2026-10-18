@@ -7,6 +7,7 @@ mod extrude_tests;
 mod fit_tests;
 mod flow_tests;
 mod local_cut_tests;
+mod loft_tests;
 mod misc_tests;
 mod perf;
 mod soft_tests;

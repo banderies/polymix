@@ -10,7 +10,8 @@
 //! * [`extrude`] — extrude / offset a face selection, naive whole-surface offset.
 //! * [`region`] — discard / separate / duplicate / flip a face selection.
 //! * [`boolean`] — exact mesh booleans (union / difference / intersection).
-//! * [`mod@mirror`], [`mod@bridge`] (bridge spans, join loops), [`smooth`] (smooth boundary),
+//! * [`mod@mirror`], [`mod@bridge`] (bridge spans, join loops), [`mod@loft`] (tube between two
+//!   openings with G0 / G1 ends), [`smooth`] (smooth boundary),
 //!   [`transform`] (affine transforms, drop to ground, principal-axis alignment).
 //!
 //! Every operation edits an [`mm_core::Mesh`] in place and keeps a manifold,
@@ -29,6 +30,7 @@ pub mod face_groups;
 pub mod fit;
 pub mod flow;
 pub mod hair;
+pub mod loft;
 pub mod mirror;
 pub mod part;
 pub mod region;
@@ -55,6 +57,7 @@ pub use extrude::{
     extract_solid, extrude_selection, offset_selection, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
 };
 pub use hair::{hair_curves, hair_mesh, HairParams};
+pub use loft::{loft, EndContinuity, LoftEnd, LoftParams, LoftShape};
 pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
 pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};
 pub use part::{builtin_parts, drop_open_part, place_part, DropResult, Part, PartKind, Placement};

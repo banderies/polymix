@@ -2731,6 +2731,35 @@ impl PolymixApp {
                     self.tool_secondary_click(ctx, vp, p);
                 }
             }
+            "dclickhole" => {
+                // dclickhole:N — double-click a visible triangle on the rim of the active
+                // object's Nth open boundary (ordered by vertex id), as a user selects a hole ring.
+                let k: usize = arg.parse().unwrap_or(0);
+                let target = self.scene.active().and_then(|o| {
+                    let m = o.mesh.clone();
+                    let mut loops = mm_core::topology::boundary_loops(&m);
+                    loops.sort_by_key(|l| l.vertices.iter().min().copied());
+                    let lp = loops.get(k)?;
+                    Some((o.id, lp.edges.iter().map(|&e| m.edge_triangles(e)[0]).collect::<Vec<u32>>(), m))
+                });
+                if let Some((id, rim, m)) = target {
+                    let spot = rim.iter().find_map(|&t| {
+                        let p = self.camera.project(m.tri_centroid(t), vp.aspect())?;
+                        let screen = vp.to_screen(p);
+                        let ray = self.camera.ray_from_ndc(vp.ndc(screen), vp.aspect());
+                        (vp.rect.contains(screen) && tools::pick_ray(&mut self.scene, &ray, Some(id)).is_some_and(|(_, h)| h.tid == t)).then_some(screen)
+                    });
+                    if let Some(p) = spot {
+                        let base = PointerInput::default();
+                        self.synthetic.push_back(PointerInput { pos: Some(p), ..base.clone() });
+                        self.synthetic.push_back(PointerInput { pos: Some(p), pressed: true, down: true, ..base.clone() });
+                        self.synthetic.push_back(PointerInput { pos: Some(p), released: true, clicked: true, double_clicked: true, ..base });
+                    } else {
+                        println!("[polymix] dclickhole: no visible rim triangle on boundary {k}");
+                    }
+                }
+                script.wait = 2;
+            }
             "click" | "dclick" | "drag" | "sdrag" => {
                 // Viewport-relative coordinates in 0..1.
                 let v: Vec<f32> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
