@@ -153,7 +153,7 @@ fn check_cell(h: f64) -> Result<f64> {
 }
 
 /// Shared tail of every pipeline: extraction, mesh build, cleanup.
-fn extract_and_clean(field: &SparseField, blocky: bool, min_edge: f64, flips: bool, shell_vol: f64, prog: &Prog) -> Result<Mesh> {
+pub(crate) fn extract_and_clean(field: &SparseField, blocky: bool, min_edge: f64, flips: bool, shell_vol: f64, prog: &Prog) -> Result<Mesh> {
     let (pos, tris) = if blocky {
         crate::blocky::voxel_faces_with(field, &prog.sub(0.0, 0.5))?
     } else {
@@ -311,7 +311,7 @@ fn transfer_face_groups_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
 
 /// Compact ids by round-tripping through flat arrays (lower peak memory than
 /// `Mesh::compacted`, which keeps both copies alive).
-fn compact(m: Mesh) -> Mesh {
+pub(crate) fn compact(m: Mesh) -> Mesh {
     let (p, t, g) = m.to_arrays();
     drop(m);
     Mesh::from_triangles(&p, &t, Some(&g)).0

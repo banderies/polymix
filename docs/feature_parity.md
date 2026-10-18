@@ -201,7 +201,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Generate Face Groups | ✅ | Edge Angle / Normal Angle, angle and size thresholds; shows group colours while open |
 | Make Solid | 🟡 | Blocky / Fast / Accurate / Sharp Edge Preserve, accuracy, density, offset, min thickness, Cull Edges Threshold, close boundaries, Transfer Groups, Color Transfer Mode (Automatic / No Colors / Vertex-to-Vertex) ✅; Material-to-Vertex ⚪ (no materials/textures) |
 | Hollow | ✅ | Hollow wall ✅; escape holes ⛔ (printing) |
-| Make Pattern | ⚪ ❌ | |
+| Make Pattern | ⚪ ✅ | All 10 pattern types (Edges, Dual Edges, Mesh + Delaunay variants, Tiled Tubes / Spheres, Lattice, Random Primitives Volume / Surface, FaceGroup Borders), Regular / Hex tiling, Subtract / Intersect, Clip To Surface, Grid Smoothing (joint fillets), Grid Resolution, Reduce, Line / Sphere gradient. Elements are balls and tubes (no Primitive Type choice); Mesh Resolution is folded into Reduce |
 | Separate Shells (Shift+Y) | ✅ | |
 | Add Tube | ✅ | Line / Spline (Inside, Outside), AutoRoute Minimal / Smooth (elastic band keeping the collision radius); Combine Boolean (union outside, difference inside) / Append / New Object; Direction Any / Face Normal; radius, end radius, tangent, length scale, solve steps; drag ends to move |
 | Unwrap / UV layout / SetUV | ⚪ ❌ | |

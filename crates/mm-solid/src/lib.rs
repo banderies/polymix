@@ -33,6 +33,7 @@ pub mod extract;
 pub mod field;
 pub mod grid;
 mod hash;
+pub mod pattern;
 mod progress;
 pub mod solid;
 pub mod winding;
@@ -43,6 +44,7 @@ pub use solid::{
     cell_size_for_resolution, hollow, make_solid, mesh_implicit, offset_solid, sdf_boolean, transfer_face_groups, transfer_vertex_colors, BoolOp,
     MakeSolidParams, SolidMode,
 };
+pub use pattern::{make_pattern, Composition, Gradient, PatternParams, PatternType, Tiling};
 pub use winding::{winding_number_exact, WindingNumber};
 
 /// Errors produced by the solid operations.

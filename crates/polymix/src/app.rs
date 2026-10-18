@@ -259,6 +259,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "facegroups" => Box::new(tools::ops::FaceGroupsTool::new(cx)),
         "weldboundaries" => Box::new(tools::ops::WeldBoundariesTool::new(cx)),
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
+        "makepattern" => Box::new(tools::pattern::MakePatternTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
         "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
         "flowext" => Box::new(tools::vessel::FlowExtensionTool::new(cx)),
@@ -1416,6 +1417,9 @@ impl PolymixApp {
                     }
                     if ui.button("Make Solid").clicked() {
                         open = Some("makesolid");
+                    }
+                    if ui.button("Make Pattern").on_hover_text("Turn the object into a frame of tubes, or perforate / fill it with tubes, balls or a lattice").clicked() {
+                        open = Some("makepattern");
                     }
                     if ui.button("Remesh").clicked() {
                         open = Some("remesh");
