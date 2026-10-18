@@ -25,10 +25,13 @@ pub enum Brush {
     BubbleSmooth,
     ShrinkSmooth,
     RobustSmooth,
+    Refine,
+    Reduce,
+    AdaptiveReduce,
 }
 
 impl Brush {
-    pub const ALL: [Brush; 17] = [
+    pub const ALL: [Brush; 20] = [
         Brush::Draw,
         Brush::Draw2,
         Brush::Draw3,
@@ -46,6 +49,9 @@ impl Brush {
         Brush::BubbleSmooth,
         Brush::ShrinkSmooth,
         Brush::RobustSmooth,
+        Brush::Refine,
+        Brush::Reduce,
+        Brush::AdaptiveReduce,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -66,6 +72,9 @@ impl Brush {
             Brush::BubbleSmooth => "BubbleSmooth",
             Brush::ShrinkSmooth => "ShrinkSmooth",
             Brush::RobustSmooth => "RobustSmooth",
+            Brush::Refine => "Refine",
+            Brush::Reduce => "Reduce",
+            Brush::AdaptiveReduce => "AdaptiveReduce",
         }
     }
     fn hint(self) -> &'static str {
@@ -87,7 +96,14 @@ impl Brush {
             Brush::BubbleSmooth => "Smooth while keeping the volume",
             Brush::ShrinkSmooth => "Plain smoothing (shrinks the surface)",
             Brush::RobustSmooth => "Smooth bumps with little shrinkage",
+            Brush::Refine => "Make the triangles under the brush smaller",
+            Brush::Reduce => "Make the triangles under the brush larger and even",
+            Brush::AdaptiveReduce => "Remove triangles where the surface is flat, keeping curved detail",
         }
+    }
+    /// Mesh density brushes change the triangles instead of moving the surface.
+    fn density(self) -> bool {
+        matches!(self, Brush::Refine | Brush::Reduce | Brush::AdaptiveReduce)
     }
     /// Brushes that grab once and follow the pointer instead of dabbing.
     fn grabs(self) -> bool {
@@ -149,30 +165,68 @@ fn refine_region(mesh: &mut Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, p: &Refi
         return false;
     }
     let target = p.target(mesh, &tris, r);
+    retriangulate(mesh, tris, target, 0.2 + 0.6 * p.reduce / 100.0, p.smooth / 100.0)
+}
+
+/// Split edges of `tris` longer than 1.33 × `target`, collapse those shorter than
+/// `min_frac` × `target`, then relax the region's interior vertices tangentially by `smooth`
+/// (0..1). The region border is kept. Returns whether the topology changed.
+fn retriangulate(mesh: &mut Mesh, tris: Vec<u32>, target: f64, min_frac: f64, smooth: f64) -> bool {
     let Ok(split) = mm_remesh::refine_uniform(mesh, target * 1.33, Some(&tris), None) else { return false };
     let tris = split.region_triangles.unwrap_or(tris);
-    let min = target * (0.2 + 0.6 * p.reduce / 100.0);
-    let Ok(col) = mm_remesh::collapse_short_edges(mesh, min, Some(&tris), None) else { return split.splits > 0 };
+    let Ok(col) = mm_remesh::collapse_short_edges(mesh, target * min_frac, Some(&tris), None) else { return split.splits > 0 };
     let tris = col.region_triangles.unwrap_or(tris);
-    if p.smooth > 0.0 {
-        let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
-        let mut verts: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).filter(|&v| !mesh.is_boundary_vertex(v) && mesh.vertex_triangles(v).iter().all(|t| set.contains(t))).collect();
-        verts.sort_unstable();
-        verts.dedup();
-        let k = (p.smooth / 100.0).min(1.0);
-        let moves: Vec<(u32, DVec3)> = verts
-            .iter()
-            .map(|&v| {
-                let n = mesh.vertex_normal(v);
-                let l = laplacian(mesh, v);
-                (v, mesh.vertex(v) + (l - n * l.dot(n)) * k)
-            })
-            .collect();
-        for (v, q) in moves {
-            mesh.set_vertex(v, q);
-        }
+    if smooth > 0.0 {
+        relax_interior(mesh, &tris, smooth.min(1.0));
     }
     split.splits + col.collapses > 0
+}
+
+/// Tangential Laplacian relaxation of the vertices whose whole one-ring lies in `tris`.
+fn relax_interior(mesh: &mut Mesh, tris: &[u32], k: f64) {
+    let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+    let mut verts: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).filter(|&v| !mesh.is_boundary_vertex(v) && mesh.vertex_triangles(v).iter().all(|t| set.contains(t))).collect();
+    verts.sort_unstable();
+    verts.dedup();
+    let moves: Vec<(u32, DVec3)> = verts
+        .iter()
+        .map(|&v| {
+            let n = mesh.vertex_normal(v);
+            let l = laplacian(mesh, v);
+            (v, mesh.vertex(v) + (l - n * l.dot(n)) * k)
+        })
+        .collect();
+    for (v, q) in moves {
+        mesh.set_vertex(v, q);
+    }
+}
+
+/// One dab of a mesh density brush over the triangles whose corners are all in `verts`.
+/// Each dab moves the edge length a step (scaled by `strength`) toward finer (Refine) or
+/// coarser (Reduce) triangles; AdaptiveReduce removes triangles by quadric error, so flat
+/// areas thin out while curved detail stays. Returns whether the topology changed.
+fn density_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, r: f64, strength: f64) -> bool {
+    let inside: std::collections::HashSet<u32> = verts.iter().map(|x| x.0).collect();
+    let mut tris: Vec<u32> = verts.iter().flat_map(|&(v, _)| mesh.vertex_triangles(v)).filter(|&t| mesh.triangle(t).iter().all(|v| inside.contains(v))).collect();
+    tris.sort_unstable();
+    tris.dedup();
+    if tris.is_empty() {
+        return false;
+    }
+    let s = strength.clamp(0.0, 1.0);
+    let mean = mm_remesh::edge_length_stats_in(mesh, &tris).mean;
+    match brush {
+        // Bounded by the brush size: a smaller brush refines further.
+        Brush::Refine => retriangulate(mesh, tris, (mean * (1.0 - 0.25 * s)).max(r * 0.04), 0.3, 0.25),
+        Brush::Reduce => retriangulate(mesh, tris, (mean * (1.0 + 0.5 * s)).min(r * 0.5), 0.75, 0.25),
+        Brush::AdaptiveReduce => {
+            // Cheapest collapses first, and none that tilt a face by more than a few degrees,
+            // so curved areas resist while flat ones thin out.
+            let params = mm_remesh::ReduceParams { target: mm_remesh::ReduceTarget::Percentage(100.0 - 40.0 * s), region: Some(tris), max_normal_change_deg: 6.0, ..Default::default() };
+            mm_remesh::reduce(mesh, &params, None).is_ok_and(|rep| rep.collapses > 0)
+        }
+        _ => false,
+    }
 }
 
 /// Meshmixer's two brush families.
@@ -512,7 +566,7 @@ fn apply_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, d: &Dab) {
                 })
                 .collect()
         }
-        Brush::Move => Vec::new(),
+        Brush::Move | Brush::Refine | Brush::Reduce | Brush::AdaptiveReduce => Vec::new(),
     };
     let pos = mesh.positions_mut();
     for (v, p) in updates {
@@ -694,21 +748,26 @@ impl Tool for SculptTool {
         if o.moved_vertices.is_empty() {
             o.moved_from = o.mesh.shape_version();
         }
-        let dab = Dab { center, r, strength, invert: stroke.invert, view, motion, start: &stroke.start, target: target.as_ref() };
-        apply_dab(o.mesh_mut(), &verts, brush, &dab);
-        if self.attract && target.is_some() && brush != Brush::Attract {
-            apply_dab(o.mesh_mut(), &verts, Brush::Attract, &Dab { strength: strength * 0.5, ..dab });
-        }
-        o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
-        if self.refinement.enabled {
-            let bvh = o.bvh();
-            if refine_region(o.mesh_mut(), &bvh, center, r, &self.refinement) {
-                // New triangles: the GPU copy and the selection are rebuilt.
-                o.moved_vertices.clear();
-                let m = o.mesh.clone();
-                o.selection.sync(&m);
-                o.touch_selection();
+        let retriangulated = if brush.density() {
+            density_dab(o.mesh_mut(), &verts, brush, r, strength)
+        } else {
+            let dab = Dab { center, r, strength, invert: stroke.invert, view, motion, start: &stroke.start, target: target.as_ref() };
+            apply_dab(o.mesh_mut(), &verts, brush, &dab);
+            if self.attract && target.is_some() && brush != Brush::Attract {
+                apply_dab(o.mesh_mut(), &verts, Brush::Attract, &Dab { strength: strength * 0.5, ..dab });
             }
+            o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
+            self.refinement.enabled && {
+                let bvh = o.bvh();
+                refine_region(o.mesh_mut(), &bvh, center, r, &self.refinement)
+            }
+        };
+        if retriangulated {
+            // New triangles: the GPU copy and the selection are rebuilt.
+            o.moved_vertices.clear();
+            let m = o.mesh.clone();
+            o.selection.sync(&m);
+            o.touch_selection();
         }
     }
 
@@ -721,6 +780,15 @@ impl Tool for SculptTool {
     fn wheel(&mut self, delta: f32, _cx: &mut ToolCx) -> bool {
         self.size_pct = (self.size_pct * (delta * 0.004).exp()).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
         true
+    }
+
+    fn script(&mut self, cmd: &str, _cx: &mut ToolCx) {
+        // `brush:Refine`, `size:8`.
+        match cmd.split_once(':') {
+            Some(("brush", name)) => self.brush = Brush::ALL.into_iter().find(|b| b.label().eq_ignore_ascii_case(name)).unwrap_or(self.brush),
+            Some(("size", pct)) => self.size_pct = pct.parse().unwrap_or(self.size_pct),
+            _ => {}
+        }
     }
 
     fn claims_secondary_drag(&self, _scene: &Scene) -> bool {
@@ -867,6 +935,48 @@ mod tests {
         // Weights follow the falloff.
         let lin = brush_vertices(&m, &bvh, DVec3::ZERO, 0.4, None, &Footprint { falloff: Falloff::Linear, ..Default::default() });
         assert!(lin.iter().all(|&(v, w)| (w - (1.0 - m.vertex(v).length() / 0.4)).abs() < 1e-12));
+    }
+
+    #[test]
+    fn density_brushes_change_triangle_size_locally() {
+        let dab = |m: &mut Mesh, brush: Brush, n: usize| {
+            for _ in 0..n {
+                let bvh = mm_core::Bvh::build(m);
+                let verts = brush_vertices(m, &bvh, DVec3::Z, 0.5, None, &Footprint::default());
+                density_dab(m, &verts, brush, 0.5, 0.8);
+            }
+            m.check_validity().unwrap();
+            assert!(m.is_closed());
+        };
+        let near = |m: &Mesh| {
+            let tris: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.95).collect();
+            mm_remesh::edge_length_stats_in(m, &tris).mean
+        };
+        let far = |m: &Mesh| m.triangle_ids().filter(|&t| m.tri_centroid(t).z < -0.5).count();
+        let m0 = primitives::icosphere(1.0, 4);
+        let mut fine = m0.clone();
+        dab(&mut fine, Brush::Refine, 3);
+        assert!(near(&fine) < near(&m0) * 0.8, "{} vs {}", near(&fine), near(&m0));
+        assert_eq!(far(&fine), far(&m0));
+        let mut coarse = m0.clone();
+        dab(&mut coarse, Brush::Reduce, 3);
+        assert!(near(&coarse) > near(&m0) * 1.3, "{} vs {}", near(&coarse), near(&m0));
+        assert_eq!(far(&coarse), far(&m0));
+        // Adaptive reduce thins a flat patch far more than a curved one, and keeps its shape.
+        let mut flat = primitives::plane_grid(2.0, 2.0, 30, 30);
+        let mut bumpy = flat.clone();
+        bumpy.transform(|p| p + DVec3::Z * (0.08 * (p.x * 25.0).sin() * (p.y * 25.0).cos()));
+        let (f0, b0) = (flat.triangle_count(), bumpy.triangle_count());
+        for m in [&mut flat, &mut bumpy] {
+            for _ in 0..3 {
+                let bvh = mm_core::Bvh::build(m);
+                let verts = brush_vertices(m, &bvh, DVec3::ZERO, 0.6, None, &Footprint::default());
+                density_dab(m, &verts, Brush::AdaptiveReduce, 0.6, 1.0);
+            }
+            m.check_validity().unwrap();
+        }
+        assert!(f0 - flat.triangle_count() > 2 * (b0 - bumpy.triangle_count()), "{} vs {}", f0 - flat.triangle_count(), b0 - bumpy.triangle_count());
+        assert!(flat.vertex_ids().all(|v| flat.vertex(v).z.abs() < 1e-9));
     }
 
     #[test]

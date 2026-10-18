@@ -175,7 +175,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Volume brushes (3) vs Surface brushes (2), Smoothing brush (1) | ✅ | Volume: dynamic refinement + volumetric footprint, Draw / BubbleSmooth; Surface: fixed triangles, footprint limited to the stroked surface; 1 opens RobustSmooth. Switchable in the panel |
 | Brushes: RobustSmooth, ShrinkSmooth (Smooth), BubbleSmooth, Inflate, Flatten, Drag | ✅ | BubbleSmooth is a volume-keeping (Taubin) smooth |
 | Brushes: Draw, Draw2, Draw3, DrawMax, Move, Push, Pinch, Spikes, Nudge, Zipper, Attract | ✅ | Own brush definitions (hover a brush for what it does); Attract pulls onto the target surface |
-| Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ❌ | |
+| Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ✅ | Refine / Reduce step the edge length per dab (Refine bounded by the brush size); AdaptiveReduce is a quadric reduction that thins flat areas first |
 | Brushes: PaintVertex, SmoothColor | ⚪ ❌ | |
 | Dynamic refinement while sculpting (Refinement, Adaptivity; R, T) | ✅ | Per dab: split / collapse / relax under the brush; Refine, Reduce, Smooth, Adaptive + Adaptivity; R and T toggle |
 | Size / Strength | ✅ | Size is a % of the model; wheel size, right-drag strength |
