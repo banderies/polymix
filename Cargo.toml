@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mm-core", "crates/mm-edit", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-solid", "crates/mm-volume", "crates/polymix", "crates/polymix-imaging", "crates/polymix-segmentation", "crates/polymix-volume", "crates/polymix-workspace"]
+members = ["crates/mm-core", "crates/mm-edit", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-segment", "crates/mm-solid", "crates/mm-volume", "crates/polymix", "crates/polymix-imaging", "crates/polymix-segmentation", "crates/polymix-volume", "crates/polymix-workspace"]
 
 [workspace.package]
 edition = "2021"

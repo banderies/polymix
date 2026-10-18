@@ -1,0 +1,15 @@
+[package]
+name = "mm-segment"
+description = "Segmentation of volumes for Polymix: threshold, region growing, islands, margins, smoothing, label maps to watertight meshes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mm-volume = { path = "../mm-volume" }
+mm-core = { path = "../mm-core" }
+mm-solid = { path = "../mm-solid" }
+glam.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+flate2 = "1"

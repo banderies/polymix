@@ -1733,6 +1733,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-segment"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "glam 0.34.1",
+ "mm-core",
+ "mm-solid",
+ "mm-volume",
+ "rayon",
+]
+
+[[package]]
 name = "mm-solid"
 version = "0.1.0"
 dependencies = [
