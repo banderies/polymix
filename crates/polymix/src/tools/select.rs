@@ -646,7 +646,7 @@ impl Tool for SelectTool {
         let (n_sel, n_tri) = cx.scene.active().map(|o| (o.selection.len(), o.mesh.triangle_count())).unwrap_or((0, 0));
         ui.label(format!("{} / {} triangles selected", ui_util::format_count(n_sel), ui_util::format_count(n_tri)));
         ui.small(match self.mode {
-            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ] or Shift+scroll",
+            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ], Shift+scroll or Cmd+middle-drag",
             SelectMode::Lasso => "Draw curves on the surface, turning the view between them; end near the start (or press Enter) to select the enclosed faces · A drag from the background is the laser lasso · Shift: deselect",
             SelectMode::Wand => "Click a face to select the connected faces facing the same way (within the angle) · Shift: deselect · A drag from the background is the laser lasso",
         });

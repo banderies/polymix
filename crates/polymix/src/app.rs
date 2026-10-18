@@ -320,6 +320,8 @@ pub struct PolymixApp {
     /// An autosave left by a session that did not exit cleanly.
     recovery: Option<PathBuf>,
     nav_drag: Option<PointerButton>,
+    /// Cmd/Ctrl+middle-drag resizing the brush.
+    brush_drag: bool,
     /// Right-button drag owned by the active tool: press position.
     tool_rmb: Option<egui::Pos2>,
     /// Previous / Next view.
@@ -390,6 +392,7 @@ impl PolymixApp {
             autosave: None,
             recovery: None,
             nav_drag: None,
+            brush_drag: false,
             tool_rmb: None,
             view_history: ViewHistory::default(),
             view_anim: None,
@@ -2003,7 +2006,7 @@ impl PolymixApp {
                     ("Shift+Y", "Separate shells"),
                     ("Select: drag / Shift+drag", "Paint selection / deselect"),
                     ("Select: double-click", "Select connected part"),
-                    ("Select / Sculpt: [ ] or Shift+scroll", "Brush size"),
+                    ("Select / Sculpt: [ ], Shift+scroll or Cmd/Ctrl+middle-drag", "Brush size"),
                     ("Select: Cmd/Ctrl+right-drag (with a selection)", "Grow / shrink the selection"),
                     ("Sculpt: Cmd/Ctrl+right-drag", "Brush strength"),
                     ("Select: E / I / G / O / < >", "Connected / Invert / Groups / Optimize / Shrink-Grow"),
@@ -2208,8 +2211,25 @@ impl PolymixApp {
                 self.tool_secondary(&ctx, vp, DragPhase::Start, p, egui::Vec2::ZERO);
             }
         }
+        // Cmd/Ctrl+middle-drag sizes the brush (right or up grows it), for mice whose wheel the
+        // OS accelerates.
+        if response.drag_started_by(PointerButton::Middle) && mods.command && self.tools.last_mut().is_some_and(|t| t.brush_size().is_some()) {
+            self.brush_drag = true;
+        }
+        if self.brush_drag {
+            let d = pointer_delta.x - pointer_delta.y;
+            if d != 0.0 {
+                self.tool_wheel(&ctx, vp, d);
+            }
+            if !ctx.input(|i| i.pointer.button_down(PointerButton::Middle)) {
+                self.brush_drag = false;
+            }
+        }
         for btn in [PointerButton::Secondary, PointerButton::Middle, PointerButton::Primary] {
             if self.tool_rmb.is_some() && btn == PointerButton::Secondary {
+                continue;
+            }
+            if self.brush_drag && btn == PointerButton::Middle {
                 continue;
             }
             if response.drag_started_by(btn) && nav.starts_navigation(btn, mods) {
@@ -2248,13 +2268,14 @@ impl PolymixApp {
             }
         }
         if in_rect {
-            // Shift+wheel arrives as horizontal scroll from a mouse wheel on macOS.
-            let wheel = if scroll.y != 0.0 { scroll.y } else { scroll.x };
-            // Shift+wheel sets brush tools' size; the plain wheel always zooms.
-            let to_tool = mods.shift;
+            // Shift+wheel sets brush tools' size, from the raw events (one step per notch, no
+            // easing lag); the plain wheel always zooms.
             let mut scroll_y = scroll.y;
-            if wheel != 0.0 && to_tool && self.tool_wheel(&ctx, vp, wheel) {
-                scroll_y = 0.0;
+            if mods.shift {
+                let d = ctx.input(|i| crate::navigation::brush_wheel_delta(&i.raw.events));
+                if d != 0.0 && self.tool_wheel(&ctx, vp, d) {
+                    scroll_y = 0.0;
+                }
             }
             let mut factor = 1.0f64;
             if scroll_y != 0.0 {

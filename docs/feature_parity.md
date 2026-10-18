@@ -129,7 +129,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Paint Mode: sphere brush, Shift deselect | ✅ | Brush keeps its size on the model |
 | Brush types: Sphere, SphereDisc, Unwrap (geodesic) | ✅ | Unwrap is the default, as in your Meshmixer |
-| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Shift+wheel in every navigation mode (the plain wheel always zooms — your preference over Meshmixer's plain wheel) |
+| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Shift+wheel in every navigation mode, one step per notch with no easing lag (the plain wheel always zooms — your preference over Meshmixer's plain wheel); also Cmd/Ctrl+middle-drag |
 | RMB-drag expands / contracts the selection | ✅ | With a selection; geodesic distance (other expand modes: ROADMAP M2.5) |
 | Laser Lasso (curve from background; closed = inside, open = smaller side, through the model) | ✅ | |
 | Lasso Mode (multi-curve loop drawn *on the surface*, rotate between curves) | ✅ | Closes when a curve ends near the start, or Enter; Esc clears |

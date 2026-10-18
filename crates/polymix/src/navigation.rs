@@ -93,6 +93,31 @@ impl NavMode {
     }
 }
 
+/// Brush-size change from this frame's raw wheel events, in the units tools take
+/// ([`crate::tools::Tool::wheel`], points). egui eases wheel notches in over several frames
+/// (which lags) and macOS accelerates them (a quick flick reports far more per notch than a
+/// slow one), so for the brush each mouse-wheel notch is one fixed step, applied at once;
+/// trackpad scrolling stays continuous. With Shift held macOS turns the wheel horizontal, so
+/// either axis counts.
+pub fn brush_wheel_delta(events: &[egui::Event]) -> f32 {
+    /// One notch: about 10% of the brush size.
+    const NOTCH: f32 = 25.0;
+    events
+        .iter()
+        .map(|e| match e {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                let d = if delta.y != 0.0 { delta.y } else { delta.x };
+                match unit {
+                    egui::MouseWheelUnit::Point => d,
+                    _ if d == 0.0 => 0.0,
+                    _ => NOTCH * d.signum(),
+                }
+            }
+            _ => 0.0,
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +144,25 @@ mod tests {
         assert_eq!(mm.drag_action(PointerButton::Secondary, m(false, true, false)), Some(Pan));
         assert_eq!(mm.drag_action(PointerButton::Middle, m(true, false, false)), Some(Pan));
         assert_eq!(mm.drag_action(PointerButton::Middle, m(false, true, false)), Some(Pan));
+    }
+
+    #[test]
+    fn brush_wheel_steps_are_per_notch() {
+        let wheel = |unit, x: f32, y: f32| egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(x, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Default::default(),
+        };
+        use egui::MouseWheelUnit::{Line, Point};
+        // Accelerated notches (1, 4.6 lines) count the same; Shift's horizontal wheel too.
+        assert_eq!(brush_wheel_delta(&[wheel(Line, 0.0, 1.0)]), brush_wheel_delta(&[wheel(Line, 0.0, 4.6)]));
+        assert_eq!(brush_wheel_delta(&[wheel(Line, -2.0, 0.0)]), -brush_wheel_delta(&[wheel(Line, 0.0, 1.0)]));
+        assert_eq!(brush_wheel_delta(&[wheel(Line, 0.0, 1.0), wheel(Line, 0.0, 3.0)]), 2.0 * brush_wheel_delta(&[wheel(Line, 0.0, 1.0)]));
+        // Trackpads stay continuous.
+        assert_eq!(brush_wheel_delta(&[wheel(Point, 0.0, 3.5)]), 3.5);
+        assert_eq!(brush_wheel_delta(&[egui::Event::Copy]), 0.0);
     }
 
     #[test]
