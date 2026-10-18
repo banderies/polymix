@@ -99,7 +99,7 @@ Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — i
       Make Solid's Color Transfer Mode (No Colors / Vertex-to-Vertex / Material-to-Vertex).
 - [x] **M6.3 Hotbox parity**: camera drag buttons, background colour, brush Size/Strength.
 - [x] **M6.4 Material library** (clay variants, glossy, metal, resin).
-- [ ] **M6.5 View cube** (own design) with clickable faces/edges.
+- [x] **M6.5 View cube** (own design) with clickable faces/edges.
 - [ ] **M6.6 Meshmixer-style light theme** and an original icon set for the palette and tools.
 
 ## M7 — Files and application shell

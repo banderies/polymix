@@ -12,6 +12,7 @@ mod scene;
 mod spacemouse;
 mod tools;
 mod ui_util;
+mod view_cube;
 
 #[cfg(test)]
 mod pipeline_tests;

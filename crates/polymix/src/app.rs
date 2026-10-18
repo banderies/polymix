@@ -105,11 +105,12 @@ pub struct ViewOptions {
     pub transparent_target: bool,
     /// Background colour at the top of the view.
     pub background: [f32; 3],
+    pub show_view_cube: bool,
 }
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true }
     }
 }
 
@@ -288,6 +289,7 @@ impl PolymixApp {
                 .unwrap_or(if flag("group_colors", false) { ColorMode::Group } else { ColorMode::Vertex });
             app.view.show_grid = flag("grid", false);
             app.view.transparent_target = flag("transparent_target", true);
+            app.view.show_view_cube = flag("view_cube", true);
             if let Some(c) = st.get_string("background") {
                 let v: Vec<f32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
                 if let [r, g, b] = v[..] {
@@ -702,6 +704,7 @@ impl PolymixApp {
                     self.next_view();
                 }
                 ui.checkbox(&mut self.view.show_grid, "Show grid");
+                ui.checkbox(&mut self.view.show_view_cube, "Show view cube");
                 ui.checkbox(&mut self.view.transparent_target, "Transparent target").on_hover_text("Draw the target surface see-through");
                 ui.menu_button("Standard views", |ui| {
                     use std::f64::consts::{FRAC_PI_2, PI};
@@ -1653,10 +1656,34 @@ impl PolymixApp {
             ctx.request_repaint();
         }
         self.axis_gizmo(&painter, rect);
+        if self.view.show_view_cube {
+            self.view_cube(ui, rect);
+        }
         if self.nav_drag.is_some() || response.dragged() || in_rect {
             // Keep hover-driven overlays (brush cursor) responsive.
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+    }
+
+    /// The view cube in the top-right corner: click a face / edge / corner for that view,
+    /// drag to tumble. It sits above the viewport, so its input never reaches tools.
+    fn view_cube(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let scale = 26.0;
+        let centre = rect.right_top() + egui::vec2(-scale * 2.2, scale * 2.2);
+        let area = egui::Rect::from_center_size(centre, egui::vec2(scale * 3.6, scale * 3.6));
+        let resp = ui.interact(area, egui::Id::NULL.with("view_cube"), egui::Sense::click_and_drag());
+        let orient = self.camera.orient;
+        let hover = resp.hover_pos().and_then(|p| crate::view_cube::region_at(orient, centre, scale, p));
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            self.camera.tumble(d.x as f64, d.y as f64);
+        } else if resp.clicked() {
+            if let Some(d) = hover {
+                let (yaw, pitch) = crate::view_cube::yaw_pitch(d);
+                self.standard_view(yaw, pitch);
+            }
+        }
+        crate::view_cube::draw(&ui.painter_at(rect), self.camera.orient, centre, scale, hover, ui_util::ACCENT);
     }
 
     fn axis_gizmo(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -2065,6 +2092,7 @@ impl eframe::App for PolymixApp {
         st.set_string("color_mode", self.view.colors.key().to_string());
         st.set_string("grid", b(self.view.show_grid));
         st.set_string("transparent_target", b(self.view.transparent_target));
+        st.set_string("view_cube", b(self.view.show_view_cube));
         let bg = self.view.background;
         st.set_string("background", format!("{},{},{}", bg[0], bg[1], bg[2]));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
