@@ -32,8 +32,9 @@ pub struct SelectTool {
     pub through: bool,
     /// Brush shape (Meshmixer's Brush Mode); Unwrap measures along the surface.
     pub brush_shape: mm_core::BrushShape,
-    /// The brush may select faces turned away from the camera.
-    pub allow_back_faces: bool,
+    /// The brush keeps to faces turned the same way as the one under it (leaving the far
+    /// side of spikes and thin parts alone). Off, it selects everything its preview covers.
+    pub visible_side_only: bool,
     /// The brush only selects faces whose outer side is outside the solid (skips faces
     /// buried inside other parts, e.g. overlapping tubes).
     pub restrict_exterior: bool,
@@ -205,7 +206,7 @@ impl Default for SelectTool {
             size_pct: 2.5,
             through: true,
             brush_shape: mm_core::BrushShape::Unwrap,
-            allow_back_faces: false,
+            visible_side_only: false,
             restrict_exterior: false,
             symmetry: None,
             expand_mode: ExpandMode::Geodesic,
@@ -339,7 +340,7 @@ impl SelectTool {
             self.exterior = Some(ExteriorCache { object, version: mesh.shape_version(), wn: std::sync::Arc::new(mm_solid::WindingNumber::new(&mesh)), eps, known: Default::default() });
         }
         let (eye, fwd, ortho) = (cx.camera.eye(), cx.camera.forward(), cx.camera.orthographic);
-        let allow_back = self.allow_back_faces;
+        let visible_only = self.visible_side_only;
         let shape = self.brush_shape;
         let crease_cos = self.crease_cos();
         let exterior = if self.restrict_exterior { self.exterior.as_mut() } else { None };
@@ -350,12 +351,13 @@ impl SelectTool {
         };
         let mut changed = 0;
         for (tid, p) in stamps {
-            // Without Allow Back Faces the brush keeps to faces turned the same way as the one
-            // under it: the outside as usual, or the inside where the model is cut open. Either
-            // way the far wall of a thin part (turned the other way) is left alone.
+            // The brush takes everything its preview covers, including faces hidden from view
+            // (the far side of a spike). With Visible Side Only it keeps to faces turned the
+            // same way as the one under it: the outside as usual, or the inside where the model
+            // is cut open, leaving the far wall of a thin part alone.
             let side = faces_eye(tid);
             let allow = |t: u32| {
-                if !allow_back && faces_eye(t) != side {
+                if visible_only && faces_eye(t) != side {
                     return false;
                 }
                 match exterior.borrow_mut().as_mut() {
@@ -569,7 +571,8 @@ impl Tool for SelectTool {
             "disc" => self.brush_shape = mm_core::BrushShape::SphereDisc,
             "unwrap" => self.brush_shape = mm_core::BrushShape::Unwrap,
             "wand" => self.mode = SelectMode::Wand,
-            "backfaces" => self.allow_back_faces = true,
+            "backfaces" => self.visible_side_only = false,
+            "visibleside" => self.visible_side_only = true,
             // `size:8` (percent of the model).
             c if c.starts_with("size:") => self.size_pct = c[5..].parse().unwrap_or(self.size_pct),
             _ => {}
@@ -630,7 +633,7 @@ impl Tool for SelectTool {
                         ui.selectable_value(&mut self.expand_mode, ExpandMode::CreaseAngle, "Crease Angle").on_hover_text("Grow across edges flatter than an angle that increases with the drag");
                         ui.selectable_value(&mut self.expand_mode, ExpandMode::VertexColor, "Vertex Color").on_hover_text("Grow into faces coloured like the selection; the drag sets the tolerance");
                     });
-                ui.checkbox(&mut self.allow_back_faces, "Allow back faces").on_hover_text("Let the brush also select faces turned the other way from the surface you are brushing (e.g. the far wall of a thin part)");
+                ui.checkbox(&mut self.visible_side_only, "Visible side only").on_hover_text("Only select faces turned the same way as the one under the cursor, leaving the far side of spikes and thin parts alone. Off: the brush selects everything its preview covers, hidden faces too.");
                 ui.checkbox(&mut self.restrict_exterior, "Restrict to exterior faces").on_hover_text("Skip faces buried inside other parts of the mesh (e.g. overlapping tubes)");
                 ui.add(egui::Slider::new(&mut self.crease_deg, 0.0..=180.0).suffix("°").text("Crease angle threshold"))
                     .on_hover_text("The brush and Cmd+right-drag growth stop at edges sharper than this (0 = off)");
@@ -1145,7 +1148,7 @@ mod tests {
         let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
         let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
         let mut tool = SelectTool { size_pct: 10.0, ..Default::default() };
-        assert!(!tool.allow_back_faces);
+        assert!(!tool.visible_side_only);
         let c = vp.rect.center();
         tool.pointer(&PointerInput { pos: Some(c), pressed: true, down: true, ..Default::default() }, &mut cx);
         tool.pointer(&PointerInput { pos: Some(c + egui::vec2(4.0, 0.0)), down: true, ..Default::default() }, &mut cx);
@@ -1155,6 +1158,41 @@ mod tests {
         // Every selected face is on the inside (turned away from the eye), none on the far rim.
         let eye = cx.camera.eye();
         assert!(o.selection.iter().all(|t| o.mesh.tri_normal(t).dot(eye - o.mesh.tri_centroid(t)) < 0.0));
+    }
+
+    #[test]
+    fn brush_takes_the_hidden_side_of_a_spike() {
+        // A spike leaning 45° to the view (looking down −z): its far side faces away from the
+        // eye. The brush covers the whole spike, so by default all of it is selected; with
+        // Visible Side Only the far side is left alone.
+        let mut m = primitives::icosphere(1.0, 4);
+        let dir = DVec3::new(1.0, 0.0, 1.0).normalize();
+        let tip = m.vertex_ids().max_by(|&a, &b| m.vertex(a).dot(dir).total_cmp(&m.vertex(b).dot(dir))).unwrap();
+        let base = m.vertex(tip);
+        m.set_vertex(tip, base * 2.5);
+        let spike: Vec<u32> = m.vertex_triangles(tip).to_vec();
+        let mut camera = crate::camera::Camera::default();
+        camera.set_view(0.0, 0.0);
+        let unselected = |visible_side_only: bool| {
+            let mut scene = Scene::default();
+            let id = scene.add("spiky", m.clone());
+            let (mut history, mut camera, mut status) = (crate::scene::History::default(), camera.clone(), String::new());
+            camera.focus(&scene.bounds());
+            let ctx = egui::Context::default();
+            let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+            let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+            let mut tool = SelectTool { size_pct: 40.0, visible_side_only, ..Default::default() };
+            let at = cx.project(base * 1.75).unwrap();
+            tool.pointer(&PointerInput { pos: Some(at), pressed: true, down: true, ..Default::default() }, &mut cx);
+            tool.pointer(&PointerInput { pos: Some(at), released: true, ..Default::default() }, &mut cx);
+            let o = cx.scene.get(id).unwrap();
+            let eye = cx.camera.eye();
+            let hidden = spike.iter().filter(|&&t| o.mesh.tri_normal(t).dot(eye - o.mesh.tri_centroid(t)) < 0.0).count();
+            assert!(hidden > 0, "part of the spike faces away");
+            spike.iter().filter(|&&t| !o.selection.contains(t)).count()
+        };
+        assert_eq!(unselected(false), 0, "the whole spike, as the preview shows");
+        assert!(unselected(true) > 0, "Visible Side Only leaves the far side");
     }
 
     #[test]
