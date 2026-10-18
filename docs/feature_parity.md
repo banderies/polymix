@@ -155,10 +155,10 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Extract (Shift+D) — offset copy into a new object | ✅ | New closed solid object; Direction and End type |
 | Edit: Offset (Ctrl+D) | 🟡 | Distance, Soft Transition, Preserve Boundary, Regularity ✅; Connected, Accuracy, Preserve Groups ❌ (meaning to confirm in Meshmixer) |
 | Edit: Remesh (R) / Reduce (Shift+R) on the selection | ✅ | In-tool D/F density ±10, T adaptive (Remesh), G preserve groups |
-| Edit: Bridge (two selected regions) | ✅ | ⌘B; Edit → Bridge boundaries also joins two existing openings |
+| Edit: Bridge (two selected regions) | ✅ | ⌘B, a straight loft (shape, ends and tension as in Erase & Fill's Loft); Edit → Bridge boundaries also lofts two existing openings together |
 | Edit: Join (along boundary edges) | ✅ | `J`: stitches the two open boundaries next to the selection |
 | Edit: Weld Boundaries | ✅ | Close Cracks restricted to the selection's open edges, tolerance in edge lengths |
-| Edit: Tube Handle | ✅ | Curved tube between two selected regions |
+| Edit: Tube Handle | ✅ | Curved tube between two selected regions: a smooth loft standing up from each opening along its normal |
 | Edit: Align To Target / Attract To Target | ✅ | Align: ICP on the selected (or all) faces, Translate and Rotate / Translate Only. Attract: offset, smooth, normal threshold, preserve mesh / group boundaries, optional refinement (density). Project to Target in Erase & Fill and Smooth Boundary |
 | Edit: Separate (Y) / Duplicate selection | ✅ | |
 | Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | ✅ | |

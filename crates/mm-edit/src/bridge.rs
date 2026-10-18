@@ -5,7 +5,7 @@
 
 use crate::util::*;
 use crate::{EditError, EditResult};
-use mm_core::{DVec3, Mesh};
+use mm_core::{DQuat, DVec3, Mesh};
 
 /// Parameters for [`bridge`] and [`join_loops`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -243,7 +243,11 @@ pub(crate) struct AlignedLoops {
     pub q: Vec<u32>,
 }
 
-pub(crate) fn aligned_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32]) -> EditResult<AlignedLoops> {
+/// `dirs`: the directions the tube leaves A and B in (out of each opening), when known. A's
+/// shape is then turned the way the tube turns between them before matching it to B's —
+/// for openings facing the same way (a handle) the shapes match equally well at any shift
+/// of a circle, and only the turn tells the outer side of the arch from the inner.
+pub(crate) fn aligned_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32], dirs: Option<[DVec3; 2]>) -> EditResult<AlignedLoops> {
     let a = orient_boundary_loop(mesh, loop_a)?;
     let b = orient_boundary_loop(mesh, loop_b)?;
     if a.iter().any(|v| b.contains(v)) {
@@ -260,11 +264,12 @@ pub(crate) fn aligned_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32]) -> Edit
 
     // Align B's start with A's: best cyclic shift of the normalised, resampled shapes.
     const M: usize = 64;
-    let sa = resample_polyline(&pa, M, true);
+    let turn = dirs.map_or(DQuat::IDENTITY, |[da, db]| tube_turn(da, -db, cb - ca));
+    let sa: Vec<DVec3> = resample_polyline(&pa, M, true).into_iter().map(|x| turn * ((x - ca) / ra)).collect();
     let sb = resample_polyline(&pb, M, true);
     let mut best = (0usize, f64::INFINITY);
     for sh in 0..M {
-        let cost: f64 = (0..M).map(|i| ((sa[i] - ca) / ra - (sb[(i + sh) % M] - cb) / rb).length_squared()).sum();
+        let cost: f64 = (0..M).map(|i| (sa[i] - (sb[(i + sh) % M] - cb) / rb).length_squared()).sum();
         if cost < best.1 {
             best = (sh, cost);
         }
@@ -278,10 +283,26 @@ pub(crate) fn aligned_loops(mesh: &Mesh, loop_a: &[u32], loop_b: &[u32]) -> Edit
     Ok(AlignedLoops { a, b, p, q })
 }
 
+/// The rotation carrying a tube's cross-section from its start (travelling along `from`) to
+/// its end (travelling along `to`): parallel transport along the path start direction →
+/// chord → end direction, so an arch turns in the plane of its chord even when the end
+/// directions are nearly opposite (where the smallest turn between them could be about any
+/// axis). Identity when a direction is unknown (zero).
+fn tube_turn(from: DVec3, to: DVec3, chord: DVec3) -> DQuat {
+    let (from, to, chord) = (from.normalize_or_zero(), to.normalize_or_zero(), chord.normalize_or_zero());
+    if from == DVec3::ZERO || to == DVec3::ZERO {
+        return DQuat::IDENTITY;
+    }
+    if chord == DVec3::ZERO {
+        return DQuat::from_rotation_arc(from, to);
+    }
+    DQuat::from_rotation_arc(chord, to) * DQuat::from_rotation_arc(from, chord)
+}
+
 /// Join two whole boundary loops (either orientation) with a tube of triangles, e.g. to
 /// reconnect a vessel across a gap. The loops may have different vertex counts.
 pub fn join_loops(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &BridgeParams) -> EditResult<BridgeResult> {
-    let AlignedLoops { a, b, p, q } = aligned_loops(mesh, loop_a, loop_b)?;
+    let AlignedLoops { a, b, p, q } = aligned_loops(mesh, loop_a, loop_b, None)?;
     let group = new_group(mesh);
     let gap = mean(&positions(mesh, &p)).distance(mean(&positions(mesh, &q)));
     let h = 0.5 * (mean_edge(mesh, &p, true) + mean_edge(mesh, &q, true));

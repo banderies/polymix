@@ -2,8 +2,8 @@
 //!
 //! Each column of the tube (one point of A's loop to the matching point of B's) follows a
 //! Hermite curve. At a G1 end the curve leaves along the surrounding wall, taken per
-//! boundary vertex (so an obliquely cut vessel blends without a kink), with the end's
-//! tension scaling the tangent; a G2 end also continues the vessel's bend (the curvature
+//! boundary vertex (so an obliquely cut vessel blends without a kink), or straight out of
+//! an opening in a surface (a handle), with the end's tension scaling the tangent; a G2 end also continues the vessel's bend (the curvature
 //! of the centres of the rings of mesh behind the opening, adjusted per column for its
 //! distance from the bend's centre), which makes the column quintic; at a G0 end the curve
 //! is free (zero curvature there), so it only meets the opening. The cross-section blends from A's shape to B's along the way, optionally
@@ -46,17 +46,29 @@ impl EndContinuity {
     }
 }
 
+/// Which way a G1 / G2 end leaves its opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EndDirection {
+    /// Along the surrounding wall, per boundary vertex: an opening cut across a vessel.
+    #[default]
+    Wall,
+    /// Straight out of the opening, along its normal: an opening in a surface, which the
+    /// tube stands up from like a handle. The tube starts straight (no bend at G2).
+    Normal,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LoftEnd {
     pub continuity: EndContinuity,
     /// Length of the end tangent relative to the gap (G1 / G2); larger keeps the tube
-    /// following the wall's direction for longer.
+    /// following the end's direction for longer.
     pub tension: f64,
+    pub direction: EndDirection,
 }
 
 impl Default for LoftEnd {
     fn default() -> Self {
-        Self { continuity: EndContinuity::G1, tension: 1.0 }
+        Self { continuity: EndContinuity::G1, tension: 1.0, direction: EndDirection::Wall }
     }
 }
 
@@ -111,7 +123,8 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     if params.bulge.is_nan() || params.bulge <= -1.0 || params.ends.iter().any(|e| e.tension.is_nan() || e.tension <= 0.0) || !unit(params.round) || !unit(params.fair) {
         return Err(EditError::InvalidParameter("bulge must exceed −100 %, tension must be positive, round and fair lie in 0..1".into()));
     }
-    let AlignedLoops { p, q, .. } = aligned_loops(mesh, loop_a, loop_b)?;
+    let dirs = [end_axis(mesh, loop_a, params.ends[0].direction), end_axis(mesh, loop_b, params.ends[1].direction)];
+    let AlignedLoops { p, q, .. } = aligned_loops(mesh, loop_a, loop_b, Some(dirs))?;
     let group = params.group.unwrap_or_else(|| new_group(mesh));
     let close = |v: &[u32]| {
         let mut c = v.to_vec();
@@ -129,8 +142,11 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     // A's points start at p[0]; B's are shifted by the twist.
     let twist = params.twist_deg.rem_euclid(360.0) / 360.0;
     let smooth = params.shape == LoftShape::Smooth;
-    let ea = EndData::sample(mesh, &p, n, 0.0, smooth);
-    let eb = EndData::sample(mesh, &q, n, twist, smooth);
+    let mut ea = EndData::sample(mesh, &p, n, 0.0, smooth, params.ends[0].direction);
+    let mut eb = EndData::sample(mesh, &q, n, twist, smooth, params.ends[1].direction);
+    // The columns run between smoothed openings; each opening's own raggedness is added
+    // back near it only (see `end_detail`).
+    let detail = [ea.smooth_profile(), eb.smooth_profile()];
 
     let columns: Vec<Column> = (0..n).map(|i| Column::new(&ea, &eb, i, params, smooth)).collect();
     // Rows along the tube: the length of its middle curve over the edge length.
@@ -138,7 +154,8 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     let length: f64 = (0..32).map(|k| mid(k as f64 / 32.0).distance(mid((k + 1) as f64 / 32.0))).sum();
     let segs = ((length / h).round() as usize).clamp(1, 10_000);
     // B's chain starts at its vertex nearest the first row point, so the last band is untwisted.
-    let start = (0..q.len()).min_by(|&x, &y| mesh.vertex(q[x]).distance_squared(eb.pos[0]).total_cmp(&mesh.vertex(q[y]).distance_squared(eb.pos[0]))).unwrap_or(0);
+    let b0 = eb.pos[0] + detail[1][0];
+    let start = (0..q.len()).min_by(|&x, &y| mesh.vertex(q[x]).distance_squared(b0).total_cmp(&mesh.vertex(q[y]).distance_squared(b0))).unwrap_or(0);
     let q: Vec<u32> = q[start..].iter().chain(&q[..start]).copied().collect();
     if segs == 1 {
         let tris = strip(mesh, &close(&p), &close(&q)).ok_or_else(|| EditError::Failed("no valid strip between the openings".into()))?;
@@ -149,7 +166,9 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     let mut new_vertices = Vec::new();
     for r in 1..segs {
         let t = r as f64 / segs as f64;
-        let pts = shape_row(columns.iter().map(|c| c.at(t)).collect(), (mid(t + 1e-3) - mid(t - 1e-3)).normalize_or_zero(), middle_weight(t), params);
+        let (wa, wb) = (end_detail(t, segs), end_detail(1.0 - t, segs));
+        let pts = columns.iter().enumerate().map(|(i, c)| c.at(t) + detail[0][i] * wa + detail[1][i] * wb).collect();
+        let pts = shape_row(pts, (mid(t + 1e-3) - mid(t - 1e-3)).normalize_or_zero(), middle_weight(t), params);
         let row: Vec<u32> = pts.into_iter().map(|x| mesh.append_vertex(x)).collect();
         new_vertices.extend_from_slice(&row);
         rows.push(row);
@@ -170,6 +189,16 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
         fair_tube(mesh, &rows, params);
     }
     Ok(result)
+}
+
+/// How much of an opening's raggedness a row at `t` (0 at the opening) keeps, with `segs`
+/// rows in all: all of it at the opening, none from the third row on, fading with zero
+/// first and second derivatives at both ends so G1 / G2 ends are kept. Carried along the
+/// tube, the notches of a ragged opening (the edge of a brush-selected region) fold the
+/// rows over themselves where the tube's cross-section narrows.
+fn end_detail(t: f64, segs: usize) -> f64 {
+    let x = (t / (3.0 / segs as f64).min(0.4)).clamp(0.0, 1.0);
+    1.0 - x * x * x * (10.0 - 15.0 * x + 6.0 * x * x)
 }
 
 /// Round and bulge one row of points about its centre, by `w` (the middle weight).
@@ -232,8 +261,8 @@ fn fair_tube(mesh: &mut Mesh, rows: &[Vec<u32>], params: &LoftParams) {
     }
 }
 
-/// Samples around one opening: points evenly spaced along the loop, the wall's direction
-/// there and (for G2) the vessel's bend behind it.
+/// Samples around one opening: points evenly spaced along the loop, the direction the tube
+/// leaves in there and (for G2) the vessel's bend behind it.
 struct EndData {
     pos: Vec<DVec3>,
     dir: Vec<DVec3>,
@@ -241,9 +270,12 @@ struct EndData {
 }
 
 impl EndData {
-    fn sample(mesh: &Mesh, c: &[u32], n: usize, offset: f64, with_bend: bool) -> Self {
-        let (mut dirs, depths) = wall_directions(mesh, c);
-        let bend = if with_bend { vessel_bend(mesh, c) } else { None };
+    fn sample(mesh: &Mesh, c: &[u32], n: usize, offset: f64, with_bend: bool, direction: EndDirection) -> Self {
+        let (mut dirs, depths) = match direction {
+            EndDirection::Wall => wall_directions(mesh, c),
+            EndDirection::Normal => (vec![opening_normal(mesh, c); c.len()], vec![0.0; c.len()]),
+        };
+        let bend = if with_bend && direction == EndDirection::Wall { vessel_bend(mesh, c) } else { None };
         let pts = positions(mesh, c);
         if let Some(b) = &bend {
             // A direction measured across the last row of triangles is the wall's direction
@@ -253,14 +285,10 @@ impl EndData {
             }
         }
         let m = pts.len();
-        let mut cum = vec![0.0];
-        for i in 0..m {
-            cum.push(cum[i] + pts[i].distance(pts[(i + 1) % m]));
-        }
-        let total = cum[m].max(1e-300);
+        let cum = loop_parameter(&pts);
         let mut out = EndData { pos: Vec::with_capacity(n), dir: Vec::with_capacity(n), bend };
         for i in 0..n {
-            let s = (offset + i as f64 / n as f64).rem_euclid(1.0) * total;
+            let s = (offset + i as f64 / n as f64).rem_euclid(1.0);
             let k = cum.partition_point(|&x| x <= s).clamp(1, m) - 1;
             let l = cum[k + 1] - cum[k];
             let f = if l > 0.0 { ((s - cum[k]) / l).clamp(0.0, 1.0) } else { 0.0 };
@@ -270,11 +298,64 @@ impl EndData {
         out
     }
 
+    /// Smooth the sampled points around the opening, keeping its size and shape (Taubin
+    /// λ|μ smoothing, which removes zigzags a few samples long without shrinking the
+    /// loop); returns what was removed from each point.
+    fn smooth_profile(&mut self) -> Vec<DVec3> {
+        let n = self.pos.len();
+        let raw = self.pos.clone();
+        for k in 0..40 {
+            let w = if k % 2 == 0 { 0.5 } else { -0.53 };
+            let p = &self.pos;
+            self.pos = (0..n).map(|i| p[i] + ((p[(i + n - 1) % n] + p[(i + 1) % n]) * 0.5 - p[i]) * w).collect();
+        }
+        raw.iter().zip(&self.pos).map(|(r, s)| *r - *s).collect()
+    }
+
     /// Second derivative per unit arc length of the wall's column through sample `i`
     /// continued past the opening: the vessel's bend, tighter on the inside of it.
     fn bend_at(&self, i: usize) -> DVec3 {
         self.bend.as_ref().map_or(DVec3::ZERO, |b| b.at(self.pos[i]))
     }
+}
+
+/// Where each point of the closed loop `pts` lies around it: `m + 1` values from 0 at the
+/// first point to 1 back at it. Mostly by angle about the loop's centre in its plane, so a
+/// ragged opening (the edge of a brush-selected region, with notches) is sampled evenly
+/// around rather than evenly along every notch: sampled by length, two ragged openings blend
+/// into rows that fold over themselves. Where the angle runs backwards (in a notch) it is
+/// held; a tenth of the parameter follows the length, so it always increases. By length
+/// alone when the loop does not wind around its centre.
+fn loop_parameter(pts: &[DVec3]) -> Vec<f64> {
+    let m = pts.len();
+    let mut length = vec![0.0];
+    for i in 0..m {
+        length.push(length[i] + pts[i].distance(pts[(i + 1) % m]));
+    }
+    let total = length[m].max(1e-300);
+    let by_length: Vec<f64> = length.iter().map(|l| l / total).collect();
+    let (c, normal) = (mean(pts), area_vector(pts).normalize_or_zero());
+    if normal == DVec3::ZERO {
+        return by_length;
+    }
+    let (e1, e2) = (normal.any_orthonormal_vector(), normal.cross(normal.any_orthonormal_vector()));
+    let angle = |p: DVec3| (p - c).dot(e2).atan2((p - c).dot(e1));
+    let mut turn = vec![0.0];
+    for i in 0..m {
+        let a = angle(pts[(i + 1) % m]) - angle(pts[i]);
+        turn.push(turn[i] + (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI);
+    }
+    if turn[m].abs() < std::f64::consts::PI {
+        return by_length;
+    }
+    let sign = turn[m].signum();
+    let mut held = 0.0f64;
+    let by_angle: Vec<f64> = turn.iter().map(|t| {
+        held = held.max(t * sign);
+        held
+    }).collect();
+    let total = by_angle[m].max(1e-300);
+    (0..=m).map(|k| 0.9 * by_angle[k] / total + 0.1 * by_length[k]).collect()
 }
 
 /// A vessel's bend just behind an opening.
@@ -380,6 +461,37 @@ pub(crate) fn wall_directions(mesh: &Mesh, c: &[u32]) -> (Vec<DVec3>, Vec<f64>) 
     (d, depths)
 }
 
+/// The overall direction a tube leaves opening `c` in (zero for a hole in a sheet left
+/// along the wall, whose directions cancel out).
+fn end_axis(mesh: &Mesh, c: &[u32], direction: EndDirection) -> DVec3 {
+    match direction {
+        EndDirection::Wall => wall_directions(mesh, c).0.iter().sum::<DVec3>().normalize_or_zero(),
+        EndDirection::Normal => opening_normal(mesh, c),
+    }
+}
+
+/// The direction straight out of opening `c` (closed): the mean normal of the triangles
+/// around it, for a hole in a surface; where the surface wraps around the opening instead
+/// (a vessel cut across, whose normals cancel out), the direction away from the surface
+/// behind it.
+fn opening_normal(mesh: &Mesh, c: &[u32]) -> DVec3 {
+    let n = c.len();
+    let (mut sum, mut total) = (DVec3::ZERO, 0.0);
+    for i in 0..n {
+        if let Some(e) = mesh.find_edge(c[i], c[(i + 1) % n]) {
+            let t = mesh.edge_triangles(e)[0];
+            let area = mesh.tri_area(t);
+            sum += mesh.tri_normal(t) * area;
+            total += area;
+        }
+    }
+    if total > 0.0 && sum.length() > 0.5 * total {
+        sum.normalize()
+    } else {
+        loop_outward_direction(mesh, c).unwrap_or(DVec3::ZERO)
+    }
+}
+
 /// The bend of the vessel behind the opening `c`: the curvature of the path through the
 /// centres of the rings of mesh behind it (rings by edge distance from the opening, out to
 /// one and a half opening radii), from a least-squares parabola `c(s) = c₀ + s D + ½ s² K`
@@ -440,6 +552,25 @@ fn vessel_bend(mesh: &Mesh, c: &[u32]) -> Option<Bend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_parameter_goes_around_by_angle() {
+        let circle = |k: usize, n: usize| {
+            let a = std::f64::consts::TAU * k as f64 / n as f64;
+            DVec3::new(a.cos(), a.sin(), 0.0)
+        };
+        // A regular polygon: the same as by length.
+        let poly: Vec<DVec3> = (0..12).map(|k| circle(k, 12)).collect();
+        let u = loop_parameter(&poly);
+        assert!(u.iter().enumerate().all(|(k, x)| (x - k as f64 / 12.0).abs() < 1e-12));
+        // A notch (in and back out at one angle, as a ragged edge does) takes up a tenth of
+        // the loop by length but only its length share of the tenth that follows the length.
+        let mut notched: Vec<DVec3> = (0..8).map(|k| circle(k, 8)).collect();
+        notched.splice(2..2, [circle(2, 8) * 0.2, circle(2, 8) * 0.6]);
+        let u = loop_parameter(&notched);
+        assert!(u.windows(2).all(|w| w[1] > w[0]) && (u[notched.len()] - 1.0).abs() < 1e-12, "{u:?}");
+        assert!(u[4] - u[2] < 0.08, "the notch is passed quickly ({:.3})", u[4] - u[2]);
+    }
 
     #[test]
     fn quintic_column_matches_the_cubic_without_g2() {

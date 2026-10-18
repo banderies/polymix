@@ -150,6 +150,17 @@ pub struct SceneRenderer {
     lines_buf: Option<(wgpu::Buffer, usize)>,
     overlay_tris_buf: Option<(wgpu::Buffer, usize)>,
     target: Option<Target>,
+    /// egui's renderer, where the target is registered as a texture (freed on drop, e.g.
+    /// when the Mesh workspace restarts after a crash).
+    egui_renderer: std::sync::Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
+}
+
+impl Drop for SceneRenderer {
+    fn drop(&mut self) {
+        if let Some(t) = &self.target {
+            self.egui_renderer.write().free_texture(&t.texture_id);
+        }
+    }
 }
 
 struct Target {
@@ -375,6 +386,7 @@ impl SceneRenderer {
             lines_buf: None,
             overlay_tris_buf: None,
             target: None,
+            egui_renderer: rs.renderer.clone(),
         }
     }
 
