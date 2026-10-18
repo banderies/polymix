@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mm-core", "crates/mm-edit", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-solid", "crates/polymix"]
+members = ["crates/mm-core", "crates/mm-edit", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-solid", "crates/polymix", "crates/polymix-volume", "crates/polymix-workspace"]
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +13,9 @@ rayon = "1.12"
 smallvec = { version = "1.15", features = ["union", "const_generics"] }
 anyhow = "1"
 thiserror = "2"
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "persistence", "system_fonts"] }
+log = "0.4"
 
 [profile.dev]
 opt-level = 1

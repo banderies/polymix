@@ -1,0 +1,12 @@
+[package]
+name = "polymix-workspace"
+description = "Polymix workspaces: the shared trait, crash guard, background jobs and data folder"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+log.workspace = true

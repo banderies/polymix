@@ -19,11 +19,13 @@ mm-solid = { path = "../mm-solid" }
 glam.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
-eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "persistence", "system_fonts"] }
-egui = "0.37"
+eframe.workspace = true
+egui.workspace = true
+polymix-workspace = { path = "../polymix-workspace" }
+polymix-volume = { path = "../polymix-volume" }
 bytemuck = { version = "1.25", features = ["derive"] }
 rfd = "0.17"
-log = "0.4"
+log.workspace = true
 env_logger = "0.11"
 png = "0.18"
 # Project files (.polymix) are zip archives.

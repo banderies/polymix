@@ -1,0 +1,13 @@
+[package]
+name = "polymix-volume"
+description = "Polymix Volume workspace: find, organise and preview medical images (DICOM, NIfTI, NRRD)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+polymix-workspace = { path = "../polymix-workspace" }
+egui.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+log.workspace = true

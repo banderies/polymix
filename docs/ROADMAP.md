@@ -149,3 +149,51 @@ two holes (double-click each open edge, then `F`).
       and the row radii restored; *Round*: circular middle cross-section.
 - [ ] **M10.3 One loft for every tube join**: ⌘B Tube Handle and Vessel → Bridge boundaries use
       the loft, so all three behave the same.
+
+## M11 — Workspaces and shell
+
+Three top-level workspaces, **Volume | Segmentation | Mesh**, for the whole
+DICOM / NIfTI → segmentation → mesh pipeline. Each lives in its own crate and is called
+through a crash guard, so a bug in one cannot stop the others.
+
+- [x] **M11.1 Workspace shell**: `polymix-workspace` crate (the `Workspace` trait, crash
+      guard with a panic hook writing `<data dir>/logs/crash-*.log`, `Job`, `data_dir`);
+      the tab bar (⌘1 / ⌘2 / ⌘3); the Mesh workspace unchanged under it; background work
+      (`tick`) for every workspace each frame; dropped files and command-line paths routed to
+      the workspace that opens them; per-workspace window titles; a crashed workspace shows a
+      card with Restart / Copy details / Show log. Test scripts: the shell owns waits, keys,
+      screenshots and `ws:` / `crash:` / `restart:`; other steps go to the shown workspace.
+
+## M12 — Volume data (`mm-volume`)
+
+The library behind the Volume workspace: no GUI, fully unit-tested.
+
+- [ ] **M12.1 Model and geometry**: catalog entries, DICOM patient / study / series tree,
+      geometry (dims, spacing, RAS affine, orientation codes, obliquity), kinds (image, label
+      map, segmentation, derived, localizer, non-image).
+- [ ] **M12.2 NIfTI-1 / NIfTI-2 / Analyze 7.5 headers.**
+- [ ] **M12.3 NRRD** (`.nrrd`, `.nhdr` + data file, Slicer `.seg.nrrd`).
+- [ ] **M12.4 DICOM headers and organisation** like 3D Slicer's DICOM browser: Patient →
+      Study → Series; series split into volumes (orientation, size, echo, time, …); slice
+      order, spacing checks (missing / irregular / duplicate slices), gantry tilt, localizers,
+      non-image objects; DICOMDIR.
+- [ ] **M12.5 Enhanced (multi-frame) DICOM** geometry from functional groups.
+- [ ] **M12.6 Folder scanner and catalog cache**: magic-byte detection, default skipped
+      folders (venv, .git, …), parallel, cancellable, fault-tolerant; incremental rescans.
+- [ ] **M12.7 Slices** for thumbnails (NIfTI / Analyze / NRRD / DICOM, pure-Rust JPEG
+      Lossless, RLE, deflate).
+
+## M13 — Volume browser
+
+- [ ] **M13.1 Browser UI**: Add folder / Rescan / Cancel, sources, the DICOM tree and the
+      other-files table, filters, search, details panel, Hide identifiers.
+- [ ] **M13.2 Thumbnail** with slice slider and window / level.
+
+## Later
+
+- **M14 — Volume viewer**: three planes (MPR) and a 3D view.
+- **M15 — Segmentation workspace**: threshold, region growing, paint, islands; hand-off to
+  Mesh through `mm_solid::mesh_implicit` / `marching_tetrahedra`.
+- **Codecs**: JPEG-LS and JPEG 2000 (pure Rust first: `j2k-native`, `dicom-toolkit-rs`;
+  else `charls-sys` / `openjpeg-sys`).
+- **More formats**: see [volume_formats.md](volume_formats.md).

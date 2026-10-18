@@ -12,6 +12,19 @@ cleaning up medical segmentations (e.g. cerebral vessels from 3D Slicer) for CFD
   analysis against the original segmentation, and named boundary patches with multi-solid STL
   export.
 
+## Workspaces
+
+Polymix has three workspaces, shown as tabs at the top of the window (⌘1 / ⌘2 / ⌘3):
+
+- **Volume**: find, organise and preview medical images (DICOM, NIfTI, NRRD) in a folder.
+- **Segmentation**: coming next.
+- **Mesh**: the mesh editor described below.
+
+Each workspace is independent: if one runs into an internal error it stops on its own (its
+tab shows what happened, with a Restart button and a log in the data folder) and the
+others keep working. Dropped files go to the workspace that opens them (meshes and
+`.polymix` projects to Mesh, images and folders to Volume).
+
 ## Build & run
 
 Requires Rust (<https://rustup.rs>).

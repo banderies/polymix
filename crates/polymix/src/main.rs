@@ -12,6 +12,7 @@ mod parts;
 mod project;
 mod renderer;
 mod scene;
+mod shell;
 mod spacemouse;
 mod tools;
 mod ui_util;
@@ -39,6 +40,8 @@ fn main() -> eframe::Result {
             .with_active(!scripted),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
+        // Test runs with their own data folder keep the window state there too.
+        persistence_path: std::env::var_os("POLYMIX_DATA_DIR").map(|d| std::path::PathBuf::from(d).join("app.ron")),
         ..Default::default()
     };
     // Scripted test runs must not steal focus (or keystrokes) from whatever the user is doing.
@@ -49,7 +52,7 @@ fn main() -> eframe::Result {
             b.with_activate_ignoring_other_apps(false).with_activation_policy(ActivationPolicy::Accessory);
         }));
     }
-    eframe::run_native("Polymix", options, Box::new(move |cc| Ok(Box::new(app::PolymixApp::new(cc, files)))))
+    eframe::run_native("Polymix", options, Box::new(move |cc| Ok(Box::new(shell::PolymixApp::new(cc, files)))))
 }
 
 /// Window / dock icon decoded from the embedded PNG.

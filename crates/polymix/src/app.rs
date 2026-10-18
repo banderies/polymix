@@ -124,21 +124,7 @@ pub enum ExportScope {
     Selection,
 }
 
-/// Where autosaves and the session marker live (per user).
-pub(crate) fn data_dir() -> Option<PathBuf> {
-    // Test runs point this elsewhere so they never touch the user's files.
-    if let Some(d) = std::env::var_os("POLYMIX_DATA_DIR") {
-        return Some(PathBuf::from(d));
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if cfg!(target_os = "macos") {
-        return home.map(|h| h.join("Library/Application Support/Polymix"));
-    }
-    if cfg!(windows) {
-        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Polymix"));
-    }
-    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".local/share"))).map(|d| d.join("polymix"))
-}
+pub(crate) use polymix_workspace::data_dir;
 
 /// Autosave state: the files, what was saved last, and the job writing it.
 struct Autosave {
@@ -308,7 +294,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
 type ImportResult = Vec<(String, Mesh, String)>;
 type BoundaryKey = (ObjectId, u64, usize);
 
-pub struct PolymixApp {
+pub struct MeshWorkspace {
     scene: Scene,
     history: History,
     camera: Camera,
@@ -370,7 +356,6 @@ pub struct PolymixApp {
     prefs_tab: usize,
     last_export_dir: Option<PathBuf>,
     export_ascii: bool,
-    window_title: String,
     /// Where the floating tool panel was last drawn (keeps viewport decorations clear of it).
     tool_panel_rect: Option<egui::Rect>,
     /// Width of the floating tool panel (drag its right edge).
@@ -383,20 +368,21 @@ pub struct PolymixApp {
     synthetic: std::collections::VecDeque<PointerInput>,
 }
 
-/// Scripted UI actions for automated testing and screenshots (`POLYMIX_SCRIPT`), e.g.
-/// `wait:20;tool:inspector;wait:5;shot:/tmp/a.png;quit`.
+/// Scripted UI actions for automated testing (`POLYMIX_SCRIPT`), e.g.
+/// `tool:inspector;toolcmd:...;log:tag`. The shell runs the script and hands the Mesh
+/// workspace its steps; waits, key presses and screenshots are the shell's.
+#[derive(Default)]
 struct Script {
     steps: std::collections::VecDeque<String>,
     wait: u32,
-    awaiting_shot: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Key presses (`key:S`) for the next frame's input.
-    keys: Vec<egui::Key>,
 }
 
-impl PolymixApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
-        ui_util::apply_theme(&cc.egui_ctx, ui_util::Theme::Dark);
-        let renderer = cc.wgpu_render_state.as_ref().map(SceneRenderer::new);
+impl MeshWorkspace {
+    /// A fresh Mesh workspace (also used to restart it after a crash), reading its
+    /// preferences from `storage`.
+    pub fn new(ctx: &egui::Context, render_state: Option<&eframe::egui_wgpu::RenderState>, storage: Option<&dyn eframe::Storage>) -> Self {
+        ui_util::apply_theme(ctx, ui_util::Theme::Dark);
+        let renderer = render_state.map(SceneRenderer::new);
         let mut app = Self {
             scene: Scene::default(),
             history: History::default(),
@@ -431,7 +417,7 @@ impl PolymixApp {
             space_moving: false,
             last_pointer: None,
             show_help: false,
-            space: SpaceMouse::start(&cc.egui_ctx),
+            space: SpaceMouse::start(ctx),
             space_cfg: spacemouse::Settings::default(),
             show_space_window: false,
             hotbox: None,
@@ -441,20 +427,14 @@ impl PolymixApp {
             prefs_tab: 0,
             last_export_dir: None,
             export_ascii: false,
-            window_title: String::new(),
             tool_panel_rect: None,
             tool_panel_width: 300.0,
             recent: Vec::new(),
             synthetic: Default::default(),
             boundary_cache: HashMap::new(),
-            script: std::env::var("POLYMIX_SCRIPT").ok().map(|s| Script {
-                steps: s.split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
-                wait: 0,
-                awaiting_shot: None,
-                keys: Vec::new(),
-            }),
+            script: None,
         };
-        if let Some(st) = cc.storage.filter(|_| std::env::var_os("POLYMIX_SCRIPT").is_none()) {
+        if let Some(st) = storage.filter(|_| std::env::var_os("POLYMIX_SCRIPT").is_none()) {
             let flag = |k: &str, d: bool| st.get_string(k).map(|v| v == "1").unwrap_or(d);
             app.view.wireframe = flag("wireframe", false);
             // Older settings only had a flat-shading flag.
@@ -474,7 +454,7 @@ impl PolymixApp {
             app.view.show_pivots = flag("pivots", true);
             if let Some(t) = st.get_string("theme").and_then(|k| ui_util::Theme::from_key(&k)) {
                 app.view.theme = t;
-                ui_util::apply_theme(&cc.egui_ctx, t);
+                ui_util::apply_theme(ctx, t);
             }
             if let Some(c) = st.get_string("background") {
                 let v: Vec<f32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -518,9 +498,6 @@ impl PolymixApp {
                 _ => ScaleMode::Ask,
             };
             app.recent = st.get_string("recent").map(|r| r.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
-        }
-        if !files.is_empty() {
-            app.start_import(files, &cc.egui_ctx);
         }
         // Autosave and crash recovery (never in scripted test runs).
         if std::env::var_os("POLYMIX_SCRIPT").is_none() {
@@ -2724,14 +2701,6 @@ impl PolymixApp {
     fn run_script(&mut self, ctx: &egui::Context, vp: Viewport) {
         let busy = self.import_job.is_some() || self.tool_busy() || !self.synthetic.is_empty();
         let Some(script) = &mut self.script else { return };
-        // Wait for an in-flight screenshot to be written.
-        if let Some(done) = &script.awaiting_shot {
-            if !done.load(std::sync::atomic::Ordering::SeqCst) {
-                ctx.request_repaint();
-                return;
-            }
-            script.awaiting_shot = None;
-        }
         if busy {
             ctx.request_repaint();
             return;
@@ -2749,13 +2718,6 @@ impl PolymixApp {
         let (cmd, arg) = step.split_once(':').unwrap_or((step.as_str(), ""));
         let arg = arg.to_string();
         match cmd {
-            "wait" => script.wait = arg.parse().unwrap_or(1),
-            "key" => {
-                if let Some(k) = egui::Key::from_name(&arg) {
-                    script.keys.push(k);
-                }
-                script.wait = 1;
-            }
             "lasso" => {
                 // Polygon in viewport-relative coordinates: x0,y0,x1,y1,...
                 let v: Vec<f32> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -2830,20 +2792,6 @@ impl PolymixApp {
                 }
                 script.wait = 2;
             }
-            "shot" => {
-                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                script.awaiting_shot = Some(done.clone());
-                let path = PathBuf::from(arg);
-                let ctx2 = ctx.clone();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
-                    if let Err(e) = save_png(&path, &img) {
-                        log::error!("screenshot failed: {e}");
-                    }
-                    done.store(true, std::sync::atomic::Ordering::SeqCst);
-                    ctx2.request_repaint();
-                })));
-            }
-            "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             "open" => self.start_import(vec![PathBuf::from(arg)], ctx),
             "wire" => self.view.wireframe = !self.view.wireframe,
             "flat" => self.view.normals = if self.view.normals == NormalMode::Face { NormalMode::Group } else { NormalMode::Face },
@@ -3125,7 +3073,46 @@ impl PolymixApp {
     }
 }
 
-impl eframe::App for PolymixApp {
+impl polymix_workspace::Workspace for MeshWorkspace {
+    fn name(&self) -> &'static str {
+        "Mesh"
+    }
+
+    fn tick(&mut self, ctx: &egui::Context, active: bool) {
+        self.poll_jobs();
+        self.autosave_tick(ctx);
+        if !active {
+            // 3D-mouse buttons meant for the Mesh view must not pile up while another
+            // workspace is shown.
+            let _ = self.space.poll();
+        }
+    }
+
+    fn title(&self) -> String {
+        match (&self.project_path, self.scene.active()) {
+            (Some(p), _) => format!("Polymix — {}", p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
+            (None, Some(o)) => format!("Polymix — {}", o.name),
+            (None, None) => "Polymix — Mesh".to_string(),
+        }
+    }
+
+    fn accepts(&self, path: &std::path::Path) -> bool {
+        mm_io::Format::from_path(path).is_some() || path.extension().is_some_and(|e| e.eq_ignore_ascii_case(crate::project::EXTENSION))
+    }
+
+    fn open(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        self.start_import(paths, ctx);
+    }
+
+    fn script_push(&mut self, step: String) {
+        self.script.get_or_insert_with(Script::default).steps.push_back(step);
+    }
+
+    fn script_idle(&self) -> bool {
+        let busy = self.import_job.is_some() || self.tool_busy() || !self.synthetic.is_empty();
+        !busy && self.script.as_ref().is_none_or(|s| s.steps.is_empty() && s.wait == 0)
+    }
+
     fn on_exit(&mut self) {
         if let Some(auto) = &self.autosave {
             let _ = std::fs::remove_file(&auto.marker);
@@ -3195,24 +3182,8 @@ impl eframe::App for PolymixApp {
         }
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if let Some(script) = &mut self.script {
-            for key in script.keys.drain(..) {
-                for pressed in [true, false] {
-                    raw_input.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() });
-                }
-            }
-        }
-    }
-
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_jobs();
-
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        if !dropped.is_empty() {
-            self.start_import(dropped, &ctx);
-        }
 
         // The viewport rect is only known after the side panels are laid out; tools that need it
         // during panel drawing use the previous frame's value.
@@ -3304,36 +3275,15 @@ impl eframe::App for PolymixApp {
             ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("vp_rect"), rect));
             self.viewport(ui, frame);
         });
-        let title = match (&self.project_path, self.scene.active()) {
-            (Some(p), _) => format!("Polymix — {}", p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
-            (None, Some(o)) => format!("Polymix — {}", o.name),
-            (None, None) => "Polymix".to_string(),
-        };
-        if title != self.window_title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.window_title = title;
-        }
         self.handle_keys(&ctx, vp_prev);
         self.help_window(&ctx);
         self.preferences_window(&ctx);
         self.finish_import(&ctx);
         self.recovery_window(&ctx);
-        self.autosave_tick(&ctx);
         self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);
     }
-}
-
-fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::Result<()> {
-    let f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(f, img.size[0] as u32, img.size[1] as u32);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut w = enc.write_header()?;
-    let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-    w.write_image_data(&bytes)?;
-    Ok(())
 }
 
 /// Floor grid under the scene, perpendicular to the up axis, with "nice" spacing (1, 2 or 5

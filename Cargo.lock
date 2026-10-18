@@ -2073,10 +2073,33 @@ dependencies = [
  "mm-repair",
  "mm-solid",
  "png",
+ "polymix-volume",
+ "polymix-workspace",
  "rayon",
  "rfd",
  "winit",
  "zip",
+]
+
+[[package]]
+name = "polymix-volume"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "log",
+ "polymix-workspace",
+]
+
+[[package]]
+name = "polymix-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "log",
 ]
 
 [[package]]
