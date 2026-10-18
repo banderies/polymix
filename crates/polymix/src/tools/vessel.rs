@@ -736,19 +736,43 @@ impl Tool for CapTool {
 // Bridge / join two open boundaries
 // ---------------------------------------------------------------------------
 
-/// Join two open boundary loops with a tube of triangles (Meshmixer Bridge / Join).
+/// Join two open boundary loops with a tube (Meshmixer Bridge / Join), lofted like Erase &
+/// Fill's Loft: the first marker picked is End 1.
 pub struct BridgeTool {
     object: Option<ObjectId>,
     ends: Vec<VesselEnd>,
     picked: Vec<usize>,
-    smooth: bool,
+    loft: ops::LoftUi,
+    refine: f64,
+    bulge: f64,
     error: Option<String>,
 }
 
 impl BridgeTool {
     pub fn new(cx: &mut ToolCx) -> Self {
         let ends = cx.scene.active().map(|o| find_vessel_ends(&o.mesh)).unwrap_or_default().into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
-        Self { object: cx.scene.active, ends, picked: Vec::new(), smooth: true, error: None }
+        Self { object: cx.scene.active, ends, picked: Vec::new(), loft: ops::LoftUi::default(), refine: 50.0, bulge: 0.0, error: None }
+    }
+
+    /// Loft the picked boundaries together; returns the status message.
+    fn join(&mut self, id: ObjectId, cx: &mut ToolCx) -> Result<String, String> {
+        let o = cx.scene.get(id).ok_or("no active object")?;
+        let mut m = (*o.mesh).clone();
+        let (Some(a), Some(b)) = (nearest_loop(&m, self.ends[self.picked[0]].center), nearest_loop(&m, self.ends[self.picked[1]].center)) else {
+            return Err("boundary not found".into());
+        };
+        if a == b {
+            return Err("pick two different boundaries".into());
+        }
+        let mean_edge = |l: &[u32]| (0..l.len()).map(|i| m.vertex(l[i]).distance(m.vertex(l[(i + 1) % l.len()]))).sum::<f64>() / l.len() as f64;
+        let h = ops::refined_edge_length(0.5 * (mean_edge(&a) + mean_edge(&b)), self.refine);
+        let r = mm_edit::loft(&mut m, &a, &b, &self.loft.params(h, self.bulge, None)).map_err(|e| e.to_string())?;
+        let message = format!("Bridged with {} triangles{}", r.triangles.len(), ops::crossing_warning(&m, &r.triangles));
+        cx.history.push("Bridge", cx.scene);
+        cx.scene.get_mut(id).unwrap().set_mesh(m);
+        self.ends = find_vessel_ends(&cx.scene.get(id).unwrap().mesh).into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
+        self.picked.clear();
+        Ok(message)
     }
 }
 
@@ -757,31 +781,47 @@ impl Tool for BridgeTool {
         "Bridge"
     }
 
+    fn script(&mut self, cmd: &str, cx: &mut ToolCx) {
+        // `pick:<marker number>`, `join`, and the loft's settings (see `LoftUi::script`).
+        let (key, val) = cmd.split_once(':').unwrap_or((cmd, ""));
+        match key {
+            "pick" => {
+                if let Some(i) = val.parse::<usize>().ok().and_then(|k| k.checked_sub(1)).filter(|&i| i < self.ends.len() && !self.picked.contains(&i)) {
+                    if self.picked.len() == 2 {
+                        self.picked.remove(0);
+                    }
+                    self.picked.push(i);
+                }
+            }
+            "join" if self.picked.len() == 2 => {
+                if let Some(id) = self.object {
+                    match self.join(id, cx) {
+                        Ok(msg) => *cx.status = msg,
+                        Err(e) => *cx.status = format!("Bridge: {e}"),
+                    }
+                }
+            }
+            "refine" => self.refine = val.parse().unwrap_or(self.refine),
+            "bulge" => self.bulge = val.parse().unwrap_or(self.bulge),
+            _ => {
+                self.loft.script(key, val);
+            }
+        }
+    }
+
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Bridge boundaries");
         let Some(id) = self.object.filter(|id| cx.scene.get(*id).is_some()) else {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
         };
-        ui.small("Click two open-boundary markers to connect them with a strip of triangles.");
-        ui.checkbox(&mut self.smooth, "Smooth (curved) bridge");
+        ui.small("Click two open-boundary markers to connect them with a tube: the first is End 1.");
+        self.loft.ui(ui, &mut self.refine, &mut self.bulge);
         ui.label(format!("Picked: {:?}", self.picked.iter().map(|i| i + 1).collect::<Vec<_>>()));
         if ui.add_enabled(self.picked.len() == 2, egui::Button::new("Join")).clicked() {
-            let o = cx.scene.get(id).unwrap();
-            let mut m = (*o.mesh).clone();
-            let a = nearest_loop(&m, self.ends[self.picked[0]].center);
-            let b = nearest_loop(&m, self.ends[self.picked[1]].center);
-            let r = match (a, b) {
-                (Some(a), Some(b)) => mm_edit::join_loops(&mut m, &a, &b, &mm_edit::BridgeParams { segments: 0, smooth: self.smooth }).map_err(|e| e.to_string()),
-                _ => Err("boundary not found".into()),
-            };
-            match r {
-                Ok(res) => {
-                    cx.history.push("Bridge", cx.scene);
-                    cx.scene.get_mut(id).unwrap().set_mesh(m);
-                    *cx.status = format!("Bridged with {} triangles", res.triangles.len());
-                    self.ends = find_vessel_ends(&cx.scene.get(id).unwrap().mesh).into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
-                    self.picked.clear();
+            match self.join(id, cx) {
+                Ok(msg) => {
+                    *cx.status = msg;
                     self.error = None;
                 }
                 Err(e) => self.error = Some(e),

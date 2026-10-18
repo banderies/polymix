@@ -147,8 +147,13 @@ two holes (double-click each open edge, then `F`).
       directions corrected for the bend, tension 1 = circular arc. *Fair*: thin-plate or
       triharmonic (new order-3 fairing) smoothing of the tube's middle with the end rows kept
       and the row radii restored; *Round*: circular middle cross-section.
-- [ ] **M10.3 One loft for every tube join**: ⌘B Tube Handle and Vessel → Bridge boundaries use
-      the loft, so all three behave the same.
+- [x] **M10.3 One loft for every tube join**: ⌘B Bridge / Tube Handle and Vessel → Bridge
+      boundaries use the loft and its settings, so all three behave the same (Bridge: Straight;
+      Tube Handle: Smooth, leaving *out of the opening* along its normal; Bridge boundaries:
+      Smooth along the wall, first marker picked = End 1). The ends are lined up by turning one
+      opening's shape the way the tube turns (handles no longer half-twist), ragged openings
+      are sampled by angle and smoothed away from the ends (no folded rows), and every join
+      warns when the tube crosses the surface.
 
 ## M11 — Workspaces and shell
 

@@ -1118,13 +1118,21 @@ pub type JoinTool = OpTool<JoinSpec>;
 // Bridge / Tube Handle between two selected regions (Cmd+B)
 // ---------------------------------------------------------------------------
 
+/// The tube is a loft ([`LoftUi`]): Bridge is straight, Tube Handle a smooth tube leaving
+/// each opening along its normal.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RegionBridgeUi {
-    /// Smooth curved tube leaving each region along its normal (Tube Handle); otherwise a
-    /// straight bridge.
-    pub tube: bool,
-    /// Rows of triangles along the bridge; 0 = automatic.
-    pub segments: usize,
+    pub loft: LoftUi,
+    /// 0..100: ring density; 50 matches the regions' edge length, +25 halves it.
+    pub refine: f64,
+    /// Percent wider (+) or narrower (−) in the middle.
+    pub bulge: f64,
+}
+
+impl RegionBridgeUi {
+    pub fn tube_handle() -> Self {
+        Self { loft: LoftUi::handle(), refine: 50.0, bulge: 0.0 }
+    }
 }
 
 pub struct RegionBridgeSpec;
@@ -1132,17 +1140,21 @@ impl OpSpec for RegionBridgeSpec {
     type Params = RegionBridgeUi;
     const NAME: &'static str = "Bridge";
     fn defaults(_: &OpInfo) -> Self::Params {
-        RegionBridgeUi { tube: false, segments: 0 }
+        let p = RegionBridgeUi::tube_handle();
+        RegionBridgeUi { loft: LoftUi { shape: mm_edit::LoftShape::Straight, ..p.loft }, ..p }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut p.tube, false, "Bridge").on_hover_text("Straight connection");
-            ui.selectable_value(&mut p.tube, true, "Tube handle").on_hover_text("Curved tube leaving each region along its surface normal");
-        });
-        ui.add(egui::Slider::new(&mut p.segments, 0..=60).text("Segments (0 = auto)"));
-        ui.small("Select two separate regions: they are removed and the openings joined by a tube.");
+        p.loft.ui(ui, &mut p.refine, &mut p.bulge);
+        ui.small("Select two separate regions: they are removed and the openings joined by a tube (Straight: Bridge; Smooth: Tube Handle).");
         if info.selection.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select two regions first.");
+        }
+    }
+    fn script(p: &mut Self::Params, cmd: &str) {
+        // The loft's settings (see `LoftUi::script`), `refine:60`, `bulge:20`.
+        let Some((key, val)) = cmd.split_once(':') else { return };
+        if !p.loft.script(key, val) {
+            script_refine_bulge(&mut p.refine, &mut p.bulge, key, val);
         }
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -1163,8 +1175,10 @@ impl OpSpec for RegionBridgeSpec {
         if parts.len() < 2 {
             anyhow::bail!("select two separate regions (found {})", parts.len());
         }
+        let picked: Vec<u32> = parts[..2].iter().flatten().copied().collect();
+        let target = refined_edge_length(mm_remesh::edge_length_stats_in(mesh, &picked).mean, p.refine);
         let mut m = mesh.clone();
-        let mut loops = Vec::new();
+        let mut ends = Vec::new();
         for part in &parts[..2] {
             let border: std::collections::HashSet<u32> = mm_core::TriSelection::from_tris(&m, part.iter().copied()).boundary_vertices(&m).into_iter().collect();
             m.remove_triangles(part.iter().copied());
@@ -1173,10 +1187,14 @@ impl OpSpec for RegionBridgeSpec {
                 .filter(|l| l.vertices.iter().any(|v| border.contains(v)))
                 .max_by_key(|l| l.vertices.len())
                 .ok_or_else(|| anyhow::anyhow!("a region did not leave an opening (does it cover a whole part?)"))?;
-            loops.push(lp.vertices);
+            ends.push(lp);
         }
-        let r = mm_edit::join_loops(&mut m, &loops[0], &loops[1], &mm_edit::BridgeParams { segments: p.segments, smooth: p.tube })?;
-        Ok(OpOutput { message: format!("bridged with {} triangles", r.triangles.len()), selection: Some(r.triangles), mesh: m, ..Default::default() })
+        // End 1 is the opening with the lowest vertex id, as in Erase & Fill's Loft.
+        ends.sort_by_key(|l| l.vertices.iter().min().copied());
+        let labels = ends.iter().enumerate().map(|(k, l)| (l.centroid(&m), format!("{}", k + 1))).collect();
+        let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &p.loft.params(target, p.bulge, None))?;
+        let message = format!("bridged with {} triangles{}", r.triangles.len(), crossing_warning(&m, &r.triangles));
+        Ok(OpOutput { message, selection: Some(r.triangles), mesh: m, labels, ..Default::default() })
     }
 }
 pub type RegionBridgeTool = OpTool<RegionBridgeSpec>;
@@ -1592,13 +1610,7 @@ pub struct EraseFillUi {
     pub create_new_groups: bool,
     /// Snap the patch onto the target surface.
     pub project_to_target: bool,
-    /// Loft: tube shape, End 1 / End 2 continuity and tension, extra twist (degrees),
-    /// roundness of the middle and fairing (percent).
-    pub loft_shape: mm_edit::LoftShape,
-    pub loft_ends: [mm_edit::LoftEnd; 2],
-    pub twist: f64,
-    pub round: f64,
-    pub fair: f64,
+    pub loft: LoftUi,
 }
 
 /// Whether `sel` is the edge rings of two holes: two separate parts, each touching an open
@@ -1667,11 +1679,7 @@ impl OpSpec for EraseFillSpec {
             bulge: 0.0,
             create_new_groups: false,
             project_to_target: false,
-            loft_shape: mm_edit::LoftShape::Smooth,
-            loft_ends: [mm_edit::LoftEnd::default(); 2],
-            twist: 0.0,
-            round: 0.0,
-            fair: 0.0,
+            loft: LoftUi::default(),
         }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
@@ -1681,7 +1689,9 @@ impl OpSpec for EraseFillSpec {
             }
         });
         if p.kind == FillKind::Loft {
-            loft_ui(ui, p);
+            p.loft.ui(ui, &mut p.refine, &mut p.bulge);
+            ui.checkbox(&mut p.create_new_groups, "Create new groups");
+            ui.small("Deletes the selection and joins the two openings it leaves with a tube.");
             if info.selection.is_none() {
                 ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select the edge rings of two holes first (double-click an open edge).");
             }
@@ -1700,39 +1710,13 @@ impl OpSpec for EraseFillSpec {
         }
     }
     fn script(p: &mut Self::Params, cmd: &str) {
-        // `loft:smooth`, `end1:g2`, `tension2:1.5`, `round:50`, `fair:100`, `twist:30`.
-        use mm_edit::{EndContinuity, LoftShape};
+        // The loft's settings (see `LoftUi::script`), `refine:60`, `bulge:20`.
         let Some((key, val)) = cmd.split_once(':') else { return };
-        let num = val.parse::<f64>().ok();
-        let end = |k: &str| k.chars().last().and_then(|c| c.to_digit(10)).map(|d| (d as usize).clamp(1, 2) - 1);
-        match key {
-            "loft" => {
-                p.kind = FillKind::Loft;
-                p.loft_shape = match val {
-                    "minimal" => LoftShape::Minimal,
-                    "straight" => LoftShape::Straight,
-                    _ => LoftShape::Smooth,
-                };
-            }
-            k if k.starts_with("end") => {
-                if let Some(i) = end(k) {
-                    p.loft_ends[i].continuity = match val {
-                        "g0" => EndContinuity::G0,
-                        "g2" => EndContinuity::G2,
-                        _ => EndContinuity::G1,
-                    };
-                }
-            }
-            k if k.starts_with("tension") => {
-                if let (Some(i), Some(x)) = (end(k), num) {
-                    p.loft_ends[i].tension = x;
-                }
-            }
-            "round" => p.round = num.unwrap_or(p.round),
-            "fair" => p.fair = num.unwrap_or(p.fair),
-            "twist" => p.twist = num.unwrap_or(p.twist),
-            "bulge" => p.bulge = num.unwrap_or(p.bulge),
-            _ => {}
+        if key == "loft" {
+            p.kind = FillKind::Loft;
+        }
+        if !p.loft.script(key, val) {
+            script_refine_bulge(&mut p.refine, &mut p.bulge, key, val);
         }
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -1743,7 +1727,7 @@ impl OpSpec for EraseFillSpec {
         let mut m = mesh.clone();
         let selection = mm_core::TriSelection::from_tris(&m, tris.iter().copied());
         let border: std::collections::HashSet<u32> = selection.boundary_vertices(&m).into_iter().collect();
-        let target = mm_remesh::edge_length_stats_in(&m, tris).mean * 2f64.powf((50.0 - p.refine) / 25.0);
+        let target = refined_edge_length(mm_remesh::edge_length_stats_in(&m, tris).mean, p.refine);
         let new_group = m.max_group_id().max(0) + 1;
         let erased = mm_core::Aabb::from_points(tris.iter().flat_map(|&t| m.tri_positions(t)));
         m.remove_triangles(tris.iter().copied());
@@ -1770,21 +1754,8 @@ impl OpSpec for EraseFillSpec {
                 labels.push((lp.centroid(&m), format!("{}", k + 1)));
             }
             let group = if p.create_new_groups { new_group } else { surrounding_group(&m, &ends[0]) };
-            let params = mm_edit::LoftParams {
-                shape: p.loft_shape,
-                ends: p.loft_ends,
-                edge_length: Some(target),
-                twist_deg: p.twist,
-                bulge: (p.bulge / 100.0).max(-0.9),
-                round: (p.round / 100.0).clamp(0.0, 1.0),
-                fair: (p.fair / 100.0).clamp(0.0, 1.0),
-                group: Some(group),
-            };
-            let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &params)?;
-            let n = crossings(&m, &r.triangles);
-            if n > 0 {
-                warning = format!(" — warning: the tube runs into the surface ({n} crossing{}); try more tension or a twist", if n == 1 { "" } else { "s" });
-            }
+            let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &p.loft.params(target, p.bulge, Some(group)))?;
+            warning = crossing_warning(&m, &r.triangles);
             new_tris.extend(r.triangles);
         }
         let mode = match p.kind {
@@ -1842,40 +1813,156 @@ fn remove_cut_off_fragments(m: &mut Mesh, border: &std::collections::HashSet<u32
     cut_off.len()
 }
 
-/// Erase & Fill's Loft settings.
-fn loft_ui(ui: &mut egui::Ui, p: &mut EraseFillUi) {
-    use mm_edit::{EndContinuity, LoftShape};
-    ui.horizontal(|ui| {
-        ui.label("Shape");
-        ui.selectable_value(&mut p.loft_shape, LoftShape::Minimal, "Minimal").on_hover_text("One band of triangles straight across, no new vertices");
-        ui.selectable_value(&mut p.loft_shape, LoftShape::Straight, "Straight").on_hover_text("Straight tube, like a cylinder, blending from one opening's shape to the other's");
-        ui.selectable_value(&mut p.loft_shape, LoftShape::Smooth, "Smooth").on_hover_text("Curved tube that meets each opening as set below");
-    });
-    let tube = p.loft_shape != LoftShape::Minimal;
-    let smooth = p.loft_shape == LoftShape::Smooth;
-    ui.add_enabled(tube, egui::Slider::new(&mut p.refine, 0.0..=100.0).text("Refine"));
-    egui::Grid::new("loft_ends").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-        for (k, end) in p.loft_ends.iter_mut().enumerate() {
-            ui.label(format!("End {}", k + 1)).on_hover_text("Marked with its number in the view");
-            ui.add_enabled_ui(smooth, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut end.continuity, EndContinuity::G0, "G0").on_hover_text("Position: the tube meets the opening (a crease may form)");
-                    ui.selectable_value(&mut end.continuity, EndContinuity::G1, "G1").on_hover_text("Tangent: the tube leaves along the surrounding wall");
-                    ui.selectable_value(&mut end.continuity, EndContinuity::G2, "G2").on_hover_text("Curvature: the tube also continues the vessel's bend");
-                });
-            });
-            ui.add_enabled(smooth && end.continuity != EndContinuity::G0, egui::Slider::new(&mut end.tension, 0.2..=3.0).text("tension"))
-                .on_hover_text("How far the tube keeps to the wall's direction before turning (1 follows a circular arc)");
-            ui.end_row();
+/// Loft settings, shared by Erase & Fill's Loft, Bridge / Tube Handle (Cmd+B) and Vessel →
+/// Bridge boundaries. Refine and bulge belong to each tool (Erase & Fill shares them with
+/// its patch fills), so they are passed to [`LoftUi::ui`] and [`LoftUi::params`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LoftUi {
+    pub shape: mm_edit::LoftShape,
+    pub ends: [mm_edit::LoftEnd; 2],
+    /// Extra twist (degrees); roundness of the middle and fairing (percent).
+    pub twist: f64,
+    pub round: f64,
+    pub fair: f64,
+}
+
+impl Default for LoftUi {
+    fn default() -> Self {
+        Self { shape: mm_edit::LoftShape::Smooth, ends: [mm_edit::LoftEnd::default(); 2], twist: 0.0, round: 0.0, fair: 0.0 }
+    }
+}
+
+impl LoftUi {
+    /// A tube standing up from two openings in a surface (Tube Handle). Its ends turn half
+    /// round, where tension 1 (an arc's length) gives a flattened arch whose cross-section
+    /// can fold; about 4/π gives a round one.
+    pub fn handle() -> Self {
+        let end = mm_edit::LoftEnd { direction: mm_edit::EndDirection::Normal, tension: 1.3, ..Default::default() };
+        Self { ends: [end; 2], ..Default::default() }
+    }
+
+    /// The library's parameters; `edge_length` is the target edge length (Refine applied),
+    /// `bulge` in percent.
+    pub fn params(&self, edge_length: f64, bulge: f64, group: Option<i32>) -> mm_edit::LoftParams {
+        mm_edit::LoftParams {
+            shape: self.shape,
+            ends: self.ends,
+            edge_length: Some(edge_length),
+            twist_deg: self.twist,
+            bulge: (bulge / 100.0).max(-0.9),
+            round: (self.round / 100.0).clamp(0.0, 1.0),
+            fair: (self.fair / 100.0).clamp(0.0, 1.0),
+            group,
         }
-    });
-    ui.add_enabled(tube, egui::Slider::new(&mut p.twist, -180.0..=180.0).suffix("°").text("Twist")).on_hover_text("Turn one end against the other (they are lined up automatically)");
-    ui.add_enabled(tube, egui::Slider::new(&mut p.bulge, -90.0..=100.0).suffix("%").text("Bulge")).on_hover_text("Widen (+) or narrow (−) the middle of the tube");
-    ui.add_enabled(tube, egui::Slider::new(&mut p.round, 0.0..=100.0).suffix("%").text("Round")).on_hover_text("Make the middle of the tube circular, however ragged the openings are");
-    ui.add_enabled(smooth, egui::Slider::new(&mut p.fair, 0.0..=100.0).suffix("%").text("Fair"))
-        .on_hover_text("Smooth the tube's middle with its ends kept: thin-plate for G0 / G1 ends, curvature-continuous (G2) when an end is G2");
-    ui.checkbox(&mut p.create_new_groups, "Create new groups");
-    ui.small("Deletes the selection and joins the two openings it leaves with a tube.");
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, refine: &mut f64, bulge: &mut f64) {
+        use mm_edit::{EndContinuity, EndDirection, LoftShape};
+        ui.horizontal(|ui| {
+            ui.label("Shape");
+            ui.selectable_value(&mut self.shape, LoftShape::Minimal, "Minimal").on_hover_text("One band of triangles straight across, no new vertices");
+            ui.selectable_value(&mut self.shape, LoftShape::Straight, "Straight").on_hover_text("Straight tube, like a cylinder, blending from one opening's shape to the other's");
+            ui.selectable_value(&mut self.shape, LoftShape::Smooth, "Smooth").on_hover_text("Curved tube that meets each opening as set below");
+        });
+        let tube = self.shape != LoftShape::Minimal;
+        let smooth = self.shape == LoftShape::Smooth;
+        ui.add_enabled(tube, egui::Slider::new(refine, 0.0..=100.0).text("Refine"));
+        ui.add_enabled_ui(smooth, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Leave");
+                let mut d = self.ends[0].direction;
+                ui.selectable_value(&mut d, EndDirection::Wall, "Along the wall").on_hover_text("The tube continues the surrounding wall, e.g. a vessel cut across");
+                ui.selectable_value(&mut d, EndDirection::Normal, "Out of the opening").on_hover_text("The tube stands up from the surface around each opening, like a handle");
+                if d != self.ends[0].direction {
+                    self.ends.iter_mut().for_each(|e| e.direction = d);
+                }
+            });
+        });
+        let along = if self.ends[0].direction == EndDirection::Wall { "the surrounding wall" } else { "the opening's normal" };
+        egui::Grid::new("loft_ends").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+            for (k, end) in self.ends.iter_mut().enumerate() {
+                ui.label(format!("End {}", k + 1)).on_hover_text("Marked with its number in the view");
+                ui.add_enabled_ui(smooth, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut end.continuity, EndContinuity::G0, "G0").on_hover_text("Position: the tube meets the opening (a crease may form)");
+                        ui.selectable_value(&mut end.continuity, EndContinuity::G1, "G1").on_hover_text(format!("Tangent: the tube leaves along {along}"));
+                        ui.selectable_value(&mut end.continuity, EndContinuity::G2, "G2").on_hover_text("Curvature: the tube also continues the vessel's bend (starts straight when leaving out of the opening)");
+                    });
+                });
+                ui.add_enabled(smooth && end.continuity != EndContinuity::G0, egui::Slider::new(&mut end.tension, 0.2..=3.0).text("tension"))
+                    .on_hover_text("How far the tube keeps to its starting direction before turning (1 follows a circular arc)");
+                ui.end_row();
+            }
+        });
+        ui.add_enabled(tube, egui::Slider::new(&mut self.twist, -180.0..=180.0).suffix("°").text("Twist")).on_hover_text("Turn one end against the other (they are lined up automatically)");
+        ui.add_enabled(tube, egui::Slider::new(bulge, -90.0..=100.0).suffix("%").text("Bulge")).on_hover_text("Widen (+) or narrow (−) the middle of the tube");
+        ui.add_enabled(tube, egui::Slider::new(&mut self.round, 0.0..=100.0).suffix("%").text("Round")).on_hover_text("Make the middle of the tube circular, however ragged the openings are");
+        ui.add_enabled(smooth, egui::Slider::new(&mut self.fair, 0.0..=100.0).suffix("%").text("Fair"))
+            .on_hover_text("Smooth the tube's middle with its ends kept: thin-plate for G0 / G1 ends, curvature-continuous (G2) when an end is G2");
+    }
+
+    /// Test-script settings: `loft:smooth`, `end1:g2`, `tension2:1.5`, `dir:normal`,
+    /// `round:50`, `fair:100`, `twist:30`. Returns false for other keys.
+    pub fn script(&mut self, key: &str, val: &str) -> bool {
+        use mm_edit::{EndContinuity, EndDirection, LoftShape};
+        let num = val.parse::<f64>().ok();
+        let end = |k: &str| k.chars().last().and_then(|c| c.to_digit(10)).map(|d| (d as usize).clamp(1, 2) - 1);
+        match key {
+            "loft" => {
+                self.shape = match val {
+                    "minimal" => LoftShape::Minimal,
+                    "straight" => LoftShape::Straight,
+                    _ => LoftShape::Smooth,
+                };
+            }
+            k if k.starts_with("end") => {
+                if let Some(i) = end(k) {
+                    self.ends[i].continuity = match val {
+                        "g0" => EndContinuity::G0,
+                        "g2" => EndContinuity::G2,
+                        _ => EndContinuity::G1,
+                    };
+                }
+            }
+            k if k.starts_with("tension") => {
+                if let (Some(i), Some(x)) = (end(k), num) {
+                    self.ends[i].tension = x;
+                }
+            }
+            "dir" => {
+                let d = if val == "normal" { EndDirection::Normal } else { EndDirection::Wall };
+                self.ends.iter_mut().for_each(|e| e.direction = d);
+            }
+            "round" => self.round = num.unwrap_or(self.round),
+            "fair" => self.fair = num.unwrap_or(self.fair),
+            "twist" => self.twist = num.unwrap_or(self.twist),
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Test-script `refine:<0..100>` and `bulge:<percent>`.
+fn script_refine_bulge(refine: &mut f64, bulge: &mut f64, key: &str, val: &str) {
+    let Ok(x) = val.parse::<f64>() else { return };
+    match key {
+        "refine" => *refine = x,
+        "bulge" => *bulge = x,
+        _ => {}
+    }
+}
+
+/// Edge length for a tube with `refine` (0..100; 50 keeps `base`, +25 halves it).
+pub(crate) fn refined_edge_length(base: f64, refine: f64) -> f64 {
+    base * 2f64.powf((50.0 - refine) / 25.0)
+}
+
+/// " — warning: …" when a new tube crosses the rest of the mesh, else empty.
+pub(crate) fn crossing_warning(m: &Mesh, tube: &[u32]) -> String {
+    match crossings(m, tube) {
+        0 => String::new(),
+        n => format!(" — warning: the tube runs into the surface ({n} crossing{}); try more tension or a twist", if n == 1 { "" } else { "s" }),
+    }
 }
 
 /// Vertices whose triangles all belong to `tris` (the region's interior).
@@ -2444,15 +2531,15 @@ mod tests {
         assert_eq!(p.kind, FillKind::Loft, "two hole rings are lofted");
         assert_eq!(EraseFillSpec::defaults(&info(&ring(2.0))).kind, FillKind::SmoothMvc, "one hole is filled");
         for shape in [mm_edit::LoftShape::Minimal, mm_edit::LoftShape::Straight, mm_edit::LoftShape::Smooth] {
-            let out = EraseFillSpec::run(&m, Some(&rings), &EraseFillUi { loft_shape: shape, ..p }, &|_| true).unwrap();
+            let out = EraseFillSpec::run(&m, Some(&rings), &EraseFillUi { loft: LoftUi { shape, ..p.loft }, ..p }, &|_| true).unwrap();
             assert!(out.mesh.check_validity().is_ok());
             assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "{shape:?}: one tube");
             assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 2, "{shape:?}: only the far ends stay open");
             assert_eq!(out.labels.len(), 2);
             assert!(!out.message.contains("warning"), "{shape:?}: {}", out.message);
         }
-        let ends = [mm_edit::LoftEnd { continuity: mm_edit::EndContinuity::G2, tension: 1.0 }; 2];
-        let out = EraseFillSpec::run(&m, Some(&rings), &EraseFillUi { loft_ends: ends, round: 100.0, fair: 100.0, ..p }, &|_| true).unwrap();
+        let ends = [mm_edit::LoftEnd { continuity: mm_edit::EndContinuity::G2, ..Default::default() }; 2];
+        let out = EraseFillSpec::run(&m, Some(&rings), &EraseFillUi { loft: LoftUi { ends, round: 100.0, fair: 100.0, ..p.loft }, ..p }, &|_| true).unwrap();
         assert!(out.mesh.check_validity().is_ok());
         assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "G2, round and fair");
         let err = EraseFillSpec::run(&m, Some(&ring(2.0)), &p, &|_| true).err().unwrap().to_string();
@@ -2583,17 +2670,99 @@ mod tests {
         b.transform(|p| p + DVec3::new(3.0, 0.0, 0.0));
         m.append_mesh(&b, 0);
         let caps: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t) - DVec3::new(1.5, 0.0, 0.0)).length() < 0.9).collect();
-        for tube in [false, true] {
-            let info = OpInfo { mesh: &m, selection: Some(&caps), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
-            let p = RegionBridgeUi { tube, ..RegionBridgeSpec::defaults(&info) };
+        let info = OpInfo { mesh: &m, selection: Some(&caps), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let bridge = RegionBridgeSpec::defaults(&info);
+        assert_eq!(bridge.loft.shape, mm_edit::LoftShape::Straight, "Cmd+B bridges straight");
+        let mut g2 = RegionBridgeUi::tube_handle();
+        RegionBridgeSpec::script(&mut g2, "end1:g2");
+        RegionBridgeSpec::script(&mut g2, "fair:100");
+        for p in [bridge, RegionBridgeUi::tube_handle(), g2] {
             let out = RegionBridgeSpec::run(&m, Some(&caps), &p, &|_| true).unwrap();
             out.mesh.check_validity().unwrap();
             assert!(out.mesh.is_closed(), "the two spheres are joined into one closed surface");
             assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1);
+            assert_eq!(out.labels.len(), 2, "End 1 and End 2 are marked");
+            assert!(!out.message.contains("warning"), "{}", out.message);
         }
         // One region is not enough.
         let one: Vec<u32> = caps.iter().copied().filter(|&t| m.tri_centroid(t).x < 1.5).collect();
         assert!(run_spec::<RegionBridgeSpec>(&m, Some(&one)).is_err());
+    }
+
+    #[test]
+    fn tube_handle_stands_up_from_a_surface() {
+        use mm_core::primitives;
+        // Two patches on top of a sphere: Tube Handle removes them and arches a tube over the
+        // surface between the openings, leaving one closed surface with a handle.
+        let m = primitives::icosphere(2.0, 4);
+        let centres = [DVec3::new(-0.9, 0.0, 1.8).normalize() * 2.0, DVec3::new(0.9, 0.0, 1.8).normalize() * 2.0];
+        let patches: Vec<u32> = m.triangle_ids().filter(|&t| centres.iter().any(|c| m.tri_centroid(t).distance(*c) < 0.4)).collect();
+        let out = RegionBridgeSpec::run(&m, Some(&patches), &RegionBridgeUi::tube_handle(), &|_| true).unwrap();
+        out.mesh.check_validity().unwrap();
+        assert!(out.mesh.is_closed() && !out.message.contains("warning"), "{}", out.message);
+        let tube = out.selection.unwrap();
+        let tube_verts: Vec<DVec3> = tube.iter().flat_map(|&t| out.mesh.tri_positions(t)).collect();
+        let top = tube_verts.iter().map(|p| p.z).fold(f64::MIN, f64::max);
+        let inner = tube_verts.iter().map(|p| p.length()).fold(f64::MAX, f64::min);
+        assert!(top > 2.15, "the handle arches above the sphere ({top:.2})");
+        assert!(inner > 1.99, "and stays outside it ({inner:.3})");
+        let mut along_wall = RegionBridgeUi::tube_handle();
+        RegionBridgeSpec::script(&mut along_wall, "dir:wall");
+        assert_eq!(along_wall.loft.ends.map(|e| e.direction), [mm_edit::EndDirection::Wall; 2]);
+    }
+
+    #[test]
+    fn tube_handle_between_branches_is_not_twisted() {
+        use mm_core::primitives;
+        // The two branches of a Y (z up), the right one also turned a little about z, so the
+        // patches on their fronts (−y) face nearly, not exactly, the same way. The handle
+        // must join top to top and outer side to outer side, not turn half over.
+        let branch = |tilt: f64, turn: f64, x: f64| {
+            let (dir, rot) = (DVec3::new(tilt.to_radians().sin(), 0.0, tilt.to_radians().cos()), mm_core::DQuat::from_rotation_z(turn.to_radians()));
+            let path: Vec<DVec3> = (0..=40).map(|k| DVec3::new(x, 0.0, 0.0) + rot * (dir * (k as f64 * 0.5 - 10.0))).collect();
+            let mut b = primitives::tube_along(&path, &[2.5; 41], 48);
+            let c = DVec3::new(x, 0.0, 0.0);
+            b.transform(|p| c + rot * (p - c));
+            b
+        };
+        let mut m = branch(-20.0, 0.0, -6.0);
+        m.append_mesh(&branch(20.0, 12.0, 6.0), 0);
+        let front = |x: f64| m.vertex_ids().map(|v| m.vertex(v)).filter(|p| (p.x - x).abs() < 2.0 && p.z.abs() < 0.3).min_by(|a, b| a.y.total_cmp(&b.y)).unwrap();
+        let centres = [front(-6.0), front(6.0)];
+        let patches: Vec<u32> = m.triangle_ids().filter(|&t| centres.iter().any(|c| m.tri_centroid(t).distance(*c) < 2.0)).collect();
+        let out = RegionBridgeSpec::run(&m, Some(&patches), &RegionBridgeUi::tube_handle(), &|_| true).unwrap();
+        out.mesh.check_validity().unwrap();
+        assert!(!out.message.contains("warning"), "{}", out.message);
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1);
+    }
+
+    #[test]
+    fn vessel_bridge_lofts_two_picked_boundaries() {
+        use mm_core::primitives;
+        // Two open tubes across a gap: pick their facing ends and join them.
+        let mut m = primitives::cylinder(0.5, 2.0, 24, 8, false);
+        let mut t2 = primitives::cylinder(0.6, 2.0, 30, 8, false);
+        t2.transform(|p| p + DVec3::new(0.7, 0.0, 3.5));
+        m.append_mesh(&t2, 1);
+        let mut scene = crate::scene::Scene::default();
+        let id = scene.add("tubes", m.clone());
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = BridgeTool::new(&mut cx);
+        let ends = crate::tools::vessel::find_vessel_ends(&m);
+        let facing = |z: f64| 1 + ends.iter().position(|e| (e.center.z - z).abs() < 1e-6).unwrap();
+        for cmd in [format!("pick:{}", facing(2.0)), format!("pick:{}", facing(3.5)), "end2:g2".into(), "join".into()] {
+            tool.script(&cmd, &mut cx);
+        }
+        assert!(cx.status.starts_with("Bridged"), "{}", cx.status);
+        let out = &cx.scene.get(id).unwrap().mesh;
+        out.check_validity().unwrap();
+        assert_eq!(mm_core::topology::connected_components(out).len(), 1, "one tube");
+        assert_eq!(mm_core::topology::boundary_loops(out).len(), 2, "only the far ends stay open");
+        assert!(out.vertex_count() > m.vertex_count(), "a smooth tube with rings");
+        assert!(cx.history.can_undo());
     }
 
     #[test]

@@ -710,9 +710,9 @@ impl Tool for SelectTool {
                 if ui.button("Bridge").on_hover_text("Cmd+B: remove two selected regions and join the openings with a tube").clicked() {
                     self.request = Some(Box::new(ops::RegionBridgeTool::new(cx)));
                 }
-                if ui.button("Tube Handle").on_hover_text("Like Bridge, with a curved tube").clicked() {
+                if ui.button("Tube Handle").on_hover_text("Like Bridge, with a curved tube standing up from each region").clicked() {
                     let mut t = ops::RegionBridgeTool::new(cx);
-                    t.params.tube = true;
+                    t.params = ops::RegionBridgeUi::tube_handle();
                     self.request = Some(Box::new(t));
                 }
                 if ui.button("Grow Hair").on_hover_text("Grow strands on the selected faces").clicked() {

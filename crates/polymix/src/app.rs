@@ -264,6 +264,11 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "closecracks" => Box::new(tools::ops::CloseCracksTool::new(cx)),
         "join" => Box::new(tools::ops::JoinTool::new(cx)),
         "regionbridge" => Box::new(tools::ops::RegionBridgeTool::new(cx)),
+        "tubehandle" => {
+            let mut t = tools::ops::RegionBridgeTool::new(cx);
+            t.params = tools::ops::RegionBridgeUi::tube_handle();
+            Box::new(t)
+        }
         "facegroups" => Box::new(tools::ops::FaceGroupsTool::new(cx)),
         "weldboundaries" => Box::new(tools::ops::WeldBoundariesTool::new(cx)),
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),

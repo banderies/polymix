@@ -35,7 +35,7 @@ fn loft_shapes_and_ends_make_valid_tubes() {
     ];
     for (shape, ea, eb) in cases {
         let (mut m, a, b) = gap_tubes(16, 24, 1.5, 0.8);
-        let params = LoftParams { shape, ends: [LoftEnd { continuity: ea, tension: 1.0 }, LoftEnd { continuity: eb, tension: 1.0 }], ..Default::default() };
+        let params = LoftParams { shape, ends: [LoftEnd { continuity: ea, tension: 1.0, ..Default::default() }, LoftEnd { continuity: eb, tension: 1.0, ..Default::default() }], ..Default::default() };
         let r = loft(&mut m, &a, &b, &params).unwrap();
         assert_valid(&m);
         assert_eq!(connected_components(&m).len(), 1, "{shape:?} {ea:?} {eb:?}");
@@ -56,7 +56,7 @@ fn g1_ends_leave_along_the_wall() {
         let h = 0.1;
         // Rows are added in order, each with one point per perimeter / edge length.
         let n = (perimeter(&m, &a).max(perimeter(&m, &b)) / h).round() as usize;
-        let params = LoftParams { shape, ends: [LoftEnd { continuity, tension: 1.0 }; 2], edge_length: Some(h), ..Default::default() };
+        let params = LoftParams { shape, ends: [LoftEnd { continuity, tension: 1.0, ..Default::default() }; 2], edge_length: Some(h), ..Default::default() };
         let r = loft(&mut m, &a, &b, &params).unwrap();
         let d = ring_centre(&m, &r.new_vertices[..n]) - ring_centre(&m, &a);
         d.normalize().dot(DVec3::Z).acos().to_degrees()
@@ -80,7 +80,7 @@ fn loft_turns_between_openings_facing_the_same_way() {
     assert_eq!(tops.len(), 2);
     let arch = |tension: f64| {
         let mut m = m.clone();
-        let params = LoftParams { ends: [LoftEnd { continuity: EndContinuity::G1, tension }; 2], ..Default::default() };
+        let params = LoftParams { ends: [LoftEnd { continuity: EndContinuity::G1, tension, ..Default::default() }; 2], ..Default::default() };
         let r = loft(&mut m, &tops[0], &tops[1], &params).unwrap();
         assert_valid(&m);
         assert_eq!(connected_components(&m).len(), 1);
@@ -137,7 +137,7 @@ fn g2_ends_follow_the_wall_bend() {
     // How far the new wall strays from the ideal torus the vessel follows.
     let stray = |c: EndContinuity| {
         let mut m = base.clone();
-        let params = LoftParams { ends: [LoftEnd { continuity: c, tension: 1.0 }; 2], edge_length: Some(0.1), ..Default::default() };
+        let params = LoftParams { ends: [LoftEnd { continuity: c, tension: 1.0, ..Default::default() }; 2], edge_length: Some(0.1), ..Default::default() };
         let r = loft(&mut m, &a, &b, &params).unwrap();
         assert_valid(&m);
         r.new_vertices.iter().map(|&v| {
@@ -159,7 +159,7 @@ fn loft_mixed_ends_round_and_fair() {
     for (ea, eb) in [(G2, G2), (G0, G2), (G2, G1), (G0, G0)] {
         for fair in [0.0, 1.0] {
             let (mut m, a, b) = gap_tubes(16, 24, 1.5, 0.8);
-            let params = LoftParams { ends: [LoftEnd { continuity: ea, tension: 1.0 }, LoftEnd { continuity: eb, tension: 1.2 }], fair, ..Default::default() };
+            let params = LoftParams { ends: [LoftEnd { continuity: ea, tension: 1.0, ..Default::default() }, LoftEnd { continuity: eb, tension: 1.2, ..Default::default() }], fair, ..Default::default() };
             loft(&mut m, &a, &b, &params).unwrap();
             assert_valid(&m);
             assert_eq!(boundary_loops(&m).len(), 2, "{ea:?} {eb:?} fair {fair}");
@@ -207,4 +207,28 @@ fn faired_g1_tube_keeps_its_ends_and_size() {
     let radius = mid.iter().map(|&v| m.vertex(v).distance(c)).sum::<f64>() / n as f64;
     assert!(lean < 6.0, "G1 kept ({lean:.1}°)");
     assert!(radius > 0.45, "no pinch ({radius:.3}, ends 0.5 and 0.6)");
+}
+
+#[test]
+fn normal_ends_stand_up_from_a_surface() {
+    // Two holes in the top of a sphere. Leaving out of the openings, the tube arches over the
+    // surface like a handle; leaving along the wall (which runs across a hole in a surface,
+    // not away from it) it dives into the sphere.
+    let mut base = primitives::icosphere(2.0, 4);
+    let centres = [DVec3::new(-0.9, 0.0, 1.8).normalize() * 2.0, DVec3::new(0.9, 0.0, 1.8).normalize() * 2.0];
+    let holes: Vec<u32> = base.triangle_ids().filter(|&t| centres.iter().any(|c| base.tri_centroid(t).distance(*c) < 0.4)).collect();
+    base.remove_triangles(holes);
+    let loops: Vec<Vec<u32>> = boundary_loops(&base).into_iter().map(|l| l.vertices).collect();
+    assert_eq!(loops.len(), 2);
+    let lowest = |direction: EndDirection| {
+        let mut m = base.clone();
+        let params = LoftParams { ends: [LoftEnd { direction, ..Default::default() }; 2], ..Default::default() };
+        let r = loft(&mut m, &loops[0], &loops[1], &params).unwrap();
+        assert_valid(&m);
+        assert!(m.is_closed());
+        r.new_vertices.iter().map(|&v| m.vertex(v).length()).fold(f64::MAX, f64::min)
+    };
+    let (normal, wall) = (lowest(EndDirection::Normal), lowest(EndDirection::Wall));
+    assert!(normal > 2.0, "out of the openings: above the surface ({normal:.3})");
+    assert!(wall < 1.9, "along the wall: into the sphere ({wall:.3})");
 }
