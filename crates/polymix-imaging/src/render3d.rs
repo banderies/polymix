@@ -272,8 +272,8 @@ impl VolumeView3d {
             _ => r.drag_delta(),
         };
         if r.dragged_by(egui::PointerButton::Primary) {
-            self.yaw -= d.x * 0.01;
-            self.pitch = (self.pitch + d.y * 0.01).clamp(-1.55, 1.55);
+            self.yaw += d.x * 0.01;
+            self.pitch = (self.pitch - d.y * 0.01).clamp(-1.55, 1.55);
         } else if r.dragged_by(egui::PointerButton::Secondary) {
             // The point at the target's depth follows the cursor.
             let (eye, target, up, fov) = self.camera(vol);

@@ -1,0 +1,179 @@
+# Segmentation workflow: 3D Slicer → Polymix tools
+
+Every tool the image → segmentation → mesh workflow needs, with its status and the tab it
+belongs in: 3D Slicer's Segment Editor (core effects, the SegmentEditorExtraEffects
+extension, the vessel tools of SlicerVMTK), the image preparation done before segmenting (N4
+bias correction, denoising, registration, …), the viewer features they share, and what
+happens to segments afterwards. Goal: at least everything Slicer does. Sources: the
+[Segment Editor guide](https://slicer.readthedocs.io/en/latest/user_guide/modules/segmenteditor.html),
+[SegmentEditorExtraEffects](https://github.com/lassoan/SlicerSegmentEditorExtraEffects) and
+SlicerVMTK.
+
+**Which tab:** a tool lives in the tab of what it produces: images in **Volume**, segments
+(label maps) in **Segmentation**, surfaces in **Mesh**. A derived image (bias-corrected,
+denoised, resampled, vesselness) joins the Volume catalog as a Derived volume and can then be
+chosen as the Segmentation tab's source volume. Hand-offs are the exception: Make mesh and
+Mask volume sit where the work finishes (Segmentation) as buttons that send the result to the
+tab that owns it.
+
+| Tab | Sections |
+|---|---|
+| Volume | [7. Image preparation](#7-image-preparation--volume-tab) |
+| Segmentation | [1](#1-foundations-needed-by-most-tools)–[6](#6-ai-assisted-segmentation-slicer-extensions) |
+| Volume and Segmentation | [8. Viewer features](#8-viewer-features--volume-and-segmentation-tabs-polymix-imaging) |
+| Mesh | [9. After segmentation](#9-after-segmentation--mesh-tab) |
+
+**Status:** ✅ done · 🟡 partial (see notes) · ❌ missing · ⚪ low priority.
+**Engine** is the GUI-free algorithm (`crates/mm-segment`, unit-tested); **UI** is the tool in
+the Segmentation tab (`crates/polymix-segmentation`). A tool is finished when both are ✅.
+
+**Mouse:** with no tool active, Polymix's slice views keep the user's mapping (left drag =
+slices, right = pan, middle = zoom, left + right = window / level, wheel = slices). A tool that
+needs the left button takes it (`SliceOptions::left_drag_scrolls = false` →
+`SliceResponse::left_drag_voxel`); right drag stays pan, so where Slicer uses a right click
+(Draw: fill) Polymix uses Enter or a double-click.
+
+---
+
+## 1. Foundations (needed by most tools)
+
+| Slicer | Engine | UI | Notes |
+|---|---|---|---|
+| Segments in one segmentation: binary label maps, shared layers when they do not overlap | 🟡 | ❌ | `Mask` per segment, `write_label` into a `u8` label map (up to 255 segments, no overlap yet) |
+| Segment list: Add, Remove, rename, colour + terminology, visibility (eye), state flag (Not started / In progress / Completed / Flagged), layer column, filter bar, q / w = previous / next segment | ❌ | ❌ | |
+| Segments in the slice views: fill and outline, opacity per segment | — | 🟡 | `SliceView` draws a `LabelOverlay` fill with opacity; outline ❌ |
+| Show 3D: segment surfaces kept up to date while editing, smoothing factor (0 = none, 0.1 weak, ≥ 0.5 strong) | — | 🟡 | `VolumeView3d` draws smoothed label surfaces; the Segmentation tab does not pass labels yet; smoothing factor ❌ |
+| Undo / redo (z / y), last 10 states | ❌ | ❌ | |
+| Masking — Editable area: Everywhere, Inside / Outside all segments, Inside / Outside all visible segments, Inside / Outside one segment | ❌ | ❌ | `Mask` boolean ops make it cheap |
+| Masking — Editable intensity range (i toggles; preview with Threshold) | ❌ | ❌ | |
+| Masking — Modify other segments: Overwrite all (default), Overwrite visible, Allow overlap | 🟡 | ❌ | `write_label(overwrite)`; overlap needs layers |
+| Source volume and segmentation geometry: Specify geometry (oversampling, ROI extent, Pad output) | ❌ | ❌ | Labels currently follow the loaded volume's grid |
+| Effects in the 3D view (Paint, Scissors, Islands clicks) | — | ❌ | needs picking in `VolumeView3d` |
+| Shortcuts: ← / → slice, Shift + move = scroll to the pointer, Ctrl + wheel zoom, Esc, Space = last two effects, 1–0 / Shift + 1–0 = effects, i = intensity masking | — | 🟡 | wheel, ⌘ / Ctrl + wheel zoom and Fit exist; the rest ❌ |
+
+## 2. Segment Editor effects (Slicer core)
+
+| Slicer effect and options | Engine | UI | Notes |
+|---|---|---|---|
+| **Threshold** — range slider over the histogram; live preview; Automatic threshold (Otsu, Huang, IsoData, Kittler-Illingworth, Li, Maximum entropy, Moments, Renyi entropy, Shanbhag, Triangle, Yen) and how it is used (lower, upper, or around the automatic value); range from a local histogram (box, circle or line drawn on a slice); Use for masking | 🟡 | ❌ | `threshold(vol, lo, hi)`; automatic methods and local histogram ❌ |
+| **Paint** — brush radius in mm or % of the view; click = one dab, drag = stroke (applied on release); Sphere brush (3D); Pixel mode; Edit in 3D views; Shift + wheel and − / + resize | ❌ | ❌ | Sphere dab is simple; brush preview in the views |
+| **Draw** — click points or drag a line on a slice; double-click / right click fills; x deletes the last point, a / Enter applies | ❌ | ❌ | Right click → Enter / double-click (right drag pans) |
+| **Erase** — Paint that removes; with Editable area = a segment, erased voxels move into that segment (split a segment) | ❌ | ❌ | Shares Paint's brush |
+| **Level tracing** — moving the pointer outlines the same-intensity region under it on the slice; click applies | ❌ | ❌ | 2D flood fill on the slice |
+| **Grow from seeds** — fast GrowCut from ≥ 2 visible seed segments; Initialize / Update / Auto-update / Cancel / Apply; seed locality; preview | ❌ | ❌ | `region_grow` is a different (threshold flood) algorithm |
+| **Fill between slices** — morphological contour interpolation across any number of skipped slices; Initialize / Update / Auto-update / Cancel / Apply; shape only | ❌ | ❌ | |
+| **Margin** — grow or shrink by mm; Apply to visible segments | ✅ | ❌ | `grow` / `shrink` (exact Euclidean distance) |
+| **Hollow** — shell of a given thickness; current segment as the inside, medial or outside surface; Apply to visible segments | 🟡 | ❌ | Composes from `grow` / `shrink` / `subtract`; vessel walls |
+| **Smoothing** — Median, Opening, Closing (kernel in mm), Gaussian (σ), Joint smoothing (all visible segments together, watertight boundaries); Apply to all or brush a region | 🟡 | ❌ | `majority` (median), `open`, `close`, `fill_holes` (enclosed cavities) ✅; Gaussian, Joint, brush region ❌ |
+| **Scissors** — Erase inside / Erase outside / Fill inside / Fill outside; free-form, circle or rectangle (lines can snap horizontal / vertical); slice cut: Unlimited, Positive, Negative, Symmetric with thickness; slice or 3D views; Apply to visible segments | ❌ | ❌ | Lasso projected through the volume |
+| **Islands** — Keep largest; Remove small (minimum size); Split islands to segments; Keep selected; Remove selected; Add selected (click an empty region) | 🟡 | ❌ | `keep_largest`, `remove_small`, `island_at` (keep / remove), `components` ✅; Add selected ❌; split needs the segment list |
+| **Logical operators** — Copy, Add, Subtract, Intersect, Invert, Clear, Fill; Bypass masking | ✅ | ❌ | `union` / `subtract` / `intersect` / `invert`; Copy / Clear / Fill are trivial |
+| **Mask volume** — Fill inside, Fill outside, or Fill inside and outside (binary) with fill values; Soft edge (Gaussian σ); output to a new or the same volume | ❌ | ❌ | Needs a scalar-volume writer |
+
+## 3. SegmentEditorExtraEffects
+
+| Slicer effect and options | Engine | UI | Notes |
+|---|---|---|---|
+| **Local threshold** — ⌘ / Ctrl-click adds the structure under the pointer within a threshold range (set visually, from a local histogram, or a slider); Minimum diameter stops leaks through narrow necks; region of interest; algorithm GrowCut, Watershed or Masking, with feature size | 🟡 | ❌ | `region_grow` + `open` cover the Masking variant; the best one-click vessel tool |
+| **Flood filling** — similar-intensity voxels connected to the click (intensity tolerance, neighbourhood size) | ✅ | ❌ | `region_grow` with 6- / 26-connectivity |
+| **Draw tube** — tube through clicked points with a radius (catheters, nerves, vessels) | ❌ | ❌ | Mesh tab has Add Tube; here as voxels |
+| **Fast marching** — grows the current segment, target size (% of volume) limits leaks | ❌ | ❌ | |
+| **Watershed** — complete segmentation from seeds, object scale smooths the result | ❌ | ❌ | |
+| **Surface cut** — smooth closed blob through points placed on its surface | ❌ | ❌ | |
+| **Split volume** — crop the volume around each segment into separate volumes | ❌ | ❌ | ⚪ |
+| **Engrave** — emboss or engrave text into a segment | ❌ | ❌ | ⚪ |
+
+## 4. Vessels (SlicerVMTK) — the main Polymix workflow
+
+| Slicer tool | Engine | UI | Notes |
+|---|---|---|---|
+| **Vesselness filtering** — Frangi filter: minimum / maximum vessel diameter, contrast, suppression of plates and blobs; result as a volume to threshold | ❌ | ❌ | Multi-scale Hessian |
+| **Level set segmentation** — geodesic active contours from seeds, on the image or its vesselness | ❌ | ❌ | |
+| **Guided arterial segmentation** — vessels grown along seed points / a rough centerline | ❌ | ❌ | |
+| **Extract centerline** — centerline network / tree with radii, from a segment | ❌ | ❌ | Mesh tab has centerlines of meshes |
+| **Cross-section analysis** — diameter and area along a centerline | ❌ | ❌ | |
+
+## 5. Segmentations module, statistics, import and export
+
+| Slicer | Engine | UI | Notes |
+|---|---|---|---|
+| Export segments as a label map: NIfTI, `.seg.nrrd` with segment names and colours | ✅ | ❌ | `write_nifti`, `write_seg_nrrd`; Slicer and the Volume tab read them back |
+| Import a label map / `.seg.nrrd` / NIfTI labels as segments | ❌ | ❌ | The Volume tab already finds them (kinds Label map, Segmentation) |
+| Export segments as models (STL / OBJ / PLY), closed-surface smoothing | ✅ | ❌ | `mask_to_mesh`: closed, manifold, outward, LPS like Slicer |
+| **Send to the Mesh tab** (Polymix) | 🟡 | ❌ | Needs `MeshWorkspace::add_mesh(name, Mesh)` reusing the import path |
+| Import a model as a segment (voxelise) | ❌ | ❌ | `mm-solid` voxelises meshes |
+| Copy / move segments between segmentations; convert representations | ❌ | ❌ | ⚪ |
+| **Segment statistics** — voxel count, volume (mm³, cm³), surface area, mean / SD / min / max / median intensity, centroid, bounding box, Feret diameter, roundness, elongation | 🟡 | ❌ | `count`, `bounds` |
+| Standard terminology (anatomical names and colours) | ❌ | ❌ | ⚪ |
+
+## 6. AI-assisted segmentation (Slicer extensions)
+
+| Slicer extension | Engine | UI | Notes |
+|---|---|---|---|
+| TotalSegmentator (automatic whole-body, includes vessels on CT) | ❌ | ❌ | ⚪ external model |
+| MONAI Auto3DSeg / MONAI Label | ❌ | ❌ | ⚪ external model |
+| nnInteractive (segment from clicks, boxes, scribbles) | ❌ | ❌ | ⚪ external model |
+| Brain mask / skull stripping (SynthStrip, HD-BET) | ❌ | ❌ | A mask for N4, cropping and editable area; a classic (non-AI) fallback is possible |
+
+## 7. Image preparation — Volume tab
+
+Image → image. Each result is a Derived volume (with where it came from, e.g. "N4 of Series 8")
+that the Segmentation tab can segment. **Engine** is GUI-free code (`mm-volume` or a new
+crate), **UI** the Volume tab.
+
+| Tool | Engine | UI | Notes |
+|---|---|---|---|
+| **N4 bias field correction** — removes MR coil shading; mask (automatic Otsu, or a segment), shrink factor, iterations per level, B-spline control-point spacing, convergence; corrected volume and the bias field | ❌ | ❌ | Pure Rust: B-spline fit of the log bias with histogram sharpening, multi-resolution. Makes MR thresholds work across the whole brain |
+| **Denoising** — Gaussian, median, curvature / gradient anisotropic diffusion (edge-preserving), non-local means | ❌ | ❌ | |
+| **Resample** — isotropic or chosen spacing; linear, cubic or windowed-sinc interpolation | ❌ | ❌ | Upsampling helps thin vessels (Slicer's oversampling) |
+| **Crop** to a box drawn in the views; pad | ❌ | ❌ | Smaller volumes make every tool faster |
+| **Reorient** — to standard axes; flip / permute axes when a header is wrong | ❌ | ❌ | |
+| **Registration** — rigid / affine (deformable later) between series of a patient; resample one onto another's grid | ❌ | ❌ | TOF-MRA ↔ T1, pre ↔ post contrast |
+| **Subtraction** — post − pre contrast after registration | ❌ | ❌ | DSA-like vessel images |
+| **Intensity normalisation** — rescale, percentile clip, z-score, histogram matching | ❌ | ❌ | Same thresholds across scans |
+| **Vessel enhancement** — Frangi / Sato / Jerman vesselness, multi-scale (min / max diameter) | ❌ | ❌ | A volume to threshold; the vessel tools in §4 compute it too |
+| **MIP / MinIP slab volumes** | ❌ | ❌ | Also as a viewing option (§8) |
+| 4D: choose a time point or echo, average, split | ❌ | ❌ | ⚪ |
+| 4D flow MRI velocity fields (phase contrast) | ❌ | ❌ | ⚪ CFD boundary conditions and validation |
+| **Save derived volumes** (NIfTI / NRRD) | ❌ | ❌ | `write_nifti` / `write_seg_nrrd` write `u8` label maps only; needs a (small) float NIfTI writer. Where they are saved: to decide |
+| De-identified export (identifiers stripped, optional defacing) | ❌ | ❌ | ⚪ for sharing data |
+
+## 8. Viewer features — Volume and Segmentation tabs (`polymix-imaging`)
+
+| Feature | Status | Notes |
+|---|---|---|
+| Before / after comparison (toggle or split view) | ❌ | Judging N4, denoising, registration |
+| Two volumes overlaid: foreground over background, opacity, colour map | ❌ | Registration check, vesselness over MRA |
+| Window presets (CT brain / bone / angio; MR automatic) and colour maps | 🟡 | Auto and File windows only |
+| Thick-slab MIP in the slice views | ❌ | Following vessels in TOF / CTA |
+| Oblique reslicing: rotate a plane, plane along a vessel | ❌ | Views follow the voxel grid now |
+| Layouts: one view, 1 × 3, 2 × 2; maximise a view | 🟡 | 2 × 2 only |
+| A viewer in the Volume tab (for preparing images) | 🟡 | Thumbnail only; reuse `SliceView` |
+| Measurements in the views: ruler, angle, region statistics | ❌ | |
+| Screenshots | ❌ | ⚪ |
+
+## 9. After segmentation — Mesh tab
+
+| Feature | Status | Notes |
+|---|---|---|
+| Receive segment meshes (`MeshWorkspace::add_mesh`) | ❌ | See §5 Send to the Mesh tab |
+| Image slices in the Mesh 3D view, to check the surface against the image | ❌ | |
+| Mesh → segment (voxelise; round trip for fixes) | ❌ | |
+| Aneurysm morphology: neck width, dome height, aspect and size ratios | ❌ | ⚪ on surface + centerline |
+| Smoothing, remeshing, trim branch, flow extensions, centerline, CFD check | ✅ | See [feature_parity.md](feature_parity.md) |
+
+---
+
+## Suggested order (vessel segmentation → CFD mesh)
+
+1. Foundations: segment list, labels drawn in the slice and 3D views, undo / redo, masking
+   (editable area, intensity range, overwrite modes); source volume picker.
+2. Threshold (preview, automatic), Islands, Paint / Erase (sphere brush), Local threshold and
+   Flood filling. In Volume: N4, crop, resample, saving derived volumes, and a viewer to
+   compare before and after.
+3. Make mesh → Mesh tab; save `.seg.nrrd` / NIfTI.
+4. Margin, Smoothing, Logical operators, Scissors, Hollow; thick-slab MIP in the views.
+5. Grow from seeds, Fill between slices, Level tracing, Draw.
+6. Vessel tools: vesselness, level set, draw tube, centerline; registration and subtraction.
+7. Statistics, Mask volume, import of label maps and models, the remaining extra effects,
+   denoising, AI.
