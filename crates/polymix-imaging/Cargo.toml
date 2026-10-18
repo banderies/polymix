@@ -13,3 +13,6 @@ glam.workspace = true
 rayon.workspace = true
 log.workspace = true
 bytemuck = { version = "1.25", features = ["derive"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

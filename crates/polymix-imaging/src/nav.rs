@@ -93,7 +93,7 @@ impl Nav {
     pub fn handle(&mut self, ui: &egui::Ui, r: &Response) -> NavEvents {
         let mut ev = NavEvents { hover: r.hover_pos(), ..Default::default() };
         let view = r.rect;
-        let (primary, secondary, middle, delta, press) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.delta(), i.pointer.press_origin()));
+        let (primary, secondary, middle, mut delta, press, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.delta(), i.pointer.press_origin(), i.pointer.latest_pos()));
         let active = r.is_pointer_button_down_on() || r.dragged();
         if !(primary || secondary || middle) {
             self.gesture = None;
@@ -108,6 +108,11 @@ impl Nav {
                     self.gesture = Some(Gesture::Window);
                 }
             } else if self.gesture.is_none() && r.dragged() {
+                // The drag starts once the pointer has moved a little: count that movement
+                // too, so the grabbed point follows the cursor exactly.
+                if let (Some(a), Some(b)) = (press, pos) {
+                    delta = b - a;
+                }
                 self.gesture = if r.dragged_by(PointerButton::Primary) {
                     Some(Gesture::Slices)
                 } else if r.dragged_by(PointerButton::Secondary) {

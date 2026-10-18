@@ -2546,6 +2546,7 @@ dependencies = [
  "eframe",
  "egui",
  "glam 0.34.1",
+ "image",
  "log",
  "mm-volume",
  "rayon",
