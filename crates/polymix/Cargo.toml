@@ -23,6 +23,7 @@ eframe.workspace = true
 egui.workspace = true
 polymix-workspace = { path = "../polymix-workspace" }
 polymix-volume = { path = "../polymix-volume" }
+polymix-segmentation = { path = "../polymix-segmentation" }
 bytemuck = { version = "1.25", features = ["derive"] }
 rfd = "0.17"
 log.workspace = true

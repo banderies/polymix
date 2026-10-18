@@ -8,6 +8,7 @@
 //! tab shows a crash card with a Restart button while the others keep working.
 
 use crate::app::MeshWorkspace;
+use polymix_segmentation::SegmentationWorkspace;
 use polymix_volume::VolumeWorkspace;
 use polymix_workspace::guard::{self, CardAction, Slot};
 use polymix_workspace::style::{apply_theme, Theme};
@@ -59,6 +60,7 @@ impl Tab {
 pub struct PolymixApp {
     active: Tab,
     volume: Slot<VolumeWorkspace>,
+    segmentation: Slot<SegmentationWorkspace>,
     mesh: Slot<MeshWorkspace>,
     /// Paths from the command line, opened on the first frame.
     pending_open: Vec<PathBuf>,
@@ -78,6 +80,8 @@ struct Script {
     awaiting_shot: Option<Arc<AtomicBool>>,
     /// Key presses (`key:S`) for the next frame's input.
     keys: Vec<egui::Key>,
+    /// Raw mouse events (`pointer:`), one frame's worth per frame.
+    pointer: VecDeque<Vec<egui::Event>>,
 }
 
 impl PolymixApp {
@@ -96,9 +100,11 @@ impl PolymixApp {
             wait: 0,
             awaiting_shot: None,
             keys: Vec::new(),
+            pointer: VecDeque::new(),
         });
         // Workspaces that fail to start are shown stopped, like a crash later on.
         let volume = slot("Volume", || VolumeWorkspace::new(ctx, storage));
+        let segmentation = slot("Segmentation", || SegmentationWorkspace::new(ctx, storage));
         let mesh = slot("Mesh", || MeshWorkspace::new(ctx, cc.wgpu_render_state.as_ref(), storage));
         // A recovery prompt (or similar) must be seen: show that workspace first.
         if mesh.live().is_some_and(|w| w.needs_attention()) {
@@ -106,7 +112,7 @@ impl PolymixApp {
         } else if volume.live().is_some_and(|w| w.needs_attention()) {
             active = Tab::Volume;
         }
-        Self { active, volume, mesh, pending_open: files, script, crash_next: None, restart_next: None, title: String::new() }
+        Self { active, volume, segmentation, mesh, pending_open: files, script, crash_next: None, restart_next: None, title: String::new() }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -135,8 +141,8 @@ impl PolymixApp {
     fn crashed(&self, tab: Tab) -> bool {
         match tab {
             Tab::Volume => matches!(self.volume, Slot::Crashed(_)),
+            Tab::Segmentation => matches!(self.segmentation, Slot::Crashed(_)),
             Tab::Mesh => matches!(self.mesh, Slot::Crashed(_)),
-            Tab::Segmentation => false,
         }
     }
 
@@ -198,23 +204,29 @@ impl PolymixApp {
                     }
                 }
             },
-            Tab::Segmentation => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.3);
-                        ui.heading("Segmentation");
-                        ui.label("Segment volumes from the Volume workspace and send the result to Mesh. Coming after the Volume browser.");
+            Tab::Segmentation => match &self.segmentation {
+                Slot::Live(_) => {
+                    self.segmentation.call(|w| {
+                        if crash {
+                            panic!("crash test requested by the script");
+                        }
+                        w.ui(ui, frame)
                     });
-                });
-            }
+                }
+                Slot::Crashed(report) => {
+                    if guard::crash_card(ui, report, "Restart opens an empty Segmentation workspace; it reloads the volume selected in Volume.") == CardAction::Restart || restart {
+                        self.segmentation = slot("Segmentation", || SegmentationWorkspace::new(&ctx, frame.storage()));
+                    }
+                }
+            },
         }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match self.active {
             Tab::Volume => self.volume.live().map(|w| w.title()),
+            Tab::Segmentation => self.segmentation.live().map(|w| w.title()),
             Tab::Mesh => self.mesh.live().map(|w| w.title()),
-            Tab::Segmentation => Some("Polymix — Segmentation".to_string()),
         }
         .unwrap_or_else(|| format!("Polymix — {} (stopped)", self.active.label()));
         if title != self.title {
@@ -227,8 +239,8 @@ impl PolymixApp {
     fn active_idle(&self) -> bool {
         match self.active {
             Tab::Volume => self.volume.live().is_none_or(|w| w.script_idle()),
+            Tab::Segmentation => self.segmentation.live().is_none_or(|w| w.script_idle()),
             Tab::Mesh => self.mesh.live().is_none_or(|w| w.script_idle()),
-            Tab::Segmentation => true,
         }
     }
 
@@ -245,6 +257,9 @@ impl PolymixApp {
         }
         if script.wait > 0 {
             script.wait -= 1;
+            return;
+        }
+        if !script.pointer.is_empty() {
             return;
         }
         if !idle {
@@ -293,11 +308,18 @@ impl PolymixApp {
                 self.restart_next = Tab::from_key(arg);
                 script.wait = 2;
             }
+            // pointer:left+right,x0,y0,x1,y1[,steps] — press the buttons at (x0, y0) (window
+            // points), move to (x1, y1) in `steps` frames, release: real mouse input for any
+            // workspace. Buttons: left, right, middle, joined with `+`.
+            "pointer" => match pointer_frames(arg) {
+                Some(frames) => script.pointer = frames,
+                None => log::warn!("bad pointer step {step}"),
+            },
             _ => {
                 let taken = match self.active {
                     Tab::Volume => self.volume.call(|w| w.script_push(step.clone())),
+                    Tab::Segmentation => self.segmentation.call(|w| w.script_push(step.clone())),
                     Tab::Mesh => self.mesh.call(|w| w.script_push(step.clone())),
-                    Tab::Segmentation => None,
                 };
                 if taken.is_none() {
                     log::warn!("script step {step} dropped: the {} workspace is not running", self.active.label());
@@ -319,7 +341,15 @@ impl eframe::App for PolymixApp {
     /// Background work for every workspace, every frame (also while the window is hidden).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let active = self.active;
+        // Segmentation shows the volume selected in Volume (read only while it is shown, so
+        // browsing in Volume loads nothing).
+        if active == Tab::Segmentation {
+            if let Some((catalog, k, label)) = self.volume.call(|w| w.current_volume()).flatten() {
+                self.segmentation.call(|w| w.show_volume(&catalog.volumes[k], &label, ctx));
+            }
+        }
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
+        self.segmentation.call(|w| w.tick(ctx, active == Tab::Segmentation));
         self.mesh.call(|w| w.tick(ctx, active == Tab::Mesh));
     }
 
@@ -347,11 +377,13 @@ impl eframe::App for PolymixApp {
         }
         storage.set_string("shell.tab", self.active.key().to_string());
         self.volume.call(|w| w.save(storage));
+        self.segmentation.call(|w| w.save(storage));
         self.mesh.call(|w| w.save(storage));
     }
 
     fn on_exit(&mut self) {
         self.volume.call(|w| w.on_exit());
+        self.segmentation.call(|w| w.on_exit());
         self.mesh.call(|w| w.on_exit());
     }
 
@@ -362,8 +394,38 @@ impl eframe::App for PolymixApp {
                     raw_input.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() });
                 }
             }
+            if let Some(events) = script.pointer.pop_front() {
+                raw_input.events.extend(events);
+            }
         }
     }
+}
+
+/// The frames of a `pointer:` script step: move to the start, press the buttons one frame
+/// apart (as hands do), move to the end, release, and one quiet frame.
+fn pointer_frames(arg: &str) -> Option<VecDeque<Vec<egui::Event>>> {
+    let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
+    let buttons: Vec<egui::PointerButton> = parts.first()?.split('+').map(|b| match b {
+        "left" => Some(egui::PointerButton::Primary),
+        "right" => Some(egui::PointerButton::Secondary),
+        "middle" => Some(egui::PointerButton::Middle),
+        _ => None,
+    }).collect::<Option<_>>()?;
+    let n: Vec<f32> = parts[1..].iter().map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let (a, b) = (egui::pos2(*n.first()?, *n.get(1)?), egui::pos2(*n.get(2)?, *n.get(3)?));
+    let steps = n.get(4).map_or(10, |s| *s as usize);
+    let button = |button, pos, pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() };
+    let mut frames = VecDeque::new();
+    frames.push_back(vec![egui::Event::PointerMoved(a)]);
+    for &bt in &buttons {
+        frames.push_back(vec![button(bt, a, true)]);
+    }
+    for s in 1..=steps {
+        frames.push_back(vec![egui::Event::PointerMoved(a.lerp(b, s as f32 / steps as f32))]);
+    }
+    frames.push_back(buttons.iter().map(|&bt| button(bt, b, false)).collect());
+    frames.push_back(Vec::new());
+    Some(frames)
 }
 
 fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::Result<()> {

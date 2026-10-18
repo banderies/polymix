@@ -137,6 +137,23 @@ impl VolumeWorkspace {
         }
     }
 
+    /// The volume other workspaces show (Segmentation): the selected volume; for a series or
+    /// a study, the one previewed if it is in it, else its first image. With its name as
+    /// listed here (identifiers masked when hidden).
+    pub fn current_volume(&self) -> Option<(Arc<Catalog>, usize, String)> {
+        let c = self.catalog.clone()?;
+        let previewed = self.preview.as_ref().map(|p| p.volume);
+        let pick = |ks: &[usize]| previewed.filter(|k| ks.contains(k)).or_else(|| ks.iter().copied().find(|&k| c.volumes[k].kind == Kind::Image)).or(ks.first().copied());
+        let k = match self.selection {
+            Selection::Volume(k) => Some(k),
+            Selection::Series(pi, si, sei) => pick(&c.patients[pi].studies[si].series[sei].volumes),
+            Selection::Study(pi, si) => pick(&c.patients[pi].studies[si].series.iter().flat_map(|s| s.volumes.iter().copied()).collect::<Vec<_>>()),
+            Selection::Patient(_) | Selection::None => None,
+        }?;
+        let label = self.privacy.path(&c.volumes.get(k)?.name);
+        Some((c, k, label))
+    }
+
     fn set_hide(&mut self, hide: bool) {
         self.hide_ids = hide;
         self.privacy = Privacy::new(hide, self.catalog.as_deref());

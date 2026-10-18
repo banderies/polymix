@@ -2530,6 +2530,7 @@ dependencies = [
  "mm-repair",
  "mm-solid",
  "png",
+ "polymix-segmentation",
  "polymix-volume",
  "polymix-workspace",
  "rayon",
@@ -2550,6 +2551,20 @@ dependencies = [
  "log",
  "mm-volume",
  "rayon",
+]
+
+[[package]]
+name = "polymix-segmentation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "glam 0.34.1",
+ "log",
+ "mm-volume",
+ "polymix-imaging",
+ "polymix-workspace",
 ]
 
 [[package]]
