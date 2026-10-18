@@ -265,6 +265,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "makesolid" => Box::new(tools::ops::MakeSolidTool::new(cx)),
         "makepattern" => Box::new(tools::pattern::MakePatternTool::new(cx)),
         "unwrap" => Box::new(tools::unwrap::UnwrapTool::new(cx)),
+        "convex" => Box::new(tools::pattern::ConvexTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
         "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
         "flowext" => Box::new(tools::vessel::FlowExtensionTool::new(cx)),
@@ -1470,6 +1471,15 @@ impl PolymixApp {
                     }
                     if ui.button("Combine visible").clicked() {
                         commands::combine_visible(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                    }
+                    if ui.button("Generate Complex").on_hover_text("Cells of the overlapping visible closed objects (A − B, A ∩ B, B − A, …), one face group each").clicked() {
+                        commands::generate_complex(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                    }
+                    if ui.button("Split Complex").on_hover_text("One object per face group").clicked() {
+                        commands::split_complex(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                    }
+                    if ui.button("Convex Decomposition").on_hover_text("Approximate the object by convex pieces (new object, one face group per piece)").clicked() {
+                        open = Some("convex");
                     }
                     if ui.button("Duplicate").clicked() {
                         commands::duplicate_object(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });

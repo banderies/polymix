@@ -22,6 +22,7 @@ mod util;
 pub mod boolean;
 pub mod bridge;
 pub mod cap;
+pub mod complex;
 pub mod cut;
 pub mod extrude;
 pub mod face_groups;
@@ -42,6 +43,7 @@ pub mod vessel;
 pub use boolean::{mesh_boolean, BooleanOp, BooleanResult};
 pub use bridge::{bridge, join_loops, BridgeParams, BridgeResult};
 pub use cap::{cap_planar_loops, CapResult};
+pub use complex::{convex_decomposition, generate_complex, ConvexParams};
 pub use cut::{
     local_plane_cut, local_plane_cut_with, nearest_intersection_curve, plane_cut, plane_intersection_curves, CutFill,
     IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,

@@ -167,6 +167,73 @@ pub fn separate_shells(cx: &mut CmdCx) {
     *cx.status = format!("Separated into {n} shells");
 }
 
+/// Generate Complex: the cells of the visible closed objects (every region covered by a
+/// particular set of them), as one new object with a face group per cell.
+pub fn generate_complex(cx: &mut CmdCx) {
+    let solids: Vec<(ObjectId, mm_core::Mesh)> = cx.scene.objects.iter().filter(|o| o.visible && o.mesh.is_closed() && o.mesh.triangle_count() > 0).map(|o| (o.id, (*o.mesh).clone())).collect();
+    if solids.len() < 2 {
+        *cx.status = "Generate Complex needs at least two visible closed objects that overlap.".into();
+        return;
+    }
+    if solids.len() > 6 {
+        *cx.status = "Generate Complex works on up to six visible closed objects.".into();
+        return;
+    }
+    let meshes: Vec<mm_core::Mesh> = solids.iter().map(|s| s.1.clone()).collect();
+    match mm_edit::generate_complex(&meshes) {
+        Ok(cells) => {
+            cx.history.push("Generate Complex", cx.scene);
+            let mut m = mm_core::Mesh::new();
+            for (i, c) in cells.iter().enumerate() {
+                let start = m.max_tid() as u32;
+                m.append_mesh(c, 0);
+                for t in start..m.max_tid() as u32 {
+                    if m.is_triangle(t) {
+                        m.set_tri_group(t, i as i32);
+                    }
+                }
+            }
+            let n = cells.len();
+            for (id, _) in &solids {
+                if let Some(o) = cx.scene.get_mut(*id) {
+                    o.visible = false;
+                }
+            }
+            let id = cx.scene.add("Complex", m);
+            cx.scene.active = Some(id);
+            *cx.status = format!("Generate Complex: {n} cells (one face group each); the inputs are hidden");
+        }
+        Err(e) => *cx.status = format!("Generate Complex: {e}"),
+    }
+}
+
+/// Split Complex: one object per face group of the active object.
+pub fn split_complex(cx: &mut CmdCx) {
+    let Some(id) = cx.scene.active else { return };
+    let o = cx.scene.get(id).unwrap();
+    let mut groups: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+    for t in o.mesh.triangle_ids() {
+        groups.entry(o.mesh.tri_group(t)).or_default().push(t);
+    }
+    if groups.len() < 2 {
+        *cx.status = "Split Complex: the object has a single face group.".into();
+        return;
+    }
+    cx.history.push("Split Complex", cx.scene);
+    let o = cx.scene.get(id).unwrap();
+    let base = o.name.clone();
+    let parts: Vec<(i32, mm_core::Mesh)> = groups.into_iter().map(|(g, tris)| (g, o.mesh.submesh(&tris).0)).collect();
+    cx.scene.remove(id);
+    let n = parts.len();
+    let mut first = None;
+    for (g, m) in parts {
+        let nid = cx.scene.add(format!("{base} cell {g}"), m);
+        first.get_or_insert(nid);
+    }
+    cx.scene.active = first;
+    *cx.status = format!("Split Complex: {n} objects");
+}
+
 /// Merge all visible objects into the active one. Every object's group 0 (its wall) stays
 /// group 0; other face groups get fresh ids, and their patch names come along.
 pub fn combine_visible(cx: &mut CmdCx) {
@@ -249,4 +316,32 @@ pub fn duplicate_object(cx: &mut CmdCx) {
 pub fn delete_object(cx: &mut CmdCx, id: ObjectId) {
     cx.history.push("Delete object", cx.scene);
     cx.scene.remove(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn generate_then_split_complex() {
+        let mut scene = Scene::default();
+        let mut history = History::default();
+        let mut status = String::new();
+        let a = primitives::cube(2.0, 1);
+        let mut b = primitives::cube(2.0, 1);
+        b.transform(|p| p + glam::DVec3::new(1.0, 0.5, 0.0));
+        scene.add("a", a);
+        scene.add("b", b);
+        generate_complex(&mut CmdCx { scene: &mut scene, history: &mut history, status: &mut status });
+        let complex = scene.active().unwrap();
+        assert_eq!(complex.name, "Complex", "{status}");
+        let groups: std::collections::BTreeSet<i32> = complex.mesh.triangle_ids().map(|t| complex.mesh.tri_group(t)).collect();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(scene.objects.iter().filter(|o| o.visible).count(), 1);
+        split_complex(&mut CmdCx { scene: &mut scene, history: &mut history, status: &mut status });
+        let cells: Vec<_> = scene.objects.iter().filter(|o| o.name.contains("cell")).collect();
+        assert_eq!(cells.len(), 3);
+        assert!(cells.iter().all(|o| o.mesh.is_closed()));
+    }
 }

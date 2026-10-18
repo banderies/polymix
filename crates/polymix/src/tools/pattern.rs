@@ -123,6 +123,43 @@ impl OpSpec for MakePatternSpec {
 }
 pub type MakePatternTool = OpTool<MakePatternSpec>;
 
+/// Convex Decomposition (Edit menu): the object is kept; its convex pieces are added as a new
+/// object with one face group per piece.
+pub struct ConvexSpec;
+impl OpSpec for ConvexSpec {
+    type Params = mm_edit::ConvexParams;
+    const NAME: &'static str = "Convex Decomposition";
+    const USES_SELECTION: bool = false;
+    const LIVE: bool = false;
+    const SHOWS_GROUPS: bool = true;
+    fn defaults(_: &OpInfo) -> Self::Params {
+        mm_edit::ConvexParams::default()
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, _: &OpInfo) {
+        ui.add(egui::Slider::new(&mut p.max_pieces, 1..=64).text("max pieces"));
+        let mut pct = p.concavity * 100.0;
+        if ui.add(egui::Slider::new(&mut pct, 0.1..=20.0).logarithmic(true).text("concavity %")).on_hover_text("Stop splitting once no piece's hull adds more than this share of the total hull volume").changed() {
+            p.concavity = pct / 100.0;
+        }
+    }
+    fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, _: ProgressFn) -> anyhow::Result<OpOutput> {
+        let hulls = mm_edit::convex_decomposition(mesh, p)?;
+        let mut pieces = Mesh::new();
+        for (i, h) in hulls.iter().enumerate() {
+            pieces.append_mesh(h, i as i32);
+        }
+        let extra = hulls.iter().map(mm_core::measure::volume).sum::<f64>() / mm_core::measure::volume(mesh).max(1e-300) - 1.0;
+        Ok(OpOutput {
+            message: format!("{} convex pieces, {:.1}% more volume than the object", hulls.len(), extra * 100.0),
+            mesh: mesh.clone(),
+            preview: Some(pieces.clone()),
+            new_objects: vec![("convex pieces".into(), pieces)],
+            ..Default::default()
+        })
+    }
+}
+pub type ConvexTool = OpTool<ConvexSpec>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

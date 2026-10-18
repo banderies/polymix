@@ -205,7 +205,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Separate Shells (Shift+Y) | ✅ | |
 | Add Tube | ✅ | Line / Spline (Inside, Outside), AutoRoute Minimal / Smooth (elastic band keeping the collision radius); Combine Boolean (union outside, difference inside) / Append / New Object; Direction Any / Face Normal; radius, end radius, tangent, length scale, solve steps; drag ends to move |
 | Unwrap / UV layout / SetUV | ⚪ 🟡 | Edit > Unwrap: By Groups / By Components (cut into discs automatically), Conformal (LSCM) / Rigid (ARAP), Stacked / Line / Optimized packing on a Width × Height sheet with Border; layout drawn in the panel; UVs exported with OBJ and kept in projects, dropped by topology edits. UV Layout editing and SetUV ❌ |
-| Generate / Filter / Split Complex, Convex Decomposition | ⚪ ❌ | |
+| Generate / Filter / Split Complex, Convex Decomposition | ⚪ 🟡 | Generate Complex: cells of the overlapping visible closed objects (A − B, A ∩ B, B − A, …) by exact booleans, one face group per cell; Split Complex: one object per face group (Polymix's reading; Meshmixer documents neither). Convex Decomposition ✅: plane splits at the piece's own vertex positions until each piece is nearly convex; the hulls become a new object. Filter Complex ❌ |
 | Make Slices | ⛔ | |
 | Remesh (whole object) | ✅ | All four modes incl. Linear Subdivision; Density (%), Regularity, Threshold, Iterations, Transition, Preserve / Smooth group borders, sharp edges, boundary modes — Meshmixer's defaults |
 | Reduce | ✅ | Percentage / triangle budget / max deviation; Uniform vs Shape Preserving (T) |
