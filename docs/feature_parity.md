@@ -94,6 +94,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Zoom: Alt+Ctrl/⌘+LMB (pen-friendly) | ✅ | |
 | Wheel zooms (outside brush tools) | ✅ | Zooms toward the cursor |
 | "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ✅ | View → Navigation; default, as in your Meshmixer |
+| — | ✅ | Polymix addition: Custom navigation mode — Preferences → General → Mouse buttons picks Orbit / Pan / Zoom for each middle and right drag, plain, with Shift or with Alt (editing a preset's table switches to Custom) |
 | ViewCube / SteeringWheels | ✅ / ⚪ | Own view cube: click a face, edge or corner for that view, drag to tumble (View → Show view cube); SteeringWheels not planned |
 | 3D mouse (3Dconnexion) | ✅ | Polymix addition: View → 3D mouse… (macOS) |
 
@@ -129,7 +130,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 |---|---|---|
 | Paint Mode: sphere brush, Shift deselect | ✅ | Brush keeps its size on the model |
 | Brush types: Sphere, SphereDisc, Unwrap (geodesic) | ✅ | Unwrap is the default, as in your Meshmixer |
-| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Shift+wheel in every navigation mode, one step per notch with no easing lag (the plain wheel always zooms — your preference over Meshmixer's plain wheel); also Cmd/Ctrl+middle-drag |
+| **Mouse wheel resizes the brush** (also `[` `]`) | ✅ | Shift+wheel (or Control / Option / Command, Preferences → General → Brush size scroll) in every navigation mode, one step per notch with no easing lag (the plain wheel always zooms — your preference over Meshmixer's plain wheel); also Cmd/Ctrl+middle-drag |
 | RMB-drag expands / contracts the selection | ✅ | With a selection; geodesic distance (other expand modes: ROADMAP M2.5) |
 | Laser Lasso (curve from background; closed = inside, open = smaller side, through the model) | ✅ | |
 | Lasso Mode (multi-curve loop drawn *on the surface*, rotate between curves) | ✅ | Closes when a curve ends near the start, or Enter; Esc clears |
@@ -178,7 +179,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ✅ | Refine / Reduce step the edge length per dab (Refine bounded by the brush size); AdaptiveReduce is a quadric reduction that thins flat areas first |
 | Brushes: PaintVertex, SmoothColor | ⚪ ✅ | Colour picker in the panel; Cmd/Ctrl paints the default grey back; strokes upload only the painted vertices |
 | Dynamic refinement while sculpting (Refinement, Adaptivity; R, T) | ✅ | Per dab: split / collapse / relax under the brush; Refine, Reduce, Smooth, Adaptive + Adaptivity; R and T toggle |
-| Size / Strength | ✅ | Size is a % of the model; Shift+wheel size, Cmd/Ctrl+right-drag strength (a plain right-drag always turns the view) |
+| Size / Strength | ✅ | Size is a % of the model; Shift+wheel size (modifier set in Preferences), Cmd/Ctrl+right-drag strength (a plain right-drag always navigates) |
 | Depth, Lazyness, Flow, Volumetric, Falloff curve | ✅ | Falloff Smooth / Linear / Sharp / Dome / Flat (own curve shapes) |
 | Spacing, AlignToStroke, Stencils, brush textures | ❌ | |
 | Primary / Secondary (Shift) / Invert (Ctrl/⌘) | ✅ | Secondary is a choice of smoothing brush; Invert for the draw brushes, Inflate, Push and Pinch |

@@ -655,9 +655,9 @@ impl Tool for SelectTool {
         let (n_sel, n_tri) = cx.scene.active().map(|o| (o.selection.len(), o.mesh.triangle_count())).unwrap_or((0, 0));
         ui.label(format!("{} / {} triangles selected", ui_util::format_count(n_sel), ui_util::format_count(n_tri)));
         ui.small(match self.mode {
-            SelectMode::Brush => "Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ], Shift+scroll or Cmd+middle-drag",
-            SelectMode::Lasso => "Draw curves on the surface, turning the view between them; end near the start (or press Enter) to select the enclosed faces · A drag from the background is the laser lasso · Shift: deselect",
-            SelectMode::Wand => "Click a face to select the connected faces facing the same way (within the angle) · Shift: deselect · A drag from the background is the laser lasso",
+            SelectMode::Brush => format!("Drag on the model to paint · Drag from the background to lasso (open curve = laser cut, selects the smaller side) · Shift: deselect · Size: [ ], {} or Cmd+middle-drag", cx.brush_scroll.scroll_label()),
+            SelectMode::Lasso => "Draw curves on the surface, turning the view between them; end near the start (or press Enter) to select the enclosed faces · A drag from the background is the laser lasso · Shift: deselect".into(),
+            SelectMode::Wand => "Click a face to select the connected faces facing the same way (within the angle) · Shift: deselect · A drag from the background is the laser lasso".into(),
         });
         ui.small("Double-click: hole border (on an open edge) or connected part · Cmd+right-drag: grow / shrink · S: clear");
 
@@ -1141,7 +1141,7 @@ mod tests {
         let mut status = String::new();
         let ctx = egui::Context::default();
         let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
-        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
         let mut tool = SelectTool { size_pct: 10.0, ..Default::default() };
         assert!(!tool.allow_back_faces);
         let c = vp.rect.center();

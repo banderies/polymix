@@ -495,6 +495,7 @@ mod tests {
             status: &mut status,
             egui: &ctx,
             vp: Viewport { rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)) },
+            brush_scroll: crate::navigation::BrushScroll::Shift,
         };
         let mut t = MeasureTool::new(&mut cx);
         let p = DVec3::new(1.0, 0.2, 0.3);

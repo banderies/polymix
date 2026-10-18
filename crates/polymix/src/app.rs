@@ -3,7 +3,7 @@
 use crate::camera::{Camera, UpAxis, ViewHistory};
 use crate::commands::{self, CmdCx};
 use crate::jobs::Job;
-use crate::navigation::{NavAction, NavMode};
+use crate::navigation::{BrushScroll, NavAction, NavBindings, NavMode};
 use crate::renderer::{self, ColorVertex, GpuMesh, ObjectStyle, SceneRenderer};
 use crate::spacemouse::{self, SpaceMouse};
 use crate::scene::{History, ObjectId, Scene};
@@ -205,6 +205,10 @@ pub struct ViewOptions {
     pub crease_deg: f32,
     /// Mouse navigation scheme (Meshmixer's Preferences → Navigation Mode).
     pub nav_mode: NavMode,
+    /// The user's own drag table, used in the Custom navigation mode.
+    pub nav_custom: NavBindings,
+    /// Modifier that turns the scroll wheel into brush size.
+    pub brush_scroll: BrushScroll,
     pub show_grid: bool,
     /// Draw the target surface see-through.
     pub transparent_target: bool,
@@ -218,7 +222,7 @@ pub struct ViewOptions {
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, nav_custom: NavBindings::FUSION360, brush_scroll: BrushScroll::Shift, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
     }
 }
 
@@ -322,6 +326,8 @@ pub struct PolymixApp {
     nav_drag: Option<PointerButton>,
     /// Cmd/Ctrl+middle-drag resizing the brush.
     brush_drag: bool,
+    /// When the brush last took a wheel notch (its eased remainder must not zoom).
+    brush_wheel_at: f64,
     /// Point the current navigation drag orbits about (picked when it started).
     orbit_pivot: Option<DVec3>,
     /// Centre of mass of an object, for the mesh version it was computed for.
@@ -397,6 +403,7 @@ impl PolymixApp {
             recovery: None,
             nav_drag: None,
             brush_drag: false,
+            brush_wheel_at: f64::NEG_INFINITY,
             orbit_pivot: None,
             com_cache: None,
             tool_rmb: None,
@@ -458,6 +465,8 @@ impl PolymixApp {
             }
             app.view.sharp_edges = flag("sharp_edges", true);
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
+            app.view.nav_custom = st.get_string("nav_custom").and_then(|v| NavBindings::from_pref(&v)).unwrap_or(NavBindings::FUSION360);
+            app.view.brush_scroll = st.get_string("brush_scroll").and_then(|k| BrushScroll::from_key(&k)).unwrap_or(BrushScroll::Shift);
             if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
                 app.space_cfg = cfg;
             }
@@ -1076,7 +1085,7 @@ impl PolymixApp {
     }
 
     fn tool_cx<'a>(&'a mut self, ctx: &'a egui::Context, vp: Viewport) -> ToolCx<'a> {
-        ToolCx { scene: &mut self.scene, history: &mut self.history, camera: &mut self.camera, status: &mut self.status, egui: ctx, vp }
+        ToolCx { scene: &mut self.scene, history: &mut self.history, camera: &mut self.camera, status: &mut self.status, egui: ctx, vp, brush_scroll: self.view.brush_scroll }
     }
 
     fn cmd_cx(&mut self) -> CmdCx<'_> {
@@ -1290,6 +1299,11 @@ impl PolymixApp {
                         ui.selectable_value(&mut self.view.nav_mode, m, m.label());
                     }
                 });
+                if ui.button("Mouse buttons…").on_hover_text("Choose what each mouse button does (Preferences → General)").clicked() {
+                    ui.close();
+                    self.show_prefs = true;
+                    self.prefs_tab = 0;
+                }
                 if ui.button("3D mouse…").on_hover_text("3Dconnexion SpaceMouse settings").clicked() {
                     ui.close();
                     self.show_space_window = true;
@@ -1917,6 +1931,16 @@ impl PolymixApp {
                             }
                         });
                         ui.end_row();
+                        ui.label("Mouse buttons").on_hover_text("What each middle / right drag does. Changing one switches to Custom. Alt+left-drag (orbit), Alt+Shift+left-drag (pan) and Alt+Cmd+left-drag (zoom) work in every mode; the wheel zooms.");
+                        crate::navigation::bindings_ui(ui, &mut self.view.nav_mode, &mut self.view.nav_custom);
+                        ui.end_row();
+                        ui.label("Brush size scroll").on_hover_text("Hold this key and scroll to resize Select and Sculpt brushes; the plain wheel always zooms. Control+scroll can be taken by macOS screen zoom (System Settings → Accessibility → Zoom).");
+                        ui.horizontal(|ui| {
+                            for m in BrushScroll::ALL {
+                                ui.selectable_value(&mut self.view.brush_scroll, m, m.label());
+                            }
+                        });
+                        ui.end_row();
                         ui.label("Mesh color mode");
                         ui.horizontal(|ui| {
                             for m in ColorMode::ALL {
@@ -2003,7 +2027,9 @@ impl PolymixApp {
             egui::Grid::new("help").num_columns(2).striped(true).show(ui, |ui| {
                 ui.label(RichText::new(format!("{} navigation", self.view.nav_mode.label())).strong());
                 ui.end_row();
-                for (k, v) in self.view.nav_mode.help_rows().into_iter().chain([
+                let brush_size = format!("Select / Sculpt: [ ], {} or Cmd/Ctrl+middle-drag", self.view.brush_scroll.scroll_label());
+                let nav_rows = self.view.nav_mode.bindings(self.view.nav_custom).help_rows();
+                for (k, v) in nav_rows.into_iter().chain([(brush_size, "Brush size")]).chain([
                     ("F", "Focus on scene"),
                     ("Space", "Hotbox (view settings)"),
                     ("W", "Toggle wireframe"),
@@ -2013,7 +2039,6 @@ impl PolymixApp {
                     ("Shift+Y", "Separate shells"),
                     ("Select: drag / Shift+drag", "Paint selection / deselect"),
                     ("Select: double-click", "Select connected part"),
-                    ("Select / Sculpt: [ ], Shift+scroll or Cmd/Ctrl+middle-drag", "Brush size"),
                     ("Select: Cmd/Ctrl+right-drag (with a selection)", "Grow / shrink the selection"),
                     ("Sculpt: Cmd/Ctrl+right-drag", "Brush strength"),
                     ("Select: E / I / G / O / < >", "Connected / Invert / Groups / Optimize / Shrink-Grow"),
@@ -2023,7 +2048,7 @@ impl PolymixApp {
                     ("Enter or A / Esc", "Accept / Cancel tool"),
                     ("Cmd+Z / Shift+Cmd+Z (Cmd+Y) / Alt+← Alt+→", "Undo / Redo"),
                     ("Cmd+Shift+O", "Object browser"),
-                ]) {
+                ].map(|(k, v)| (k.to_string(), v))) {
                     ui.label(RichText::new(k).monospace());
                     ui.label(v);
                     ui.end_row();
@@ -2230,14 +2255,14 @@ impl PolymixApp {
         let ctx = ui.ctx().clone();
 
         // --- navigation -------------------------------------------------
-        let (mods, scroll, zoom_delta, pointer_delta, hover) = ctx.input(|i| {
+        let (mods, scroll, mut zoom_delta, pointer_delta, hover) = ctx.input(|i| {
             (i.modifiers, i.smooth_scroll_delta(), i.zoom_delta(), i.pointer.delta(), i.pointer.hover_pos())
         });
         // `hovered` respects layering, so popups over the viewport don't leak input into it.
         let in_rect = hover.map(|p| rect.contains(p)).unwrap_or(false) && (response.hovered() || response.dragged());
-        let nav = self.view.nav_mode;
+        let nav = self.view.nav_mode.bindings(self.view.nav_custom);
         let primary_nav = nav.starts_navigation(PointerButton::Primary, mods);
-        // A plain right-drag always turns the view; tools get Cmd/Ctrl+right-drag (selection
+        // A plain right-drag always navigates; tools get Cmd/Ctrl+right-drag (selection
         // grow / shrink, brush strength).
         let tool_claims_rmb = mods.command && !mods.alt && !mods.shift && self.tools.last().is_some_and(|t| t.claims_secondary_drag(&self.scene));
         if response.drag_started_by(PointerButton::Secondary) && tool_claims_rmb {
@@ -2309,14 +2334,21 @@ impl PolymixApp {
             }
         }
         if in_rect {
-            // Shift+wheel sets brush tools' size, from the raw events (one step per notch, no
-            // easing lag); the plain wheel always zooms.
+            // The brush-scroll modifier (Shift by default) + wheel sets brush tools' size, from
+            // the raw events (one step per notch, no easing lag); the plain wheel always zooms.
+            let now = ctx.input(|i| i.time);
             let mut scroll_y = scroll.y;
-            if mods.shift {
+            if self.view.brush_scroll.held(mods) {
                 let d = ctx.input(|i| crate::navigation::brush_wheel_delta(&i.raw.events));
                 if d != 0.0 && self.tool_wheel(&ctx, vp, d) {
-                    scroll_y = 0.0;
+                    self.brush_wheel_at = now;
                 }
+            }
+            // egui eases each notch in over ~0.1 s, as a vertical scroll (Ctrl, Option) or a
+            // zoom (Cmd); the rest of a notch the brush took must not zoom the view.
+            if now - self.brush_wheel_at < 0.25 {
+                scroll_y = 0.0;
+                zoom_delta = 1.0;
             }
             let mut factor = 1.0f64;
             if scroll_y != 0.0 {
@@ -2326,7 +2358,6 @@ impl PolymixApp {
                 factor /= zoom_delta as f64;
             }
             if factor != 1.0 {
-                let now = ctx.input(|i| i.time);
                 if now - self.last_wheel > 0.6 {
                     self.remember_view();
                 }
@@ -3020,6 +3051,8 @@ impl eframe::App for PolymixApp {
         st.set_string("background", format!("{},{},{}", bg[0], bg[1], bg[2]));
         st.set_string("sharp_edges", b(self.view.sharp_edges));
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
+        st.set_string("nav_custom", self.view.nav_custom.to_pref());
+        st.set_string("brush_scroll", self.view.brush_scroll.key().to_string());
         st.set_string("spacemouse", self.space_cfg.to_pref());
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));

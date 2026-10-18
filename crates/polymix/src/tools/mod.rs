@@ -107,6 +107,8 @@ pub struct ToolCx<'a> {
     pub status: &'a mut String,
     pub egui: &'a egui::Context,
     pub vp: Viewport,
+    /// Modifier that turns the wheel into brush size (for hints).
+    pub brush_scroll: crate::navigation::BrushScroll,
 }
 
 impl ToolCx<'_> {
