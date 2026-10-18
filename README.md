@@ -72,12 +72,12 @@ Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs
 |---|---|
 | Tumble (free trackball in every direction; *View → Free rotation* off = turntable) | Shift + middle-drag (Fusion 360 mode), right-drag, or Alt + left-drag |
 | Pan | Middle-drag, Shift + right-drag, or Alt + Shift + left-drag; the point you grab follows the cursor exactly (off the model, the object's centre of mass does) |
-| Zoom | Scroll / pinch, Alt + right-drag (Meshmixer mode), or Alt + Cmd + left-drag |
+| Zoom | Scroll / pinch, Alt + right-drag (Meshmixer mode), or Alt + Cmd + left-drag. The wheel heads for the point under the cursor (or the centre of the view), each step a fraction of the distance to it, so it slows near the surface and never zooms through the model; speed and both choices in *Preferences → General → Scroll zoom* |
 | Navigation scheme | *View → Navigation*: Fusion 360 (default) or Meshmixer, as in Meshmixer's preferences, or Custom: *Preferences → General → Mouse buttons* sets Orbit / Pan / Zoom for each middle and right drag (plain, Shift, Alt) |
 | Brush size / strength (Select, Sculpt) | Shift + scroll (or Control / Option / Command: *Preferences → General → Brush size scroll*), Cmd + middle-drag or `[` `]` / Cmd + right-drag (a plain right-drag always navigates) |
 | `S` | Opens Select with nothing selected (accepting the open tool, e.g. Erase & Fill) |
 | 3D mouse (3Dconnexion SpaceMouse, macOS) | Move the cap the way you want the model to move; Menu button = Hotbox, Fit = focus. Settings and a live readout under *View → 3D mouse…*; needs the 3DxWare driver |
-| Focus / wireframe / hotbox | `F` / `W` / `Space` |
+| Fit / wireframe / hotbox | `F` or the *Fit* button beside the view cube (frames the visible objects) / `W` / `Space` |
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |
 | Switching tools | Opening another tool (hotkey, palette, menu) accepts the current one, as in Meshmixer; only `Esc` / Cancel discards |

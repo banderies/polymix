@@ -289,6 +289,16 @@ impl Camera {
         self.target += off_plane * k;
     }
 
+    /// Zoom by moving the camera toward (`factor` < 1) or away from `point` by that fraction
+    /// of its distance, so the point stays put on screen and is never passed: each step
+    /// shrinks as the camera nears the surface.
+    pub fn zoom_about(&mut self, factor: f64, point: DVec3) {
+        let old = self.distance;
+        self.zoom(factor);
+        let f = self.distance / old;
+        self.target = point + (self.target - point) * f;
+    }
+
     /// Fit the view to bounds.
     pub fn focus(&mut self, b: &Aabb) {
         if b.is_empty() {
@@ -298,6 +308,34 @@ impl Camera {
         self.target = b.center();
         self.scene_radius = self.scene_radius.max(r);
         self.distance = r / (self.fov_y * 0.5).sin() * 1.1;
+    }
+
+    /// Frame `b` from the current direction for a viewport of `aspect` (width / height): the
+    /// box's centre in the middle, as close as keeps all its corners inside the view with a
+    /// 10 % margin on the tighter side.
+    pub fn fit(&mut self, b: &Aabb, aspect: f64) {
+        if b.is_empty() {
+            return;
+        }
+        let r = (b.diagonal() * 0.5).max(1e-6);
+        self.target = b.center();
+        self.scene_radius = self.scene_radius.max(r);
+        let (right, up, fwd) = (self.right(), self.up(), self.forward());
+        let ty = (self.fov_y * 0.5).tan() * 0.9;
+        let tx = ty * aspect.max(1e-3);
+        let corners = (0..8).map(|i| DVec3::new([b.min.x, b.max.x][i & 1], [b.min.y, b.max.y][(i >> 1) & 1], [b.min.z, b.max.z][i >> 2]) - self.target);
+        let mut d: f64 = 0.0;
+        for c in corners {
+            let (x, y, z) = (c.dot(right).abs(), c.dot(up).abs(), c.dot(fwd));
+            d = if self.orthographic {
+                // The view's half height is distance · tan(fov / 2), whatever the depth.
+                d.max(y / ty).max(x / tx)
+            } else {
+                // A corner at depth (distance + z) must fit inside the frustum there.
+                d.max(y / ty - z).max(x / tx - z)
+            };
+        }
+        self.distance = d.max(r * 0.05);
     }
 
     /// Turn the model by (`rx`, `ry`, `rz`) radians about the view's axes (x right, y up,
@@ -355,6 +393,48 @@ mod tests {
 
     fn orthonormal(c: &Camera) -> bool {
         c.forward().dot(c.up()).abs() < 1e-9 && c.forward().dot(c.right()).abs() < 1e-9 && (c.up().length() - 1.0).abs() < 1e-9
+    }
+
+    #[test]
+    fn fit_frames_every_corner() {
+        let b = Aabb { min: DVec3::new(-4.0, -1.0, -0.5), max: DVec3::new(6.0, 1.0, 0.5) };
+        for (ortho, aspect) in [(false, 1.6), (false, 0.6), (true, 1.6), (true, 0.6)] {
+            let mut c = Camera { orthographic: ortho, ..Default::default() };
+            c.tumble(35.0, 20.0);
+            c.fit(&b, aspect);
+            let ndc: Vec<DVec3> = (0..8)
+                .map(|i| DVec3::new([b.min.x, b.max.x][i & 1], [b.min.y, b.max.y][(i >> 1) & 1], [b.min.z, b.max.z][i >> 2]))
+                .map(|p| c.project(p, aspect).unwrap())
+                .collect();
+            let reach = ndc.iter().map(|p| p.x.abs().max(p.y.abs())).fold(0.0, f64::max);
+            assert!(reach <= 0.9 + 1e-9 && reach > 0.85, "ortho {ortho}, aspect {aspect}: the box fills 90 % of the view ({reach:.3})");
+        }
+    }
+
+    #[test]
+    fn zoom_about_never_passes_the_point() {
+        let (w, h) = (800.0, 600.0);
+        for ortho in [false, true] {
+            let mut c = Camera { orthographic: ortho, ..Default::default() };
+            c.focus(&Aabb { min: DVec3::splat(-1.0), max: DVec3::splat(1.0) });
+            c.tumble(30.0, 20.0);
+            // A surface point in front of the view target, off-centre.
+            let p = c.target - c.forward() * 0.8 + c.right() * 0.3 + c.up() * 0.1;
+            let screen = c.project(p, w / h).unwrap().truncate();
+            let mut depth = (p - c.eye()).dot(c.forward());
+            let start = depth;
+            for _ in 0..40 {
+                // An accelerated wheel: big steps in (until the closest zoom is reached).
+                c.zoom_about(0.5, p);
+                let d = (p - c.eye()).dot(c.forward());
+                assert!(d > 0.0 && d <= depth + 1e-12, "ortho {ortho}: the camera nears the point without passing it");
+                depth = d;
+                assert!((c.project(p, w / h).unwrap().truncate() - screen).length() < 1e-9, "the point stays put");
+            }
+            assert!(depth < start * 1e-3, "it got close");
+            c.zoom_about(1.0 / 0.5, p);
+            assert!((p - c.eye()).dot(c.forward()) > depth, "and backs away again");
+        }
     }
 
     #[test]

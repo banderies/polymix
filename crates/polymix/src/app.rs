@@ -209,6 +209,15 @@ pub struct ViewOptions {
     pub nav_custom: NavBindings,
     /// Modifier that turns the scroll wheel into brush size.
     pub brush_scroll: BrushScroll,
+    /// Scroll-wheel zoom speed multiplier.
+    pub zoom_speed: f32,
+    /// Wheel zoom heads for the part of the model under the cursor (otherwise the part in
+    /// the centre of the view).
+    pub zoom_to_cursor: bool,
+    /// Wheel zoom moves toward the point under the cursor by a fraction of the distance to
+    /// it (slowing down near the surface, never passing it); otherwise toward the view
+    /// target's depth.
+    pub zoom_near: bool,
     pub show_grid: bool,
     /// Draw the target surface see-through.
     pub transparent_target: bool,
@@ -222,7 +231,7 @@ pub struct ViewOptions {
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, nav_custom: NavBindings::FUSION360, brush_scroll: BrushScroll::Shift, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, nav_custom: NavBindings::FUSION360, brush_scroll: BrushScroll::Shift, zoom_speed: 1.0, zoom_to_cursor: true, zoom_near: true, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
     }
 }
 
@@ -331,6 +340,8 @@ pub struct PolymixApp {
     brush_drag: bool,
     /// When the brush last took a wheel notch (its eased remainder must not zoom).
     brush_wheel_at: f64,
+    /// Width / height of the viewport last frame (for framing the scene).
+    vp_aspect: f64,
     /// Point the current navigation drag holds on to (picked when it started): orbits turn
     /// about it, pans keep it under the cursor.
     nav_anchor: Option<DVec3>,
@@ -410,6 +421,7 @@ impl PolymixApp {
             nav_drag: None,
             brush_drag: false,
             brush_wheel_at: f64::NEG_INFINITY,
+            vp_aspect: 1.6,
             nav_anchor: None,
             com_cache: None,
             tool_rmb: None,
@@ -474,6 +486,9 @@ impl PolymixApp {
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
             app.view.nav_custom = st.get_string("nav_custom").and_then(|v| NavBindings::from_pref(&v)).unwrap_or(NavBindings::FUSION360);
             app.view.brush_scroll = st.get_string("brush_scroll").and_then(|k| BrushScroll::from_key(&k)).unwrap_or(BrushScroll::Shift);
+            app.view.zoom_speed = st.get_string("zoom_speed").and_then(|v| v.parse().ok()).filter(|x: &f32| x.is_finite() && *x > 0.0).unwrap_or(1.0);
+            app.view.zoom_near = flag("zoom_near", true);
+            app.view.zoom_to_cursor = flag("zoom_to_cursor", true);
             if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
                 app.space_cfg = cfg;
             }
@@ -1945,6 +1960,19 @@ impl PolymixApp {
                         ui.label("Mouse buttons").on_hover_text("What each middle / right drag does. Changing one switches to Custom. Alt+left-drag (orbit), Alt+Shift+left-drag (pan) and Alt+Cmd+left-drag (zoom) work in every mode; the wheel zooms.");
                         crate::navigation::bindings_ui(ui, &mut self.view.nav_mode, &mut self.view.nav_custom);
                         ui.end_row();
+                        ui.label("Scroll zoom");
+                        ui.vertical(|ui| {
+                            ui.add(egui::Slider::new(&mut self.view.zoom_speed, 0.1..=4.0).logarithmic(true).suffix("×").text("speed"))
+                                .on_hover_text("How far one wheel step zooms");
+                            ui.horizontal(|ui| {
+                                ui.label("toward");
+                                ui.selectable_value(&mut self.view.zoom_to_cursor, true, "Point under the cursor").on_hover_text("The part of the model under the cursor stays under it while you zoom");
+                                ui.selectable_value(&mut self.view.zoom_to_cursor, false, "Centre of the view").on_hover_text("Zoom into whatever is in the middle of the view");
+                            });
+                            ui.checkbox(&mut self.view.zoom_near, "Slow down near the surface")
+                                .on_hover_text("Each wheel step covers a fraction of the distance to the surface you zoom toward: steps shrink as you get close, and you never zoom through the model. Off: steps are a fraction of the distance to the view's centre depth.");
+                        });
+                        ui.end_row();
                         ui.label("Brush size scroll").on_hover_text("Hold this key and scroll to resize Select and Sculpt brushes; the plain wheel always zooms. Control+scroll can be taken by macOS screen zoom (System Settings → Accessibility → Zoom).");
                         ui.horizontal(|ui| {
                             for m in BrushScroll::ALL {
@@ -2073,9 +2101,10 @@ impl PolymixApp {
         self.view_history.record(self.camera.view_state(), self.camera.scene_radius);
     }
 
+    /// Frame the visible objects (F, the Fit button).
     fn focus_scene(&mut self) {
         self.remember_view();
-        self.camera.focus(&self.scene.bounds());
+        self.camera.fit(&self.scene.bounds(), self.vp_aspect);
     }
 
     fn standard_view(&mut self, yaw: f64, pitch: f64) {
@@ -2263,6 +2292,7 @@ impl PolymixApp {
     fn viewport(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let rect = ui.available_rect_before_wrap();
         let vp = Viewport { rect };
+        self.vp_aspect = vp.aspect();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         let ctx = ui.ctx().clone();
 
@@ -2367,7 +2397,7 @@ impl PolymixApp {
             }
             let mut factor = 1.0f64;
             if scroll_y != 0.0 {
-                factor *= (-scroll_y as f64 * 0.0025).exp();
+                factor *= (-scroll_y as f64 * 0.0025 * self.view.zoom_speed as f64).exp();
             }
             if zoom_delta != 1.0 {
                 factor /= zoom_delta as f64;
@@ -2377,11 +2407,13 @@ impl PolymixApp {
                     self.remember_view();
                 }
                 self.last_wheel = now;
-                let pivot = hover.and_then(|p| {
+                let aim = if self.view.zoom_to_cursor { hover } else { Some(rect.center()) };
+                let pivot = aim.and_then(|p| {
                     let ray = self.camera.ray_from_ndc(vp.ndc(p), vp.aspect());
                     tools::pick_ray(&mut self.scene, &ray, None).map(|(_, h)| h.point)
                 });
                 match pivot {
+                    Some(p) if self.view.zoom_near => self.camera.zoom_about(factor, p),
                     Some(p) => self.camera.zoom_towards(factor, p),
                     None => self.camera.zoom(factor),
                 }
@@ -2573,6 +2605,7 @@ impl PolymixApp {
         if self.view.show_view_cube {
             self.view_cube(ui, rect);
         }
+        self.fit_button(ui, rect);
         if self.nav_drag.is_some() || response.dragged() || in_rect {
             // Keep hover-driven overlays (brush cursor) responsive.
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -2599,6 +2632,21 @@ impl PolymixApp {
             }
         }
         crate::view_cube::draw(&ui.painter_at(rect), self.camera.orient, centre, scale, hover, ui_util::ACCENT);
+    }
+
+    /// "Fit" beside the view cube (in the corner when the cube is hidden): frame the visible
+    /// objects.
+    fn fit_button(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let scale = 26.0;
+        let at = if self.view.show_view_cube {
+            rect.right_top() + egui::vec2(-scale * 2.2 - scale * 1.8 - 26.0, scale * 2.2)
+        } else {
+            rect.right_top() + egui::vec2(-30.0, 22.0)
+        };
+        let button = egui::Button::new(RichText::new("Fit").size(12.0)).corner_radius(4.0);
+        if ui.put(egui::Rect::from_center_size(at, egui::vec2(36.0, 22.0)), button).on_hover_text("Fit the visible objects in the view (F)").clicked() {
+            self.focus_scene();
+        }
     }
 
     fn axis_gizmo(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -3108,6 +3156,9 @@ impl eframe::App for PolymixApp {
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
         st.set_string("nav_custom", self.view.nav_custom.to_pref());
         st.set_string("brush_scroll", self.view.brush_scroll.key().to_string());
+        st.set_string("zoom_speed", self.view.zoom_speed.to_string());
+        st.set_string("zoom_near", b(self.view.zoom_near));
+        st.set_string("zoom_to_cursor", b(self.view.zoom_to_cursor));
         st.set_string("spacemouse", self.space_cfg.to_pref());
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));

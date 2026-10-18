@@ -92,7 +92,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Pan: Alt+MMB, Shift+RMB, Alt+Shift+LMB | ✅ | plus MMB |
 | Zoom: Alt+RMB (Maya) | ✅ | In Meshmixer navigation mode |
 | Zoom: Alt+Ctrl/⌘+LMB (pen-friendly) | ✅ | |
-| Wheel zooms (outside brush tools) | ✅ | Zooms toward the cursor |
+| Wheel zooms (outside brush tools) | ✅ | Toward the point under the cursor or the centre of the view; steps are a fraction of the distance to that surface (slows near it, never passes it); speed multiplier (Preferences → General) |
+| — | ✅ | Polymix addition: *Fit* button beside the view cube (and `F`): frames the visible objects tightly for the current view direction and window shape |
 | "Fusion 360" navigation mode (Shift+MMB tumble, MMB pan, wheel zoom) | ✅ | View → Navigation; default, as in your Meshmixer |
 | — | ✅ | Polymix addition: Custom navigation mode — Preferences → General → Mouse buttons picks Orbit / Pan / Zoom for each middle and right drag, plain, with Shift or with Alt (editing a preset's table switches to Custom) |
 | ViewCube / SteeringWheels | ✅ / ⚪ | Own view cube: click a face, edge or corner for that view, drag to tumble (View → Show view cube); SteeringWheels not planned |
