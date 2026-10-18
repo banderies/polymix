@@ -160,7 +160,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Edit: Separate (Y) / Duplicate selection | ✅ | |
 | Edit menu hotkeys Join (J), Fit Primitive (P), Bridge (⌘B) | ✅ | |
 | Edit: Fit Primitive | ✅ | Square, Rectangle, Cylinder, Sphere from plane / best-fit, Disc, Linear Sweep, Convex Hull, Height Field; Mesh Density, Single Primitive, Create New Objects; fitted sizes shown. The per-primitive adjust gizmo ❌ (use Transform) |
-| Edit: Grow Hair | ⚪ ❌ | |
+| Edit: Grow Hair | ⚪ ✅ | Select > Edit > Grow Hair: NumHairs, Points, Length, Curl Radius / Pitch, HairStiff / TipStiff, Gravity, Obj Collisions, Base / Tip Radius, Show Tubes; live preview, Accept adds tapered tubes as a new face group (Fill Density / Hair Patch modes ❌) |
 | **Deform** menu: Smooth (⌘F) | ✅ | |
 | Deform: Smooth Boundary ("Smooth Loop", B) | ✅ | Meshmixer's parameters and defaults; remesher smooths the border curve |
 | Deform: Transform selection (T) | ✅ | Face Transform: T in Select with a selection; frame along the selection normal; Shared Frame, Fixed Boundary |

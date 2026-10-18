@@ -701,6 +701,9 @@ impl Tool for SelectTool {
                     t.params.tube = true;
                     self.request = Some(Box::new(t));
                 }
+                if ui.button("Grow Hair").on_hover_text("Grow strands on the selected faces").clicked() {
+                    self.request = Some(Box::new(super::hair::HairTool::new(cx)));
+                }
                 if ui.button("Join").on_hover_text("J: stitch the two open boundaries next to the selection").clicked() {
                     self.request = Some(Box::new(ops::JoinTool::new(cx)));
                 }

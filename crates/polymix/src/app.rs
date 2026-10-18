@@ -266,6 +266,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "makepattern" => Box::new(tools::pattern::MakePatternTool::new(cx)),
         "unwrap" => Box::new(tools::unwrap::UnwrapTool::new(cx)),
         "convex" => Box::new(tools::pattern::ConvexTool::new(cx)),
+        "hair" => Box::new(tools::hair::HairTool::new(cx)),
         "planecut" => Box::new(tools::plane_cut::PlaneCutTool::new(cx)),
         "trim" => Box::new(tools::vessel::TrimTool::new(cx)),
         "flowext" => Box::new(tools::vessel::FlowExtensionTool::new(cx)),

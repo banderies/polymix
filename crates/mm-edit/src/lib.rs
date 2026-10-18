@@ -28,6 +28,7 @@ pub mod extrude;
 pub mod face_groups;
 pub mod fit;
 pub mod flow;
+pub mod hair;
 pub mod mirror;
 pub mod part;
 pub mod region;
@@ -53,6 +54,7 @@ pub use fit::{convex_hull, fit_cylinder, fit_primitive, CylinderFit, FitResult, 
 pub use extrude::{
     extract_solid, extrude_selection, offset_selection, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
 };
+pub use hair::{hair_curves, hair_mesh, HairParams};
 pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
 pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};
 pub use part::{builtin_parts, drop_open_part, place_part, DropResult, Part, PartKind, Placement};

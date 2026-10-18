@@ -28,6 +28,7 @@ pub mod stamp;
 pub mod drop_part;
 pub mod pattern;
 pub mod unwrap;
+pub mod hair;
 pub mod patches;
 pub mod boolean;
 pub mod deviation;
