@@ -241,6 +241,8 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
         "clearance" => Box::new(tools::clearance::ClearanceTool::new(cx)),
         "sculpt" => Box::new(tools::sculpt::SculptTool::new(cx)),
+        "sculptvolume" => Box::new(tools::sculpt::SculptTool::with_mode(cx, tools::sculpt::SculptMode::Volume, None)),
+        "sculptsmooth" => Box::new(tools::sculpt::SculptTool::with_mode(cx, tools::sculpt::SculptMode::Surface, Some(tools::sculpt::Brush::RobustSmooth))),
         "remesh" => Box::new(tools::ops::RemeshTool::new(cx)),
         "reduce" => Box::new(tools::ops::ReduceTool::new(cx)),
         "smooth" => Box::new(tools::ops::SmoothTool::new(cx)),
@@ -1503,8 +1505,14 @@ impl PolymixApp {
             Category::Sculpt => {
                 ui_util::section(ui, "Sculpt");
                 ui.add_enabled_ui(has_obj, |ui| {
-                    if ui.button("Surface brushes").clicked() {
+                    if ui.button("Volume brushes  (3)").on_hover_text("Refine the mesh as you sculpt").clicked() {
+                        open = Some("sculptvolume");
+                    }
+                    if ui.button("Surface brushes  (2)").on_hover_text("Sculpt without changing the triangles").clicked() {
                         open = Some("sculpt");
+                    }
+                    if ui.button("Smoothing brush  (1)").clicked() {
+                        open = Some("sculptsmooth");
                     }
                 });
             }
@@ -2720,7 +2728,7 @@ impl PolymixApp {
             self.hotbox = if self.hotbox.is_some() { None } else { i.pointer.hover_pos().or(Some(vp.rect.center())) };
             return;
         }
-        // Accept: Enter, or A (Meshmixer); Sculpt will use A for attract (ROADMAP M8.3).
+        // Accept: Enter, or A (Meshmixer); in Sculpt, A toggles attract.
         let accept_a = i.key_pressed(Key::A) && !cmd && !i.modifiers.shift && !i.modifiers.alt && self.tools.last().is_some_and(|t| t.name() != "Sculpt");
         if i.key_pressed(Key::Enter) || accept_a {
             if let Some(mut t) = self.tools.pop() {
@@ -2748,7 +2756,8 @@ impl PolymixApp {
             if used {
                 return;
             }
-            if is_select {
+            let brush_key = [Key::Num1, Key::Num2, Key::Num3].iter().any(|&k| i.key_pressed(k));
+            if is_select && !brush_key {
                 // The select tool consumes most letter keys.
                 if i.key_pressed(Key::W) {
                     self.view.wireframe = !self.view.wireframe;
@@ -2774,6 +2783,12 @@ impl PolymixApp {
                 Some("inspector")
             } else if i.key_pressed(Key::T) && !i.modifiers.shift {
                 Some("transform")
+            } else if i.key_pressed(Key::Num1) {
+                Some("sculptsmooth")
+            } else if i.key_pressed(Key::Num2) {
+                Some("sculpt")
+            } else if i.key_pressed(Key::Num3) {
+                Some("sculptvolume")
             } else {
                 None
             };

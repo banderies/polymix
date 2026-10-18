@@ -1,5 +1,6 @@
-//! Surface sculpting brushes (Meshmixer "Sculpt > Brushes"): smooth, inflate, flatten,
-//! drag. Brushes move vertices only, so the picking BVH is refitted rather than rebuilt.
+//! Sculpt brushes (Meshmixer "Sculpt > Brushes"). Volume brushes refine the mesh under the
+//! brush as they go and reach everything inside the brush sphere; surface brushes keep the
+//! triangles and stay on the stroked surface. Shift switches to the secondary (smoothing) brush.
 
 use super::*;
 use crate::ui_util;
@@ -174,8 +175,79 @@ fn refine_region(mesh: &mut Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, p: &Refi
     split.splits + col.collapses > 0
 }
 
+/// Meshmixer's two brush families.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SculptMode {
+    /// Dynamic refinement on, the brush acts on everything inside its sphere.
+    Volume,
+    /// The mesh keeps its triangles and the brush stays on the stroked surface.
+    Surface,
+}
+
+/// Brush falloff curves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Falloff {
+    Smooth,
+    Linear,
+    Sharp,
+    Dome,
+    Flat,
+}
+
+impl Falloff {
+    const ALL: [Falloff; 5] = [Falloff::Smooth, Falloff::Linear, Falloff::Sharp, Falloff::Dome, Falloff::Flat];
+    fn label(self) -> &'static str {
+        match self {
+            Falloff::Smooth => "Smooth",
+            Falloff::Linear => "Linear",
+            Falloff::Sharp => "Sharp",
+            Falloff::Dome => "Dome",
+            Falloff::Flat => "Flat",
+        }
+    }
+    /// Weight at `x` = distance / radius in 0..1.
+    fn weight(self, x: f64) -> f64 {
+        let x = x.clamp(0.0, 1.0);
+        match self {
+            Falloff::Smooth => (1.0 - x * x).powi(2),
+            Falloff::Linear => 1.0 - x,
+            Falloff::Sharp => (1.0 - x).powi(3),
+            Falloff::Dome => (1.0 - x * x).sqrt(),
+            Falloff::Flat => {
+                let t = ((x - 0.7) / 0.3).clamp(0.0, 1.0);
+                1.0 - t * t * (3.0 - 2.0 * t)
+            }
+        }
+    }
+}
+
+/// Which vertices a dab reaches, and how strongly.
+#[derive(Clone, Copy, Debug)]
+struct Footprint {
+    falloff: Falloff,
+    /// Everything inside the sphere (otherwise only surface connected to the stroke).
+    volumetric: bool,
+    hold_boundary: bool,
+    hold_groups: bool,
+}
+
 pub struct SculptTool {
     brush: Brush,
+    mode: SculptMode,
+    /// Used while Shift is held.
+    secondary: Brush,
+    /// -100..100: moves the brush centre into (+) or out of (−) the surface.
+    depth: f64,
+    /// 0..100: the brush trails the pointer for steadier strokes.
+    lazyness: f64,
+    /// Keep dabbing while the pointer rests (otherwise only while it moves).
+    flow: bool,
+    falloff: Falloff,
+    volumetric: bool,
+    /// Face-group border vertices stay put.
+    hold_groups: bool,
+    /// Pull the stroked surface toward the target surface as well.
+    attract: bool,
     refinement: Refinement,
     /// Brush radius in percent of the model size.
     size_pct: f32,
@@ -200,13 +272,31 @@ struct SculptStroke {
     last_center: Option<DVec3>,
     /// Positions when the stroke first touched each vertex (Draw3's layer reference).
     start: std::collections::HashMap<u32, DVec3>,
+    /// Lazy brush centre, and the pointer position of the last dab (Flow off).
+    lazy: Option<DVec3>,
+    last_pos: Option<egui::Pos2>,
 }
 
 impl SculptTool {
-    pub fn new(_cx: &mut ToolCx) -> Self {
+    pub fn new(cx: &mut ToolCx) -> Self {
+        Self::with_mode(cx, SculptMode::Surface, None)
+    }
+
+    /// Volume or surface brushes (Meshmixer hotkeys 3 and 2), optionally with a brush.
+    pub fn with_mode(_cx: &mut ToolCx, mode: SculptMode, brush: Option<Brush>) -> Self {
+        let volume = mode == SculptMode::Volume;
         Self {
-            brush: Brush::RobustSmooth,
-            refinement: Refinement::default(),
+            brush: brush.unwrap_or(if volume { Brush::Draw } else { Brush::RobustSmooth }),
+            mode,
+            secondary: if volume { Brush::BubbleSmooth } else { Brush::RobustSmooth },
+            depth: 0.0,
+            lazyness: 0.0,
+            flow: true,
+            falloff: Falloff::Smooth,
+            volumetric: volume,
+            hold_groups: false,
+            attract: false,
+            refinement: Refinement { enabled: volume, ..Refinement::default() },
             size_pct: 4.0,
             strength: 0.5,
             stroke: None,
@@ -218,27 +308,47 @@ impl SculptTool {
     }
 }
 
-#[inline]
-fn falloff(d: f64, r: f64) -> f64 {
-    let x = (d / r).min(1.0);
-    let t = 1.0 - x * x;
-    t * t
+impl Default for Footprint {
+    fn default() -> Self {
+        Self { falloff: Falloff::Smooth, volumetric: true, hold_boundary: false, hold_groups: false }
+    }
 }
 
-/// Vertices within `r` of `c`, with falloff weights.
-fn brush_vertices(mesh: &Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, hold_boundary: bool) -> Vec<(u32, f64)> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
+/// Vertices within `r` of `c`, with falloff weights. Without `volumetric`, only vertices
+/// reachable along edges from `seed` (the stroked triangle) inside the sphere count, so a
+/// nearby but separate sheet of surface is left alone.
+fn brush_vertices(mesh: &Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, seed: Option<u32>, fp: &Footprint) -> Vec<(u32, f64)> {
+    let mut inside = std::collections::HashSet::new();
     bvh.query_sphere(mesh, c, r, |t| {
         for v in mesh.triangle(t) {
-            if seen.insert(v) {
-                let d = mesh.vertex(v).distance(c);
-                if d < r && !(hold_boundary && mesh.is_boundary_vertex(v)) {
-                    out.push((v, falloff(d, r)));
-                }
+            if mesh.vertex(v).distance(c) < r {
+                inside.insert(v);
             }
         }
     });
+    let reached: std::collections::HashSet<u32> = match seed.filter(|&t| !fp.volumetric && mesh.is_triangle(t)) {
+        Some(t) => {
+            let mut seen: std::collections::HashSet<u32> = mesh.triangle(t).into_iter().filter(|v| inside.contains(v)).collect();
+            let mut stack: Vec<u32> = seen.iter().copied().collect();
+            while let Some(v) = stack.pop() {
+                for u in mesh.vertex_neighbors(v) {
+                    if inside.contains(&u) && seen.insert(u) {
+                        stack.push(u);
+                    }
+                }
+            }
+            seen
+        }
+        None => inside,
+    };
+    let held = |v: u32| {
+        (fp.hold_boundary && mesh.is_boundary_vertex(v)) || (fp.hold_groups && {
+            let tris = mesh.vertex_triangles(v);
+            tris.iter().any(|&t| mesh.tri_group(t) != mesh.tri_group(tris[0]))
+        })
+    };
+    let mut out: Vec<(u32, f64)> = reached.into_iter().filter(|&v| !held(v)).map(|v| (v, fp.falloff.weight(mesh.vertex(v).distance(c) / r))).collect();
+    out.sort_unstable_by_key(|x| x.0);
     out
 }
 
@@ -430,9 +540,29 @@ impl Tool for SculptTool {
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Sculpt brushes");
+        ui.horizontal(|ui| {
+            let before = self.mode;
+            ui.selectable_value(&mut self.mode, SculptMode::Volume, "Volume (3)").on_hover_text("Refines the mesh as you sculpt; acts on everything inside the brush");
+            ui.selectable_value(&mut self.mode, SculptMode::Surface, "Surface (2)").on_hover_text("Keeps the triangles; stays on the stroked surface");
+            if self.mode != before {
+                let volume = self.mode == SculptMode::Volume;
+                self.refinement.enabled = volume;
+                self.volumetric = volume;
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             for b in Brush::ALL {
                 ui.selectable_value(&mut self.brush, b, b.label()).on_hover_text(b.hint());
+            }
+        });
+        egui::ComboBox::from_label("Secondary (Shift)").selected_text(self.secondary.label()).show_ui(ui, |ui| {
+            for b in [Brush::BubbleSmooth, Brush::ShrinkSmooth, Brush::RobustSmooth] {
+                ui.selectable_value(&mut self.secondary, b, b.label());
+            }
+        });
+        egui::ComboBox::from_label("Falloff").selected_text(self.falloff.label()).show_ui(ui, |ui| {
+            for f in Falloff::ALL {
+                ui.selectable_value(&mut self.falloff, f, f.label());
             }
         });
         if self.brush == Brush::Attract && cx.scene.target.is_none() {
@@ -444,7 +574,17 @@ impl Tool for SculptTool {
             ui.label("Strength");
             ui.add(egui::Slider::new(&mut self.strength, 0.01..=1.0));
         });
-        ui.checkbox(&mut self.hold_boundary, "Hold open boundaries");
+        ui.add(egui::Slider::new(&mut self.depth, -100.0..=100.0).text("depth")).on_hover_text("Moves the brush centre into (+) or out of (−) the surface");
+        ui.add(egui::Slider::new(&mut self.lazyness, 0.0..=100.0).text("lazyness")).on_hover_text("The brush trails the pointer for steadier strokes");
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.flow, "Flow").on_hover_text("Keep sculpting while the pointer rests");
+            ui.checkbox(&mut self.volumetric, "Volumetric").on_hover_text("Affect everything inside the brush, not only the stroked surface");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.hold_boundary, "Hold boundary (B)");
+            ui.checkbox(&mut self.hold_groups, "Preserve groups (G)");
+            ui.checkbox(&mut self.attract, "Attract (A)").on_hover_text("Also pull the stroked surface toward the target surface");
+        });
         ui_util::section(ui, "Refinement");
         let rf = &mut self.refinement;
         ui.checkbox(&mut rf.enabled, "Dynamic refinement (R)").on_hover_text("Re-triangulate under the brush so detail can be added");
@@ -457,7 +597,7 @@ impl Tool for SculptTool {
                 ui.add_enabled(rf.adaptive, egui::Slider::new(&mut rf.adaptivity, 0.0..=100.0).text("adaptivity"));
             });
         });
-        ui.small("Drag on the surface. Cmd/Ctrl inverts the draw brushes, Inflate, Push and Pinch. Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation). Right-drag: strength.");
+        ui.small("Drag on the surface. Shift uses the secondary brush; Cmd/Ctrl inverts the draw brushes, Inflate, Push and Pinch. Size: [ ] or the wheel (Shift+wheel in Fusion 360 navigation). Right-drag: strength.");
         ui.add_space(8.0);
         if ui.button("Done").clicked() {
             return ToolOutcome::Close;
@@ -484,6 +624,8 @@ impl Tool for SculptTool {
                     drag_start_pos: Vec::new(),
                     last_center: None,
                     start: Default::default(),
+                    lazy: None,
+                    last_pos: None,
                 });
             }
         }
@@ -496,16 +638,20 @@ impl Tool for SculptTool {
             return;
         }
         let Some(stroke) = &mut self.stroke else { return };
-        let brush = self.brush;
+        let brush = if input.shift && !self.brush.grabs() { self.secondary } else { self.brush };
         let strength = self.strength;
-        let hold = self.hold_boundary;
+        let fp = Footprint { falloff: self.falloff, volumetric: self.volumetric, hold_boundary: self.hold_boundary, hold_groups: self.hold_groups };
+        if !self.flow && stroke.last_pos == Some(pos) {
+            return;
+        }
+        stroke.last_pos = Some(pos);
         if brush.grabs() {
             if stroke.drag_origin.is_none() {
                 let Some((_, h)) = hover else { return };
                 let r = brush_radius(cx.scene, stroke.object, self.size_pct);
                 let Some(o) = cx.scene.get_mut(stroke.object) else { return };
                 let bvh = o.bvh();
-                stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, hold);
+                stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
                 stroke.drag_start_pos = stroke.drag_verts.iter().map(|&(v, _)| o.mesh.vertex(v)).collect();
                 stroke.drag_origin = Some((h.point, pos));
                 return;
@@ -531,23 +677,32 @@ impl Tool for SculptTool {
         let r = brush_radius(cx.scene, stroke.object, self.size_pct);
         let view = cx.camera.forward();
         let target = cx.scene.target_surface(Some(stroke.object));
-        let motion = stroke.last_center.map_or(DVec3::ZERO, |c| h.point - c);
-        stroke.last_center = Some(h.point);
         let Some(o) = cx.scene.get_mut(stroke.object) else { return };
+        // Depth moves the centre along the surface normal; lazyness lets it trail the pointer.
+        let mut center = h.point - o.mesh.tri_normal(h.tid) * (self.depth / 100.0 * r);
+        if let Some(prev) = stroke.lazy {
+            center = prev + (center - prev) * (1.0 - 0.95 * self.lazyness / 100.0);
+        }
+        stroke.lazy = Some(center);
+        let motion = stroke.last_center.map_or(DVec3::ZERO, |c| center - c);
+        stroke.last_center = Some(center);
         let bvh = o.bvh();
-        let verts = brush_vertices(&o.mesh, &bvh, h.point, r, hold);
+        let verts = brush_vertices(&o.mesh, &bvh, center, r, Some(h.tid), &fp);
         for &(v, _) in &verts {
             stroke.start.entry(v).or_insert_with(|| o.mesh.vertex(v));
         }
         if o.moved_vertices.is_empty() {
             o.moved_from = o.mesh.shape_version();
         }
-        let dab = Dab { center: h.point, r, strength, invert: stroke.invert, view, motion, start: &stroke.start, target: target.as_ref() };
+        let dab = Dab { center, r, strength, invert: stroke.invert, view, motion, start: &stroke.start, target: target.as_ref() };
         apply_dab(o.mesh_mut(), &verts, brush, &dab);
+        if self.attract && target.is_some() && brush != Brush::Attract {
+            apply_dab(o.mesh_mut(), &verts, Brush::Attract, &Dab { strength: strength * 0.5, ..dab });
+        }
         o.moved_vertices.extend(verts.iter().map(|&(v, _)| v));
         if self.refinement.enabled {
             let bvh = o.bvh();
-            if refine_region(o.mesh_mut(), &bvh, h.point, r, &self.refinement) {
+            if refine_region(o.mesh_mut(), &bvh, center, r, &self.refinement) {
                 // New triangles: the GPU copy and the selection are rebuilt.
                 o.moved_vertices.clear();
                 let m = o.mesh.clone();
@@ -594,6 +749,20 @@ impl Tool for SculptTool {
             *cx.status = format!("Adaptive refinement {}", if self.refinement.adaptive { "on" } else { "off" });
             return true;
         }
+        let toggle = |flag: &mut bool, name: &str, status: &mut String| {
+            *flag = !*flag;
+            *status = format!("{name} {}", if *flag { "on" } else { "off" });
+            true
+        };
+        if plain(egui::Key::B) {
+            return toggle(&mut self.hold_boundary, "Hold boundary", cx.status);
+        }
+        if plain(egui::Key::G) {
+            return toggle(&mut self.hold_groups, "Preserve groups", cx.status);
+        }
+        if plain(egui::Key::A) {
+            return toggle(&mut self.attract, "Attract", cx.status);
+        }
         if i.key_pressed(egui::Key::OpenBracket) {
             step_brush_size(&mut self.size_pct, false);
             return true;
@@ -616,7 +785,7 @@ mod tests {
         let mut m = m0.clone();
         let bvh = mm_core::Bvh::build(&m);
         let c = DVec3::Z;
-        let verts = brush_vertices(&m, &bvh, c, 0.4, false);
+        let verts = brush_vertices(&m, &bvh, c, 0.4, None, &Footprint::default());
         let start = verts.iter().map(|&(v, _)| (v, m.vertex(v))).collect();
         let d = Dab { center: c, r: 0.4, strength: 0.8, invert: false, view: -DVec3::Z, motion, start: &start, target };
         for _ in 0..5 {
@@ -658,6 +827,46 @@ mod tests {
         let target = crate::scene::TargetSurface { id: 7, bvh: std::sync::Arc::new(mm_core::Bvh::build(&tm)), mesh: std::sync::Arc::new(tm) };
         let (m0, m, v) = dab_on_sphere(Brush::Attract, DVec3::ZERO, Some(&target));
         assert!(mean_radius(&m, &v) < mean_radius(&m0, &v) && mean_radius(&m, &v) > 0.89);
+    }
+
+    #[test]
+    fn falloff_curves() {
+        for f in Falloff::ALL {
+            assert!((f.weight(0.0) - 1.0).abs() < 1e-12 && f.weight(1.0).abs() < 1e-12, "{f:?}");
+            let w: Vec<f64> = (0..=20).map(|i| f.weight(i as f64 / 20.0)).collect();
+            assert!(w.windows(2).all(|p| p[1] <= p[0] + 1e-12), "{f:?} decreases");
+        }
+        assert_eq!(Falloff::Flat.weight(0.6), 1.0);
+        let at = |f: Falloff| f.weight(0.5);
+        assert!(at(Falloff::Sharp) < at(Falloff::Linear) && at(Falloff::Linear) < at(Falloff::Smooth) && at(Falloff::Smooth) < at(Falloff::Dome));
+    }
+
+    #[test]
+    fn footprint_volumetric_connected_and_held() {
+        // Two parallel sheets 0.1 apart; the brush sphere reaches both.
+        let mut m = primitives::plane_grid(2.0, 2.0, 20, 20);
+        let mut top = m.clone();
+        top.transform(|p| p + DVec3::Z * 0.1);
+        let top_verts = m.append_mesh(&top, 1);
+        let bvh = mm_core::Bvh::build(&m);
+        let seed = m.triangle_ids().find(|&t| m.tri_group(t) == 0 && m.tri_centroid(t).truncate().length() < 0.1).unwrap();
+        let ids = |v: &[(u32, f64)]| v.iter().map(|x| x.0).collect::<std::collections::HashSet<u32>>();
+        let all = ids(&brush_vertices(&m, &bvh, DVec3::ZERO, 0.4, Some(seed), &Footprint::default()));
+        let surface = ids(&brush_vertices(&m, &bvh, DVec3::ZERO, 0.4, Some(seed), &Footprint { volumetric: false, ..Default::default() }));
+        assert!(all.iter().any(|v| top_verts.contains(v)));
+        assert!(!surface.is_empty() && surface.iter().all(|v| !top_verts.contains(v)));
+        assert!(surface.len() < all.len());
+        // Preserve groups: split the bottom sheet in two along x = 0; its border stays out.
+        for t in m.triangle_ids().collect::<Vec<_>>() {
+            if m.tri_group(t) == 0 && m.tri_centroid(t).x > 0.0 {
+                m.set_tri_group(t, 2);
+            }
+        }
+        let held = brush_vertices(&m, &bvh, DVec3::ZERO, 0.4, Some(seed), &Footprint { volumetric: false, hold_groups: true, ..Default::default() });
+        assert!(!held.is_empty() && held.iter().all(|&(v, _)| m.vertex(v).x.abs() > 1e-9));
+        // Weights follow the falloff.
+        let lin = brush_vertices(&m, &bvh, DVec3::ZERO, 0.4, None, &Footprint { falloff: Falloff::Linear, ..Default::default() });
+        assert!(lin.iter().all(|&(v, w)| (w - (1.0 - m.vertex(v).length() / 0.4)).abs() < 1e-12));
     }
 
     #[test]

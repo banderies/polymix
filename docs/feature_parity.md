@@ -172,16 +172,17 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 
 | Meshmixer | Polymix | Notes |
 |---|---|---|
-| Volume brushes (3) vs Surface brushes (2), Smoothing brush (1) | 🟡 | One brush tool, surface-style |
+| Volume brushes (3) vs Surface brushes (2), Smoothing brush (1) | ✅ | Volume: dynamic refinement + volumetric footprint, Draw / BubbleSmooth; Surface: fixed triangles, footprint limited to the stroked surface; 1 opens RobustSmooth. Switchable in the panel |
 | Brushes: RobustSmooth, ShrinkSmooth (Smooth), BubbleSmooth, Inflate, Flatten, Drag | ✅ | BubbleSmooth is a volume-keeping (Taubin) smooth |
 | Brushes: Draw, Draw2, Draw3, DrawMax, Move, Push, Pinch, Spikes, Nudge, Zipper, Attract | ✅ | Own brush definitions (hover a brush for what it does); Attract pulls onto the target surface |
 | Brushes: Refine, Reduce, AdaptiveReduce (mesh density brushes) | ❌ | |
 | Brushes: PaintVertex, SmoothColor | ⚪ ❌ | |
 | Dynamic refinement while sculpting (Refinement, Adaptivity; R, T) | ✅ | Per dab: split / collapse / relax under the brush; Refine, Reduce, Smooth, Adaptive + Adaptivity; R and T toggle |
 | Size / Strength | ✅ | Size is a % of the model; wheel size, right-drag strength |
-| Spacing, Flow, Lazyness, AlignToStroke, Falloff curve, Stencils, brush textures | ❌ | |
-| Primary / Secondary (Shift) / Invert (Ctrl/⌘) | 🟡 | Invert ✅ for Inflate; Secondary brush ❌ |
-| Toggles: Symmetry (Shift+S), Hold boundary (B), Preserve groups (G), Attract (A) | 🟡 | Hold boundary checkbox ✅ (no hotkey) |
+| Depth, Lazyness, Flow, Volumetric, Falloff curve | ✅ | Falloff Smooth / Linear / Sharp / Dome / Flat (own curve shapes) |
+| Spacing, AlignToStroke, Stencils, brush textures | ❌ | |
+| Primary / Secondary (Shift) / Invert (Ctrl/⌘) | ✅ | Secondary is a choice of smoothing brush; Invert for the draw brushes, Inflate, Push and Pinch |
+| Toggles: Symmetry (Shift+S), Hold boundary (B), Preserve groups (G), Attract (A) | 🟡 | B, G, A ✅ (Attract pulls toward the target after each dab); Symmetry ❌ (M8.5) |
 
 ## 4. Edit category
 
