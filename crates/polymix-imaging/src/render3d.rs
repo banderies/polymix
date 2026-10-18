@@ -272,8 +272,10 @@ impl VolumeView3d {
             _ => r.drag_delta(),
         };
         if r.dragged_by(egui::PointerButton::Primary) {
+            // As if the front of the volume were grabbed: dragging right turns the face right,
+            // dragging down tips the top towards the viewer (the camera rises).
             self.yaw += d.x * 0.01;
-            self.pitch = (self.pitch - d.y * 0.01).clamp(-1.55, 1.55);
+            self.pitch = (self.pitch + d.y * 0.01).clamp(-1.55, 1.55);
         } else if r.dragged_by(egui::PointerButton::Secondary) {
             // The point at the target's depth follows the cursor.
             let (eye, target, up, fov) = self.camera(vol);
@@ -284,9 +286,6 @@ impl VolumeView3d {
             self.pan += (-right * d.x + up2 * d.y) * per_point;
         } else if r.dragged_by(egui::PointerButton::Middle) {
             self.zoom = (self.zoom * (-d.y * 0.01).exp()).clamp(0.1, 40.0);
-        }
-        if r.double_clicked() {
-            self.reset_camera();
         }
         if r.hovered() {
             let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));

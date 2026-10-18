@@ -8,7 +8,7 @@
 //! | left + right drag | window (across) and level (up / down) |
 //! | wheel | scroll through slices, one per notch; ⌘ / Ctrl + wheel or pinch zooms |
 //! | left click | point at a spot (e.g. move the crosshair) |
-//! | double-click | back to the automatic view |
+//! | double-click | the view fills the layout, and back (a view on its own: back to the automatic view) |
 //!
 //! The wheel is captured while the pointer is over the view, so a scrollable panel around it
 //! does not scroll too.
@@ -71,6 +71,11 @@ impl Nav {
     pub fn image_rect(&self, view: Rect, content: Vec2) -> Rect {
         let fit = (view.width() / content.x.max(1e-6)).min(view.height() / content.y.max(1e-6));
         Rect::from_center_size(view.center() + self.pan, content * fit * self.zoom)
+    }
+
+    /// A window / level drag is in progress.
+    pub fn windowing(&self) -> bool {
+        self.gesture == Some(Gesture::Window)
     }
 
     pub fn reset(&mut self) {

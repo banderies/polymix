@@ -1,6 +1,8 @@
 //! Image views shared by the Volume and Segmentation workspaces: the mouse controls every
-//! image view uses ([`nav`]), one plane of a volume ([`slice_view`]) and the 3D view ([`render3d`]).
+//! image view uses ([`nav`]), one plane of a volume ([`slice_view`]), the 3D view ([`render3d`])
+//! and the histogram shown while the window / level is dragged ([`histogram`]).
 
+pub mod histogram;
 pub mod nav;
 pub mod slice_view;
 pub mod render3d;

@@ -145,9 +145,10 @@ crate), **UI** the Volume tab.
 | Before / after comparison (toggle or split view) | ❌ | Judging N4, denoising, registration |
 | Two volumes overlaid: foreground over background, opacity, colour map | ❌ | Registration check, vesselness over MRA |
 | Window presets (CT brain / bone / angio; MR automatic) and colour maps | 🟡 | Auto and File windows only |
+| Histogram while the window / level is dragged | ✅ | `polymix_imaging::histogram`: bottom left of the view, log counts, the window's ends and ramp; volume in slice views, the slice in the thumbnail |
 | Thick-slab MIP in the slice views | ❌ | Following vessels in TOF / CTA |
 | Oblique reslicing: rotate a plane, plane along a vessel | ❌ | Views follow the voxel grid now |
-| Layouts: one view, 1 × 3, 2 × 2; maximise a view | 🟡 | 2 × 2 only |
+| Layouts: one view, 1 × 3, 2 × 2; maximise a view | 🟡 | 2 × 2; double-click fills the view area with a view and back (not while a tool has the left button); 1 × 3 ❌ |
 | A viewer in the Volume tab (for preparing images) | 🟡 | Thumbnail only; reuse `SliceView` |
 | Measurements in the views: ruler, angle, region statistics | ❌ | |
 | Screenshots | ❌ | ⚪ |

@@ -312,7 +312,8 @@ impl PolymixApp {
             }
             // pointer:left+right,x0,y0,x1,y1[,steps] — press the buttons at (x0, y0) (window
             // points), move to (x1, y1) in `steps` frames, release: real mouse input for any
-            // workspace. Buttons: left, right, middle, joined with `+`.
+            // workspace. Buttons: left, right, middle, joined with `+`; `,hold` at the end keeps
+            // them down until `pointer:release,x,y`.
             "pointer" => match pointer_frames(arg) {
                 Some(frames) => script.pointer = frames,
                 None => log::warn!("bad pointer step {step}"),
@@ -411,9 +412,20 @@ impl eframe::App for PolymixApp {
 }
 
 /// The frames of a `pointer:` script step: move to the start, press the buttons one frame
-/// apart (as hands do), move to the end, release, and one quiet frame.
+/// apart (as hands do), move to the end, release, and one quiet frame. With `hold` last the
+/// buttons stay down (for a screenshot mid-drag) until a `pointer:release,x,y,x,y` step.
 fn pointer_frames(arg: &str) -> Option<VecDeque<Vec<egui::Event>>> {
-    let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
+    let mut parts: Vec<&str> = arg.split(',').map(str::trim).collect();
+    let hold = parts.last() == Some(&"hold");
+    if hold {
+        parts.pop();
+    }
+    if parts.first() == Some(&"release") {
+        let n: Vec<f32> = parts[1..].iter().map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        let pos = egui::pos2(*n.first()?, *n.get(1)?);
+        let up = [egui::PointerButton::Primary, egui::PointerButton::Secondary, egui::PointerButton::Middle].map(|button| egui::Event::PointerButton { pos, button, pressed: false, modifiers: Default::default() });
+        return Some(VecDeque::from([up.to_vec(), Vec::new()]));
+    }
     let buttons: Vec<egui::PointerButton> = parts.first()?.split('+').map(|b| match b {
         "left" => Some(egui::PointerButton::Primary),
         "right" => Some(egui::PointerButton::Secondary),
@@ -432,7 +444,9 @@ fn pointer_frames(arg: &str) -> Option<VecDeque<Vec<egui::Event>>> {
     for s in 1..=steps {
         frames.push_back(vec![egui::Event::PointerMoved(a.lerp(b, s as f32 / steps as f32))]);
     }
-    frames.push_back(buttons.iter().map(|&bt| button(bt, b, false)).collect());
+    if !hold {
+        frames.push_back(buttons.iter().map(|&bt| button(bt, b, false)).collect());
+    }
     frames.push_back(Vec::new());
     Some(frames)
 }

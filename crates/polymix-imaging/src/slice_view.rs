@@ -7,6 +7,7 @@
 //! (i, j, k) is centred on (i, j, k) and covers ±0.5 around it, so rounding gives the voxel
 //! and `geometry.world(cursor)` gives its position in the patient.
 
+use crate::histogram;
 use crate::nav::{drag_window, Nav};
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use glam::DVec3;
@@ -73,6 +74,8 @@ pub struct SliceResponse {
     pub left_drag_voxel: Option<DVec3>,
     /// Shift + wheel over the view while a brush is shown, in notches (positive = up).
     pub brush_wheel: f32,
+    /// Double-clicked (the layout around the view decides what that does).
+    pub double_clicked: bool,
 }
 
 /// View colours as in 3D Slicer: red axial, yellow sagittal, green coronal.
@@ -272,16 +275,15 @@ impl SliceView {
         if let (Some(c), true) = (clicked_voxel, opts.left_drag_scrolls) {
             state.cursor = c;
         }
-        if ev.double_clicked {
-            self.nav.reset();
-            state.window = vol.auto_window;
-        }
         let hover_voxel = ev.hover.and_then(on_image).map(at);
         let left_drag_voxel = if tool_drag { response.interact_pointer_pos().and_then(on_image).map(at) } else { None };
 
         self.update_texture(ui.ctx(), vol, &grid, slice, state.window, overlay, opts.smooth);
         self.paint(ui, rect, img, vol, &grid, state, opts, ev.hover);
-        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel }
+        // Above the slice position in the bottom left corner.
+        let key = (volume_id(vol), vol.range.0.to_bits(), vol.range.1.to_bits());
+        histogram::show(ui, response.id, rect, rect.bottom() - 24.0, key, &vol.values, state.window, vol.invert, self.nav.windowing());
+        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel, double_clicked: ev.double_clicked }
     }
 
     /// Re-make the texture when what it shows has changed.

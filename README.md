@@ -57,8 +57,11 @@ surface above a threshold).
 
 Every image view uses the same mouse: **left drag** scrolls through slices, **right drag**
 pans, **middle drag** zooms, **left + right drag** sets window / level, the **wheel** scrolls
-slices (⌘ + wheel zooms), a **click** moves the crosshair and a **double-click** resets. In the
-3D view, left drag rotates.
+slices (⌘ + wheel zooms) and a **click** moves the crosshair. While the window / level is
+dragged, a histogram in the bottom left of the view shows the image's values with the window
+over them. In the Segmentation tab a **double-click** makes a view fill the view area, and
+another brings the four views back (**Fit** resets zoom and pan, **Auto** the window); in the
+Volume tab's thumbnail a double-click resets. In the 3D view, left drag rotates.
 
 Each workspace is independent: if one runs into an internal error it stops on its own (its
 tab shows what happened, with a Restart button and a log in the data folder) and the

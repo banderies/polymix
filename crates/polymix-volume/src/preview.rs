@@ -162,6 +162,8 @@ impl Preview {
                 let colour = if inside { egui::Color32::from_rgb(255, 196, 0) } else { egui::Color32::from_rgba_unmultiplied(255, 196, 0, 90) };
                 ui.painter_at(rect).rect_stroke(r, 0.0, egui::Stroke::new(1.5, colour), egui::StrokeKind::Middle);
             }
+            let key = ("volume.preview", self.volume, self.slice, s.values.as_ptr() as usize, s.values.len());
+            polymix_imaging::histogram::show(ui, r.id, rect, rect.bottom(), key, &s.values, self.current_window(), s.invert, self.nav.windowing());
             if let Some(d) = ev.window {
                 self.window = Some(drag_window(self.current_window(), d));
                 self.dirty = true;

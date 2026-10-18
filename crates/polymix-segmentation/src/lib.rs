@@ -142,8 +142,11 @@ pub struct SegmentationWorkspace {
     smooth: bool,
     /// The voxel under the pointer, and in which view.
     hover: Option<(Plane, DVec3)>,
-    /// Where the views were drawn last frame: axial, 3D, sagittal, coronal (for scripts).
+    /// Where the views were drawn last frame: axial, 3D, sagittal, coronal (for scripts);
+    /// `Rect::NOTHING` for a view hidden by another filling the view area.
     rects: [Rect; 4],
+    /// The view (index into `rects`) filling the view area, if one was double-clicked.
+    maximized: Option<usize>,
     script: VecDeque<String>,
 
     seg: Option<Segmentation>,
@@ -186,6 +189,7 @@ impl SegmentationWorkspace {
             smooth: true,
             hover: None,
             rects: [Rect::NOTHING; 4],
+            maximized: None,
             script: VecDeque::new(),
             seg: None,
             hist: None,
@@ -579,6 +583,9 @@ impl SegmentationWorkspace {
                 }
             }
             "seg.keep" => self.declined = self.pending.take().map(|(p, _)| p),
+            // seg.maximize:axial|3d|sagittal|coronal — one view fills the view area (anything
+            // else: back to four).
+            "seg.maximize" => self.maximized = ["axial", "3d", "sagittal", "coronal"].iter().position(|n| *n == arg),
             _ => {
                 // Effect settings.
                 let Some(st) = &mut self.settings else { return };
@@ -757,11 +764,11 @@ impl SegmentationWorkspace {
             let tool = self.effect.is_some_and(|e| self.settings.as_ref().is_some_and(|s| s.takes_left_button(e)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(if over_3d {
-                    "Left drag: rotate · Right drag: pan · Middle drag or wheel: zoom · Double-click: reset"
+                    "Left drag: rotate · Right drag: pan · Middle drag or wheel: zoom · Double-click: fill the view area / back to four views"
                 } else if tool {
                     "Left: the effect · Right drag: pan · Middle drag: zoom · Left + right drag: window / level · Wheel: slices · Esc: put the effect away"
                 } else {
-                    "Left drag: slices · Right drag: pan · Middle drag: zoom · Left + right drag: window / level · Wheel: slices · Click: move the crosshair · Double-click: reset"
+                    "Left drag: slices · Right drag: pan · Middle drag: zoom · Left + right drag: window / level · Wheel: slices · Click: move the crosshair · Double-click: fill the view area / back to four views"
                 });
             });
         });
@@ -772,8 +779,12 @@ impl SegmentationWorkspace {
         let gap = 2.0;
         let size = Vec2::new(((full.width() - gap) * 0.5).floor(), ((full.height() - gap) * 0.5).floor());
         let cell = |col: f32, row: f32| Rect::from_min_size(full.min + Vec2::new(col * (size.x + gap), row * (size.y + gap)), size);
-        // Axial top left, 3D top right, sagittal bottom left, coronal bottom right.
-        self.rects = [cell(0.0, 0.0), cell(1.0, 0.0), cell(0.0, 1.0), cell(1.0, 1.0)];
+        // Axial top left, 3D top right, sagittal bottom left, coronal bottom right; or one of
+        // them filling the area.
+        self.rects = match self.maximized {
+            Some(m) => std::array::from_fn(|i| if i == m { full } else { Rect::NOTHING }),
+            None => [cell(0.0, 0.0), cell(1.0, 0.0), cell(0.0, 1.0), cell(1.0, 1.0)],
+        };
         let Some(vol) = self.volume.clone().filter(|_| self.state.is_some()) else {
             ui.allocate_rect(full, egui::Sense::hover());
             self.empty_message(ui, full);
@@ -803,8 +814,16 @@ impl SegmentationWorkspace {
         });
         let state = self.state.as_mut().expect("checked above");
         let mut responses = Vec::new();
-        for (view, rect) in self.views.iter_mut().zip([self.rects[0], self.rects[2], self.rects[3]]) {
+        let mut toggle = None;
+        for ((view, rect), at) in self.views.iter_mut().zip([self.rects[0], self.rects[2], self.rects[3]]).zip([0, 2, 3]) {
+            if !rect.is_positive() {
+                continue;
+            }
             let r = ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| view.ui(ui, &vol, state, overlay.as_ref().map(|o| &o.1), &opts)).inner;
+            // Not while the left button is a tool's (a double click is two clicks of the tool).
+            if r.double_clicked && opts.left_drag_scrolls {
+                toggle = Some(at);
+            }
             responses.push((view.plane, r));
         }
         if let Some((key, o)) = &overlay {
@@ -816,7 +835,15 @@ impl SegmentationWorkspace {
         let state = self.state.as_ref().expect("checked above");
         let labels3d = self.seg.as_ref().filter(|_| has_segments).map(|s| LabelOverlay { labels: &s.labels, colours: &colours, opacity: 1.0, version: s.version_3d });
         let view3d = &mut self.view3d;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(self.rects[1]), |ui| view3d.ui(ui, render_state, &vol, state, labels3d.as_ref()));
+        if self.rects[1].is_positive() {
+            let r3 = ui.scope_builder(egui::UiBuilder::new().max_rect(self.rects[1]), |ui| view3d.ui(ui, render_state, &vol, state, labels3d.as_ref())).inner;
+            if r3.double_clicked() {
+                toggle = Some(1);
+            }
+        }
+        if let Some(at) = toggle {
+            self.maximized = if self.maximized.is_some() { None } else { Some(at) };
+        }
     }
 
     fn empty_message(&self, ui: &mut egui::Ui, rect: Rect) {

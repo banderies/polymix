@@ -207,8 +207,9 @@ Lives in the Segmentation tab, which shows the volume selected in Volume. Views 
 (`polymix-imaging`) so every image view behaves the same.
 
 - [x] **M14.1 Mouse controls for image views**: left drag slices, right drag pan, middle drag
-      zoom, left + right drag window / level, wheel slices (captured over the view), click for
-      the crosshair, double-click resets.
+      zoom, left + right drag window / level (with a histogram of the image and the window in
+      the bottom left while dragging), wheel slices (captured over the view), click for the
+      crosshair, double-click fills the view area with a view and back (resets the thumbnail).
 - [x] **M14.2 Three planes**: axial, sagittal and coronal (radiological convention) with a
       shared crosshair, orientation letters, label overlays, value under the pointer.
 - [x] **M14.3 3D view**: GPU ray casting (MIP, shaded volume rendering, threshold surface)
