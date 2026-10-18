@@ -235,6 +235,9 @@ enum SwitchTo {
     Tool(String),
     /// Show a category palette (or nothing).
     Category(Option<Category>),
+    /// The S hotkey: Select with nothing selected, whatever was selected before (e.g. the
+    /// patch Erase & Fill just made).
+    ClearSelect,
 }
 
 /// Create a tool by name. Shared by the palette, hotkeys, menus and test scripts.
@@ -374,6 +377,8 @@ struct Script {
     steps: std::collections::VecDeque<String>,
     wait: u32,
     awaiting_shot: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Key presses (`key:S`) for the next frame's input.
+    keys: Vec<egui::Key>,
 }
 
 impl PolymixApp {
@@ -433,6 +438,7 @@ impl PolymixApp {
                 steps: s.split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
                 wait: 0,
                 awaiting_shot: None,
+                keys: Vec::new(),
             }),
         };
         if let Some(st) = cc.storage.filter(|_| std::env::var_os("POLYMIX_SCRIPT").is_none()) {
@@ -1006,10 +1012,8 @@ impl PolymixApp {
     /// first and the switch happens when its result has been accepted.
     fn switch_to(&mut self, to: SwitchTo, ctx: &egui::Context, vp: Viewport) {
         // Switching to Select returns to an open Select tool underneath the current sub-tool.
-        let keep = match &to {
-            SwitchTo::Tool(n) if n == "select" => self.tools.iter().position(|t| t.name() == "Select").map(|i| i + 1).unwrap_or(0),
-            _ => 0,
-        };
+        let to_select = matches!(&to, SwitchTo::ClearSelect) || matches!(&to, SwitchTo::Tool(n) if n == "select");
+        let keep = if to_select { self.tools.iter().position(|t| t.name() == "Select").map(|i| i + 1).unwrap_or(0) } else { 0 };
         if !self.accept_tools(keep, ctx, vp) {
             if self.pending_switch.is_none() {
                 self.status = "Finishing the current tool before switching…".into();
@@ -1033,6 +1037,12 @@ impl PolymixApp {
                         self.tools.push(t);
                     }
                 }
+            }
+            SwitchTo::ClearSelect => {
+                if self.scene.active().is_some_and(|o| !o.selection.is_empty()) {
+                    commands::selection_command(&mut self.cmd_cx(), commands::SelectCmd::Clear);
+                }
+                self.switch_to(SwitchTo::Tool("select".into()), ctx, vp);
             }
             SwitchTo::Category(c) => {
                 if c == Some(Category::Meshmix) {
@@ -2687,6 +2697,12 @@ impl PolymixApp {
         let arg = arg.to_string();
         match cmd {
             "wait" => script.wait = arg.parse().unwrap_or(1),
+            "key" => {
+                if let Some(k) = egui::Key::from_name(&arg) {
+                    script.keys.push(k);
+                }
+                script.wait = 1;
+            }
             "lasso" => {
                 // Polygon in viewport-relative coordinates: x0,y0,x1,y1,...
                 let v: Vec<f32> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -2833,14 +2849,16 @@ impl PolymixApp {
                 // Print scene statistics to stdout (automated checks).
                 for o in &self.scene.objects {
                     println!(
-                        "[polymix] {} {}: tris={} verts={} open_edges={} closed={} valid={}",
+                        "[polymix] {} {}: tris={} verts={} open_edges={} closed={} valid={} selected={} tool={}",
                         arg,
                         o.name,
                         o.mesh.triangle_count(),
                         o.mesh.vertex_count(),
                         o.mesh.boundary_edge_ids().count(),
                         o.mesh.is_closed(),
-                        o.mesh.check_validity().is_ok()
+                        o.mesh.check_validity().is_ok(),
+                        o.selection.len(),
+                        self.tools.last().map(|t| t.name()).unwrap_or("none")
                     );
                 }
             }
@@ -2995,25 +3013,27 @@ impl PolymixApp {
         }
         if self.scene.active().is_some() && !cmd {
             // Tool hotkeys work from inside other tools too: the open tool is accepted first.
+            // S always starts Select with nothing selected.
+            let tool = |name: &str| Some(SwitchTo::Tool(name.into()));
             let to = if i.key_pressed(Key::S) {
-                Some("select")
+                Some(SwitchTo::ClearSelect)
             } else if i.key_pressed(Key::I) {
-                Some("inspector")
+                tool("inspector")
             } else if i.key_pressed(Key::T) && !i.modifiers.shift {
-                Some("transform")
+                tool("transform")
             } else if i.key_pressed(Key::Num1) {
-                Some("sculptsmooth")
+                tool("sculptsmooth")
             } else if i.key_pressed(Key::Num2) {
-                Some("sculpt")
+                tool("sculpt")
             } else if i.key_pressed(Key::Num3) {
-                Some("sculptvolume")
+                tool("sculptvolume")
             } else if i.key_pressed(Key::Num4) {
-                Some("stamp")
+                tool("stamp")
             } else {
                 None
             };
-            if let Some(name) = to {
-                self.switch_to(SwitchTo::Tool(name.into()), ctx, vp);
+            if let Some(to) = to {
+                self.switch_to(to, ctx, vp);
             } else if i.key_pressed(Key::Y) && i.modifiers.shift && self.accept_tools_for_command(ctx, vp) {
                 commands::separate_shells(&mut self.cmd_cx());
                 self.scene_changed(ctx, vp);
@@ -3086,6 +3106,16 @@ impl eframe::App for PolymixApp {
         st.set_string("recent", self.recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
         if let Some(d) = &self.last_export_dir {
             st.set_string("last_export_dir", d.display().to_string());
+        }
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(script) = &mut self.script {
+            for key in script.keys.drain(..) {
+                for pressed in [true, false] {
+                    raw_input.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() });
+                }
+            }
         }
     }
 
