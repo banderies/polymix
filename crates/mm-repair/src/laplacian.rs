@@ -6,7 +6,9 @@
 //! * order 2 (thin plate / bilaplacian): `L M⁻¹ L x = 0` on the free vertices, with `M` the
 //!   vertex mass (degree for uniform weights — which makes this exactly the
 //!   "umbrella-of-umbrella" operator `U² x = 0` scaled by the degree — and the barycentric
-//!   area for cotangent weights, the usual FEM discretisation of Δ²).
+//!   area for cotangent weights, the usual FEM discretisation of Δ²);
+//! * order 3 (triharmonic, minimum curvature variation): `−L M⁻¹ L M⁻¹ L x = 0`, which
+//!   blends C² with three rings of fixed surroundings.
 //!
 //! Both are symmetric positive definite once every free component touches a fixed vertex,
 //! so they are solved with preconditioned conjugate gradients ([`crate::sparse`]): Jacobi
@@ -239,7 +241,7 @@ fn constrained_free_set(mesh: &Mesh, free: &[u32]) -> Vec<u32> {
     list.into_iter().zip(keep).filter(|(_, k)| *k).map(|(v, _)| v).collect()
 }
 
-/// Build the order-1 or order-2 system for `free` (other vertices are fixed).
+/// Build the order-1, 2 or 3 system for `free` (other vertices are fixed).
 pub(crate) fn build_fair_system(mesh: &Mesh, free: &[u32], order: u32, kind: LaplacianWeights) -> FairSystem {
     build_fair_system_with(mesh, free, order, kind, &|v| mesh.vertex(v))
 }
@@ -279,6 +281,9 @@ pub(crate) fn build_fair_system_with<P: Fn(u32) -> DVec3 + Sync>(
             if par { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
         let (ent, rhs): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
         return FairSystem { matrix: CsrMatrix::from_rows(nf, nf, ent), rhs, free };
+    }
+    if order >= 3 {
+        return build_order3_system(mesh, free, fidx, kind, wpos);
     }
 
     // Order 2: Laplacian rows are needed for the free vertices and their one ring.
@@ -323,6 +328,66 @@ pub(crate) fn build_fair_system_with<P: Fn(u32) -> DVec3 + Sync>(
     };
     let rows: Vec<(Vec<(u32, f64)>, DVec3)> =
         if par { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
+    let (ent, rhs): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    FairSystem { matrix: CsrMatrix::from_rows(nf, nf, ent), rhs, free }
+}
+
+/// Order 3: rows `−(L M⁻¹ L M⁻¹ L)ᵢ` for the free vertices, from Laplacian rows of the free
+/// vertices and their two rings.
+fn build_order3_system<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: Vec<u32>, fidx: LocalIndex, kind: LaplacianWeights, wpos: &P) -> FairSystem {
+    let nf = free.len();
+    let mut ridx = LocalIndex::new(mesh.max_vid(), nf * 3);
+    let mut row_verts: Vec<u32> = Vec::with_capacity(nf * 3);
+    let mut ring: Vec<u32> = free.clone();
+    for &v in &ring {
+        ridx.insert(v, row_verts.len() as u32);
+        row_verts.push(v);
+    }
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for &v in &ring {
+            for nb in mesh.vertex_neighbors(v) {
+                if ridx.get(nb).is_none() {
+                    ridx.insert(nb, row_verts.len() as u32);
+                    row_verts.push(nb);
+                    next.push(nb);
+                }
+            }
+        }
+        ring = next;
+    }
+    let lap: Vec<LapRow> = if nf >= 2048 {
+        row_verts.par_iter().map(|&v| lap_row(mesh, v, kind, wpos)).collect()
+    } else {
+        row_verts.iter().map(|&v| lap_row(mesh, v, kind, wpos)).collect()
+    };
+    let row_of = |v: u32| &lap[ridx.get(v).unwrap() as usize];
+    // Row v of L as (column, value), diagonal first.
+    let l_row = |v: u32| std::iter::once((v, -row_of(v).diag)).chain(row_of(v).nbrs.iter().copied());
+    let build = |&i: &u32| -> (Vec<(u32, f64)>, DVec3) {
+        // r = e_iᵀ L M⁻¹ L M⁻¹ L, accumulated sparsely.
+        let mut acc: std::collections::HashMap<u32, f64> = std::collections::HashMap::with_capacity(64);
+        for (j, lij) in l_row(i) {
+            let cj = lij / row_of(j).mass;
+            for (l, ljl) in l_row(j) {
+                let cl = cj * ljl / row_of(l).mass;
+                for (k, llk) in l_row(l) {
+                    *acc.entry(k).or_insert(0.0) += cl * llk;
+                }
+            }
+        }
+        let mut ent = Vec::with_capacity(acc.len());
+        let mut rhs = DVec3::ZERO;
+        for (k, val) in acc {
+            // Negated: L is negative semi-definite, so −L M⁻¹ L M⁻¹ L is positive.
+            match fidx.get(k) {
+                Some(l) => ent.push((l, -val)),
+                None => rhs += mesh.vertex(k) * val,
+            }
+        }
+        (ent, rhs)
+    };
+    let rows: Vec<(Vec<(u32, f64)>, DVec3)> = if nf >= 2048 { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
     let (ent, rhs): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     FairSystem { matrix: CsrMatrix::from_rows(nf, nf, ent), rhs, free }
 }
@@ -375,8 +440,8 @@ pub(crate) fn fair_vertices(
     pcg: &PcgParams,
     callback: Option<&dyn Fn(usize, f64) -> bool>,
 ) -> Result<PcgStats> {
-    if order == 0 || order > 2 {
-        return Err(RepairError::InvalidParameter(format!("fairing order must be 1 or 2, got {order}")));
+    if order == 0 || order > 3 {
+        return Err(RepairError::InvalidParameter(format!("fairing order must be 1, 2 or 3, got {order}")));
     }
     let sys = build_fair_system(mesh, free, order, kind);
     if sys.free.is_empty() {
@@ -482,12 +547,37 @@ mod tests {
         let m = primitives::icosphere(1.0, 2);
         let free: Vec<u32> = m.vertex_ids().filter(|&v| m.vertex(v).z > 0.6).collect();
         for kind in [LaplacianWeights::Uniform, LaplacianWeights::Cotangent, LaplacianWeights::MeanValue] {
-            for order in [1, 2] {
+            for order in [1, 2, 3] {
                 let s = build_fair_system(&m, &free, order, kind);
                 assert_eq!(s.free.len(), free.len());
                 assert!(s.matrix.is_symmetric(1e-9), "{kind:?} order {order}");
             }
         }
+    }
+
+    #[test]
+    fn order3_reproduces_a_quartic_height_field() {
+        // Uniform Δ³ of x⁴ vanishes on a regular grid (Δ² of it does not): order 3 restores the
+        // field from a disturbed start, order 2 cannot.
+        let field = |p: DVec3| 0.02 * p.x.powi(4);
+        let mut m = primitives::plane_grid(16.0, 16.0, 16, 16);
+        let ids: Vec<u32> = m.vertex_ids().collect();
+        for &v in &ids {
+            let p = m.vertex(v);
+            m.set_vertex(v, DVec3::new(p.x, p.y, field(p)));
+        }
+        let free: Vec<u32> = ids.iter().copied().filter(|&v| m.vertex(v).x.abs() < 3.5 && m.vertex(v).y.abs() < 3.5).collect();
+        let err = |order: u32| {
+            let mut m = m.clone();
+            for &v in &free {
+                let p = m.vertex(v);
+                m.set_vertex(v, p + DVec3::new(0.0, 0.0, 0.3));
+            }
+            fair_vertices(&mut m, &free, order, LaplacianWeights::Uniform, &PcgParams { tolerance: 1e-12, max_iterations: 20_000 }, None).unwrap();
+            free.iter().map(|&v| (m.vertex(v).z - field(m.vertex(v))).abs()).fold(0.0, f64::max)
+        };
+        assert!(err(3) < 1e-6, "order 3 restores x⁴ ({})", err(3));
+        assert!(err(2) > 1e-3, "order 2 does not ({})", err(2));
     }
 
     #[test]

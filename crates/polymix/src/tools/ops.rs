@@ -55,6 +55,8 @@ pub trait OpSpec: Send + 'static {
     fn keys(_p: &mut Self::Params, _i: &egui::InputState) -> bool {
         false
     }
+    /// Test-script settings (`toolcmd:<cmd>`).
+    fn script(_p: &mut Self::Params, _cmd: &str) {}
 }
 
 /// Plain (unmodified) key press.
@@ -211,6 +213,11 @@ impl<S: OpSpec> Tool for OpTool<S> {
 
     fn shows_groups(&self) -> bool {
         S::SHOWS_GROUPS
+    }
+
+    fn script(&mut self, cmd: &str, _cx: &mut ToolCx) {
+        S::script(&mut self.params, cmd);
+        self.changed_at = Some(Instant::now() - Duration::from_secs(1));
     }
 
     fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
@@ -1585,10 +1592,13 @@ pub struct EraseFillUi {
     pub create_new_groups: bool,
     /// Snap the patch onto the target surface.
     pub project_to_target: bool,
-    /// Loft: tube shape, End 1 / End 2 continuity and tension, extra twist (degrees).
+    /// Loft: tube shape, End 1 / End 2 continuity and tension, extra twist (degrees),
+    /// roundness of the middle and fairing (percent).
     pub loft_shape: mm_edit::LoftShape,
     pub loft_ends: [mm_edit::LoftEnd; 2],
     pub twist: f64,
+    pub round: f64,
+    pub fair: f64,
 }
 
 /// Whether `sel` is the edge rings of two holes: two separate parts, each touching an open
@@ -1660,6 +1670,8 @@ impl OpSpec for EraseFillSpec {
             loft_shape: mm_edit::LoftShape::Smooth,
             loft_ends: [mm_edit::LoftEnd::default(); 2],
             twist: 0.0,
+            round: 0.0,
+            fair: 0.0,
         }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
@@ -1685,6 +1697,42 @@ impl OpSpec for EraseFillSpec {
         ui.small("Deletes the selection and fills the opening so it blends into the surrounding surface.");
         if info.selection.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select a region first.");
+        }
+    }
+    fn script(p: &mut Self::Params, cmd: &str) {
+        // `loft:smooth`, `end1:g2`, `tension2:1.5`, `round:50`, `fair:100`, `twist:30`.
+        use mm_edit::{EndContinuity, LoftShape};
+        let Some((key, val)) = cmd.split_once(':') else { return };
+        let num = val.parse::<f64>().ok();
+        let end = |k: &str| k.chars().last().and_then(|c| c.to_digit(10)).map(|d| (d as usize).clamp(1, 2) - 1);
+        match key {
+            "loft" => {
+                p.kind = FillKind::Loft;
+                p.loft_shape = match val {
+                    "minimal" => LoftShape::Minimal,
+                    "straight" => LoftShape::Straight,
+                    _ => LoftShape::Smooth,
+                };
+            }
+            k if k.starts_with("end") => {
+                if let Some(i) = end(k) {
+                    p.loft_ends[i].continuity = match val {
+                        "g0" => EndContinuity::G0,
+                        "g2" => EndContinuity::G2,
+                        _ => EndContinuity::G1,
+                    };
+                }
+            }
+            k if k.starts_with("tension") => {
+                if let (Some(i), Some(x)) = (end(k), num) {
+                    p.loft_ends[i].tension = x;
+                }
+            }
+            "round" => p.round = num.unwrap_or(p.round),
+            "fair" => p.fair = num.unwrap_or(p.fair),
+            "twist" => p.twist = num.unwrap_or(p.twist),
+            "bulge" => p.bulge = num.unwrap_or(p.bulge),
+            _ => {}
         }
     }
     fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -1728,6 +1776,8 @@ impl OpSpec for EraseFillSpec {
                 edge_length: Some(target),
                 twist_deg: p.twist,
                 bulge: (p.bulge / 100.0).max(-0.9),
+                round: (p.round / 100.0).clamp(0.0, 1.0),
+                fair: (p.fair / 100.0).clamp(0.0, 1.0),
                 group: Some(group),
             };
             let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &params)?;
@@ -1811,15 +1861,19 @@ fn loft_ui(ui: &mut egui::Ui, p: &mut EraseFillUi) {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut end.continuity, EndContinuity::G0, "G0").on_hover_text("Position: the tube meets the opening (a crease may form)");
                     ui.selectable_value(&mut end.continuity, EndContinuity::G1, "G1").on_hover_text("Tangent: the tube leaves along the surrounding wall");
+                    ui.selectable_value(&mut end.continuity, EndContinuity::G2, "G2").on_hover_text("Curvature: the tube also continues the vessel's bend");
                 });
             });
-            ui.add_enabled(smooth && end.continuity == EndContinuity::G1, egui::Slider::new(&mut end.tension, 0.2..=3.0).text("tension"))
-                .on_hover_text("How far the tube keeps to the wall's direction before turning");
+            ui.add_enabled(smooth && end.continuity != EndContinuity::G0, egui::Slider::new(&mut end.tension, 0.2..=3.0).text("tension"))
+                .on_hover_text("How far the tube keeps to the wall's direction before turning (1 follows a circular arc)");
             ui.end_row();
         }
     });
     ui.add_enabled(tube, egui::Slider::new(&mut p.twist, -180.0..=180.0).suffix("°").text("Twist")).on_hover_text("Turn one end against the other (they are lined up automatically)");
     ui.add_enabled(tube, egui::Slider::new(&mut p.bulge, -90.0..=100.0).suffix("%").text("Bulge")).on_hover_text("Widen (+) or narrow (−) the middle of the tube");
+    ui.add_enabled(tube, egui::Slider::new(&mut p.round, 0.0..=100.0).suffix("%").text("Round")).on_hover_text("Make the middle of the tube circular, however ragged the openings are");
+    ui.add_enabled(smooth, egui::Slider::new(&mut p.fair, 0.0..=100.0).suffix("%").text("Fair"))
+        .on_hover_text("Smooth the tube's middle with its ends kept: thin-plate for G0 / G1 ends, curvature-continuous (G2) when an end is G2");
     ui.checkbox(&mut p.create_new_groups, "Create new groups");
     ui.small("Deletes the selection and joins the two openings it leaves with a tube.");
 }
@@ -2397,6 +2451,10 @@ mod tests {
             assert_eq!(out.labels.len(), 2);
             assert!(!out.message.contains("warning"), "{shape:?}: {}", out.message);
         }
+        let ends = [mm_edit::LoftEnd { continuity: mm_edit::EndContinuity::G2, tension: 1.0 }; 2];
+        let out = EraseFillSpec::run(&m, Some(&rings), &EraseFillUi { loft_ends: ends, round: 100.0, fair: 100.0, ..p }, &|_| true).unwrap();
+        assert!(out.mesh.check_validity().is_ok());
+        assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "G2, round and fair");
         let err = EraseFillSpec::run(&m, Some(&ring(2.0)), &p, &|_| true).err().unwrap().to_string();
         assert!(err.contains("two openings"), "{err}");
     }

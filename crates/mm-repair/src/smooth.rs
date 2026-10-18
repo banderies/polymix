@@ -3,9 +3,10 @@
 //! * [`smooth_vertices`] — explicit Laplacian or Taubin λ|μ smoothing (Taubin, "A Signal
 //!   Processing Approach to Fair Surface Design", SIGGRAPH 1995), Jacobi-style updates
 //!   computed in parallel.
-//! * [`fair_region`] — implicit membrane (order 1) or thin-plate (order 2) fairing of a set
-//!   of vertices with every other vertex held fixed, so the faired region blends smoothly
-//!   (C⁰ resp. C¹) into its surroundings ("select a bump and smooth it away").
+//! * [`fair_region`] — implicit membrane (order 1), thin-plate (order 2) or triharmonic
+//!   (order 3) fairing of a set of vertices with every other vertex held fixed, so the faired
+//!   region blends smoothly (C⁰, C¹ or C²) into its surroundings ("select a bump and smooth
+//!   it away").
 
 use crate::laplacian::{directed_weight, fair_vertices, LaplacianWeights};
 use crate::sparse::{PcgParams, PcgStats};
@@ -212,7 +213,8 @@ pub(crate) fn restore_volume(mesh: &mut Mesh, moved: &[u32], target: f64) {
 /// Parameters of [`fair_region_with`].
 #[derive(Clone, Copy, Debug)]
 pub struct FairParams {
-    /// 1 = membrane (Laplace, C⁰ blend), 2 = thin plate (bilaplacian, C¹ blend).
+    /// 1 = membrane (Laplace, C⁰ blend), 2 = thin plate (bilaplacian, C¹ blend),
+    /// 3 = triharmonic (C² blend).
     pub order: u32,
     /// Laplacian weights (cotangent recommended).
     pub weights: LaplacianWeights,
@@ -231,7 +233,7 @@ impl Default for FairParams {
     }
 }
 
-/// Implicitly fair `vertices_to_move` (order 1 = Laplacian, 2 = bilaplacian) with every
+/// Implicitly fair `vertices_to_move` (order 1 = Laplacian, 2 = bilaplacian, 3 = triharmonic) with every
 /// other vertex fixed. Vertices whose connected free region has no fixed neighbour are left
 /// unchanged.
 pub fn fair_region(mesh: &mut Mesh, vertices_to_move: &[u32], order: u32, weights: LaplacianWeights) -> Result<PcgStats> {

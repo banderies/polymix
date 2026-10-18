@@ -111,3 +111,100 @@ fn loft_twist_and_bulge() {
     let mut m = base.clone();
     assert!(loft(&mut m, &a, &b, &LoftParams { bulge: -1.0, ..Default::default() }).is_err());
 }
+
+/// An arc-shaped vessel (radius `big` in the xy-plane, tube radius `small`) with the section
+/// between `gap.0` and `gap.1` degrees missing: the mesh and the two openings facing the gap.
+fn arc_with_gap(big: f64, small: f64, gap: (f64, f64)) -> (Mesh, Vec<u32>, Vec<u32>) {
+    let arc = |a0: f64, a1: f64| {
+        let path: Vec<DVec3> = (0..=40).map(|k| {
+            let a = (a0 + (a1 - a0) * k as f64 / 40.0).to_radians();
+            DVec3::new(big * a.cos(), big * a.sin(), 0.0)
+        }).collect();
+        primitives::tube_along(&path, &vec![small; path.len()], 32)
+    };
+    let mut m = arc(0.0, gap.0);
+    m.append_mesh(&arc(gap.1, gap.0 + gap.1), 1);
+    let angle = |l: &mm_core::topology::EdgeLoop| { let c = l.centroid(&m); c.y.atan2(c.x).to_degrees() };
+    let loops = boundary_loops(&m);
+    let near = |deg: f64| loops.iter().min_by(|a, b| (angle(a) - deg).abs().total_cmp(&(angle(b) - deg).abs())).unwrap().vertices.clone();
+    (m.clone(), near(gap.0), near(gap.1))
+}
+
+#[test]
+fn g2_ends_follow_the_wall_bend() {
+    let (big, small) = (6.0, 0.6);
+    let (base, a, b) = arc_with_gap(big, small, (50.0, 90.0));
+    // How far the new wall strays from the ideal torus the vessel follows.
+    let stray = |c: EndContinuity| {
+        let mut m = base.clone();
+        let params = LoftParams { ends: [LoftEnd { continuity: c, tension: 1.0 }; 2], edge_length: Some(0.1), ..Default::default() };
+        let r = loft(&mut m, &a, &b, &params).unwrap();
+        assert_valid(&m);
+        r.new_vertices.iter().map(|&v| {
+            let p = m.vertex(v);
+            let d = ((p.x * p.x + p.y * p.y).sqrt() - big).hypot(p.z);
+            (d - small).abs()
+        }).fold(0.0, f64::max)
+    };
+    let (g1, g2) = (stray(EndContinuity::G1), stray(EndContinuity::G2));
+    // The baseline is the mesh's own polygonal cross-section (0.003 for 32 sides).
+    assert!(g2 < 0.005, "G2 follows the torus ({g2:.4})");
+    assert!(g1 < 0.012 && g2 < g1, "G2 beats G1 on a bend ({g2:.4} vs {g1:.4})");
+}
+
+#[test]
+fn loft_mixed_ends_round_and_fair() {
+    use EndContinuity::*;
+    // Every mix of end settings, with and without fairing, gives a valid closed tube.
+    for (ea, eb) in [(G2, G2), (G0, G2), (G2, G1), (G0, G0)] {
+        for fair in [0.0, 1.0] {
+            let (mut m, a, b) = gap_tubes(16, 24, 1.5, 0.8);
+            let params = LoftParams { ends: [LoftEnd { continuity: ea, tension: 1.0 }, LoftEnd { continuity: eb, tension: 1.2 }], fair, ..Default::default() };
+            loft(&mut m, &a, &b, &params).unwrap();
+            assert_valid(&m);
+            assert_eq!(boundary_loops(&m).len(), 2, "{ea:?} {eb:?} fair {fair}");
+            let loops: Vec<Vec<u32>> = boundary_loops(&m).into_iter().map(|l| l.vertices).collect();
+            cap_planar_loops(&mut m, &loops, None, CutFill::Flat).unwrap();
+            assert!(m.is_closed() && volume(&m) > 0.0, "{ea:?} {eb:?} fair {fair}");
+        }
+    }
+}
+
+#[test]
+fn loft_round_makes_the_middle_circular() {
+    // Elliptical openings: Round pulls the middle cross-section to a circle.
+    let (mut base, a, b) = gap_tubes(32, 32, 2.0, 0.0);
+    base.transform(|p| DVec3::new(p.x * 1.6, p.y, p.z));
+    let spread = |round: f64| {
+        let mut m = base.clone();
+        let r = loft(&mut m, &a, &b, &LoftParams { shape: LoftShape::Straight, round, ..Default::default() }).unwrap();
+        assert_valid(&m);
+        let mid: Vec<u32> = r.new_vertices.iter().copied().filter(|&v| (m.vertex(v).z - 3.0).abs() < 0.08).collect();
+        let c = ring_centre(&m, &mid);
+        let d: Vec<f64> = mid.iter().map(|&v| (m.vertex(v) - c).truncate().length()).collect();
+        let mean = d.iter().sum::<f64>() / d.len() as f64;
+        d.iter().map(|x| (x - mean).abs()).fold(0.0, f64::max) / mean
+    };
+    let (oval, round) = (spread(0.0), spread(1.0));
+    assert!(oval > 0.2, "the openings are oval ({oval:.3})");
+    assert!(round < 0.02, "Round 100 % gives a circle ({round:.3})");
+}
+
+#[test]
+fn faired_g1_tube_keeps_its_ends_and_size() {
+    // Fairing (bi-Laplacian here) keeps G1 ends leaving along the wall and does not pinch.
+    let (mut m, a, b) = gap_tubes(24, 24, 2.0, 1.2);
+    let h = 0.1;
+    let n = (perimeter(&m, &a).max(perimeter(&m, &b)) / h).round() as usize;
+    let params = LoftParams { edge_length: Some(h), fair: 1.0, ..Default::default() };
+    let r = loft(&mut m, &a, &b, &params).unwrap();
+    assert_valid(&m);
+    let d = ring_centre(&m, &r.new_vertices[..n]) - ring_centre(&m, &a);
+    let lean = d.normalize().dot(DVec3::Z).acos().to_degrees();
+    let rows = r.new_vertices.len() / n;
+    let mid = &r.new_vertices[(rows / 2) * n..(rows / 2 + 1) * n];
+    let c = ring_centre(&m, mid);
+    let radius = mid.iter().map(|&v| m.vertex(v).distance(c)).sum::<f64>() / n as f64;
+    assert!(lean < 6.0, "G1 kept ({lean:.1}°)");
+    assert!(radius > 0.45, "no pinch ({radius:.3}, ends 0.5 and 0.6)");
+}

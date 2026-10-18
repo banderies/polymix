@@ -142,8 +142,10 @@ two holes (double-click each open edge, then `F`).
       (position) or G1 (leaves along the surrounding wall, per boundary vertex) with tension;
       twist, bulge, refine; End 1 / End 2 marked in the view; warning when the tube runs into
       the surface.
-- [ ] **M10.2 G2 ends** (curvature from the rings behind each opening, higher-order curves)
-      and a fairing pass with 1 / 2 / 3 rings held fixed; *Round* option (circular middle
-      cross-section for vessels).
+- [x] **M10.2 G2 ends**: the vessel's bend behind each opening (curvature of the ring
+      centres, tighter on the inside of the bend) continued by quintic Hermite columns; G1
+      directions corrected for the bend, tension 1 = circular arc. *Fair*: thin-plate or
+      triharmonic (new order-3 fairing) smoothing of the tube's middle with the end rows kept
+      and the row radii restored; *Round*: circular middle cross-section.
 - [ ] **M10.3 One loft for every tube join**: ⌘B Tube Handle and Vessel → Bridge boundaries use
       the loft, so all three behave the same.

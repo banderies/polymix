@@ -170,7 +170,7 @@ fn fair_region_options_and_errors() {
     let cap = 20f64.to_radians();
     let (dented, region) = dented_sphere(3, cap, 0.1);
     let mut m = dented.clone();
-    assert!(matches!(fair_region(&mut m, &region, 3, LaplacianWeights::Uniform), Err(RepairError::InvalidParameter(_))));
+    assert!(matches!(fair_region(&mut m, &region, 4, LaplacianWeights::Uniform), Err(RepairError::InvalidParameter(_))));
     let p = FairParams { reweight_passes: 2, weights: LaplacianWeights::MeanValue, ..Default::default() };
     fair_region_with(&mut m, &region, &p, None).unwrap();
     let (mx, _) = max_rms(&m, &region, |p| p.length() - 1.0);
