@@ -31,6 +31,18 @@ impl MeasureType {
         MeasureType::FitCylinder,
         MeasureType::VesselDiameter,
     ];
+    fn key(self) -> &'static str {
+        match self {
+            MeasureType::PointToPoint => "point_to_point",
+            MeasureType::PointCoordinates => "point_coordinates",
+            MeasureType::MinInterior => "min_interior",
+            MeasureType::MaxInterior => "max_interior",
+            MeasureType::MinExterior => "min_exterior",
+            MeasureType::MaxExterior => "max_exterior",
+            MeasureType::FitCylinder => "fit_cylinder",
+            MeasureType::VesselDiameter => "vessel_diameter",
+        }
+    }
     fn label(self) -> &'static str {
         match self {
             MeasureType::PointToPoint => "Point to point",
@@ -107,7 +119,26 @@ impl MeasureTool {
 
     /// Surface hit under the pointer, snapped as requested.
     fn hit(&self, cx: &mut ToolCx, pos: egui::Pos2) -> Option<(ObjectId, mm_core::bvh::RayHit)> {
-        let (id, mut hit) = cx.pick(pos, None)?;
+        let (id, hit) = cx.pick(pos, None)?;
+        self.snap(cx, id, hit)
+    }
+
+    /// The surface point of a visible object nearest `p` (for agents), snapped as requested.
+    fn nearest(&self, cx: &mut ToolCx, p: DVec3) -> Option<(ObjectId, mm_core::bvh::RayHit)> {
+        let mut best: Option<(ObjectId, mm_core::bvh::NearestHit)> = None;
+        for o in cx.scene.objects.iter_mut().filter(|o| o.visible) {
+            let bvh = o.bvh();
+            if let Some(h) = bvh.nearest(&o.mesh, p, f64::INFINITY) {
+                if best.as_ref().is_none_or(|(_, b)| h.dist_sq < b.dist_sq) {
+                    best = Some((o.id, h));
+                }
+            }
+        }
+        let (id, h) = best?;
+        self.snap(cx, id, mm_core::bvh::RayHit { tid: h.tid, t: 0.0, point: h.point, bary: h.bary })
+    }
+
+    fn snap(&self, cx: &mut ToolCx, id: ObjectId, mut hit: mm_core::bvh::RayHit) -> Option<(ObjectId, mm_core::bvh::RayHit)> {
         let o = cx.scene.get(id)?;
         let m = &o.mesh;
         let tv = m.triangle(hit.tid);
@@ -328,6 +359,154 @@ impl Tool for MeasureTool {
 
     fn name(&self) -> &'static str {
         "Measure"
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        let direction = match self.direction {
+            Direction::Normal => "normal",
+            Direction::Axis(0) => "x",
+            Direction::Axis(1) => "y",
+            Direction::Axis(_) => "z",
+        };
+        let snapping = match self.snapping {
+            Snapping::None => "none",
+            Snapping::Vertices => "vertices",
+            Snapping::Edges => "edges",
+            Snapping::GroupBorders => "group_borders",
+        };
+        Some(serde_json::json!({"type": self.kind.key(), "direction": direction, "snapping": snapping, "fit_radius_mm": self.fit_radius}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "type": {"type": "string", "enum": MeasureType::ALL.map(|k| k.key()), "description": "What a measurement at a point measures: point_to_point (two points), point_coordinates, min/max_interior (thickness through the object along the direction), min/max_exterior (gap out of it), fit_cylinder (diameter of a cylinder fitted around the point), vessel_diameter (equivalent diameter of the vessel's cross-section, and wall to wall)"},
+            "direction": {"type": "string", "enum": ["normal", "x", "y", "z"], "description": "Direction of interior / exterior measurements"},
+            "snapping": {"type": "string", "enum": ["none", "vertices", "edges", "group_borders"], "description": "Where measured points snap to"},
+            "fit_radius_mm": {"type": "number", "description": "fit_cylinder: radius of the surface patch the cylinder is fitted to"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let get = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        self.kind = MeasureType::ALL.into_iter().find(|k| k.key() == get("type")).ok_or("unknown measurement type")?;
+        self.direction = match get("direction").as_str() {
+            "x" => Direction::Axis(0),
+            "y" => Direction::Axis(1),
+            "z" => Direction::Axis(2),
+            "normal" => Direction::Normal,
+            _ => return Err("direction must be normal, x, y or z".into()),
+        };
+        self.snapping = match get("snapping").as_str() {
+            "none" => Snapping::None,
+            "vertices" => Snapping::Vertices,
+            "edges" => Snapping::Edges,
+            "group_borders" => Snapping::GroupBorders,
+            _ => return Err("snapping must be none, vertices, edges or group_borders".into()),
+        };
+        self.fit_radius = v["fit_radius_mm"].as_f64().filter(|r| *r > 0.0).ok_or("fit_radius_mm must be a positive number")?;
+        self.first = None;
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::{round, vec3};
+        use serde_json::json;
+        let stent_ready = {
+            let ends: Vec<&Measurement> = self.items.iter().rev().filter(|m| m.section.is_some()).take(2).collect();
+            matches!(ends[..], [b, a] if a.object == b.object)
+        };
+        json!({
+            "type": self.kind.key(),
+            "first_point_mm": self.first.map(|(_, p)| vec3(p.to_array(), 3)),
+            "measurements": self.items.iter().enumerate().map(|(i, m)| json!({
+                "measurement": i + 1,
+                "object": m.object,
+                "label": m.label,
+                "length_mm": m.length.map(|l| round(l, 4)),
+                "a_mm": vec3(m.a.to_array(), 3),
+                "b_mm": vec3(m.b.to_array(), 3),
+                "cross_section": m.section.as_ref().map(|s| json!({"centre_mm": vec3(s.center.to_array(), 3), "axis": vec3(s.normal.to_array(), 4), "diameter_mm": round(s.diameter, 3)})),
+                "selected": self.selected == Some(i),
+            })).collect::<Vec<_>>(),
+            "can_place_stent": stent_ready,
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("measure_at", "Measure at the surface point nearest `at`, as clicking there does, by the type setting (point_to_point takes two of these)", json!({"at": arg::point("A point in mm on or near the surface")})).required(&["at"]),
+            Action::new("measure_between", "The distance between the surface points nearest `a` and `b`", json!({"a": arg::point("First point in mm"), "b": arg::point("Second point in mm")})).required(&["a", "b"]),
+            Action::new("remove", "Remove a measurement", json!({"measurement": arg::integer("Its number (from 1)")})).required(&["measurement"]),
+            Action::plain("clear", "Remove every measurement"),
+            Action::new("set_length", "Scale the measured object uniformly about its centre so a measurement gets this length", json!({"measurement": arg::integer("Its number (from 1); default the selected one"), "length_mm": arg::number("The length it should have")})).required(&["length_mm"]),
+            Action::plain("place_stent", "Open Virtual stent with the last two vessel diameters (on one object) as its ends"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        let number = |k: &str, len: usize| -> Result<usize, String> { a.usize(k)?.checked_sub(1).filter(|i| *i < len).ok_or_else(|| format!("there is no measurement {}", a.usize(k).unwrap_or(0))) };
+        match action {
+            "measure_at" => {
+                let (id, hit) = self.nearest(cx, DVec3::from_array(a.point("at")?)).ok_or("no visible surface")?;
+                let before = self.items.len();
+                self.measure_at(cx, id, hit);
+                if self.items.len() > before {
+                    Ok(format!("Measurement {}: {}", self.items.len(), self.items.last().unwrap().label))
+                } else if self.first.is_some() {
+                    Ok("First point set: measure_at the second".into())
+                } else {
+                    Err(cx.status.clone())
+                }
+            }
+            "measure_between" => {
+                let (id, ha) = self.nearest(cx, DVec3::from_array(a.point("a")?)).ok_or("no visible surface")?;
+                let (_, hb) = self.nearest(cx, DVec3::from_array(a.point("b")?)).ok_or("no visible surface")?;
+                let d = ha.point.distance(hb.point);
+                self.items.push(Measurement { object: id, a: ha.point, b: hb.point, length: Some(d), label: format!("↔ {d:.3}"), ring: Vec::new(), section: None });
+                self.selected = Some(self.items.len() - 1);
+                self.target_length = d;
+                Ok(format!("Measurement {}: ↔ {d:.4} mm", self.items.len()))
+            }
+            "remove" => {
+                let i = number("measurement", self.items.len())?;
+                self.items.remove(i);
+                self.selected = None;
+                Ok(format!("Measurement {} removed", i + 1))
+            }
+            "clear" => {
+                self.items.clear();
+                self.selected = None;
+                self.first = None;
+                Ok("Measurements cleared".into())
+            }
+            "set_length" => {
+                if a.has("measurement") {
+                    self.selected = Some(number("measurement", self.items.len())?);
+                }
+                let m = self.selected.and_then(|i| self.items.get(i)).ok_or("select a measurement first")?;
+                if m.length.is_none() {
+                    return Err("that measurement has no length".into());
+                }
+                self.target_length = a.f64("length_mm")?;
+                self.apply_target_length(cx);
+                Ok(cx.status.clone())
+            }
+            "place_stent" => {
+                let ends: Vec<&Measurement> = self.items.iter().rev().filter(|m| m.section.is_some()).take(2).collect();
+                let [b, a] = ends[..] else { return Err("measure two vessel diameters first (type vessel_diameter)".into()) };
+                if a.object != b.object {
+                    return Err("the last two vessel diameters are on different objects".into());
+                }
+                let sections = [a.section.clone().unwrap(), b.section.clone().unwrap()];
+                self.request = Some(Box::new(super::stent::StentTool::with_sections(cx, a.object, sections)));
+                Ok("Virtual stent opened with the two cross-sections as its ends".into())
+            }
+            _ => Err(format!("Measure has no action {action}")),
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {

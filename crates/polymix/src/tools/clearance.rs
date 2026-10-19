@@ -82,6 +82,60 @@ impl ClearanceTool {
 }
 
 impl Tool for ClearanceTool {
+    fn pending(&self) -> bool {
+        self.dirty && self.other.is_some()
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"other": self.other, "min_clearance_mm": self.min_clearance, "both_ways": self.both_ways}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "other": {"type": "integer", "description": "Object id of the object to measure against"},
+            "min_clearance_mm": {"type": "number", "description": "Closer than this shows red"},
+            "both_ways": {"type": "boolean", "description": "Also colour (and measure from) the other object"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.other = Some(v["other"].as_u64().filter(|id| cx.scene.get(*id).is_some() && Some(*id) != self.object).ok_or("other must be the id of another object")?);
+        self.min_clearance = v["min_clearance_mm"].as_f64().filter(|d| *d >= 0.0).ok_or("min_clearance_mm must be a number ≥ 0")?;
+        self.both_ways = v["both_ways"].as_bool().ok_or("both_ways must be true or false")?;
+        self.compute(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::{round, vec3};
+        serde_json::json!({
+            "object": self.object,
+            "other": self.other,
+            "result": self.result.as_ref().map(|r| serde_json::json!({
+                "intersecting": r.intersecting,
+                "min_distance_mm": round(r.min, 5),
+                "closest_points_mm": [vec3(r.closest.0.to_array(), 4), vec3(r.closest.1.to_array(), 4)],
+                "vertices_closer_than_min_clearance": r.dist_a.iter().filter(|&&d| d < self.min_clearance).count(),
+            })),
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![Action::plain("compute", "Measure again (after the objects changed)")]
+    }
+
+    fn act(&mut self, action: &str, _args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "compute" => {
+                self.compute(cx);
+                Ok(cx.status.clone())
+            }
+            _ => Err(format!("Clearance has no action {action}")),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "Clearance"
     }

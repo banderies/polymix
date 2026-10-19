@@ -17,19 +17,19 @@ use glam::{DVec2, DVec3};
 use mm_core::{topology, Mesh};
 use mm_repair::sparse::{solve_pcg, CsrMatrix, PcgParams};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum UnwrapElements {
     Components,
     Groups,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum UnwrapType {
     Conformal,
     Rigid,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum Packing {
     /// Every chart at the sheet origin.
     Stacked,
@@ -39,7 +39,7 @@ pub enum Packing {
     Optimized,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct UnwrapParams {
     pub elements: UnwrapElements,
     pub kind: UnwrapType,

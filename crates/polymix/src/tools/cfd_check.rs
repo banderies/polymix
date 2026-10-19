@@ -73,6 +73,57 @@ impl CfdCheckTool {
     pub fn new(cx: &mut ToolCx) -> Self {
         Self { object: cx.scene.active, job: None, report: None, analyzed: 0, request: None }
     }
+
+    /// Check the object's current mesh unless that is done or under way (`again`: check anew).
+    fn check(&mut self, cx: &mut ToolCx, again: bool) {
+        let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
+        let version = o.mesh.shape_version();
+        if self.analyzed != version {
+            // Never show (or act on) a report for a different mesh.
+            self.report = None;
+        }
+        if self.job.is_none() && (again || self.report.is_none() || self.analyzed != version) {
+            let m = o.mesh.clone();
+            self.analyzed = version;
+            self.job = Some(Job::spawn("CFD check", cx.egui.clone(), move |_| Ok(analyze(&m))));
+        }
+    }
+
+    fn poll(&mut self) {
+        if let Some(r) = self.job.as_ref().and_then(|j| j.poll()) {
+            self.job = None;
+            if let Ok(r) = r {
+                self.report = Some(r);
+            }
+        }
+    }
+
+    fn select_intersecting(&self, cx: &mut ToolCx, tris: &[u32]) {
+        cx.history.push("Select intersecting", cx.scene);
+        if let Some(o) = self.object.and_then(|id| cx.scene.get_mut(id)) {
+            let m = o.mesh.clone();
+            o.selection.sync(&m);
+            for &t in tris.iter().filter(|&&t| m.is_triangle(t)) {
+                o.selection.insert(t);
+            }
+            o.touch_selection();
+        }
+    }
+}
+
+impl CfdReport {
+    /// Each check: whether it passed (`None`: a warning), and the detail.
+    fn checks(&self) -> [(&'static str, Option<bool>, String); 7] {
+        [
+            ("Watertight", Some(self.open_edges == 0), if self.open_edges == 0 { "no open edges".into() } else { format!("{} open edges", self.open_edges) }),
+            ("Manifold", Some(self.bowties == 0), format!("{} non-manifold vertices", self.bowties)),
+            ("Single shell", Some(self.shells == 1), format!("{} shell(s)", self.shells)),
+            ("Outward orientation", Some(!self.inconsistent && self.volume > 0.0), format!("volume {:.3}", self.volume)),
+            ("No self-intersections", Some(self.self_intersecting.is_empty()), format!("{} intersecting triangles", self.self_intersecting.len())),
+            ("Triangle quality", if self.min_angle_deg >= 10.0 { Some(true) } else { None }, format!("min angle {:.1}°, {:.2}% below 10°", self.min_angle_deg, self.sliver_fraction * 100.0)),
+            ("Boundary patches", if self.groups > 1 { Some(true) } else { None }, if self.groups > 1 { format!("{} face groups (wall + caps)", self.groups) } else { "only one patch: name inlets/outlets for boundary conditions".into() }),
+        ]
+    }
 }
 
 fn status_row(ui: &mut egui::Ui, ok: Option<bool>, label: &str, detail: String) {
@@ -105,53 +156,20 @@ impl Tool for CfdCheckTool {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
         };
-        let version = o.mesh.shape_version();
-        if self.analyzed != version {
-            // Never show (or act on) a report for a different mesh.
-            self.report = None;
-        }
-        if self.job.is_none() && (self.report.is_none() || self.analyzed != version) {
-            let m = o.mesh.clone();
-            self.analyzed = version;
-            self.job = Some(Job::spawn("CFD check", cx.egui.clone(), move |_| Ok(analyze(&m))));
-        }
-        if let Some(j) = &self.job {
-            if let Some(r) = j.poll() {
-                self.job = None;
-                if let Ok(r) = r {
-                    self.report = Some(r);
-                }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Checking…");
-                });
-            }
+        let _ = o;
+        self.check(cx, false);
+        self.poll();
+        if self.job.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking…");
+            });
         }
         let mut open: Option<Box<dyn Tool>> = None;
         if let Some(r) = self.report.clone() {
-            status_row(ui, Some(r.open_edges == 0), "Watertight", if r.open_edges == 0 { "no open edges".into() } else { format!("{} open edges", r.open_edges) });
-            status_row(ui, Some(r.bowties == 0), "Manifold", format!("{} non-manifold vertices", r.bowties));
-            status_row(ui, Some(r.shells == 1), "Single shell", format!("{} shell(s)", r.shells));
-            status_row(ui, Some(!r.inconsistent && r.volume > 0.0), "Outward orientation", format!("volume {:.3}", r.volume));
-            status_row(
-                ui,
-                Some(r.self_intersecting.is_empty()),
-                "No self-intersections",
-                format!("{} intersecting triangles", r.self_intersecting.len()),
-            );
-            status_row(
-                ui,
-                if r.min_angle_deg >= 10.0 { Some(true) } else { None },
-                "Triangle quality",
-                format!("min angle {:.1}°, {:.2}% below 10°", r.min_angle_deg, r.sliver_fraction * 100.0),
-            );
-            status_row(
-                ui,
-                if r.groups > 1 { Some(true) } else { None },
-                "Boundary patches",
-                if r.groups > 1 { format!("{} face groups (wall + caps)", r.groups) } else { "only one patch: name inlets/outlets for boundary conditions".into() },
-            );
+            for (label, ok, detail) in r.checks() {
+                status_row(ui, ok, label, detail);
+            }
             ui.weak(format!("Edge length min {:.4} · mean {:.4} · max {:.4}", r.edge_min, r.edge_mean, r.edge_max));
 
             ui_util::section(ui, "Fix");
@@ -161,15 +179,7 @@ impl Tool for CfdCheckTool {
                 }
                 if !r.self_intersecting.is_empty() {
                     if ui.button("Select intersecting").clicked() {
-                        cx.history.push("Select intersecting", cx.scene);
-                        if let Some(o) = self.object.and_then(|id| cx.scene.get_mut(id)) {
-                            let m = o.mesh.clone();
-                            o.selection.sync(&m);
-                            for &t in r.self_intersecting.iter().filter(|&&t| m.is_triangle(t)) {
-                                o.selection.insert(t);
-                            }
-                            o.touch_selection();
-                        }
+                        self.select_intersecting(cx, &r.self_intersecting);
                     }
                     if ui.button("Make Solid").on_hover_text("Rebuilds a clean, non-intersecting surface").clicked() {
                         open = Some(Box::new(crate::tools::ops::MakeSolidTool::new(cx)));
@@ -193,5 +203,72 @@ impl Tool for CfdCheckTool {
 
     fn take_request(&mut self) -> Option<Box<dyn Tool>> {
         self.request.take()
+    }
+
+    fn busy(&self) -> Option<(String, f32)> {
+        self.job.as_ref().map(|j| ("Checking for CFD".to_string(), j.progress()))
+    }
+
+    fn pending(&self) -> bool {
+        self.job.is_none() && self.report.is_none() && self.object.is_some()
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::round;
+        use serde_json::json;
+        let current = self.object.and_then(|id| scene.get(id)).is_some_and(|o| o.mesh.shape_version() == self.analyzed);
+        json!({
+            "object": self.object,
+            "checking": self.job.is_some(),
+            "report": self.report.as_ref().map(|r| {
+                let checks = r.checks();
+                json!({
+                    "for_current_mesh": current,
+                    "ready_for_cfd": checks.iter().all(|(_, ok, _)| *ok != Some(false)),
+                    "checks": checks.iter().map(|(label, ok, detail)| json!({"check": label, "result": match ok { Some(true) => "pass", Some(false) => "fail", None => "warning" }, "detail": detail})).collect::<Vec<_>>(),
+                    "edge_length_mm": {"min": round(r.edge_min, 5), "mean": round(r.edge_mean, 5), "max": round(r.edge_max, 5)},
+                })
+            }),
+            "next": if self.report.is_none() { "wait for the check (app_wait)" } else { "fix what fails (open_fix), then check again" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::plain("check", "Check the object again now (the check also reruns by itself when the mesh changes)"),
+            Action::plain("select_intersecting", "Select the self-intersecting triangles the last check found"),
+            Action::new("open_fix", "Open the tool that fixes what failed (the check stays open underneath)", json!({"tool": arg::choice(&["inspector", "makesolid", "remesh", "patches"], "inspector for holes, non-manifold vertices and extra shells; makesolid for self-intersections; remesh for poor triangles; patches to name inlets and outlets")})).required(&["tool"]),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        self.poll();
+        match action {
+            "check" => {
+                self.check(cx, true);
+                Ok("Checking; app_wait, then read the report".into())
+            }
+            "select_intersecting" => {
+                let r = self.report.clone().ok_or("no check yet: app_wait for it")?;
+                if r.self_intersecting.is_empty() {
+                    return Err("the last check found no self-intersections".into());
+                }
+                self.select_intersecting(cx, &r.self_intersecting);
+                Ok(format!("Selected {} intersecting triangles", r.self_intersecting.len()))
+            }
+            "open_fix" => {
+                let tool: Box<dyn Tool> = match Args(args).str("tool")? {
+                    "inspector" => Box::new(crate::tools::inspector::InspectorTool::new(cx)),
+                    "makesolid" => Box::new(crate::tools::ops::MakeSolidTool::new(cx)),
+                    "remesh" => Box::new(crate::tools::ops::RemeshTool::new(cx)),
+                    _ => Box::new(crate::tools::patches::PatchesTool::new(cx)),
+                };
+                let name = tool.name();
+                self.request = Some(tool);
+                Ok(format!("{name} opened over the check"))
+            }
+            _ => Err(format!("Check for CFD has no action {action}")),
+        }
     }
 }

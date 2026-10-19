@@ -1,6 +1,7 @@
 //! Interactive tools. Each tool draws its own property panel, may consume viewport
 //! input, may show a preview mesh, and ends with Accept / Cancel.
 
+pub use polymix_workspace::agent::{arg, Action, Args};
 use crate::camera::Camera;
 use crate::renderer::ColorVertex;
 use crate::scene::{History, ObjectId, Scene, TargetSurface};
@@ -290,6 +291,11 @@ pub trait Tool {
     fn busy(&self) -> Option<(String, f32)> {
         None
     }
+    /// Work waiting for the panel to be drawn (a preview to recompute after a change, an
+    /// accept to finish): not [`Tool::busy`] yet, but not done either.
+    fn pending(&self) -> bool {
+        false
+    }
     /// The settings agents can read and change, as a JSON object (none for most interactive
     /// tools: agents work their panels instead).
     fn settings(&self) -> Option<serde_json::Value> {
@@ -303,9 +309,19 @@ pub trait Tool {
     fn set_settings(&mut self, _settings: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
         Err(format!("{} has no settings agents can set directly; work its panel with app_ui / app_ui_action", self.name()))
     }
-    /// What the panel shows besides the settings (result, errors), for agents.
-    fn report(&self) -> serde_json::Value {
+    /// What the tool holds and shows besides its settings, for agents: picked points,
+    /// readouts, results, warnings, errors.
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
         serde_json::Value::Null
+    }
+    /// What agents can ask the tool to do besides changing settings: its panel's buttons and
+    /// its clicks, as named operations with typed arguments.
+    fn actions(&self) -> Vec<Action> {
+        Vec::new()
+    }
+    /// Do one of [`Tool::actions`] (arguments already checked). `Ok` says what was done.
+    fn act(&mut self, action: &str, _args: &serde_json::Value, _cx: &mut ToolCx) -> Result<String, String> {
+        Err(format!("{} has no action {action}", self.name()))
     }
 }
 
@@ -324,6 +340,14 @@ pub fn merge_settings(settings: &mut serde_json::Value, changes: &serde_json::Va
         }
     }
     Ok(())
+}
+
+/// `params` with `changes` merged in (see [`merge_settings`]), for tools whose settings are a
+/// serde type.
+pub fn merged<T: serde::Serialize + serde::de::DeserializeOwned>(params: &T, changes: &serde_json::Value) -> Result<T, String> {
+    let mut v = serde_json::to_value(params).map_err(|e| e.to_string())?;
+    merge_settings(&mut v, changes)?;
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// A type's JSON Schema for agents.

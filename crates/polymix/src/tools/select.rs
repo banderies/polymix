@@ -559,6 +559,80 @@ impl Tool for SelectTool {
         Some(&mut self.size_pct)
     }
 
+    fn settings(&self) -> Option<serde_json::Value> {
+        let mode = match self.mode {
+            SelectMode::Brush => "brush",
+            SelectMode::Lasso => "lasso",
+            SelectMode::Wand => "wand",
+        };
+        Some(serde_json::json!({
+            "mode": mode, "size_percent": self.size_pct, "visible_side_only": self.visible_side_only, "restrict_exterior": self.restrict_exterior,
+            "crease_deg": self.crease_deg, "wand_deg": self.wand_deg, "lasso_through": self.through,
+        }))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "mode": {"type": "string", "enum": ["brush", "lasso", "wand"], "description": "What clicking and dragging do (agents select with mesh_select, or wand_at here)"},
+            "size_percent": {"type": "number", "description": "Brush radius as a percentage of the object's size"},
+            "visible_side_only": {"type": "boolean", "description": "The brush keeps to faces turned the same way as the one under it"},
+            "restrict_exterior": {"type": "boolean", "description": "Skip faces buried inside other parts of the mesh"},
+            "crease_deg": {"type": "number", "description": "Brush spread and growth stop at edges sharper than this (degrees; 0 = off)"},
+            "wand_deg": {"type": "number", "description": "Magic wand: largest angle between a face's normal and the picked face's (1..90)"},
+            "lasso_through": {"type": "boolean", "description": "Lasso selects through the model"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let a = Args(&v);
+        self.mode = match a.opt_str("mode") {
+            Some("lasso") => SelectMode::Lasso,
+            Some("wand") => SelectMode::Wand,
+            _ => SelectMode::Brush,
+        };
+        self.size_pct = (a.f64("size_percent")? as f32).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        self.visible_side_only = a.opt_bool("visible_side_only").unwrap_or(self.visible_side_only);
+        self.restrict_exterior = a.opt_bool("restrict_exterior").unwrap_or(self.restrict_exterior);
+        self.crease_deg = (a.f64("crease_deg")? as f32).clamp(0.0, 180.0);
+        self.wand_deg = (a.f64("wand_deg")? as f32).clamp(1.0, 90.0);
+        self.through = a.opt_bool("lasso_through").unwrap_or(self.through);
+        Ok(())
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        serde_json::json!({
+            "object": scene.active,
+            "selected_triangles": scene.active().map(|o| o.selection.len()),
+            "note": "mesh_selection describes the selection; mesh_select changes it; mesh_edit acts on it (discard, separate, …)",
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![Action::new(
+            "wand_at",
+            "Magic wand: add (or remove) the connected faces turned nearly the same way as the face nearest `at` (within wand_deg, stopping at creases)",
+            json!({"at": arg::point("A point on or near the surface, mm"), "deselect": arg::boolean("Remove them from the selection instead")}),
+        )
+        .required(&["at"])]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "wand_at" => {
+                let id = cx.scene.active.ok_or("no active object")?;
+                let o = cx.scene.get_mut(id).ok_or("no object")?;
+                let h = o.bvh().nearest(&o.mesh, DVec3::from_array(a.point("at")?), f64::INFINITY).ok_or("no surface")?;
+                self.wand(cx, id, h.tid, a.opt_bool("deselect").unwrap_or(false));
+                Ok(cx.status.clone())
+            }
+            _ => Err(format!("Select has no action {action}")),
+        }
+    }
+
     fn survives_scene_change(&self) -> bool {
         true
     }

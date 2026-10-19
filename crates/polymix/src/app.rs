@@ -703,8 +703,14 @@ impl MeshWorkspace {
 
     /// Add meshes made in another workspace (Segmentation's Make mesh), in file coordinates
     /// (LPS, Z up, like 3D Slicer's model files): they go through the import prompts like
-    /// imported files.
-    pub fn add_meshes(&mut self, meshes: Vec<(String, Mesh)>) {
+    /// imported files, unless they were made for an agent.
+    pub fn add_meshes(&mut self, meshes: Vec<(String, Mesh)>, by_agent: bool) {
+        if by_agent {
+            // Added without prompts, labelled as the agent's.
+            self.agent_import = true;
+            self.history.by_agent = true;
+            self.agent_quiet_frames = 0;
+        }
         let mut meshes: Vec<(String, Mesh, String)> = meshes
             .into_iter()
             .map(|(name, mesh)| {
@@ -3119,6 +3125,11 @@ impl polymix_workspace::Workspace for MeshWorkspace {
 
     fn tick(&mut self, ctx: &egui::Context, active: bool) {
         self.poll_jobs();
+        if self.agent_import {
+            // An agent's import asks nothing, so it needs no drawn frame (the window may be
+            // covered).
+            self.finish_import(ctx);
+        }
         self.autosave_tick(ctx);
         if self.history.by_agent {
             self.agent_quiet_frames = if self.agent_quiet() { self.agent_quiet_frames + 1 } else { 0 };
@@ -3157,7 +3168,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     }
 
     fn script_idle(&self) -> bool {
-        let busy = self.import_job.is_some() || self.project_job.is_some() || self.export_job.is_some() || self.pending_import.is_some() || self.tool_busy() || !self.synthetic.is_empty();
+        let busy = self.import_job.is_some() || self.project_job.is_some() || self.export_job.is_some() || self.pending_import.is_some() || self.tool_busy() || self.tools.last().is_some_and(|t| t.pending()) || !self.synthetic.is_empty();
         !busy && self.script.as_ref().is_none_or(|s| s.steps.is_empty() && s.wait == 0)
     }
 

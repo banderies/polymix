@@ -20,7 +20,18 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Agents' work waits for drawn frames; none for this long means the window is not drawn
+/// (eframe draws nothing while it is covered or minimized).
+const NOT_DRAWN_AFTER: Duration = Duration::from_millis(750);
+/// With "Bring Polymix forward" on: bring the window forward after this long without a frame,
+/// and give it this long to be drawn then.
+const BRING_FORWARD_AFTER: Duration = Duration::from_millis(250);
+const NOT_DRAWN_AFTER_BRINGING: Duration = Duration::from_millis(2000);
+/// How long after an agent's change its work in the Mesh workspace counts as the agent's.
+const AGENT_WORK: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -82,12 +93,21 @@ pub struct PolymixApp {
     ui_access: crate::ui_access::UiAccess,
     /// `app_wait` calls, answered when every workspace is idle or their time is up.
     waits: Vec<Wait>,
+    /// Screenshots asked for: the callback takes the call when the frame is drawn, or the
+    /// watchdog when no frame comes.
+    shots: Vec<Arc<Mutex<Option<Call>>>>,
+    /// Since when agents' work has waited for a frame (cleared by every drawn frame).
+    want_frame: Option<Instant>,
+    /// The window was brought forward for the current wait.
+    brought_forward: bool,
+    /// Until when work in the Mesh workspace is an agent's (after its last change).
+    agent_work_until: Option<Instant>,
 }
 
 struct Wait {
     call: Call,
-    start: f64,
-    until: f64,
+    start: Instant,
+    until: Instant,
     /// Frames in a row with every workspace idle.
     quiet: u32,
 }
@@ -139,11 +159,10 @@ impl PolymixApp {
             active = Tab::Volume;
         }
         // Every workspace's agent tools are listed, even those of a workspace that failed to start.
-        let tools = agents::shell_tools().into_iter().chain(VolumeWorkspace::agent_tools()).chain(SegmentationWorkspace::agent_tools()).chain(MeshWorkspace::agent_tools()).collect();
-        let mut agents = AgentAccess::new(storage, tools);
+        let mut agents = AgentAccess::new(storage, agents::all_tools());
         agents.start_if_enabled(ctx);
         let ui_access = crate::ui_access::UiAccess::new(ctx);
-        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new() }
+        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -289,6 +308,7 @@ impl PolymixApp {
             if let Some(tab) = call.tool.split('_').next().and_then(Tab::from_key) {
                 self.active = tab;
             }
+            self.agent_work_until = Some(Instant::now() + AGENT_WORK);
         }
         // Patients' names can turn up in any text (object names come from file names).
         let mask = self.volume.live().map(|w| w.agent_mask());
@@ -297,9 +317,9 @@ impl PolymixApp {
             "app_log" => agents::masked(Ok(agents::log(&call.args)), mask.as_ref()),
             "app_screenshot" => return self.agent_screenshot(call, ctx),
             "app_wait" => {
-                let now = ctx.input(|i| i.time);
-                let seconds = polymix_workspace::agent::arg_usize(&call.args, "seconds", 10, 1, 25) as f64;
-                self.waits.push(Wait { call, start: now, until: now + seconds, quiet: 0 });
+                let now = Instant::now();
+                let seconds = polymix_workspace::agent::arg_usize(&call.args, "seconds", 10, 1, 25) as u64;
+                self.waits.push(Wait { call, start: now, until: now + Duration::from_secs(seconds), quiet: 0 });
                 ctx.request_repaint();
                 return;
             }
@@ -329,9 +349,9 @@ impl PolymixApp {
             },
             tool => {
                 let (name, r) = match tool.split('_').next().unwrap_or("") {
-                    "volume" => ("Volume", self.volume.call(|w| w.agent_call(tool, &call.args, ctx))),
-                    "segmentation" => ("Segmentation", self.segmentation.call(|w| w.agent_call(tool, &call.args, ctx))),
-                    "mesh" => ("Mesh", self.mesh.call(|w| w.agent_call(tool, &call.args, ctx))),
+                    "volume" => ("Volume", self.volume.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
+                    "segmentation" => ("Segmentation", self.segmentation.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
+                    "mesh" => ("Mesh", self.mesh.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
                     _ => ("", Some(AgentReply::error(format!("unknown tool {tool}")))),
                 };
                 match r {
@@ -377,13 +397,13 @@ impl PolymixApp {
         if self.waits.is_empty() {
             return;
         }
-        let now = ctx.input(|i| i.time);
-        let idle = self.volume.live().is_none_or(|w| w.script_idle()) && self.segmentation.live().is_none_or(|w| w.script_idle()) && self.mesh.live().is_none_or(|w| w.script_idle());
+        let now = Instant::now();
+        let idle = self.all_idle();
         let mask = self.volume.live().map(|w| w.agent_mask());
         for mut w in std::mem::take(&mut self.waits) {
             w.quiet = if idle { w.quiet + 1 } else { 0 };
             if w.quiet >= 3 || now >= w.until {
-                let v = json!({"idle": w.quiet >= 3, "waited_s": polymix_workspace::agent::round(now - w.start, 2), "status": self.agent_status(ctx)});
+                let v = json!({"idle": w.quiet >= 3, "waited_s": polymix_workspace::agent::round((now - w.start).as_secs_f64(), 2), "status": self.agent_status(ctx)});
                 w.call.answer(agents::masked(Ok(v), mask.as_ref()));
             } else {
                 self.waits.push(w);
@@ -394,14 +414,67 @@ impl PolymixApp {
         }
     }
 
+    fn all_idle(&self) -> bool {
+        self.volume.live().is_none_or(|w| w.script_idle()) && self.segmentation.live().is_none_or(|w| w.script_idle()) && self.mesh.live().is_none_or(|w| w.script_idle())
+    }
+
     /// Ask for a screenshot of the next frame; the callback hands it to the server to encode.
     fn agent_screenshot(&mut self, call: Call, ctx: &egui::Context) {
         if let Err(e) = self.identifiers_hidden() {
             return call.answer(Reply::Error(e));
         }
         let max = polymix_workspace::agent::arg_usize(&call.args, "max_size", 1568, 256, 4096);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| call.answer(Reply::Later(Box::new(move || agents::png(&img, max)))))));
+        let slot = Arc::new(Mutex::new(Some(call)));
+        self.shots.push(slot.clone());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
+            if let Some(call) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                call.answer(Reply::Later(Box::new(move || agents::png(&img, max))));
+            }
+        })));
         ctx.request_repaint();
+    }
+
+    /// Agents' requests that need the window drawn (screenshots, panels, and the agent's work
+    /// in the Mesh workspace: tool previews, clicks, files opening) get it drawn, or are told
+    /// why it is not: eframe draws nothing while the window is covered or minimized. With
+    /// "Bring Polymix forward" on, the window first comes to the front, keyboard focus staying
+    /// where it is.
+    fn watch_drawing(&mut self, ctx: &egui::Context) {
+        self.shots.retain(|s| s.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        let agent_work = self.agent_work_until.is_some_and(|t| Instant::now() < t) || !self.waits.is_empty();
+        let mesh_busy = self.mesh.live().is_some_and(|w| !w.script_idle());
+        if self.shots.is_empty() && !self.ui_access.is_waiting() && !(agent_work && mesh_busy) {
+            self.want_frame = None;
+            self.brought_forward = false;
+            return;
+        }
+        let waited = self.want_frame.get_or_insert_with(Instant::now).elapsed();
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let bring = self.agents.brings_forward();
+        if bring && !self.brought_forward && waited > BRING_FORWARD_AFTER {
+            agents::bring_to_front();
+            self.brought_forward = true;
+        }
+        if waited < if bring { NOT_DRAWN_AFTER_BRINGING } else { NOT_DRAWN_AFTER } {
+            return;
+        }
+        log::info!("agent work waits for frames, and the window is not drawn");
+        for slot in self.shots.drain(..) {
+            if let Some(call) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                call.answer(Reply::Error(agents::not_drawn("take a screenshot")));
+            }
+        }
+        self.ui_access.fail_waiting(&agents::not_drawn("read or work its panels"));
+        if !self.all_idle() {
+            let mask = self.volume.live().map(|w| w.agent_mask());
+            for w in std::mem::take(&mut self.waits) {
+                let v = json!({"idle": false, "drawn": false, "note": agents::not_drawn("finish tool previews, clicks or opening files"), "status": self.agent_status(ctx)});
+                w.call.answer(agents::masked(Ok(v), mask.as_ref()));
+            }
+        }
+        // Start over: the next request gets its own chance.
+        self.want_frame = None;
+        self.brought_forward = false;
     }
 
     /// Whether the shown workspace has finished the script steps handed to it.
@@ -473,6 +546,8 @@ impl PolymixApp {
                 })));
             }
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            // window:minimize / window:restore — e.g. to test what happens while it is not drawn.
+            "window" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(arg == "minimize")),
             // ws:volume — show a workspace.
             "ws" => {
                 if let Some(t) = Tab::from_key(arg) {
@@ -541,8 +616,8 @@ impl eframe::App for PolymixApp {
             }
         }
         // Meshes made in Segmentation go to Mesh, which is shown.
-        if let Some(meshes) = self.segmentation.call(|w| w.take_meshes()).filter(|m| !m.is_empty()) {
-            self.mesh.call(|w| w.add_meshes(meshes));
+        if let Some((meshes, by_agent)) = self.segmentation.call(|w| w.take_meshes()).filter(|(m, _)| !m.is_empty()) {
+            self.mesh.call(|w| w.add_meshes(meshes, by_agent));
             self.active = Tab::Mesh;
         }
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
@@ -551,11 +626,20 @@ impl eframe::App for PolymixApp {
         self.serve_agents(ctx);
         self.finish_waits(ctx);
         self.ui_access.tick(ctx);
+        self.watch_drawing(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.frames += 1;
+        // Drawn: whatever waited for a frame gets it now.
+        self.want_frame = None;
+        self.brought_forward = false;
+        // Agents' panel actions, for the widgets about to be drawn.
+        let actions = self.ui_access.take_actions();
+        if !actions.is_empty() {
+            ctx.input_mut(|i| i.events.extend(actions));
+        }
         let mut open: Vec<PathBuf> = std::mem::take(&mut self.pending_open);
         #[cfg(target_os = "macos")]
         open.extend(crate::macos_open::take());
@@ -594,7 +678,6 @@ impl eframe::App for PolymixApp {
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        raw_input.events.extend(self.ui_access.take_actions());
         if let Some(script) = &mut self.script {
             for key in script.keys.drain(..) {
                 for pressed in [true, false] {

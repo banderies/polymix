@@ -107,6 +107,63 @@ impl Tool for StampTool {
         "Stamp"
     }
 
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"stencil": self.name_of(), "mode": if self.mode == StampMode::Hole { "hole" } else { "face_group" }, "rotation_deg": self.rotation, "whole_unit_sizes": self.snap}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        let names: Vec<&str> = self.stencils.iter().map(|s| s.0.as_str()).collect();
+        Some(serde_json::json!({"type": "object", "properties": {
+            "stencil": {"type": "string", "enum": names, "description": "The outline stamped (built-in shapes, then the user's own)"},
+            "mode": {"type": "string", "enum": ["face_group", "hole"], "description": "The inside becomes a new face group, or is removed"},
+            "rotation_deg": {"type": "number", "description": "Turn the stencil in its plane, degrees"},
+            "whole_unit_sizes": {"type": "boolean", "description": "Round diameters to whole millimetres"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let name = v["stencil"].as_str().unwrap_or_default().to_string();
+        self.choice = self.stencils.iter().position(|s| s.0 == name).ok_or_else(|| format!("no stencil {name}"))?;
+        self.mode = if v["mode"] == "hole" { StampMode::Hole } else { StampMode::FaceGroup };
+        self.rotation = v["rotation_deg"].as_f64().ok_or("rotation_deg must be a number")?;
+        self.snap = v["whole_unit_sizes"].as_bool().unwrap_or(false);
+        Ok(())
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![Action::new(
+            "stamp_at",
+            "Cut the stencil into the active object, centred at the surface point nearest `at` and facing out of the surface there (as pressing there and dragging to the size does)",
+            json!({"at": arg::point("Centre, mm"), "diameter_mm": arg::number("The stamp's size"), "up": arg::point("Which way the stencil's top points (default the view's up)")}),
+        )
+        .required(&["at", "diameter_mm"])]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "stamp_at" => {
+                let id = cx.scene.active.ok_or("no active object")?;
+                let o = cx.scene.get_mut(id).ok_or("no object")?;
+                let h = o.bvh().nearest(&o.mesh, DVec3::from_array(a.point("at")?), f64::INFINITY).ok_or("no surface")?;
+                let n = o.mesh.triangle(h.tid).iter().map(|&v| o.mesh.vertex_normal(v)).sum::<DVec3>().normalize_or(o.mesh.tri_normal(h.tid));
+                let up = a.opt_point("up").map(DVec3::from_array).unwrap_or_else(|| cx.camera.up());
+                let d = a.f64("diameter_mm")?;
+                if d <= 0.0 {
+                    return Err("diameter_mm must be positive".into());
+                }
+                let drag = StampDrag { object: id, seed: h.tid, frame: StampFrame::new(h.point, n, up), radius: self.snapped(0.5 * d) };
+                let before = cx.history.generation();
+                self.apply(drag, cx);
+                if cx.history.generation() == before { Err(cx.status.clone()) } else { Ok(cx.status.clone()) }
+            }
+            _ => Err(format!("Stamp has no action {action}")),
+        }
+    }
+
     fn shows_groups(&self) -> bool {
         true
     }

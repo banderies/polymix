@@ -281,6 +281,72 @@ impl Tool for BooleanTool {
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|(_, j)| ("Boolean".to_string(), j.progress()))
     }
+
+    fn pending(&self) -> bool {
+        self.job.is_none() && self.error.is_none() && self.key().is_some() && self.result.as_ref().is_none_or(|(k, _)| Some(*k) != self.key())
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        let op = match self.op {
+            Op::Union => "union",
+            Op::Difference => "difference",
+            Op::Intersection => "intersection",
+        };
+        let solution = match self.solution {
+            Solution::FastApproximate => "fast_approximate",
+            Solution::Precise => "precise",
+            Solution::MaxQuality => "max_quality",
+        };
+        Some(serde_json::json!({"with": self.other, "operation": op, "solution": solution, "accuracy": self.accuracy, "auto_reduce": self.auto_reduce, "target_edge_scale": self.target_edge_scale, "merge_border_rings": self.merge_rings}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "with": {"type": "integer", "description": "Object id of the other operand (it is removed when the result is accepted)"},
+            "operation": {"type": "string", "enum": ["union", "difference", "intersection"], "description": "Difference removes the other object from the active one"},
+            "solution": {"type": "string", "enum": ["fast_approximate", "precise", "max_quality"], "description": "fast_approximate: volumetric, robust to open or messy input, the whole result re-meshed; precise: exact, needs closed meshes; max_quality: exact, then remeshes a band around the seam"},
+            "accuracy": {"type": "number", "description": "fast_approximate: 0..1 (64 to 1024 cells across)"},
+            "auto_reduce": {"type": "boolean", "description": "precise: collapse the slivers the cut leaves along the seam"},
+            "target_edge_scale": {"type": "number", "description": "max_quality: edge length around the seam relative to the inputs' (0.25..4)"},
+            "merge_border_rings": {"type": "integer", "description": "max_quality: width of the remeshed band, in triangle rings (1..6)"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.other = Some(v["with"].as_u64().filter(|id| cx.scene.get(*id).is_some() && Some(*id) != self.object).ok_or("with must be the id of another object")?);
+        self.op = match v["operation"].as_str() {
+            Some("union") => Op::Union,
+            Some("difference") => Op::Difference,
+            Some("intersection") => Op::Intersection,
+            _ => return Err("operation must be union, difference or intersection".into()),
+        };
+        self.solution = match v["solution"].as_str() {
+            Some("fast_approximate") => Solution::FastApproximate,
+            Some("precise") => Solution::Precise,
+            Some("max_quality") => Solution::MaxQuality,
+            _ => return Err("solution must be fast_approximate, precise or max_quality".into()),
+        };
+        self.accuracy = v["accuracy"].as_f64().ok_or("accuracy must be a number")?.clamp(0.0, 1.0);
+        self.auto_reduce = v["auto_reduce"].as_bool().ok_or("auto_reduce must be true or false")?;
+        self.target_edge_scale = v["target_edge_scale"].as_f64().ok_or("target_edge_scale must be a number")?.clamp(0.25, 4.0);
+        self.merge_rings = (v["merge_border_rings"].as_u64().ok_or("merge_border_rings must be a whole number")? as u32).clamp(1, 6);
+        self.error = None;
+        self.start(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        serde_json::json!({
+            "object": self.object,
+            "with": self.other,
+            "computing": self.job.as_ref().map(|(_, j)| polymix_workspace::agent::round(j.progress() as f64, 2)),
+            "result": self.result.as_ref().map(|(k, m)| serde_json::json!({"triangles": m.triangle_count(), "for_current_settings": Some(*k) == self.key(), "note": (!self.note.is_empty()).then(|| self.note.clone())})),
+            "error": self.error,
+            "next": if self.error.is_some() { "try solution fast_approximate (works on open or messy meshes)" } else { "accept (mesh_tool accept) once the result is ready" },
+        })
+    }
 }
 
 #[cfg(test)]

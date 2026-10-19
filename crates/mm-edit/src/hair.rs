@@ -7,7 +7,7 @@ use crate::tube_mesh;
 use glam::DVec3;
 use mm_core::{Bvh, Mesh};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct HairParams {
     /// Strands.
     pub count: usize,
@@ -24,6 +24,8 @@ pub struct HairParams {
     /// 0..1.
     pub gravity: f64,
     /// Direction gravity pulls.
+    #[serde(skip)]
+    #[schemars(skip)]
     pub down: DVec3,
     /// Push strands out of the object.
     pub collisions: bool,

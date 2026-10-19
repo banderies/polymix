@@ -47,6 +47,7 @@ impl SegmentationWorkspace {
         }
         if cancel {
             self.running = None;
+            self.agent_op = false;
         }
         if let Some((m, error)) = &self.message {
             if *error {

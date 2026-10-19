@@ -87,7 +87,11 @@ pub struct DeviationTool {
 type MeshKey = (usize, u64, usize, u64);
 
 fn mesh_key(cx: &ToolCx, a: ObjectId, b: ObjectId) -> Option<MeshKey> {
-    let (ma, mb) = (&cx.scene.get(a)?.mesh, &cx.scene.get(b)?.mesh);
+    scene_key(cx.scene, a, b)
+}
+
+fn scene_key(scene: &Scene, a: ObjectId, b: ObjectId) -> Option<MeshKey> {
+    let (ma, mb) = (&scene.get(a)?.mesh, &scene.get(b)?.mesh);
     Some((Arc::as_ptr(ma) as usize, ma.shape_version(), Arc::as_ptr(mb) as usize, mb.shape_version()))
 }
 
@@ -135,6 +139,108 @@ impl DeviationTool {
 impl Tool for DeviationTool {
     fn name(&self) -> &'static str {
         "Deviation"
+    }
+
+    fn busy(&self) -> Option<(String, f32)> {
+        self.job.as_ref().map(|_| ("Deviation".to_string(), 0.5))
+    }
+
+    fn pending(&self) -> bool {
+        self.job.is_none() && self.result.is_none() && self.reference.is_some()
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"reference": self.reference, "colour_range_mm": (!self.auto_range).then_some(self.range)}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "reference": {"type": "integer", "description": "Object id of the reference (e.g. a duplicate of the original segmentation)"},
+            "colour_range_mm": {"type": ["number", "null"], "description": "Distance shown at full colour (±), mm; null for automatic (the 95th percentile)"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let reference = v["reference"].as_u64().filter(|id| cx.scene.get(*id).is_some() && Some(*id) != self.object).ok_or("reference must be the id of another object")?;
+        match &v["colour_range_mm"] {
+            serde_json::Value::Null => self.auto_range = true,
+            x => {
+                self.range = x.as_f64().filter(|r| *r > 0.0).ok_or("colour_range_mm must be a positive number or null")?;
+                self.auto_range = false;
+            }
+        }
+        if Some(reference) != self.reference {
+            self.reference = Some(reference);
+            self.clear(cx);
+            self.result = None;
+            self.start(cx);
+        } else {
+            if let (true, Some((_, r))) = (self.auto_range, &self.result) {
+                self.range = r.stats.p95.max(r.stats.mean_abs * 2.0).max(1e-9);
+            }
+            self.apply_colors(cx);
+        }
+        Ok(())
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::round;
+        use serde_json::json;
+        let current = self.object.zip(self.reference).and_then(|(a, b)| scene_key(scene, a, b));
+        json!({
+            "object": self.object,
+            "reference": self.reference,
+            "computing": self.job.is_some(),
+            "statistics_mm": self.result.as_ref().map(|(key, r)| {
+                let s = &r.stats;
+                json!({
+                    "for_current_meshes": Some(*key) == current,
+                    "mean_abs": round(s.mean_abs, 5),
+                    "rms": round(s.rms, 5),
+                    "p95": round(s.p95, 5),
+                    "max_outward": round(s.max_out, 5),
+                    "max_inward": round(s.max_in, 5),
+                    "hausdorff_symmetric": round(s.max_out.max(s.max_in).max(s.reverse_max), 5),
+                })
+            }),
+            "colour_range_mm": round(self.range, 5),
+            "sign": "positive = outside the reference, negative = inside",
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![
+            Action::plain("compute", "Compute the distances to the reference again"),
+            Action::plain("duplicate_as_reference", "Duplicate the active object to serve as the reference (before changing the original)"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, _args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "compute" => {
+                if self.reference.is_none() {
+                    return Err("set a reference first (settings reference)".into());
+                }
+                self.clear(cx);
+                self.result = None;
+                self.start(cx);
+                Ok("Computing; app_wait, then read the statistics".into())
+            }
+            "duplicate_as_reference" => {
+                let a = self.object.filter(|id| cx.scene.get(*id).is_some()).ok_or("no active object")?;
+                let mut c = crate::commands::CmdCx { scene: cx.scene, history: cx.history, status: cx.status };
+                crate::commands::duplicate_object(&mut c);
+                let copy = cx.scene.active.filter(|id| *id != a);
+                cx.scene.active = Some(a);
+                self.reference = copy;
+                self.result = None;
+                self.start(cx);
+                Ok(format!("Duplicated as reference (object {})", copy.map_or("?".into(), |c| c.to_string())))
+            }
+            _ => Err(format!("Deviation has no action {action}")),
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {

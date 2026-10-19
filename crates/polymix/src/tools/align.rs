@@ -209,7 +209,117 @@ impl AlignTool {
     }
 }
 
+const SOURCES: [(&str, SourceType); 4] = [("center_point", SourceType::CenterPoint), ("base_point", SourceType::BasePoint), ("surface_point", SourceType::SurfacePoint), ("surface_scribble", SourceType::SurfaceScribble)];
+
+impl AlignTool {
+    /// The point of the active object (as it was when the tool opened) nearest `p`, with its
+    /// normal.
+    fn source_at(&self, p: DVec3) -> Option<Frame> {
+        let h = self.bvh.nearest(&self.source, p, f64::INFINITY)?;
+        Some(Frame { p: h.point, n: self.source.tri_normal(h.tid) })
+    }
+}
+
 impl Tool for AlignTool {
+    fn settings(&self) -> Option<serde_json::Value> {
+        let source = SOURCES.iter().find(|(_, s)| *s == self.source_type).map_or("base_point", |(k, _)| *k);
+        let destination = match self.dest {
+            Destination::WorldOrigin(0) => "world_origin_x_up",
+            Destination::WorldOrigin(1) => "world_origin_y_up",
+            Destination::WorldOrigin(_) => "world_origin_z_up",
+            Destination::GroundPlane => "ground_plane",
+            Destination::Surface(..) => "surface_point",
+        };
+        Some(serde_json::json!({"source": source, "destination": destination, "rotate": self.mode == Transformation::TranslateAndRotate, "flip": self.flip}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "source": {"type": "string", "enum": SOURCES.map(|(k, _)| k), "description": "What on the object is aligned: its box centre or base (facing the picked normal, or down), a picked surface point, or the average of a scribble"},
+            "destination": {"type": "string", "enum": ["world_origin_x_up", "world_origin_y_up", "world_origin_z_up", "ground_plane", "surface_point"], "description": "Where it goes: the origin with an axis up, onto the ground plane, or a point picked on another object (pick_destination)"},
+            "rotate": {"type": "boolean", "description": "Turn the source's normal onto the destination's, not only move"},
+            "flip": {"type": "boolean", "description": "Face the other way"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let a = Args(&v);
+        self.source_type = SOURCES.iter().find(|(k, _)| Some(*k) == a.opt_str("source")).map(|(_, s)| *s).ok_or("unknown source")?;
+        self.dest = match a.opt_str("destination") {
+            Some("world_origin_x_up") => Destination::WorldOrigin(0),
+            Some("world_origin_y_up") => Destination::WorldOrigin(1),
+            Some("world_origin_z_up") => Destination::WorldOrigin(2),
+            Some("ground_plane") => Destination::GroundPlane,
+            Some("surface_point") if matches!(self.dest, Destination::Surface(..)) => self.dest,
+            Some("surface_point") => return Err("pick the destination point with pick_destination".into()),
+            _ => return Err("unknown destination".into()),
+        };
+        self.mode = if a.opt_bool("rotate").unwrap_or(true) { Transformation::TranslateAndRotate } else { Transformation::TranslateOnly };
+        self.flip = a.opt_bool("flip").unwrap_or(false);
+        self.rebuild(cx.camera.world_up());
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::vec3;
+        let f = |f: &Frame| serde_json::json!({"at_mm": vec3(f.p.to_array(), 4), "normal": vec3(f.n.to_array(), 4)});
+        serde_json::json!({
+            "object": self.object,
+            "picked_source": self.picked.as_ref().map(f),
+            "scribble_points": self.scribble.len(),
+            "destination_point": match self.dest { Destination::Surface(p, n) => Some(f(&Frame { p, n })), _ => None },
+            "aligned": self.alignment.is_some(),
+            "moves_centre_to_mm": self.alignment.map(|al| vec3(al.apply(self.source.bounds().center()).to_array(), 4)),
+            "next": if self.alignment.is_some() { "accept (mesh_tool accept) to keep the alignment" } else { "pick_source (surface sources) or adjust the settings" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("pick_source", "Use the object's surface point nearest `at` (and its normal) as the source; with source surface_scribble, add it to the scribble", json!({"at": arg::point("A point on or near the object, mm (its position before aligning)")})).required(&["at"]),
+            Action::new("pick_destination", "Align to the point of another visible object nearest `at` (and its normal); sets destination surface_point", json!({"at": arg::point("A point on or near another object, mm")})).required(&["at"]),
+            Action::plain("clear", "Forget the picked source and the scribble"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "pick_source" => {
+                let f = self.source_at(DVec3::from_array(a.point("at")?)).ok_or("the object has no surface")?;
+                if self.source_type == SourceType::SurfaceScribble {
+                    self.scribble.push(f);
+                } else {
+                    self.picked = Some(f);
+                }
+            }
+            "pick_destination" => {
+                let at = DVec3::from_array(a.point("at")?);
+                let mut best: Option<(f64, Frame)> = None;
+                for o in cx.scene.objects.iter_mut().filter(|o| o.visible && Some(o.id) != self.object) {
+                    let bvh = o.bvh();
+                    if let Some(h) = bvh.nearest(&o.mesh, at, f64::INFINITY) {
+                        if best.as_ref().is_none_or(|b| h.dist_sq < b.0) {
+                            best = Some((h.dist_sq, Frame { p: h.point, n: o.mesh.tri_normal(h.tid) }));
+                        }
+                    }
+                }
+                let (_, f) = best.ok_or("there is no other visible object")?;
+                self.dest = Destination::Surface(f.p, f.n);
+            }
+            "clear" => {
+                self.picked = None;
+                self.scribble.clear();
+            }
+            _ => return Err(format!("Align has no action {action}")),
+        }
+        self.rebuild(cx.camera.world_up());
+        Ok(if self.alignment.is_some() { "Previewing the alignment".into() } else { "Picked; the source needs a point".into() })
+    }
+
     fn name(&self) -> &'static str {
         "Align"
     }

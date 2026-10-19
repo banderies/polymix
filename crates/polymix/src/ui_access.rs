@@ -52,8 +52,8 @@ struct Waiting {
 
 pub struct UiAccess {
     captured: Arc<Mutex<Captured>>,
-    /// Input time until which AccessKit stays on.
-    on_until: Option<f64>,
+    /// When AccessKit is turned off again.
+    on_until: Option<std::time::Instant>,
     waiting: Vec<Waiting>,
     /// Actions for the next frame's input.
     actions: Vec<ActionRequest>,
@@ -74,7 +74,7 @@ impl UiAccess {
         if self.on_until.is_none() {
             ctx.enable_accesskit();
         }
-        self.on_until = Some(ctx.input(|i| i.time) + KEEP_ON);
+        self.on_until = Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(KEEP_ON));
         ctx.request_repaint();
     }
 
@@ -106,7 +106,22 @@ impl UiAccess {
         }
     }
 
-    /// The actions for this frame's input (from `raw_input_hook`).
+    /// Calls waiting for a drawn frame.
+    pub fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// The window is not drawn: answer the waiting calls with `why`, and drop the actions so
+    /// none lands later, after the agent was told it failed.
+    pub fn fail_waiting(&mut self, why: &str) {
+        self.actions.clear();
+        for w in self.waiting.drain(..) {
+            w.call.answer(Reply::Error(why.to_string()));
+        }
+    }
+
+    /// The actions for this pass, handed to egui at its start (only a pass that is drawn
+    /// gets them).
     pub fn take_actions(&mut self) -> Vec<egui::Event> {
         self.actions.drain(..).map(egui::Event::AccessKitActionRequest).collect()
     }
@@ -142,13 +157,13 @@ impl UiAccess {
         if !self.waiting.is_empty() || !self.actions.is_empty() {
             ctx.request_repaint();
         } else if let Some(until) = self.on_until {
-            let now = ctx.input(|i| i.time);
+            let now = std::time::Instant::now();
             if now > until {
                 ctx.disable_accesskit();
                 self.on_until = None;
                 self.captured.lock().unwrap_or_else(|e| e.into_inner()).tree = None;
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(until - now));
+                ctx.request_repaint_after(until - now);
             }
         }
     }

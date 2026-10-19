@@ -2,10 +2,11 @@
 
 AI agents (Claude Code, Claude Desktop, Cursor and other [Model Context
 Protocol](https://modelcontextprotocol.io) clients) can work with the session open in Polymix.
-They can read the mesh scene, the image catalog, the segmentation, the log, a screenshot and the
-panels on screen. If you allow it, they can also select, edit, run tools, work the panels and
-open and export files. Use it to debug Polymix with an agent, or to have an agent help with the
-data on screen.
+They can read the mesh scene, every tool's state (picked points, readouts, previews, warnings),
+the image catalog, the segmentation, the log, a screenshot and the panels on screen. If you
+allow it, they can also select, edit, run tools and their actions, segment and prepare images,
+work the panels, and open and export files. Use it to debug Polymix with an agent, or to have an
+agent help with the data on screen.
 
 ## Turning it on
 
@@ -66,48 +67,57 @@ For development and scripted runs:
 | `mesh_scene` | Every object (id, name, counts, open edges, bounds, selection, face groups), active / target object, the tool stack and whether it is computing, status line, undo / redo steps, background jobs, camera, display options |
 | `mesh_object` | One object (`object`: id or name): area, enclosed volume and orientation, edge lengths, validity, shells, numbered open boundaries with perimeters and centres, defects, face groups and patch names, pivots |
 | `mesh_selection` | The selected triangles: count, area, bounds, separate regions, border length, face groups |
-| `mesh_tool_state` | The open tool: computing, settings (with their JSON Schema on request), what it reports |
-| `mesh_tools` | The tools `mesh_tool` opens, and one tool's settings schema |
+| `mesh_tool_state` | The open tool's full state: computing, settings (with their JSON Schema on request), what it holds and shows (picked points, readouts, previews, warnings, errors), and its actions with their arguments |
+| `mesh_tools` | The tools `mesh_tool` opens with their actions, and one tool's settings schema and action arguments |
 | `mesh_select` | all, clear, invert, grow, shrink, connected, …; by face `groups`; the rim of open `boundary` N; triangles `near` a point |
 | `mesh_objects` | Activate, show, hide, rename; set or clear the target |
 | `mesh_edit` | Discard / separate / flip the selection, new face group, duplicate, delete, separate shells, combine, add a shape, clear the scene |
 | `mesh_history` | Undo or redo (`steps`) |
 | `mesh_view` | Standard views, fit, orbit; wireframe, normals, colours, boundaries, grid, orthographic, up axis |
-| `mesh_tool` | open (`tool`, `settings`), set (`settings`), accept, cancel, click (`at`: the surface nearest a point) |
+| `mesh_tool` | open (`tool`, `settings`), set (`settings`), run (`command`, `args`: one of the tool's actions), accept, cancel, click (`at`: the surface nearest a point) |
 | `mesh_file` | Open meshes or a project, export (`scope`), save the project. Absolute paths only; existing files are kept unless `overwrite` |
 
 ### Volume and Segmentation
 
 | Tool | What it does |
 |---|---|
-| `volume_catalog` | Folders, scan state, the DICOM tree (patients numbered), every volume (kind, format, dimensions, spacing), selected and previewed volume (`search`, `limit`) |
+| `volume_catalog` | Folders, scan state, the DICOM tree (patients numbered), every volume (kind, format, dimensions, spacing), selected and previewed volume with its slice and window, image preparation (operation, running, last result) (`search`, `limit`) |
 | `volume_info` | One volume (`volume`): grid and voxel → RAS affine, orientation, data type, warnings, files, header fields by group |
-| `volume_browse` | Select a volume (Segmentation then loads it), go to a slice, add a folder, rescan |
-| `segmentation_state` | The volume shown (grid, value range, window), crosshair voxel / RAS / value, segments with voxel counts and volumes in mL, effect, masking, running operation, message |
+| `volume_do` | Volume's actions: select a volume (Segmentation then shows it), slice, window, add / remove a folder, rescan, cancel the scan, prepare an image (N4, denoise, resample, crop, reorient, register, subtract, normalise, vesselness, slab, time points, phase contrast, de-identified export), cancel it |
+| `segmentation_state` | The volume shown (grid, value range, window), crosshair voxel / RAS / value, segments with voxel counts and volumes in mL, effect and every effect's settings (with Otsu's threshold), masking, undo, display, running operation, message, a waiting volume-switch prompt |
+| `segmentation_do` | Segmentation's actions: add, select, rename / recolour / show / remove segments; threshold (or its preview), paint and erase strokes, flood fill, islands, margin, smoothing, logical operations; apply, cancel; masking; undo, redo; make a mesh for the Mesh tab; save (.seg.nrrd, .nii.gz); move the crosshair; window, opacity and views; answer the volume-switch prompt |
 
 Lengths are in millimetres. Volume numbers stay valid until the folders are scanned again.
 Mesh objects are addressed by their id, which never changes, and open boundaries by the number
-`mesh_object` gives them.
+`mesh_object` gives them. Segmentation positions are RAS millimetres, or voxel indices with
+`in_voxels`, and segments are named by label number or name.
 
-## How agents work a tool
+## How agents work the app
 
-1. **Tools with typed settings.** These are Remesh, Reduce, Smooth, Smooth Boundary, Make
-   Solid, Erase & Fill, Extrude / Extract, Offset, Mirror, Bridge, Close Cracks, Weld
-   Boundaries, Face Groups, Attract / Align To Target, Fit Primitive, Make Pattern and Convex
-   Decomposition. Open one with `settings`, or change them with `set`. Only the keys given
-   change, and a misspelt key is an error that lists the valid ones. Each setting's meaning
-   and range come from the source's doc comments, through the schema in `mesh_tools` and
-   `mesh_tool_state`. The preview recomputes; `app_wait`, then `mesh_tool_state` shows the
-   result and `accept` applies it.
-2. **Tools worked by clicking** (Trim branch, Measure, Add Tube, Align, sculpt brushes, …):
-   `mesh_tool` click with a point in mm. Polymix clicks the visible surface nearest that point.
-   If the point is hidden from the current view, the view first turns to face it, so you see
-   where the click went. Tools that preview a click (Trim) apply it with `accept` and stay open
-   for the next one.
-3. **Everything else a panel offers** (Inspector's *Auto Repair All*, the CFD check's fixes,
-   Boundary patches' names, Segmentation's effects): read the panel with `app_ui` and act with
-   `app_ui_action`. These are the same widgets you use, read from egui's accessibility tree.
-   Buttons that open a file dialog wait for you to answer it.
+Agents read state and act through typed calls first. Screenshots and panel reads are a fallback
+for what the typed calls do not cover.
+
+1. **State.** Every Mesh tool reports what it holds and shows (`mesh_tool_state`): the points
+   picked (a stent's ends with their centres, axes and diameters), measurements, previews and
+   their checks, warnings and errors, and what to do next. `segmentation_state` and
+   `volume_catalog` do the same for the image workspaces.
+2. **Settings.** Every tool with settings takes them as typed JSON: open it with `settings`,
+   or change them with `set`. Only the keys given change, and a misspelt key is an error that
+   lists the valid ones. Each setting's meaning and range come from the source's doc comments,
+   through the schema in `mesh_tools` and `mesh_tool_state`. A preview recomputes; `app_wait`,
+   then `mesh_tool_state` shows the result and `accept` applies it.
+3. **Actions.** What a tool's panel buttons and clicks do is offered as named actions with
+   typed arguments, listed in `mesh_tool_state` and run with `mesh_tool` run. Examples:
+   `set_end` (a stent's end at a point), Trim's `cut_at`, Measure's `measure_between`,
+   Inspector's `repair_all`, the CFD check's `check`, Boundary patches' `rename`. The image
+   workspaces' actions are the tools `volume_do` and `segmentation_do`, whose descriptions list
+   every action with its arguments.
+4. **Clicks.** `mesh_tool` click with a point in mm clicks the visible surface nearest that
+   point, as a user would. If the point is hidden from the current view, the view first turns
+   to face it, so you see where the click went.
+5. **Panels.** Anything else: read the panel with `app_ui` and act with `app_ui_action`. These
+   are the same widgets you use, read from egui's accessibility tree. Buttons that open a file
+   dialog wait for you to answer it.
 
 Work that takes time finishes after a call returns: computing previews, loading and saving,
 and clicks, which land on the next frames. Replies say when something is still pending, and
@@ -128,6 +138,8 @@ Whatever an agent reads is sent to its provider, so agents get less than the win
 - Screenshots and panel reads show the window as it is. They are therefore refused while the
   Volume or Segmentation tab is shown, unless *Hide identifiers* is on. The Mesh tab is always
   allowed.
+- The typed Volume and Segmentation tools work on every tab, whatever *Hide identifiers* is
+  set to, since what they return is masked as above. Segmentation never names the volume.
 
 Masking names in text relies on the DICOM patients the Volume workspace has found. A name in a
 file that is not DICOM and was not matched to a DICOM patient is not known, so it is not
@@ -167,10 +179,18 @@ to ask you before running.
   asks. The agent tools turn their arguments into commands. While an agent's commands (and any
   computing, loading or clicks they started) are under way, `History::by_agent` labels the
   undo steps.
-- **Tool settings.** `OpSpec::Params` derive `serde` and `schemars`. `OpTool` therefore offers
-  `Tool::settings`, `settings_schema`, `set_settings` and `report` for every operation tool,
-  and `tools::ops::settings_schema` gives a tool's schema by name. A test checks that the two
-  agree for every tool.
+- **Tool API.** Every Mesh tool implements `Tool::state` (everything it holds and shows, as
+  JSON), `Tool::settings` / `settings_schema` / `set_settings` (its settings types derive
+  `serde` and `schemars`, so doc comments become the schema's descriptions), and
+  `Tool::actions` / `act`. An `Action` (`polymix_workspace::agent`) is a name, a purpose and
+  the JSON Schema of its arguments; the same description lists it to agents and checks each
+  call (`Action::check`). A test opens every tool in the catalog and checks that its settings,
+  schema and actions agree.
+- **Workspace actions.** A workspace lists its actions (`Workspace::agent_actions`) and does
+  them (`agent_act`). The shell turns them into the tool `<workspace>_do`
+  (`agent::do_tool`), whose description is generated from the actions' signatures, purposes
+  and arguments, and checks each call against them before handing it over. A new action
+  reaches agents without other code.
 - **Panels.** `ui_access.rs` turns egui's AccessKit support on while agents use it. A plugin
   keeps the last frame's tree, and actions go back in as `Event::AccessKitActionRequest` with
   the next frame's input.
@@ -180,8 +200,10 @@ gets an error saying so.
 
 ## Limits
 
-- Segmentation and Volume have no typed editing tools yet. Agents select volumes and work the
-  Segmentation panel through `app_ui`.
+- Segmentation's undo steps are not labelled; its status message says "Agent: …" instead.
+- The image preparation options are keys and values as the panel names them (listed in
+  `volume_do`'s description), not a JSON Schema.
+- *Hide identifiers* and the Volume browser's filters are left to the user.
 - `app_ui` sees the shown tab only, plus open windows. Painted views (the 3D viewport, slice
   views) are not widgets, so `app_screenshot` and the read tools cover them.
 - Nothing is pushed to agents: they ask again (or `app_wait`) to see changes.

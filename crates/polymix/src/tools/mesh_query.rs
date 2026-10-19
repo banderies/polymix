@@ -32,6 +32,16 @@ impl ColorMode {
     fn is_scalar(self) -> bool {
         !matches!(self, ColorMode::VertexPosition | ColorMode::SurfaceNormal)
     }
+    fn key(self) -> &'static str {
+        match self {
+            ColorMode::VertexPosition => "vertex_position",
+            ColorMode::SurfaceNormal => "surface_normal",
+            ColorMode::AspectRatio => "aspect_ratio",
+            ColorMode::InternalAngle => "internal_angle",
+            ColorMode::GaussianCurvature => "gaussian_curvature",
+            ColorMode::MeanCurvature => "mean_curvature",
+        }
+    }
 }
 
 /// What was learned about the clicked triangle.
@@ -57,6 +67,8 @@ pub struct MeshQueryTool {
     curvature: Option<(Vec<f64>, Vec<f64>)>,
     query: Option<Query>,
     dirty: bool,
+    /// The scalar field's distribution and its worst triangles (agents).
+    summary: Option<serde_json::Value>,
 }
 
 /// Blue → cyan → green → yellow → red for `t` in [0, 1].
@@ -76,7 +88,7 @@ fn pack(c: [f64; 3]) -> u32 {
 
 impl MeshQueryTool {
     pub fn new(cx: &mut ToolCx) -> Self {
-        Self { object: cx.scene.active, mode: ColorMode::SurfaceNormal, range: (0.0, 1.0), values: Vec::new(), curvature: None, query: None, dirty: true }
+        Self { object: cx.scene.active, mode: ColorMode::SurfaceNormal, range: (0.0, 1.0), values: Vec::new(), curvature: None, query: None, dirty: true, summary: None }
     }
 
     fn curvatures(&mut self, m: &Mesh) -> &(Vec<f64>, Vec<f64>) {
@@ -102,10 +114,37 @@ impl MeshQueryTool {
                 let (_, h) = self.curvatures(m).clone();
                 tris.iter().for_each(|&t| self.values[t as usize] = per_vertex(&h, t));
             }
-            _ => return,
+            _ => {
+                self.summary = None;
+                return;
+            }
         }
         let mut sorted: Vec<f64> = tris.iter().map(|&t| self.values[t as usize]).filter(|x| x.is_finite()).collect();
         sorted.sort_by(f64::total_cmp);
+        self.summary = (!sorted.is_empty()).then(|| {
+            use polymix_workspace::agent::{round, vec3};
+            let n = sorted.len();
+            let q = |f: f64| round(sorted[((n - 1) as f64 * f) as usize], 6);
+            // Worst: the most elongated (aspect ratio), the sharpest (internal angle), the
+            // most curved (either sign).
+            let badness = |t: u32| match self.mode {
+                ColorMode::InternalAngle => -self.values[t as usize],
+                ColorMode::AspectRatio => self.values[t as usize],
+                _ => self.values[t as usize].abs(),
+            };
+            let mut worst: Vec<u32> = tris.iter().copied().filter(|&t| self.values[t as usize].is_finite()).collect();
+            let k = worst.len().min(5);
+            if k > 0 {
+                worst.select_nth_unstable_by(k - 1, |&a, &b| badness(b).total_cmp(&badness(a)));
+            }
+            worst.truncate(k);
+            worst.sort_by(|&a, &b| badness(b).total_cmp(&badness(a)));
+            serde_json::json!({
+                "triangles": n,
+                "min": q(0.0), "p2": q(0.02), "median": q(0.5), "p98": q(0.98), "max": q(1.0),
+                "worst": worst.iter().map(|&t| serde_json::json!({"triangle": t, "value": round(self.values[t as usize], 6), "centre_mm": vec3(m.tri_centroid(t).to_array(), 3)})).collect::<Vec<_>>(),
+            })
+        });
         if let (Some(_), n) = (sorted.first(), sorted.len()) {
             self.range = (sorted[n * 2 / 100], sorted[(n * 98 / 100).min(n - 1)]);
             if self.range.1 <= self.range.0 {
@@ -239,30 +278,81 @@ impl Tool for MeshQueryTool {
         let Some(pos) = input.pos else { return };
         let Some((id, hit)) = cx.pick(pos, self.object) else { return };
         let Some(m) = cx.scene.get(id).map(|o| o.mesh.clone()) else { return };
-        let t = hit.tid;
-        let tv = m.triangle(t);
-        let angles = mm_core::measure::triangle_angles(&m, t).map(f64::to_degrees);
-        let vertex = tv.into_iter().min_by(|&a, &b| m.vertex(a).distance(hit.point).total_cmp(&m.vertex(b).distance(hit.point))).unwrap_or(tv[0]);
-        let seg = |e: u32| {
-            let [a, b] = m.edge_vertices(e);
-            let (pa, pb) = (m.vertex(a), m.vertex(b));
-            let ab = pb - pa;
-            let s = ((hit.point - pa).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
-            (pa + ab * s).distance(hit.point)
-        };
-        let edge = m.tri_edges(t).into_iter().min_by(|&a, &b| seg(a).total_cmp(&seg(b))).unwrap_or(0);
-        let (k, h) = self.curvatures(&m).clone();
-        self.query = Some(Query {
-            tri: t,
-            group: m.tri_group(t),
-            aspect: mm_core::measure::triangle_aspect_ratio(&m, t),
-            min_angle: angles.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
-            max_angle: angles.iter().fold(0.0, |a, &b| a.max(b)),
-            edge,
-            vertex,
-            gauss: k[vertex as usize],
-            mean: h[vertex as usize],
-        });
+        self.query_at(&m, hit.tid, hit.point);
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"color_mode": self.mode.key(), "range": [self.range.0, self.range.1]}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "color_mode": {"type": "string", "enum": ColorMode::ALL.map(|m| m.key()), "description": "What colours the surface: position, normal, triangle aspect ratio, smallest internal angle (degrees), Gaussian or mean curvature"},
+            "range": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "Values at the two ends of the colour scale (scalar modes)"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let mode = ColorMode::ALL.into_iter().find(|m| v["color_mode"] == m.key()).ok_or("unknown color_mode")?;
+        let m = self.object.and_then(|id| cx.scene.get(id)).map(|o| o.mesh.clone()).ok_or("no active object")?;
+        if mode != self.mode || self.values.len() != m.max_tid() {
+            self.mode = mode;
+            self.compute_values(&m);
+        }
+        if changes.get("range").is_some() {
+            match v["range"].as_array().map(|r| r.iter().filter_map(serde_json::Value::as_f64).collect::<Vec<_>>()).as_deref() {
+                Some([lo, hi]) if hi > lo => self.range = (*lo, *hi),
+                _ => return Err("range must be [min, max] with max > min".into()),
+            }
+        }
+        self.apply(cx);
+        Ok(())
+    }
+
+    fn pending(&self) -> bool {
+        self.dirty && self.object.is_some()
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::round;
+        serde_json::json!({
+            "object": self.object,
+            "color_mode": self.mode.key(),
+            "range": [round(self.range.0, 6), round(self.range.1, 6)],
+            "distribution": self.summary,
+            "queried_triangle": self.query.as_ref().map(|q| serde_json::json!({
+                "triangle": q.tri, "group": q.group, "aspect_ratio": round(q.aspect, 4), "min_angle_deg": round(q.min_angle, 3), "max_angle_deg": round(q.max_angle, 3),
+                "nearest_edge": q.edge, "nearest_vertex": q.vertex, "gaussian_curvature": round(q.gauss, 6), "mean_curvature": round(q.mean, 6),
+            })),
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![
+            Action::new("query_at", "Report the triangle at the surface point nearest `at` (as clicking it does)", serde_json::json!({"at": arg::point("A point in mm")})).required(&["at"]),
+            Action::plain("compute", "Compute the colour field and its distribution now (also done while the panel is shown)"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let id = self.object.ok_or("no active object")?;
+        let m = cx.scene.get(id).map(|o| o.mesh.clone()).ok_or("no active object")?;
+        match action {
+            "query_at" => {
+                let o = cx.scene.get_mut(id).unwrap();
+                let h = o.bvh().nearest(&m, DVec3::from_array(Args(args).point("at")?), f64::INFINITY).ok_or("no surface")?;
+                self.query_at(&m, h.tid, h.point);
+                Ok(format!("Triangle {}", h.tid))
+            }
+            "compute" => {
+                self.compute_values(&m);
+                self.apply(cx);
+                Ok(format!("{} computed", self.mode.label()))
+            }
+            _ => Err(format!("Mesh Query has no action {action}")),
+        }
     }
 
     fn cancel(&mut self, cx: &mut ToolCx) -> bool {
@@ -280,6 +370,36 @@ impl Tool for MeshQueryTool {
     }
 }
 
+
+impl MeshQueryTool {
+    fn query_at(&mut self, m: &Mesh, t: u32, point: DVec3) {
+        let hit = mm_core::bvh::RayHit { tid: t, t: 0.0, point, bary: DVec3::ZERO };
+        let tv = m.triangle(t);
+        let angles = mm_core::measure::triangle_angles(m, t).map(f64::to_degrees);
+        let vertex = tv.into_iter().min_by(|&a, &b| m.vertex(a).distance(hit.point).total_cmp(&m.vertex(b).distance(hit.point))).unwrap_or(tv[0]);
+        let seg = |e: u32| {
+            let [a, b] = m.edge_vertices(e);
+            let (pa, pb) = (m.vertex(a), m.vertex(b));
+            let ab = pb - pa;
+            let s = ((hit.point - pa).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
+            (pa + ab * s).distance(hit.point)
+        };
+        let edge = m.tri_edges(t).into_iter().min_by(|&a, &b| seg(a).total_cmp(&seg(b))).unwrap_or(0);
+        let (k, h) = self.curvatures(m).clone();
+        self.query = Some(Query {
+            tri: t,
+            group: m.tri_group(t),
+            aspect: mm_core::measure::triangle_aspect_ratio(m, t),
+            min_angle: angles.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+            max_angle: angles.iter().fold(0.0, |a, &b| a.max(b)),
+            edge,
+            vertex,
+            gauss: k[vertex as usize],
+            mean: h[vertex as usize],
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +407,7 @@ mod tests {
     #[test]
     fn colours_and_ranges() {
         let m = mm_core::primitives::icosphere(2.0, 3);
-        let mut t = MeshQueryTool { object: None, mode: ColorMode::MeanCurvature, range: (0.0, 1.0), values: Vec::new(), curvature: None, query: None, dirty: true };
+        let mut t = MeshQueryTool { object: None, mode: ColorMode::MeanCurvature, range: (0.0, 1.0), values: Vec::new(), curvature: None, query: None, dirty: true, summary: None };
         t.compute_values(&m);
         // A sphere's mean curvature is 1/r everywhere, so the automatic range hugs 0.5.
         assert!((t.range.0 - 0.5).abs() < 0.05 && (t.range.1 - 0.5).abs() < 0.05, "{:?}", t.range);

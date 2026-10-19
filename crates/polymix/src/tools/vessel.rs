@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::ui_util;
+use polymix_workspace::agent::{round, vec3};
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Vessel ends (open boundary loops and planar caps)
@@ -125,6 +127,36 @@ fn draw_end_markers(painter: &egui::Painter, cx: &mut ToolCx, ends: &[VesselEnd]
     }
 }
 
+/// Vessel ends as agents read them (numbered from 1, as the markers are).
+fn ends_state(ends: &[VesselEnd], picked: impl Fn(usize) -> bool) -> Vec<Value> {
+    ends.iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let kind = match e.kind {
+                EndKind::Open if e.planar => json!("open end"),
+                EndKind::Open => json!("hole (not flat: fill it with the Inspector)"),
+                EndKind::Cap(g) => json!(format!("flat cap, face group {g}")),
+            };
+            json!({"end": i + 1, "kind": kind, "centre_mm": vec3(e.center.to_array(), 3), "outward": vec3(e.normal.to_array(), 3), "diameter_mm": round(e.diameter, 3), "picked": picked(i)})
+        })
+        .collect()
+}
+
+/// End numbers (from 1) in an action's `ends` argument.
+fn end_numbers(args: &Value, count: usize) -> Result<Vec<usize>, String> {
+    let list = args.get("ends").and_then(Value::as_array).ok_or("`ends` must be a list of end numbers")?;
+    list.iter()
+        .map(|v| match v.as_u64() {
+            Some(k) if k >= 1 && (k as usize) <= count => Ok(k as usize - 1),
+            _ => Err(format!("{v} is not an end number (1 to {count})")),
+        })
+        .collect()
+}
+
+fn ends_arg(about: &str) -> Value {
+    json!({"type": "array", "items": {"type": "integer"}, "description": about})
+}
+
 fn end_under_cursor(cx: &mut ToolCx, ends: &[VesselEnd], pos: egui::Pos2) -> Option<usize> {
     ends.iter()
         .enumerate()
@@ -143,6 +175,14 @@ enum TrimFill {
     Remeshed,
     Flat,
     Open,
+}
+
+impl TrimFill {
+    const KEYS: [(&str, TrimFill); 3] = [("flat_cap_remeshed", TrimFill::Remeshed), ("flat_cap", TrimFill::Flat), ("open", TrimFill::Open)];
+
+    fn key(self) -> &'static str {
+        Self::KEYS.iter().find(|(_, f)| *f == self).map(|(k, _)| *k).unwrap_or("flat_cap_remeshed")
+    }
 }
 
 struct TrimCandidate {
@@ -211,6 +251,54 @@ impl TrimTool {
         }));
     }
 
+    /// A cut across the vessel at the wall point `p` of object `id`.
+    fn cut_at(&mut self, cx: &mut ToolCx, id: ObjectId, p: DVec3) -> Result<f64, String> {
+        self.object = Some(id);
+        cx.scene.active = Some(id);
+        let o = cx.scene.get_mut(id).ok_or("no object")?;
+        let bvh = o.bvh();
+        let mesh = o.mesh.clone();
+        let x = mm_edit::estimate_vessel_cross_section(&mesh, Some(&bvh), p, None).map_err(|e| {
+            self.error = Some(format!("{e}"));
+            format!("{e}")
+        })?;
+        self.cand = Some(TrimCandidate { seed: p, plane: x.plane, radius: x.radius, curve: Vec::new() });
+        self.preview = None;
+        self.refresh_curve(&mesh);
+        self.start(cx);
+        Ok(2.0 * x.radius)
+    }
+
+    /// Move the cut along the vessel (positive: toward the tip, removing less) and / or flip
+    /// which side is removed.
+    fn shift(&mut self, cx: &mut ToolCx, moved: f64, flip: bool) {
+        let Some(c) = &mut self.cand else { return };
+        if moved != 0.0 {
+            c.plane.d += moved;
+            c.seed += c.plane.normal * moved;
+        }
+        if flip {
+            c.plane = mm_core::Plane { normal: -c.plane.normal, d: -c.plane.d };
+        }
+        if let Some(mesh) = self.object.and_then(|id| cx.scene.get(id)).map(|o| o.mesh.clone()) {
+            self.refresh_curve(&mesh);
+            self.start(cx);
+        }
+    }
+
+    fn poll(&mut self) {
+        if let Some(r) = self.job.as_ref().and_then(|j| j.poll()) {
+            self.job = None;
+            match r {
+                Ok(out) => self.preview = Some(out),
+                Err(e) => {
+                    self.preview = None;
+                    self.error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
     fn apply(&mut self, cx: &mut ToolCx) -> bool {
         let Some(out) = self.preview.take() else { return false };
         if Some(out.key) != self.key() {
@@ -259,23 +347,12 @@ impl Tool for TrimTool {
                 self.start(cx);
             }
         });
-        // Poll the preview job.
-        if let Some(j) = &self.job {
-            if let Some(r) = j.poll() {
-                self.job = None;
-                match r {
-                    Ok(out) => self.preview = Some(out),
-                    Err(e) => {
-                        self.preview = None;
-                        self.error = Some(format!("{e:#}"));
-                    }
-                }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Computing cut…");
-                });
-            }
+        self.poll();
+        if self.job.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Computing cut…");
+            });
         }
         if self.cand.is_some() {
             let r = self.cand.as_ref().unwrap().radius;
@@ -297,20 +374,8 @@ impl Tool for TrimTool {
                     self.preview = None;
                 }
             });
-            if let Some(c) = &mut self.cand {
-                if moved != 0.0 {
-                    c.plane.d += moved;
-                    c.seed += c.plane.normal * moved;
-                }
-                if flip {
-                    c.plane = mm_core::Plane { normal: -c.plane.normal, d: -c.plane.d };
-                }
-                if moved != 0.0 || flip {
-                    if let Some(mesh) = self.object.and_then(|id| cx.scene.get(id)).map(|o| o.mesh.clone()) {
-                        self.refresh_curve(&mesh);
-                        self.start(cx);
-                    }
-                }
+            if moved != 0.0 || flip {
+                self.shift(cx, moved, flip);
             }
             if let Some(c) = &self.cand {
                 ui.label(format!("Local diameter ≈ {:.3}", 2.0 * c.radius));
@@ -342,20 +407,7 @@ impl Tool for TrimTool {
         }
         let Some(pos) = input.pos else { return };
         let Some((id, hit)) = cx.pick(pos, None) else { return };
-        self.object = Some(id);
-        cx.scene.active = Some(id);
-        let o = cx.scene.get_mut(id).unwrap();
-        let bvh = o.bvh();
-        let mesh = o.mesh.clone();
-        match mm_edit::estimate_vessel_cross_section(&mesh, Some(&bvh), hit.point, None) {
-            Ok(x) => {
-                self.cand = Some(TrimCandidate { seed: hit.point, plane: x.plane, radius: x.radius, curve: Vec::new() });
-                self.preview = None;
-                self.refresh_curve(&mesh);
-                self.start(cx);
-            }
-            Err(e) => self.error = Some(format!("{e}")),
-        }
+        let _ = self.cut_at(cx, id, hit.point);
     }
 
     fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
@@ -397,6 +449,89 @@ impl Tool for TrimTool {
 
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|j| ("Trim".to_string(), j.progress()))
+    }
+
+    fn settings(&self) -> Option<Value> {
+        Some(json!({"end": self.fill.key()}))
+    }
+
+    fn settings_schema(&self) -> Option<Value> {
+        Some(json!({"type": "object", "properties": {"end": {"type": "string", "enum": TrimFill::KEYS.map(|(k, _)| k), "description": "How the cut end is closed: a flat cap remeshed to the surrounding edge length, a plain flat cap, or left open"}}}))
+    }
+
+    fn set_settings(&mut self, changes: &Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let key = v["end"].as_str().unwrap_or_default();
+        let fill = TrimFill::KEYS.iter().find(|(k, _)| *k == key).map(|(_, f)| *f).ok_or_else(|| format!("end must be one of {:?}", TrimFill::KEYS.map(|(k, _)| k)))?;
+        if fill != self.fill {
+            self.fill = fill;
+            if self.cand.is_some() {
+                self.start(cx);
+            }
+        }
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> Value {
+        let current = self.preview.as_ref().filter(|p| Some(p.key) == self.key());
+        json!({
+            "object": self.object,
+            "cut": self.cand.as_ref().map(|c| json!({
+                "centre_mm": vec3(c.plane.project(c.seed).to_array(), 3),
+                "toward_removed_side": vec3(c.plane.normal.to_array(), 4),
+                "local_diameter_mm": round(2.0 * c.radius, 3),
+                "outline_segments": c.curve.len(),
+            })),
+            "computing": self.job.is_some(),
+            "preview": current.map(|p| p.msg.clone()),
+            "error": self.error,
+            "trimmed_in_this_session": self.trims,
+            "next": if self.cand.is_none() { "cut_at a point on the branch where the inlet / outlet should be" } else if current.is_some() { "apply (or move / flip the cut first)" } else { "wait for the preview (app_wait)" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![
+            Action::new("cut_at", "Place a cut square to the vessel's axis through the wall point nearest `at` (as clicking the branch does); only the part beyond it is removed, previewed", json!({"at": arg::point("A point in mm on or near the branch")})).required(&["at"]),
+            Action::new("move", "Move the cut along the vessel", json!({"mm": arg::number("Distance in mm: positive toward the tip (removing less), negative toward the trunk")})).required(&["mm"]),
+            Action::plain("flip", "Remove the other side of the cut instead"),
+            Action::plain("clear", "Drop the cut"),
+            Action::plain("apply", "Make the previewed cut (the cap becomes a patch named outlet_N); the tool stays open for the next branch"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "cut_at" => {
+                let id = self.object.or(cx.scene.active).ok_or("no active object")?;
+                let o = cx.scene.get_mut(id).ok_or("no object")?;
+                let p = o.bvh().nearest(&o.mesh, DVec3::from_array(a.point("at")?), f64::INFINITY).ok_or("the object has no surface")?.point;
+                let d = self.cut_at(cx, id, p)?;
+                Ok(format!("Cut placed at a ⌀ {d:.2} mm cross-section; previewing"))
+            }
+            "move" | "flip" => {
+                if self.cand.is_none() {
+                    return Err("place a cut first (cut_at)".into());
+                }
+                self.shift(cx, if action == "move" { a.f64("mm")? } else { 0.0 }, action == "flip");
+                Ok(if action == "move" { "Cut moved; previewing".into() } else { "Cut flipped; previewing".into() })
+            }
+            "clear" => {
+                self.cand = None;
+                self.preview = None;
+                Ok("Cut cleared".into())
+            }
+            "apply" => {
+                self.poll();
+                if self.job.is_some() {
+                    return Err("the preview is still being computed: app_wait, then apply".into());
+                }
+                if self.apply(cx) { Ok(cx.status.clone()) } else { Err(self.error.clone().unwrap_or_else(|| "nothing to apply: place a cut first (cut_at)".into())) }
+            }
+            _ => Err(format!("Trim branch has no action {action}")),
+        }
     }
 }
 
@@ -653,6 +788,74 @@ impl Tool for FlowExtensionTool {
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|(_, j)| ("Flow extensions".to_string(), j.progress()))
     }
+
+    fn settings(&self) -> Option<Value> {
+        let p = &self.params;
+        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap}))
+    }
+
+    fn settings_schema(&self) -> Option<Value> {
+        Some(json!({"type": "object", "properties": {
+            "length_in_diameters": {"type": "number", "description": "Extension length as a multiple of each end's diameter (0.5..20), used unless length_mm is set"},
+            "length_mm": {"type": ["number", "null"], "description": "Extension length in mm for every end (0.1..200); null to use length_in_diameters"},
+            "circular": {"type": "boolean", "description": "Blend each extension to a circular cross-section"},
+            "cap": {"type": "boolean", "description": "Cap the extensions' ends"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let p = &mut self.params;
+        p.diameters = v["length_in_diameters"].as_f64().ok_or("length_in_diameters must be a number")?.clamp(0.5, 20.0);
+        p.absolute = match &v["length_mm"] {
+            Value::Null => None,
+            x => Some(x.as_f64().ok_or("length_mm must be a number or null")?.clamp(0.1, 200.0)),
+        };
+        p.circular = v["circular"].as_bool().ok_or("circular must be true or false")?;
+        p.cap = v["cap"].as_bool().ok_or("cap must be true or false")?;
+        self.start(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> Value {
+        let current = self.preview.as_ref().filter(|(p, _)| *p == self.params);
+        json!({
+            "object": self.object,
+            "ends": ends_state(&self.ends, |i| self.params.selected[i]),
+            "computing": self.job.is_some(),
+            "preview": current.map(|(_, out)| out.msg.clone()),
+            "error": self.error,
+            "next": if !self.params.selected.contains(&true) { "select the ends to extend" } else if current.is_some() { "accept (mesh_tool accept) to keep the extensions" } else { "wait for the preview (app_wait)" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![Action::new(
+            "select",
+            "Choose the ends to extend (numbers from the state's ends, as the markers show): replaces the choice unless `add`",
+            json!({"ends": ends_arg("End numbers (from 1)"), "add": arg::boolean("Add to the ends already chosen")}),
+        )
+        .required(&["ends"])]
+    }
+
+    fn act(&mut self, action: &str, args: &Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "select" => {
+                let picked = end_numbers(args, self.ends.len())?;
+                if !Args(args).opt_bool("add").unwrap_or(false) {
+                    self.params.selected.iter_mut().for_each(|s| *s = false);
+                }
+                for i in &picked {
+                    self.params.selected[*i] = true;
+                }
+                self.start(cx);
+                let n = self.params.selected.iter().filter(|s| **s).count();
+                Ok(format!("{n} end(s) chosen; previewing"))
+            }
+            _ => Err(format!("Flow extensions has no action {action}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +892,62 @@ impl Tool for CapTool {
         ui.checkbox(&mut self.remeshed, "Remesh caps to match the surrounding edge length");
         ui.small("Each cap becomes its own named patch (outlet_N). Non-planar holes are better filled with the Inspector's smooth fill.");
         if ui.add_enabled(!self.ends.is_empty(), egui::Button::new("Cap all")).clicked() {
+            self.cap_all(cx, id);
+        }
+        if let Some(m) = &self.message {
+            ui.label(m);
+        }
+        ui.add_space(8.0);
+        if ui.button("Done").clicked() {
+            return ToolOutcome::Close;
+        }
+        ToolOutcome::Continue
+    }
+
+    fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
+        draw_end_markers(painter, cx, &self.ends, &[]);
+    }
+
+    fn settings(&self) -> Option<Value> {
+        Some(json!({"remesh_caps": self.remeshed}))
+    }
+
+    fn settings_schema(&self) -> Option<Value> {
+        Some(json!({"type": "object", "properties": {"remesh_caps": {"type": "boolean", "description": "Remesh the caps to match the surrounding edge length"}}}))
+    }
+
+    fn set_settings(&mut self, changes: &Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.remeshed = v["remesh_caps"].as_bool().ok_or("remesh_caps must be true or false")?;
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> Value {
+        json!({"object": self.object, "open_ends": ends_state(&self.ends, |_| false), "message": self.message})
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![Action::plain("cap_all", "Cap every open boundary flat; each cap becomes its own patch named outlet_N")]
+    }
+
+    fn act(&mut self, action: &str, _args: &Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "cap_all" => {
+                let id = self.object.filter(|id| cx.scene.get(*id).is_some()).ok_or("no active object")?;
+                if self.ends.is_empty() {
+                    return Err("there are no open ends to cap".into());
+                }
+                Ok(self.cap_all(cx, id))
+            }
+            _ => Err(format!("Cap open ends has no action {action}")),
+        }
+    }
+}
+
+impl CapTool {
+    fn cap_all(&mut self, cx: &mut ToolCx, id: ObjectId) -> String {
+        {
             cx.history.push("Cap open ends", cx.scene);
             let o = cx.scene.get_mut(id).unwrap();
             let target = o.mesh.average_edge_length();
@@ -717,18 +976,7 @@ impl Tool for CapTool {
             *cx.status = self.message.clone().unwrap();
             self.ends = find_vessel_ends(&o.mesh).into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
         }
-        if let Some(m) = &self.message {
-            ui.label(m);
-        }
-        ui.add_space(8.0);
-        if ui.button("Done").clicked() {
-            return ToolOutcome::Close;
-        }
-        ToolOutcome::Continue
-    }
-
-    fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
-        draw_end_markers(painter, cx, &self.ends, &[]);
+        self.message.clone().unwrap_or_default()
     }
 }
 
@@ -752,6 +1000,17 @@ pub struct BridgeTool {
     /// Settings waiting to settle before they are previewed, and since when.
     changed: Option<(BridgeKey, std::time::Instant)>,
     error: Option<(BridgeKey, String)>,
+}
+
+/// Bridge's settings as agents set them.
+#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+struct BridgeSettings {
+    /// The tube's shape and how it meets each end (as Erase & Fill's Loft).
+    loft: ops::LoftUi,
+    /// 0..100: tube density; 50 matches the ends' edge length.
+    refine: f64,
+    /// -100..100: pushes the middle of the tube out (+) or in (−).
+    bulge: f64,
 }
 
 /// What a preview was made from.
@@ -933,6 +1192,70 @@ impl Tool for BridgeTool {
 
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|(_, j)| ("Bridge".to_string(), j.progress()))
+    }
+
+    fn pending(&self) -> bool {
+        let Some(key) = self.key() else { return false };
+        let done = |k: Option<&BridgeKey>| k == Some(&key);
+        self.job.is_none() && !done(self.preview.as_ref().map(|p| &p.0)) && !done(self.error.as_ref().map(|e| &e.0))
+    }
+
+    fn settings(&self) -> Option<Value> {
+        serde_json::to_value(BridgeSettings { loft: self.loft, refine: self.refine, bulge: self.bulge }).ok()
+    }
+
+    fn settings_schema(&self) -> Option<Value> {
+        Some(schema_of::<BridgeSettings>())
+    }
+
+    fn set_settings(&mut self, changes: &Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let b: BridgeSettings = serde_json::from_value(v).map_err(|e| format!("Bridge: {e}"))?;
+        (self.loft, self.refine, self.bulge) = (b.loft, b.refine.clamp(0.0, 100.0), b.bulge.clamp(-100.0, 100.0));
+        self.update(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> Value {
+        let key = self.key();
+        json!({
+            "object": self.object,
+            "open_ends": ends_state(&self.ends, |i| self.picked.contains(&i)),
+            "picked": self.picked.iter().map(|i| i + 1).collect::<Vec<_>>(),
+            "computing": self.job.is_some(),
+            "preview": self.preview.as_ref().filter(|p| Some(p.0) == key).map(|p| p.1.message.clone()),
+            "error": self.error.as_ref().filter(|e| Some(e.0) == key).map(|e| e.1.clone()),
+            "next": if self.picked.len() < 2 { "pick two open ends (End 1 first)" } else { "join, once previewed (app_wait)" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![
+            Action::new("pick", "Choose the two open ends to connect (numbers from the state's open_ends); the first is End 1", json!({"ends": ends_arg("Two end numbers (from 1)")})).required(&["ends"]),
+            Action::plain("join", "Keep the tube (the preview, or built now)"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "pick" => {
+                let picked = end_numbers(args, self.ends.len())?;
+                if picked.len() != 2 || picked[0] == picked[1] {
+                    return Err("pick two different ends".into());
+                }
+                self.picked = picked;
+                self.update(cx);
+                Ok(format!("Ends {} and {} picked; previewing", self.picked[0] + 1, self.picked[1] + 1))
+            }
+            "join" => {
+                let id = self.object.filter(|id| cx.scene.get(*id).is_some()).ok_or("no active object")?;
+                let msg = self.join(id, cx)?;
+                *cx.status = msg.clone();
+                Ok(msg)
+            }
+            _ => Err(format!("Bridge has no action {action}")),
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {

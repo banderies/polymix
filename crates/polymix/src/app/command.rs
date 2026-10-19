@@ -163,6 +163,8 @@ pub enum MeshCommand {
     OpenTool(String),
     /// Change the open tool's settings (see [`Tool::set_settings`]).
     ToolSettings(serde_json::Value),
+    /// One of the open tool's actions (see [`Tool::actions`]) with its arguments.
+    ToolAction(String, serde_json::Value),
     AcceptTool,
     CancelTool,
     /// Click the surface nearest to a point as a user would (for tools worked by clicking),
@@ -409,6 +411,20 @@ impl MeshWorkspace {
                 self.tools.push(t);
                 r.map(|()| format!("{name} settings changed"))
             }
+            C::ToolAction(name, args) => {
+                let mut t = self.tools.pop().ok_or("No tool is open.")?;
+                let actions = t.actions();
+                let result = match actions.iter().find(|a| a.name == name) {
+                    Some(a) => a.check(&args).and_then(|()| t.act(&name, &args, &mut self.tool_cx(ctx, vp))),
+                    None if actions.is_empty() => Err(format!("{} has no actions", t.name())),
+                    None => Err(format!("{} has no action {name}; it has {}", t.name(), actions.iter().map(|a| a.signature()).collect::<Vec<_>>().join(", "))),
+                };
+                // A tool may hand over to another one (Measure → Place stent).
+                let sub = t.take_request();
+                self.tools.push(t);
+                self.tools.extend(sub);
+                result
+            }
             C::AcceptTool => {
                 let mut t = self.tools.pop().ok_or("No tool is open.")?;
                 let name = t.name();
@@ -465,7 +481,7 @@ impl MeshWorkspace {
     /// Nothing left to happen from an agent's last command: no tool computing or waiting to
     /// open, no clicks queued, nothing loading or saving.
     pub(super) fn agent_quiet(&self) -> bool {
-        !self.tool_busy() && self.synthetic.is_empty() && self.import_job.is_none() && self.pending_import.is_none() && self.project_job.is_none() && self.export_job.is_none() && self.pending_switch.is_none()
+        !self.tool_busy() && !self.tools.last().is_some_and(|t| t.pending()) && self.synthetic.is_empty() && self.import_job.is_none() && self.pending_import.is_none() && self.project_job.is_none() && self.export_job.is_none() && self.pending_switch.is_none()
     }
 
     fn active_id(&self) -> Result<ObjectId, String> {
@@ -555,8 +571,12 @@ pub(super) mod tests {
         let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: BrushScroll::Shift };
         for t in TOOLS {
             let tool = make_tool(t.name, &mut cx).unwrap_or_else(|| panic!("{} does not open", t.name));
-            let schema = crate::tools::ops::settings_schema(t.name);
+            let schema = tool.settings_schema();
             assert_eq!(tool.settings().is_some(), schema.is_some(), "{}: settings and schema disagree", t.name);
+            for a in tool.actions() {
+                assert!(a.schema()["properties"].is_object(), "{}: {}", t.name, a.name);
+                assert!(!a.about.is_empty(), "{}: {}", t.name, a.name);
+            }
             if let (Some(s), Some(schema)) = (tool.settings(), schema) {
                 let props = schema["properties"].as_object().map(|p| p.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
                 let keys: Vec<String> = s.as_object().unwrap().keys().cloned().collect();

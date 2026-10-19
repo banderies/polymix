@@ -356,6 +356,10 @@ impl<S: OpSpec> Tool for OpTool<S> {
         self.job.as_ref().map(|(_, j)| (S::NAME.to_string(), j.progress()))
     }
 
+    fn pending(&self) -> bool {
+        !self.invalid && self.job.is_none() && (self.pending_accept || (S::LIVE && self.changed_at.is_some() && !self.up_to_date()))
+    }
+
     fn settings(&self) -> Option<serde_json::Value> {
         serde_json::to_value(&self.params).ok().filter(|v| v.is_object())
     }
@@ -364,19 +368,43 @@ impl<S: OpSpec> Tool for OpTool<S> {
         self.settings().map(|_| schema_of::<S::Params>())
     }
 
-    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
         if self.invalid {
             return Err(format!("{}: no active object", S::NAME));
         }
         let mut v = self.settings().ok_or_else(|| format!("{} has no settings", S::NAME))?;
         merge_settings(&mut v, changes)?;
         self.params = serde_json::from_value(v).map_err(|e| format!("{}: {e}", S::NAME))?;
-        // Recompute now, not after the usual typing pause.
-        self.changed_at = Some(Instant::now() - Duration::from_secs(1));
+        // Previews start now, not after the usual typing pause (nor only once the panel is
+        // drawn); accept collects the result.
+        if S::LIVE && !self.up_to_date() {
+            self.start(cx.egui);
+            self.changed_at = None;
+        }
         Ok(())
     }
 
-    fn report(&self) -> serde_json::Value {
+    fn actions(&self) -> Vec<Action> {
+        if S::LIVE {
+            return Vec::new();
+        }
+        vec![Action::plain("update", "Compute the preview for the current settings (this operation does not preview by itself; accept computes it too)")]
+    }
+
+    fn act(&mut self, action: &str, _args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "update" if !S::LIVE => {
+                if self.invalid {
+                    return Err(format!("{}: no active object", S::NAME));
+                }
+                self.start(cx.egui);
+                Ok(format!("{}: computing the preview; app_wait, then mesh_tool_state", S::NAME))
+            }
+            _ => Err(format!("{} has no action {action}", S::NAME)),
+        }
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
         serde_json::json!({
             "computing": self.job.as_ref().map(|(_, j)| j.progress()),
             "acting_on_selected_triangles": self.selection.as_ref().map(|s| s.len()),
@@ -3196,28 +3224,3 @@ mod color_transfer_tests {
     }
 }
 
-/// JSON Schema of the settings of the operation tool opened as `tool` (see `app::TOOLS`), for
-/// agents choosing a tool before opening it; `None` for tools without typed settings.
-pub fn settings_schema(tool: &str) -> Option<serde_json::Value> {
-    Some(match tool {
-        "remesh" => schema_of::<RemeshUi>(),
-        "reduce" => schema_of::<ReduceUi>(),
-        "smooth" => schema_of::<SmoothUi>(),
-        "smoothboundary" => schema_of::<SmoothBoundaryUi>(),
-        "closecracks" => schema_of::<CloseCracksUi>(),
-        "regionbridge" | "tubehandle" => schema_of::<RegionBridgeUi>(),
-        "facegroups" => schema_of::<FaceGroupsUi>(),
-        "weldboundaries" => schema_of::<WeldBoundariesUi>(),
-        "makesolid" => schema_of::<MakeSolidUi>(),
-        "makepattern" => schema_of::<crate::tools::pattern::PatternUi>(),
-        "convex" => schema_of::<mm_edit::ConvexParams>(),
-        "erasefill" => schema_of::<EraseFillUi>(),
-        "extrude" | "extract" => schema_of::<ExtrudeParamsUi>(),
-        "mirror" => schema_of::<MirrorParams>(),
-        "offset" => schema_of::<OffsetUi>(),
-        "attracttotarget" => schema_of::<AttractToTargetUi>(),
-        "aligntotarget" => schema_of::<AlignToTargetUi>(),
-        "fitprimitive" => schema_of::<FitPrimitiveUi>(),
-        _ => return None,
-    })
-}

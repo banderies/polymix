@@ -108,6 +108,22 @@ impl Preview {
         }
     }
 
+    /// The window / level shown (centre, width).
+    pub fn shown_window(&self) -> (f64, f64) {
+        self.current_window()
+    }
+
+    /// Show `w` (centre, width), or the automatic window.
+    pub fn set_window(&mut self, w: Option<(f64, f64)>) {
+        self.window = w;
+        self.dirty = true;
+    }
+
+    /// The window stored in the file.
+    pub fn file_window(&self) -> Option<(f64, f64)> {
+        self.file_window
+    }
+
     fn current_window(&self) -> (f64, f64) {
         self.window.or_else(|| self.image.as_ref().map(|s| s.auto_window)).unwrap_or((0.5, 1.0))
     }

@@ -94,13 +94,36 @@ impl CenterlineTool {
     }
 
     fn save(&mut self, csv: bool) {
-        let Some(cl) = &self.result else { return };
-        let (ext, text) = if csv { ("csv", cl.to_csv()) } else { ("vtk", cl.to_vtk()) };
+        let ext = if csv { "csv" } else { "vtk" };
+        if self.result.is_none() {
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("centerline.{ext}")).save_file() {
-            self.message = Some(match std::fs::write(&path, text) {
-                Ok(()) => format!("Saved {}", path.display()),
-                Err(e) => format!("Save failed: {e}"),
-            });
+            self.message = Some(self.save_to(&path).unwrap_or_else(|e| e));
+        }
+    }
+
+    /// Write the centerline as CSV or VTK (by the extension).
+    fn save_to(&self, path: &std::path::Path) -> Result<String, String> {
+        let cl = self.result.as_ref().ok_or("compute the centerline first")?;
+        let text = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
+            Some("csv") => cl.to_csv(),
+            Some("vtk") => cl.to_vtk(),
+            _ => return Err("the file must end in .csv or .vtk".into()),
+        };
+        std::fs::write(path, text).map(|()| format!("Saved {}", path.display())).map_err(|e| format!("Save failed: {e}"))
+    }
+
+    fn poll(&mut self, cx: &mut ToolCx) {
+        if let Some(r) = self.job.as_ref().and_then(|j| j.poll()) {
+            self.job = None;
+            match r {
+                Ok(cl) => {
+                    *cx.status = format!("Centerline: {} branch(es)", cl.branches.len());
+                    self.result = Some(cl);
+                }
+                Err(e) => self.message = Some(format!("{e:#}")),
+            }
         }
     }
 }
@@ -135,19 +158,9 @@ impl Tool for CenterlineTool {
         if ui.add_enabled(self.job.is_none(), egui::Button::new("Compute centerline")).clicked() {
             self.start(cx);
         }
-        if let Some(j) = &self.job {
-            if let Some(r) = j.poll() {
-                self.job = None;
-                match r {
-                    Ok(cl) => {
-                        *cx.status = format!("Centerline: {} branch(es)", cl.branches.len());
-                        self.result = Some(cl);
-                    }
-                    Err(e) => self.message = Some(format!("{e:#}")),
-                }
-            } else {
-                ui.spinner();
-            }
+        self.poll(cx);
+        if self.job.is_some() {
+            ui.spinner();
         }
         self.hovered_branch = None;
         if let Some(cl) = &self.result {
@@ -260,5 +273,109 @@ impl Tool for CenterlineTool {
 
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|_| ("Centerline".to_string(), 0.5))
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"spacing_mm": (!self.auto_step).then_some(self.step)}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {"spacing_mm": {"type": ["number", "null"], "description": "Distance between centerline nodes along the vessel, mm; null for automatic (half the inlet radius)"}}}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        match &v["spacing_mm"] {
+            serde_json::Value::Null => self.auto_step = true,
+            x => {
+                self.step = x.as_f64().filter(|s| *s > 0.0).ok_or("spacing_mm must be a positive number or null")?;
+                self.auto_step = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::{round, vec3};
+        use serde_json::json;
+        json!({
+            "object": self.object,
+            "ends": self.ends.iter().enumerate().map(|(i, e)| json!({"end": i + 1, "centre_mm": vec3(e.center.to_array(), 3), "diameter_mm": round(e.diameter, 3), "inlet": self.inlet == Some(i)})).collect::<Vec<_>>(),
+            "inlet": match (self.inlet, self.inlet_point) {
+                (Some(i), _) => json!({"end": i + 1}),
+                (None, Some(p)) => json!({"near_mm": vec3(p.to_array(), 3)}),
+                _ => serde_json::Value::Null,
+            },
+            "computing": self.job.is_some(),
+            "branches": self.result.as_ref().map(|cl| cl.branches.iter().enumerate().map(|(i, b)| {
+                // Up to 12 samples along the branch, ends included.
+                let n = b.nodes.len();
+                let samples: Vec<serde_json::Value> = (0..n.min(12)).map(|k| if n <= 12 { k } else { k * (n - 1) / 11 }).map(|k| {
+                    let node = &cl.nodes[b.nodes[k]];
+                    json!({"at_mm": vec3(node.position.to_array(), 3), "diameter_mm": round(2.0 * node.radius, 3)})
+                }).collect();
+                json!({
+                    "branch": i + 1,
+                    "parent": b.parent.map(|p| p + 1),
+                    "length_mm": round(b.length, 3),
+                    "diameter_mm": {"mean": round(2.0 * b.mean_radius, 3), "min": round(2.0 * b.min_radius, 3), "max": round(2.0 * b.max_radius, 3)},
+                    "samples": samples,
+                })
+            }).collect::<Vec<_>>()),
+            "message": self.message,
+            "next": if self.result.is_some() { "read the branches, or export" } else if self.inlet.is_some() || self.inlet_point.is_some() { "compute" } else { "set_inlet" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("set_inlet", "Choose the inlet: an end by number (from the state's ends), or on a closed model a point near it", json!({"end": arg::integer("End number (from 1)"), "at": arg::point("A point in mm on or near the inlet")})),
+            Action::plain("compute", "Compute the centerline tree from the inlet (in the background)"),
+            Action::new("export", "Save the centerline: CSV (nodes, branches, radii) or VTK (polyline with Radius point data, for ParaView or VMTK), by the extension", json!({"path": arg::text("Absolute path ending in .csv or .vtk"), "overwrite": arg::boolean("Replace an existing file")})).required(&["path"]),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        self.poll(cx);
+        match action {
+            "set_inlet" => match (a.opt_usize("end"), a.opt_point("at")) {
+                (Some(k), _) => {
+                    let i = k.checked_sub(1).filter(|i| *i < self.ends.len()).ok_or_else(|| format!("there is no end {k}: the object has {}", self.ends.len()))?;
+                    (self.inlet, self.inlet_point) = (Some(i), None);
+                    Ok(format!("Inlet: end {k} (⌀ {:.2} mm)", self.ends[i].diameter))
+                }
+                (None, Some(p)) => {
+                    (self.inlet, self.inlet_point) = (None, Some(DVec3::from_array(p)));
+                    Ok("Inlet: near the given point".into())
+                }
+                _ => Err("give `end` or `at`".into()),
+            },
+            "compute" => {
+                if self.job.is_some() {
+                    return Err("already computing: app_wait".into());
+                }
+                self.start(cx);
+                match &self.message {
+                    Some(m) if self.job.is_none() => Err(m.clone()),
+                    _ => Ok("Computing the centerline; app_wait, then read the branches".into()),
+                }
+            }
+            "export" => {
+                let path = std::path::PathBuf::from(a.str("path")?);
+                if !path.is_absolute() {
+                    return Err(format!("{} is not an absolute path", path.display()));
+                }
+                if path.exists() && !a.opt_bool("overwrite").unwrap_or(false) {
+                    return Err(format!("{} exists: pass overwrite: true to replace it", path.display()));
+                }
+                let msg = self.save_to(&path)?;
+                self.message = Some(msg.clone());
+                Ok(msg)
+            }
+            _ => Err(format!("Centerline has no action {action}")),
+        }
     }
 }

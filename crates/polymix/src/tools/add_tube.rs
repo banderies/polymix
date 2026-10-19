@@ -173,6 +173,106 @@ impl Tool for AddTubeTool {
         "Add Tube"
     }
 
+    fn settings(&self) -> Option<serde_json::Value> {
+        let key = |k: TubeType| k.label().to_lowercase().replace(['(', ')'], "").replace(' ', "_");
+        let combine = match self.combine {
+            Combine::Boolean => "boolean",
+            Combine::Append => "append",
+            Combine::NewObject => "new_object",
+        };
+        let p = &self.params;
+        Some(serde_json::json!({
+            "type": key(self.kind), "combine": combine, "along_normal": self.along_normal,
+            "radius_mm": p.radius, "end_radius_mm": p.end_radius, "tangent": p.tangent,
+            "collision_radius_mm": p.collision_radius, "length_scale": p.length_scale, "solve_steps": p.solve_steps, "route_inside": p.inside,
+        }))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        let types: Vec<String> = TubeType::ALL.iter().map(|k| k.label().to_lowercase().replace(['(', ')'], "").replace(' ', "_")).collect();
+        Some(serde_json::json!({"type": "object", "properties": {
+            "type": {"type": "string", "enum": types, "description": "Path: straight line or spline, outside the surface (handle, bypass) or inside (channel); autoroute finds a path around the object"},
+            "combine": {"type": "string", "enum": ["boolean", "append", "new_object"], "description": "boolean: outside tubes are added, inside tubes cut a channel (needs a closed object); append: a separate shell of the object; new_object"},
+            "along_normal": {"type": "boolean", "description": "Line tubes: run along the first end's normal instead of toward the second end"},
+            "radius_mm": {"type": "number"},
+            "end_radius_mm": {"type": ["number", "null"], "description": "Radius at the second end; null for the same"},
+            "tangent": {"type": "number", "description": "Spline tangent length as a fraction of the distance between the ends (0..1.5)"},
+            "collision_radius_mm": {"type": "number", "description": "Autoroute: clearance kept from the surface"},
+            "length_scale": {"type": "number", "description": "Autoroute: 0..1, how strongly the route is pulled shorter"},
+            "solve_steps": {"type": "integer", "description": "Autoroute: 1..500"},
+            "route_inside": {"type": "boolean", "description": "Autoroute: inside the object"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let key = |k: TubeType| k.label().to_lowercase().replace(['(', ')'], "").replace(' ', "_");
+        self.kind = TubeType::ALL.into_iter().find(|k| v["type"] == key(*k).as_str()).ok_or("unknown tube type")?;
+        self.combine = match v["combine"].as_str() {
+            Some("boolean") => Combine::Boolean,
+            Some("append") => Combine::Append,
+            Some("new_object") => Combine::NewObject,
+            _ => return Err("combine must be boolean, append or new_object".into()),
+        };
+        let num = |k: &str| v[k].as_f64().ok_or_else(|| format!("{k} must be a number"));
+        self.along_normal = v["along_normal"].as_bool().unwrap_or(false);
+        let p = &mut self.params;
+        p.radius = num("radius_mm")?.max(1e-6);
+        p.end_radius = v["end_radius_mm"].as_f64().filter(|r| *r > 0.0);
+        p.tangent = num("tangent")?.clamp(0.0, 1.5);
+        p.collision_radius = num("collision_radius_mm")?.max(0.0);
+        p.length_scale = num("length_scale")?.clamp(0.0, 1.0);
+        p.solve_steps = (v["solve_steps"].as_u64().ok_or("solve_steps must be a whole number")? as usize).clamp(1, 500);
+        p.inside = v["route_inside"].as_bool().unwrap_or(false);
+        self.rebuild();
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::vec3;
+        serde_json::json!({
+            "object": self.object,
+            "ends": self.ends.iter().enumerate().map(|(i, e)| serde_json::json!({"end": i + 1, "at_mm": vec3(e.point.to_array(), 4), "normal": vec3(e.normal.to_array(), 4)})).collect::<Vec<_>>(),
+            "tube_triangles": self.tube.as_ref().map(|t| t.triangle_count()),
+            "error": self.error,
+            "next": if self.ends.len() < 2 { "set_end twice" } else { "accept (mesh_tool accept) to combine the tube with the object" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("set_end", "Put a tube end at the surface point nearest `at` (as clicking there does): the first missing end, or end `end`", json!({"at": arg::point("A point on or near the surface, mm"), "end": arg::integer("1 or 2")})).required(&["at"]),
+            Action::plain("clear", "Remove both ends"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, _cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "set_end" => {
+                let h = self.bvh.nearest(&self.source, DVec3::from_array(a.point("at")?), f64::INFINITY).ok_or("the object has no surface")?;
+                let end = TubeEnd { point: h.point, normal: self.source.tri_normal(h.tid) };
+                match a.opt_usize("end") {
+                    Some(k @ 1..=2) if k - 1 < self.ends.len() => self.ends[k - 1] = end,
+                    Some(k @ 1..=2) if k - 1 == self.ends.len() => self.ends.push(end),
+                    Some(k) => return Err(format!("cannot set end {k} now (the tube has {} end(s))", self.ends.len())),
+                    None if self.ends.len() < 2 => self.ends.push(end),
+                    None => return Err("both ends are set: give `end` to move one".into()),
+                }
+                self.rebuild();
+                Ok(format!("{} end(s) set{}", self.ends.len(), if self.ends.len() == 2 { "; tube previewed" } else { "" }))
+            }
+            "clear" => {
+                self.ends.clear();
+                self.rebuild();
+                Ok("Ends cleared".into())
+            }
+            _ => Err(format!("Add Tube has no action {action}")),
+        }
+    }
+
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Add Tube");
         if self.object.is_none() {

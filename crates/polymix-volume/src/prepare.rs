@@ -127,7 +127,7 @@ impl Op {
         }
     }
 
-    fn key(self) -> &'static str {
+    pub fn key(self) -> &'static str {
         match self {
             Op::N4 => "n4",
             Op::Denoise => "denoise",
@@ -212,6 +212,20 @@ enum TimeMode {
     Pick,
     Combine,
     Split,
+}
+
+/// The keys [`Prepare::set_options`] takes besides `op` (agents' `prepare` options).
+pub const OPTION_KEYS: [&str; 24] = ["levels", "iterations", "distance", "shrink", "bias", "method", "sigma", "spacing", "interp", "axes", "mirror", "swap", "pad", "thickness", "slab", "norm", "min_d", "max_d", "dark", "motion", "metric", "time", "label", "out"];
+
+/// What each of [`OPTION_KEYS`] sets, by operation (for agents).
+pub fn options_about() -> String {
+    let lower = |v: Vec<&str>| v.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>().join(", ");
+    let denoise = lower(DenoiseMethod::ALL.iter().map(|m| m.label()).collect());
+    let interp = lower(Interpolation::ALL.iter().map(|m| m.label()).collect());
+    let vessel = lower(mm_image::vessel::VesselMethod::ALL.iter().map(|m| m.label()).collect());
+    format!(
+        "Settings by key; others keep what the panel shows. n4: levels (1–6), iterations, distance (B-spline distance, mm), shrink, bias (true: also save the bias field). denoise: method ({denoise}), sigma (mm). resample: spacing (mm, isotropic), interp ({interp}). crop: crop_from and crop_to ([i, j, k], inclusive voxels; default the whole image), pad (voxels added on every side). reorient: axes (e.g. \"RAS\"), mirror (axis 0–2), swap (two header axes, e.g. \"ij\"). register / subtract / normalise with norm match: the other image is `reference`; register: motion (rigid, affine), metric (mi, correlation). normalise: norm (rescale, clip, zscore, match). vessels: method ({vessel}), min_d, max_d (vessel diameters, mm), dark (true: dark vessels on a bright background). slab: slab (max, min, mean), thickness (mm). time: time (a time point from 1, or mean, max, min, split). pc: the images are `phases` (and `magnitude`). export: label (the subject's new name), out (absolute folder)."
+    )
 }
 
 /// Another image of the catalog, remembered by its first file and name (indices change on a
@@ -394,8 +408,9 @@ impl Prepare {
         (self.op == Op::Crop && self.set_for.as_ref() == v.files.first()).then_some((self.crop_lo, self.crop_hi))
     }
 
-    /// Defaults that depend on the image (the crop box, the voxel size), set when it changes.
-    fn fit_to(&mut self, v: &Volume) {
+    /// Defaults that depend on the image (the crop box, the voxel size), set when it changes
+    /// (before options for it are set: [`Prepare::start`] fits them too).
+    pub fn fit_to(&mut self, v: &Volume) {
         if self.set_for.as_ref() == v.files.first() {
             return;
         }
@@ -447,6 +462,14 @@ impl Prepare {
                 "axes" => {
                     self.reorient = ReorientMode::Axes;
                     self.axes = v.to_uppercase();
+                }
+                "swap" => {
+                    if let [a, b] = v.chars().filter_map(|c| "ijk".find(c)).collect::<Vec<_>>()[..] {
+                        if a != b {
+                            self.reorient = ReorientMode::Swap;
+                            self.swap = (a.min(b), a.max(b));
+                        }
+                    }
                 }
                 "mirror" => {
                     self.reorient = ReorientMode::Mirror;
@@ -504,6 +527,53 @@ impl Prepare {
         }
         self.magnitude = names.get(3).and_then(|n| find(n));
         self.phases.iter().all(|p| p.is_some())
+    }
+
+    /// For agents: the operation chosen, the other images chosen, whether it is running, and
+    /// how the last run went.
+    pub fn agent_state(&self) -> serde_json::Value {
+        let last = match &self.last {
+            Some(Ok(m)) => serde_json::json!({"ok": m}),
+            Some(Err(e)) => serde_json::json!({"error": e}),
+            None => serde_json::Value::Null,
+        };
+        serde_json::json!({
+            "operation": self.op.key(),
+            "operations": Op::ALL.map(Op::key),
+            "running": self.busy(),
+            "progress": self.job.as_ref().map(|j| (j.progress() * 100.0).round() / 100.0),
+            "last_run": last,
+            "reference": self.reference.as_ref().map(|p| p.name.clone()),
+            "phases": self.phases.iter().map(|p| p.as_ref().map(|p| p.name.clone())).collect::<Vec<_>>(),
+            "magnitude": self.magnitude.as_ref().map(|p| p.name.clone()),
+        })
+    }
+
+    /// The other image (registration, subtraction, histogram matching).
+    pub fn choose_reference(&mut self, v: &Volume) {
+        self.reference = Some(Pick::of(v));
+    }
+
+    /// The phase images (x, y, z) and the magnitude image of phase contrast.
+    pub fn choose_phases(&mut self, phases: [&Volume; 3], magnitude: Option<&Volume>) {
+        self.phases = phases.map(|v| Some(Pick::of(v)));
+        self.magnitude = magnitude.map(Pick::of);
+    }
+
+    /// The box Crop keeps of `v`: voxels `lo` to `hi`, inclusive.
+    pub fn set_crop(&mut self, v: &Volume, lo: [usize; 3], hi: [usize; 3]) -> Result<(), String> {
+        self.fit_to(v);
+        let dims = v.geometry.as_ref().map(|g| g.dims).ok_or("This image has no voxel grid")?;
+        if (0..3).any(|a| lo[a] > hi[a] || hi[a] >= dims[a]) {
+            return Err(format!("The box must lie in the image ({} × {} × {} voxels) with crop_from ≤ crop_to", dims[0], dims[1], dims[2]));
+        }
+        (self.crop_lo, self.crop_hi) = (lo, hi);
+        Ok(())
+    }
+
+    /// Stop the operation running.
+    pub fn cancel(&self) -> bool {
+        self.job.as_ref().inspect(|j| j.cancel()).is_some()
     }
 
     /// Choose the reference image (registration, subtraction, histogram matching) by name.

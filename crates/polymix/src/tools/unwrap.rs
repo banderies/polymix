@@ -107,6 +107,30 @@ impl Tool for UnwrapTool {
         "Unwrap"
     }
 
+    fn settings(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(self.params).ok()
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(schema_of::<UnwrapParams>())
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        self.params = merged(&self.params, changes).map_err(|e| format!("Unwrap: {e}"))?;
+        self.start(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        serde_json::json!({
+            "object": self.object,
+            "computing": self.job.is_some(),
+            "result": self.result.as_ref().map(|(p, _, msg)| serde_json::json!({"message": msg, "for_current_settings": *p == self.params})),
+            "error": self.error,
+            "next": "accept (mesh_tool accept) to keep the UVs (written with OBJ export)",
+        })
+    }
+
     fn shows_uvs(&self) -> bool {
         true
     }

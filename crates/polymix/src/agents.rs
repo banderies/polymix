@@ -14,6 +14,7 @@
 use polymix_mcp::{Reply, Server, ToolSpec};
 use polymix_workspace::jobs::Job;
 use polymix_workspace::agent::{AgentReply, AgentTool, ToolKind};
+use polymix_workspace::Workspace;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +26,38 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Masks patients' identifiers in text (see `VolumeWorkspace::agent_mask`).
 pub type Mask = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-const INSTRUCTIONS: &str = "Polymix is a desktop app for medical images and meshes: the Volume workspace finds and previews images (DICOM, NIfTI, …), Segmentation segments one in three planes, and Mesh edits surface meshes (vessel cleanup for CFD). The tools work on the session the user has open, in front of them. Start with app_status; app_screenshot shows the window as the user sees it, app_ui lists the widgets of the shown panels. Tools that change things work only if the user allowed changes (Agents window); each change is an undo step labelled \"Agent: …\" and shows the workspace it changes. Typed tools first (mesh_select, mesh_edit, mesh_tool with settings, mesh_file); app_ui_action for anything only a panel offers. Work that takes time (tools computing, files loading, clicks) finishes after the call returns: call app_wait, then read the result. Lengths are in millimetres. Patient identifiers are masked and dates cut to the year: do not try to recover them.";
+const INSTRUCTIONS: &str = "Polymix is a desktop app for medical images and meshes: the Volume workspace finds and previews images (DICOM, NIfTI, …), Segmentation segments one in three planes, and Mesh edits surface meshes (vessel cleanup for CFD). The tools work on the session the user has open, in front of them. Start with app_status; app_screenshot shows the window as the user sees it, app_ui lists the widgets of the shown panels. Tools that change things work only if the user allowed changes (Agents window); each change is an undo step labelled \"Agent: …\" and shows the workspace it changes. Typed tools first: each workspace's state tool (mesh_scene / mesh_tool_state, volume_catalog, segmentation_state) reports everything it holds and shows, and mesh_tool run, volume_do and segmentation_do list and run every action with typed arguments; app_ui_action only for what they lack. Work that takes time (tools computing, files loading, clicks) finishes after the call returns: call app_wait, then read the result. Lengths are in millimetres. Patient identifiers are masked and dates cut to the year: do not try to recover them.";
+
+/// Every tool agents get: the shell's and each workspace's (listed even for a workspace that
+/// failed to start).
+pub fn all_tools() -> Vec<AgentTool> {
+    let mut all = shell_tools();
+    all.extend(workspace_tools::<polymix_volume::VolumeWorkspace>("volume"));
+    all.extend(workspace_tools::<polymix_segmentation::SegmentationWorkspace>("segmentation"));
+    all.extend(workspace_tools::<crate::app::MeshWorkspace>("mesh"));
+    all
+}
+
+/// A workspace's tools: those it lists, and `<key>_do`, made from its actions.
+fn workspace_tools<W: Workspace>(key: &str) -> Vec<AgentTool> {
+    let mut tools = W::agent_tools();
+    let actions = W::agent_actions();
+    if !actions.is_empty() {
+        tools.push(polymix_workspace::agent::do_tool(key, W::agent_actions_about(), &actions));
+    }
+    tools
+}
+
+/// Answer a call of one of a workspace's tools (`<key>_do` runs one of its actions, checked).
+pub fn workspace_call<W: Workspace>(w: &mut W, tool: &str, args: &Value, ctx: &egui::Context) -> AgentReply {
+    if !tool.ends_with("_do") {
+        return w.agent_call(tool, args, ctx);
+    }
+    match polymix_workspace::agent::find_action(&W::agent_actions(), args) {
+        Ok((a, args)) => w.agent_act(a.name, &args, ctx),
+        Err(e) => AgentReply::error(e),
+    }
+}
 
 pub fn shell_tools() -> Vec<AgentTool> {
     vec![
@@ -234,6 +266,46 @@ fn add_to_claude(url: &str, token: Option<&str>) -> anyhow::Result<String> {
     Ok("Added to Claude Code for all your projects. Start a new Claude Code session to use it.".into())
 }
 
+/// Why an agent's request cannot be done while the window is not drawn.
+pub fn not_drawn(what: &str) -> String {
+    format!("Polymix's window is covered by other windows or minimized, so it is not drawn and cannot {what} until it is. Ask the user to bring it into view (any part of it showing is enough; it does not need the keyboard focus), or to tick \"Bring Polymix forward when an agent needs it\" in its Agents window. Reading tools such as mesh_scene work meanwhile.")
+}
+
+/// Bring the app's windows to the front of other apps' windows without making Polymix the
+/// active app: the keyboard stays where the user is typing. Minimized windows stay put.
+#[cfg(target_os = "macos")]
+pub fn bring_to_front() {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    let Some(class) = AnyClass::get(c"NSApplication") else { return };
+    // SAFETY: plain AppKit calls on the main thread (the shell's logic), on objects AppKit owns.
+    unsafe {
+        let app: *mut AnyObject = msg_send![class, sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let windows: *mut AnyObject = msg_send![&*app, windows];
+        if windows.is_null() {
+            return;
+        }
+        let n: usize = msg_send![&*windows, count];
+        for i in 0..n {
+            let w: *mut AnyObject = msg_send![&*windows, objectAtIndex: i];
+            if w.is_null() {
+                continue;
+            }
+            let visible: bool = msg_send![&*w, isVisible];
+            let minimized: bool = msg_send![&*w, isMiniaturized];
+            if visible && !minimized {
+                let _: () = msg_send![&*w, orderFrontRegardless];
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn bring_to_front() {}
+
 /// The token file in the data folder.
 fn token_path() -> Option<PathBuf> {
     polymix_workspace::data_dir().map(|d| d.join("agent-token"))
@@ -268,6 +340,9 @@ pub struct AgentAccess {
     port: u16,
     /// Clients must send the token (otherwise any local program may connect; web pages never).
     require_token: bool,
+    /// Bring the window to the front (without the keyboard focus) when an agent's work waits
+    /// for it to be drawn.
+    bring_forward: bool,
     /// What *Add to Claude Code* last registered ("port:token start"), to notice when Claude
     /// Code needs updating.
     claude_setup: Option<String>,
@@ -295,6 +370,7 @@ impl AgentAccess {
             allow_changes: env_write || stored("agents.changes").is_some_and(|v| v == "1"),
             port: env_port.or_else(|| stored("agents.port").and_then(|p| p.parse().ok())).unwrap_or(polymix_mcp::DEFAULT_PORT),
             require_token: stored("agents.require_token").is_none_or(|v| v != "0"),
+            bring_forward: stored("agents.bring_forward").is_some_and(|v| v == "1"),
             claude_setup: stored("agents.claude_setup").filter(|s| !s.is_empty()),
             claude_job: None,
             claude_message: None,
@@ -320,6 +396,10 @@ impl AgentAccess {
 
     pub fn kind(&self, tool: &str) -> ToolKind {
         self.kinds.get(tool).copied().unwrap_or(ToolKind::Destructive)
+    }
+
+    pub fn brings_forward(&self) -> bool {
+        self.bring_forward && cfg!(target_os = "macos")
     }
 
     /// Start the server if agent access is on.
@@ -369,6 +449,7 @@ impl AgentAccess {
         storage.set_string("agents.changes", if self.allow_changes { "1" } else { "0" }.into());
         storage.set_string("agents.port", self.port.to_string());
         storage.set_string("agents.require_token", if self.require_token { "1" } else { "0" }.into());
+        storage.set_string("agents.bring_forward", if self.bring_forward { "1" } else { "0" }.into());
         storage.set_string("agents.claude_setup", self.claude_setup.clone().unwrap_or_default());
     }
 
@@ -434,6 +515,9 @@ impl AgentAccess {
             ui.add_enabled_ui(self.enabled, |ui| {
                 ui.checkbox(&mut self.allow_changes, "Let agents make changes")
                     .on_hover_text("Select, edit, run tools, open and export files, work the panels. Each change is an undo step labelled \"Agent: …\"; the workspace being changed is shown.");
+                #[cfg(target_os = "macos")]
+                ui.checkbox(&mut self.bring_forward, "Bring Polymix forward when an agent needs it")
+                    .on_hover_text("Polymix is not drawn while other windows cover it, so screenshots, panels, tool previews and clicks wait. On: it comes to the front for the agent, while the keyboard stays where you are typing.");
                 restart = ui
                     .checkbox(&mut self.require_token, "Require a token")
                     .on_hover_text("On: only programs given the token (in Polymix's data folder, readable by you only) can connect, so not other user accounts on this Mac or sandboxed apps. Off: any program on this computer can. Web pages never can.")
@@ -571,8 +655,8 @@ mod catalog_tests {
 
     #[test]
     fn every_tool_has_a_unique_name_and_a_plain_object_schema() {
-        let all: Vec<AgentTool> = shell_tools().into_iter().chain(polymix_volume::VolumeWorkspace::agent_tools()).chain(polymix_segmentation::SegmentationWorkspace::agent_tools()).chain(crate::app::MeshWorkspace::agent_tools()).collect();
-        let mut names: Vec<&str> = all.iter().map(|t| t.name).collect();
+        let all = all_tools();
+        let mut names: Vec<&str> = all.iter().map(|t| &*t.name).collect();
         names.sort();
         let n = names.len();
         names.dedup();
@@ -590,7 +674,31 @@ mod catalog_tests {
                 assert!(!t.description.is_empty());
             }
         }
-        use polymix_workspace::Workspace;
+        // Each image workspace offers its actions as one tool.
+        for (name, kind) in [("volume_do", ToolKind::Destructive), ("segmentation_do", ToolKind::Destructive)] {
+            let t = all.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name} listed"));
+            assert_eq!(t.kind, kind);
+            assert!(t.description.contains("\n- "), "{name} lists its actions");
+        }
+        assert!(all.iter().all(|t| t.name != "volume_browse"), "volume_do replaced volume_browse");
+    }
+
+    #[test]
+    fn workspace_do_tools_check_then_act() {
+        let ctx = egui::Context::default();
+        let mut seg = polymix_segmentation::SegmentationWorkspace::new(&ctx, None);
+        let answer = |r: AgentReply| match r {
+            AgentReply::Now(r) => r,
+            AgentReply::Later(f) => f(),
+        };
+        let e = answer(workspace_call(&mut seg, "segmentation_do", &json!({"action": "paint", "args": {}}), &ctx)).unwrap_err();
+        assert!(e.contains("needs `points`"), "{e}");
+        let e = answer(workspace_call(&mut seg, "segmentation_do", &json!({"action": "explode"}), &ctx)).unwrap_err();
+        assert!(e.contains("no action explode") && e.contains("threshold"), "{e}");
+        // Checked, then the workspace's own answer.
+        let e = answer(workspace_call(&mut seg, "segmentation_do", &json!({"action": "add_segment"}), &ctx)).unwrap_err();
+        assert!(e.contains("No volume is loaded"), "{e}");
+        assert!(answer(workspace_call(&mut seg, "segmentation_state", &json!({}), &ctx)).is_ok());
     }
 
     #[test]

@@ -136,6 +136,89 @@ impl Tool for WarpTool {
         "Warp"
     }
 
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"preserve_detail": self.rigid, "handle_size_mm": self.handle_size}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "preserve_detail": {"type": "boolean", "description": "As-rigid-as-possible: surface detail keeps its shape (slower)"},
+            "handle_size_mm": {"type": "number", "description": "Radius of the patch each handle carries, along the surface"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.rigid = v["preserve_detail"].as_bool().ok_or("preserve_detail must be true or false")?;
+        self.handle_size = v["handle_size_mm"].as_f64().filter(|s| *s >= 0.0).ok_or("handle_size_mm must be a number ≥ 0")?;
+        for i in 0..self.handles.len() {
+            self.handles[i].disc = self.disc(self.handles[i].vertex);
+        }
+        self.rebuild();
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::vec3;
+        serde_json::json!({
+            "object": self.object,
+            "selected_triangles": self.selection.len(),
+            "handles": self.handles.iter().enumerate().map(|(i, h)| serde_json::json!({"handle": i + 1, "from_mm": vec3(self.source.vertex(h.vertex).to_array(), 4), "to_mm": vec3(h.target.to_array(), 4)})).collect::<Vec<_>>(),
+            "next": if self.selection.is_empty() { "select the region to warp first" } else { "add_handle, move_handle, then accept (mesh_tool accept)" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("add_handle", "Put a handle on the selection's interior vertex nearest `at`", json!({"at": arg::point("A point in the selected region, mm")})).required(&["at"]),
+            Action::new("move_handle", "Drag a handle to a point (the region bends to follow)", json!({"handle": arg::integer("Its number (from 1)"), "to": arg::point("Where it goes, mm")})).required(&["handle", "to"]),
+            Action::new("remove_handle", "Remove a handle", json!({"handle": arg::integer("Its number (from 1)")})).required(&["handle"]),
+            Action::plain("clear", "Remove every handle"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, _cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        let index = |n: usize| -> Result<usize, String> { a.usize("handle")?.checked_sub(1).filter(|i| *i < n).ok_or_else(|| "there is no such handle".to_string()) };
+        match action {
+            "add_handle" => {
+                let at = DVec3::from_array(a.point("at")?);
+                let m = &*self.source;
+                let selected: std::collections::HashSet<u32> = self.selection.iter().copied().collect();
+                let v = self
+                    .selection
+                    .iter()
+                    .flat_map(|&t| m.triangle(t))
+                    .filter(|&v| m.vertex_triangles(v).iter().all(|t| selected.contains(t)))
+                    .min_by(|&x, &y| m.vertex(x).distance(at).total_cmp(&m.vertex(y).distance(at)))
+                    .ok_or("the selection has no interior vertices: select a region first")?;
+                let disc = self.disc(v);
+                self.handles.push(Handle { vertex: v, target: m.vertex(v), disc });
+                Ok(format!("Handle {} at [{:.3}, {:.3}, {:.3}]", self.handles.len(), m.vertex(v).x, m.vertex(v).y, m.vertex(v).z))
+            }
+            "move_handle" => {
+                let i = index(self.handles.len())?;
+                self.handles[i].target = DVec3::from_array(a.point("to")?);
+                self.rebuild();
+                Ok(format!("Handle {} moved; previewing", i + 1))
+            }
+            "remove_handle" => {
+                let i = index(self.handles.len())?;
+                self.handles.remove(i);
+                self.rebuild();
+                Ok(format!("Handle {} removed", i + 1))
+            }
+            "clear" => {
+                self.handles.clear();
+                self.rebuild();
+                Ok("Handles cleared".into())
+            }
+            _ => Err(format!("Warp has no action {action}")),
+        }
+    }
+
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Warp");
         if self.object.is_none() || self.selection.is_empty() {

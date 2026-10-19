@@ -70,12 +70,12 @@ pub fn tools() -> Vec<AgentTool> {
         ),
         AgentTool::new(
             "mesh_tool_state",
-            "The tools open in the Mesh workspace and the top one's state: whether it is computing, its settings (operation tools such as Remesh, Reduce, Smooth, Make Solid) and what its panel reports (result, errors). Interactive tools have no settings here: read their panel with app_ui.",
+            "The tools open in the Mesh workspace and the top one's full state: whether it is computing, its settings, what it holds and shows (picked points, readouts, results, warnings, errors), and its actions with their arguments (run them with mesh_tool run).",
             json!({"schema": {"type": "boolean", "description": "Include the JSON Schema of the settings, with each setting's meaning and range"}}),
         ),
         AgentTool::new(
             "mesh_tools",
-            "The Mesh tools that mesh_tool can open: name, title and purpose; with `tool`, that tool's settings schema (operation tools only). Tools worked by clicking say so.",
+            "The Mesh tools that mesh_tool can open: name, title, purpose, whether it has settings, and its actions; with `tool`, that tool's settings schema and its actions' arguments.",
             json!({"tool": choice(&tool_names, "One tool to describe in full")}),
         ),
         AgentTool::new(
@@ -145,10 +145,12 @@ pub fn tools() -> Vec<AgentTool> {
         .kind(ToolKind::Change),
         AgentTool::new(
             "mesh_tool",
-            "Work a Mesh tool. open (`tool` from mesh_tools, optionally `settings`; the open tool is applied first, as in the app), set (`settings`: only the keys to change, see mesh_tool_state / mesh_tools), accept (apply the result and close; a tool still computing applies when done), cancel (close without applying), click (`at`: the surface nearest that point is clicked as a user would, for tools worked by clicking; `double`, `shift`). Operation tools preview live and act on the selection if there is one. Call app_wait after open, set, accept or click, then read the result with mesh_tool_state, mesh_scene or app_screenshot. Accepted results are undoable.",
+            "Work a Mesh tool. open (`tool` from mesh_tools, optionally `settings`; the open tool is applied first, as in the app), set (`settings`: only the keys to change), run (`command` and `args`: one of the open tool's actions, such as placing a stent's end at a point or pressing a panel button; mesh_tool_state lists them with their arguments), accept (apply the result and close; a tool still computing applies when done), cancel (close without applying), click (`at`: the surface nearest that point is clicked as a user would; prefer a run action where the tool has one). Call app_wait after open, set, run, accept or click, then read the result with mesh_tool_state (the tool's full state) or mesh_scene. Accepted results are undoable.",
             json!({
-                "action": choice(&["open", "set", "accept", "cancel", "click"], "What to do"),
+                "action": choice(&["open", "set", "run", "accept", "cancel", "click"], "What to do"),
                 "tool": choice(&tool_names, "Tool to open (action open)"),
+                "command": {"type": "string", "description": "The open tool's action to run (action run; see mesh_tool_state)"},
+                "args": {"type": "object", "description": "Its arguments (action run)"},
                 "object": object["object"],
                 "settings": {"type": "object", "description": "Settings to change (actions open and set)"},
                 "at": point("Point in mm on or near the surface (action click)"),
@@ -209,7 +211,7 @@ pub fn call(ws: &mut MeshWorkspace, tool: &str, args: &Value, ctx: &egui::Contex
     match tool {
         "mesh_scene" => scene(ws),
         "mesh_tool_state" => AgentReply::Now(Ok(json!({"open_tools": ws.tools.iter().map(|t| t.name()).collect::<Vec<_>>(), "tool": current_tool(ws, args.get("schema").and_then(Value::as_bool).unwrap_or(false))}))),
-        "mesh_tools" => AgentReply::Now(catalog(arg_str(args, "tool"))),
+        "mesh_tools" => AgentReply::Now(catalog(arg_str(args, "tool"), ctx)),
         "mesh_select" | "mesh_objects" | "mesh_edit" | "mesh_history" | "mesh_view" | "mesh_tool" | "mesh_file" => AgentReply::Now(act(ws, tool, args, ctx)),
         "mesh_object" | "mesh_selection" => {
             let o = match find(&ws.scene, args) {
@@ -232,7 +234,8 @@ fn current_tool(ws: &MeshWorkspace, schema: bool) -> Value {
         "name": t.name(),
         "computing": t.busy().map(|(what, p)| json!({"what": what, "progress": round(p as f64, 2)})),
         "settings": t.settings(),
-        "report": t.report(),
+        "state": t.state(&ws.scene),
+        "actions": t.actions().iter().map(|a| if schema { a.describe() } else { json!(format!("{} — {}", a.signature(), a.about)) }).collect::<Vec<_>>(),
     });
     if schema {
         v["settings_schema"] = json!(t.settings_schema());
@@ -240,13 +243,31 @@ fn current_tool(ws: &MeshWorkspace, schema: bool) -> Value {
     v
 }
 
-fn catalog(tool: Option<&str>) -> AgentResult {
+/// What the tools offer, read from the tools themselves: each is opened on a scratch cube (in
+/// a scene of its own) and asked.
+fn catalog(tool: Option<&str>, ctx: &egui::Context) -> AgentResult {
+    let mut scene = Scene::default();
+    scene.add("cube", mm_core::primitives::cube(10.0, 2));
+    let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+    let vp = crate::tools::Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+    let mut cx = crate::tools::ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
     match tool {
         Some(name) => {
             let t = TOOLS.iter().find(|t| t.name == name).ok_or_else(|| format!("No tool {name} (see mesh_tools)"))?;
-            Ok(json!({"name": t.name, "title": t.title, "about": t.about, "settings_schema": crate::tools::ops::settings_schema(t.name)}))
+            let tool = super::make_tool(name, &mut cx).ok_or_else(|| format!("{name} does not open"))?;
+            Ok(json!({
+                "name": t.name,
+                "title": t.title,
+                "about": t.about,
+                "settings_schema": tool.settings_schema(),
+                "actions": tool.actions().iter().map(|a| a.describe()).collect::<Vec<_>>(),
+            }))
         }
-        None => Ok(json!({"tools": TOOLS.iter().map(|t| json!({"name": t.name, "title": t.title, "about": t.about, "typed_settings": crate::tools::ops::settings_schema(t.name).is_some()})).collect::<Vec<_>>()})),
+        None => Ok(json!({"tools": TOOLS.iter().map(|t| {
+            let tool = super::make_tool(t.name, &mut cx);
+            let actions: Vec<String> = tool.as_ref().map(|x| x.actions().iter().map(|a| a.name.to_string()).collect()).unwrap_or_default();
+            json!({"name": t.name, "title": t.title, "about": t.about, "settings": tool.as_ref().is_some_and(|x| x.settings().is_some()), "actions": actions})
+        }).collect::<Vec<_>>()})),
     }
 }
 
@@ -413,6 +434,7 @@ fn parse(ws: &MeshWorkspace, tool: &str, args: &Value) -> Result<Vec<MeshCommand
                 v
             }
             Some("set") => vec![C::ToolSettings(need("settings")?.clone())],
+            Some("run") => vec![C::ToolAction(need("command")?.as_str().ok_or("`command` must be an action's name")?.to_string(), args.get("args").cloned().unwrap_or(Value::Null))],
             Some("accept") => vec![C::AcceptTool],
             Some("cancel") => vec![C::CancelTool],
             Some("click") => vec![C::Click { at: vec3_arg(need("at")?)?, double: flag("double").unwrap_or(false), shift: flag("shift").unwrap_or(false) }],
@@ -567,7 +589,7 @@ fn object(o: &Snap, limit: usize) -> Value {
     }
     let closed = stats.boundary_edges == 0;
     let mut shells: Vec<(usize, f64)> = defects.components.iter().map(|c| (c.len(), c.iter().map(|&t| m.tri_area(t)).sum())).collect();
-    shells.sort_by(|a, b| b.0.cmp(&a.0));
+    shells.sort_by_key(|s| std::cmp::Reverse(s.0));
     // Numbered as mesh_select's `boundary` counts them.
     let mut loops: Vec<Value> = boundary_loops(m).iter().enumerate().map(|(k, l)| json!({"boundary": k, "edges": l.len(), "perimeter_mm": round(l.perimeter(m), 3), "centre_mm": vec3(l.centroid(m).to_array(), 3)})).collect();
     loops.sort_by(|a, b| b["perimeter_mm"].as_f64().partial_cmp(&a["perimeter_mm"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
@@ -576,7 +598,7 @@ fn object(o: &Snap, limit: usize) -> Value {
         *groups.entry(m.tri_group(t)).or_default() += 1;
     }
     let mut groups: Vec<(i32, usize)> = groups.into_iter().collect();
-    groups.sort_by(|a, b| b.1.cmp(&a.1));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1));
     let [r, g, bl, _] = o.color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
     json!({
         "id": o.id,

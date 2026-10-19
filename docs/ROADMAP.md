@@ -299,16 +299,24 @@ the Model Context Protocol, for debugging and for help with the data on screen
       `MeshWorkspace::execute`; agent tools `mesh_select`, `mesh_objects`, `mesh_edit`,
       `mesh_history`, `mesh_view`, `mesh_tool` (open / set / accept / cancel / click a surface
       point, facing it if hidden), `mesh_file`, `mesh_tool_state`, `mesh_tools`,
-      `volume_browse`, `app_show`, `app_wait`; typed settings for every operation tool
+      `volume_browse` (since replaced by `volume_do`), `app_show`, `app_wait`; typed settings for every operation tool
       (`OpSpec::Params`: serde + schemars, doc comments as descriptions); every panel read and
       worked through egui's AccessKit tree (`app_ui`, `app_ui_action`); a second permission,
       *Let agents make changes*, agents cannot grant themselves; changes shown in their
       workspace and labelled "Agent: …" in the undo history; read / change / destructive hints
       for clients.
-- [ ] **M17.3 Long work and batch**: job handles for long operations (start → poll
+- [x] **M17.3 Agent API**: every Mesh tool reports its full state (`Tool::state`: picked
+      points, readouts, previews, warnings) and offers typed actions (`Tool::actions` / `act`,
+      run with `mesh_tool` run); typed settings for every tool with settings; Volume and
+      Segmentation offer theirs (`Workspace::agent_actions` / `agent_act`), which the shell
+      lists as `volume_do` and `segmentation_do`, their descriptions generated from the
+      actions and each call checked against them. Segmentation: segments, every effect with its
+      settings, masking, undo, meshes for the Mesh tab, saving, views. Volume: selection,
+      slices, window, folders, image preparation. Screenshots and panel reads become the
+      fallback.
+- [ ] **M17.4 Long work and batch**: job handles for long operations (start → poll
       `job_status`, cancel); a headless `polymix --mcp-stdio` mode on the `mm-*` crates for
-      batch pipelines without a window; typed Segmentation commands (segments, threshold,
-      effects, make mesh).
+      batch pipelines without a window.
 
 ## Later
 

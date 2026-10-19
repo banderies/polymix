@@ -42,15 +42,28 @@ impl Section {
 }
 
 /// The stent's settings as shown (percentages for the 0..1 ones).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 struct StentUi {
+    /// The stent's nominal (fully expanded) diameter, mm (0.5..60). Follows the wider end until set.
     diameter: f64,
+    /// Length along the stent's own axis, mm (1..400), centred on the two ends. Follows the
+    /// centerline between the ends (up to the next 5 mm) until set.
     length: f64,
+    /// 0..100 %: 0 follows the vessel's centerline as it is, 100 takes the smoothest path
+    /// between the ends, straightening the vessel where the stent grips it.
     straightness: f64,
+    /// The smoothest path: G0 a straight line between the ends' centres, G1 leaving each end
+    /// square to its cross-section, G2 also continuing the vessel's bend.
     continuity: EndContinuity,
+    /// 0..100 %: radial force, how far narrower wall is opened towards the stent's diameter
+    /// (100 makes a perfect tube; wider wall is never pulled in unless covered).
     stiffness: f64,
+    /// How far past each end the wall eases back to its own shape, mm (0..10).
     end_blend: f64,
+    /// Stent graft: the lumen along it becomes the stent's tube (wider wall narrowed, side
+    /// branches opening along it sealed off and removed).
     covered: bool,
+    /// Even triangles over the reshaped region (recommended for CFD).
     remesh: bool,
 }
 
@@ -167,25 +180,30 @@ impl StentTool {
     }
 
     /// Set an end at the wall point `p`: the first two clicks set ends 1 and 2, later ones
-    /// move the nearer end.
-    fn set_end(&mut self, cx: &mut ToolCx, id: ObjectId, p: DVec3) {
+    /// move the nearer end (or end `which`, 0 or 1, when given).
+    fn set_end(&mut self, cx: &mut ToolCx, id: ObjectId, p: DVec3, which: Option<usize>) -> Result<usize, String> {
         if self.object != Some(id) {
             self.object = Some(id);
             self.sections.clear();
         }
-        let Some(o) = cx.scene.get_mut(id) else { return };
+        if which.is_some_and(|i| i > self.sections.len()) {
+            return Err("set end 1 first".into());
+        }
+        let o = cx.scene.get_mut(id).ok_or("no object")?;
         let bvh = o.bvh();
-        let Some(s) = Section::at(&o.mesh, &bvh, p) else {
-            *cx.status = "No vessel cross-section there: click the wall of a tube-like vessel.".into();
-            return;
+        let s = Section::at(&o.mesh, &bvh, p).ok_or("No vessel cross-section there: pick the wall of a tube-like vessel.")?;
+        let i = match which {
+            Some(i) => i,
+            None if self.sections.len() < 2 => self.sections.len(),
+            None => usize::from(self.sections[0].center.distance(p) > self.sections[1].center.distance(p)),
         };
-        if self.sections.len() < 2 {
+        if i == self.sections.len() {
             self.sections.push(s);
         } else {
-            let i = if self.sections[0].center.distance(p) <= self.sections[1].center.distance(p) { 0 } else { 1 };
             self.sections[i] = s;
         }
         self.sections_changed();
+        Ok(i)
     }
 
     /// The reshaped vessel for `key` (in the background, or at once for scripts).
@@ -331,6 +349,26 @@ impl StentTool {
     }
 }
 
+/// What the preview warns about.
+fn warnings(out: &StentOut) -> Vec<String> {
+    let pl = &out.placement;
+    let mut w = Vec::new();
+    if let Some(e) = (0..2).filter(|&e| pl.return_bend[e] > 0.7).max_by(|&a, &b| pl.return_bend[a].total_cmp(&pl.return_bend[b])) {
+        w.push(format!("Past end {} the vessel has to bend back sharply onto its course, so its wall may crease: lower the straightness.", e + 1));
+    }
+    let moved = out.report.moved_openings.saturating_sub(out.report.sealed_openings);
+    if moved > 0 {
+        w.push(format!("The reshaping reaches {moved} open end{} of the mesh and moves {}: check the inlets and outlets, or lower the straightness.", if moved == 1 { "" } else { "s" }, if moved == 1 { "it" } else { "them" }));
+    }
+    if out.report.outside {
+        w.push("The stent's axis runs outside the vessel (a tight bend): lower the straightness.".into());
+    }
+    if out.crossings > 0 {
+        w.push(format!("The reshaped wall runs into itself ({} new crossings): lower the straightness or the stent's length.", out.crossings));
+    }
+    w
+}
+
 fn trim(x: f64) -> String {
     let s = format!("{x:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -464,7 +502,9 @@ impl Tool for StentTool {
                 if let (Some(id), &[x, y, z]) = (self.object.or(cx.scene.active), &v[..]) {
                     let point = cx.scene.get_mut(id).and_then(|o| o.bvh().nearest(&o.mesh, DVec3::new(x, y, z), f64::INFINITY)).map(|h| h.point);
                     if let Some(p) = point {
-                        self.set_end(cx, id, p);
+                        if let Err(e) = self.set_end(cx, id, p, None) {
+                            *cx.status = e;
+                        }
                     }
                 }
             }
@@ -528,6 +568,117 @@ impl Tool for StentTool {
             return Some(("Tracing the centerline".into(), j.progress()));
         }
         self.job.as_ref().map(|(_, j)| ("Stent".to_string(), j.progress()))
+    }
+
+    fn pending(&self) -> bool {
+        let Some(key) = self.key() else { return false };
+        let done = |k: Option<&StentKey>| k == Some(&key);
+        self.job.is_none() && self.trace_job.is_none() && !done(self.preview.as_ref().map(|p| &p.0)) && !done(self.error.as_ref().map(|e| &e.0))
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        let mut v = serde_json::to_value(self.ui).ok()?;
+        v["in_place"] = self.in_place.into();
+        Some(v)
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        let mut s = schema_of::<StentUi>();
+        s["properties"]["in_place"] = serde_json::json!({"type": "boolean", "description": "Reshape the object itself; otherwise the result is a new object and this one is hidden"});
+        Some(s)
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.in_place = v["in_place"].as_bool().unwrap_or(self.in_place);
+        let ui: StentUi = serde_json::from_value(v).map_err(|e| format!("Virtual stent: {e}"))?;
+        // Typed sizes stop following the ends, as in the panel.
+        self.sized[0] |= changes.get("diameter").is_some();
+        self.sized[1] |= changes.get("length").is_some();
+        self.ui = StentUi { diameter: ui.diameter.clamp(0.5, 60.0), length: ui.length.clamp(1.0, 400.0), straightness: ui.straightness.clamp(0.0, 100.0), stiffness: ui.stiffness.clamp(0.0, 100.0), end_blend: ui.end_blend.clamp(0.0, 10.0), ..ui };
+        self.update(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::{round, vec3};
+        use serde_json::json;
+        let key = self.key();
+        let current = self.preview.as_ref().filter(|p| Some(p.0) == key).map(|p| &p.1);
+        json!({
+            "object": self.object,
+            "ends": self.sections.iter().enumerate().map(|(i, s)| json!({
+                "end": i + 1,
+                "centre_mm": vec3(s.center.to_array(), 3),
+                "axis": vec3(s.normal.to_array(), 4),
+                "diameter_mm": round(s.diameter, 3),
+            })).collect::<Vec<_>>(),
+            "next": match self.sections.len() {
+                0 | 1 => "set_end (or click the wall) at both ends of the stretch to treat",
+                _ if current.is_some() => "adjust the settings, then apply (or accept)",
+                _ => "wait for the preview (app_wait)",
+            },
+            "centerline_between_ends_mm": self.trace.as_ref().filter(|t| t.0 == self.revision).map(|t| round(t.2.span, 2)),
+            "sizes_follow_the_ends": {"diameter": !self.sized[0], "length": !self.sized[1]},
+            "computing": self.trace_job.as_ref().map(|_| "tracing the centerline").or(self.job.as_ref().map(|_| "previewing")),
+            "preview": current.map(|out| {
+                let pl = &out.placement;
+                json!({
+                    "stent_axis_between_ends_mm": round(pl.path_length, 2),
+                    "centerline_between_ends_mm": round(pl.centerline_length, 2),
+                    "reaches_past_ends_mm": pl.overhang().map(|x| round(x, 2)),
+                    "narrowest_lumen_mm": {"before": round(2.0 * out.report.narrowest[0], 3), "after": round(2.0 * out.report.narrowest[1], 3)},
+                    "sealed_openings": out.report.sealed_openings,
+                    "removed_triangles": out.report.removed_triangles,
+                    "new_crossings": out.crossings,
+                    "warnings": warnings(out),
+                })
+            }),
+            "error": self.error.as_ref().filter(|e| Some(e.0) == key).map(|e| e.1.clone()),
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![
+            Action::new(
+                "set_end",
+                "Put an end of the stretch at the vessel's cross-section through the wall point nearest `at` (as clicking the wall does). Without `end`: the first missing end, else the nearer one",
+                serde_json::json!({"at": arg::point("A point in mm on or near the vessel wall"), "end": arg::integer("1 or 2: which end to set")}),
+            )
+            .required(&["at"]),
+            Action::plain("clear", "Remove both ends"),
+            Action::plain("apply", "Keep the reshaped vessel (the preview, or built now) in the object or as a copy (see in_place); the ends are cleared for the next stent"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "set_end" => {
+                let which = match a.opt_usize("end") {
+                    Some(e @ 1..=2) => Some(e - 1),
+                    Some(e) => return Err(format!("there is no end {e}: 1 or 2")),
+                    None => None,
+                };
+                let id = self.object.or(cx.scene.active).ok_or("no active object")?;
+                let at = DVec3::from_array(a.point("at")?);
+                let o = cx.scene.get_mut(id).ok_or("no object")?;
+                let p = o.bvh().nearest(&o.mesh, at, f64::INFINITY).ok_or("the object has no surface")?.point;
+                let i = self.set_end(cx, id, p, which)?;
+                self.update(cx);
+                let s = &self.sections[i];
+                Ok(format!("End {} at [{:.2}, {:.2}, {:.2}], ⌀ {:.2} mm", i + 1, s.center.x, s.center.y, s.center.z, s.diameter))
+            }
+            "clear" => {
+                self.sections.clear();
+                self.sections_changed();
+                self.update(cx);
+                Ok("Ends cleared".into())
+            }
+            "apply" => self.apply(cx),
+            _ => Err(format!("Virtual stent has no action {action}")),
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
@@ -596,19 +747,8 @@ impl Tool for StentTool {
             if !sealed.is_empty() {
                 ui.label(sealed.trim_start_matches("; "));
             }
-            let warn = egui::Color32::from_rgb(240, 170, 80);
-            if let Some(e) = (0..2).filter(|&e| pl.return_bend[e] > 0.7).max_by(|&a, &b| pl.return_bend[a].total_cmp(&pl.return_bend[b])) {
-                ui.colored_label(warn, format!("Past end {} the vessel has to bend back sharply onto its course, so its wall may crease: lower the straightness.", e + 1));
-            }
-            let moved = out.report.moved_openings.saturating_sub(out.report.sealed_openings);
-            if moved > 0 {
-                ui.colored_label(warn, format!("The reshaping reaches {moved} open end{} of the mesh and moves {}: check the inlets and outlets, or lower the straightness.", if moved == 1 { "" } else { "s" }, if moved == 1 { "it" } else { "them" }));
-            }
-            if out.report.outside {
-                ui.colored_label(warn, "The stent's axis runs outside the vessel (a tight bend): lower the straightness.");
-            }
-            if out.crossings > 0 {
-                ui.colored_label(warn, format!("The reshaped wall runs into itself ({} new crossings): lower the straightness or the stent's length.", out.crossings));
+            for w in warnings(out) {
+                ui.colored_label(egui::Color32::from_rgb(240, 170, 80), w);
             }
         }
         let ready = current.is_some();
@@ -647,7 +787,9 @@ impl Tool for StentTool {
             return;
         }
         if let Some((id, hit)) = cx.pick(pos, self.object.filter(|_| !self.sections.is_empty())) {
-            self.set_end(cx, id, hit.point);
+            if let Err(e) = self.set_end(cx, id, hit.point, None) {
+                *cx.status = e;
+            }
         }
     }
 
@@ -760,6 +902,45 @@ mod tests {
             assert!(2.0 * rep.narrowest[1] > want - 0.3, "{label}: {:?}", rep.narrowest);
             assert_eq!(mm_core::topology::boundary_loops(&out).len(), 2, "{label}");
         }
+    }
+
+    #[test]
+    fn agents_work_the_tool_through_its_api() {
+        let (m, centre) = bent_stenosis();
+        let mut scene = crate::scene::Scene::default();
+        let id = scene.add("vessel", m);
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut t = StentTool::new(&mut cx);
+        let names: Vec<&str> = t.actions().iter().map(|a| a.name).collect();
+        assert_eq!(names, ["set_end", "clear", "apply"]);
+        assert_eq!(t.state(cx.scene)["next"], "set_end (or click the wall) at both ends of the stretch to treat");
+        let wall = |s: f64| (centre(s) + DVec3::Z * 4.5).to_array();
+        let (a0, b0) = (15.0 + 25.0 * 30f64.to_radians(), 15.0 + 25.0 * 90f64.to_radians());
+        let msg = t.act("set_end", &serde_json::json!({"at": wall(a0)}), &mut cx).unwrap();
+        assert!(msg.starts_with("End 1 at"), "{msg}");
+        t.act("set_end", &serde_json::json!({"at": wall(b0)}), &mut cx).unwrap();
+        let st = t.state(cx.scene);
+        assert_eq!(st["ends"].as_array().unwrap().len(), 2);
+        assert!((st["ends"][0]["diameter_mm"].as_f64().unwrap() - 8.0).abs() < 0.3, "{st}");
+        // Moving end 2 explicitly; end 3 does not exist.
+        t.act("set_end", &serde_json::json!({"at": wall(b0 + 2.0), "end": 2}), &mut cx).unwrap();
+        assert!(t.act("set_end", &serde_json::json!({"at": wall(b0), "end": 3}), &mut cx).is_err());
+        // Settings: typed sizes stop following the ends; misspelt ones are refused.
+        t.set_settings(&serde_json::json!({"diameter": 7.5, "straightness": 100, "continuity": "G0"}), &mut cx).unwrap();
+        assert_eq!(t.settings().unwrap()["diameter"], 7.5);
+        assert_eq!(t.state(cx.scene)["sizes_follow_the_ends"]["diameter"], false);
+        assert!(t.set_settings(&serde_json::json!({"diamter": 7.0}), &mut cx).is_err());
+        assert!(t.actions()[0].check(&serde_json::json!({"at": [1, 2]})).is_err());
+        // Applied without waiting for a preview: built at once, as a new object.
+        let msg = t.act("apply", &serde_json::Value::Null, &mut cx).unwrap();
+        assert!(msg.contains("narrowest lumen"), "{msg}");
+        assert_eq!(cx.scene.objects.len(), 2);
+        assert!(!cx.scene.get(id).unwrap().visible);
+        assert_eq!(cx.history.undo_label(), Some("Stent"));
+        assert!(t.state(cx.scene)["ends"].as_array().unwrap().is_empty());
     }
 
     /// A real mesh (`POLYMIX_STENT_MESH`, local only): stents along the longest branch of its

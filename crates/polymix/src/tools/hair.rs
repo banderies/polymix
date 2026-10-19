@@ -41,6 +41,46 @@ impl HairTool {
 }
 
 impl Tool for HairTool {
+    fn settings(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(self.params).ok()
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(schema_of::<HairParams>())
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let down = self.params.down;
+        self.params = HairParams { down, ..merged(&self.params, changes).map_err(|e| format!("Grow Hair: {e}"))? };
+        self.refresh(cx);
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        serde_json::json!({
+            "object": self.object,
+            "on_selected_triangles": self.tris.len(),
+            "strands": self.curves.as_ref().filter(|(p, _)| *p == self.params).map(|(_, c)| c.len()),
+            "next": if self.tris.is_empty() { "select the triangles to grow hair on first (close this tool, mesh_select, open it again)" } else { "accept (mesh_tool accept) to add the strands as tubes" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        vec![Action::plain("reseed", "Scatter the strands anew")]
+    }
+
+    fn act(&mut self, action: &str, _args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        match action {
+            "reseed" => {
+                let p = &mut self.params;
+                p.seed = p.seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                self.refresh(cx);
+                Ok("Reseeded".into())
+            }
+            _ => Err(format!("Grow Hair has no action {action}")),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "Grow Hair"
     }

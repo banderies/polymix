@@ -234,11 +234,14 @@ impl VolumeWorkspace {
             "vol.search" => self.search = arg.to_string(),
             // vol.prepare:op=resample,spacing=1 (vol.n4:… is op=n4) — on the previewed volume.
             "vol.prepare" | "vol.n4" => {
+                let target = self.preview.as_ref().map(|p| p.volume).zip(self.catalog.clone());
+                if let Some((k, c)) = &target {
+                    self.prepare.fit_to(&c.volumes[*k]);
+                }
                 if cmd == "vol.n4" {
                     self.prepare.set_options("op=n4");
                 }
                 self.prepare.set_options(arg);
-                let target = self.preview.as_ref().map(|p| p.volume).zip(self.catalog.clone());
                 match target {
                     Some((k, c)) => self.prepare.start(&c, k, &c.volumes[k].name, ctx),
                     None => println!("[volume] {cmd}: nothing selected"),
@@ -823,8 +826,20 @@ impl Workspace for VolumeWorkspace {
         agent::tools()
     }
 
-    fn agent_call(&mut self, tool: &str, args: &serde_json::Value, ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
-        agent::call(self, tool, args, ctx)
+    fn agent_call(&mut self, tool: &str, args: &serde_json::Value, _ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
+        agent::call(self, tool, args)
+    }
+
+    fn agent_actions() -> Vec<polymix_workspace::agent::Action> {
+        agent::actions()
+    }
+
+    fn agent_actions_about() -> &'static str {
+        agent::ABOUT
+    }
+
+    fn agent_act(&mut self, action: &str, args: &serde_json::Value, ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
+        agent::act(self, action, args, ctx)
     }
 }
 

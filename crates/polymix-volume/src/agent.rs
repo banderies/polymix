@@ -5,12 +5,14 @@
 //! parts are masked inside file names, and dates are cut to the year. Patients are numbered
 //! instead of named.
 
+use crate::prepare::{self, Op};
 use crate::privacy::Privacy;
 use crate::{relative, Selection, VolumeWorkspace};
 use mm_volume::model::{Catalog, Field, Volume};
 use mm_volume::scan::Progress;
-use polymix_workspace::agent::{arg_str, arg_usize, round, year_only, AgentReply, AgentResult, AgentTool, ToolKind};
+use polymix_workspace::agent::{arg, arg_str, arg_usize, round, year_only, Action, AgentReply, AgentResult, AgentTool, Args};
 use serde_json::{json, Map, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn tools() -> Vec<AgentTool> {
@@ -30,59 +32,183 @@ pub fn tools() -> Vec<AgentTool> {
             }),
         ),
         info,
-        AgentTool::new(
-            "volume_browse",
-            "Work the Volume workspace: select (`volume`: select and preview it; the Segmentation tab then loads it), slice (`slice`: the previewed slice), add_folder (`path`: an absolute folder or file path to scan), rescan (scan the folders again; volume numbers may change). Scans run in the background: app_wait, then volume_catalog.",
-            json!({
-                "action": {"type": "string", "enum": ["select", "slice", "add_folder", "rescan"]},
-                "volume": {"type": "integer", "description": "Volume number from volume_catalog (action select)"},
-                "slice": {"type": "integer", "description": "Slice number from 0 (action slice)"},
-                "path": {"type": "string", "description": "Absolute path (action add_folder)"}
-            }),
-        )
-        .required(&["action"])
-        .kind(ToolKind::Change),
     ]
 }
 
-/// `volume_browse`.
-fn browse(ws: &mut VolumeWorkspace, args: &Value, ctx: &egui::Context) -> AgentResult {
-    let catalog = || ws.catalog.clone().ok_or("No catalog yet: add a folder (action add_folder) or wait for the scan.");
-    match arg_str(args, "action") {
-        Some("select") => {
-            let c = catalog()?;
-            let k = args.get("volume").and_then(Value::as_u64).ok_or("select needs `volume`")? as usize;
-            if k >= c.volumes.len() {
-                return Err(format!("No volume {k}: the catalog has {}", c.volumes.len()));
-            }
+/// The start of `volume_do`'s description.
+pub const ABOUT: &str = "Work the Volume workspace: choose the image the Segmentation workspace shows, browse its slices, manage the folders scanned, and prepare images (bias correction, resampling, registration, …: each result is saved as a new derived image, which is selected when done). Volumes are numbered as volume_catalog lists them. Scans and image operations run in the background: app_wait, then volume_catalog.";
+
+pub fn actions() -> Vec<Action> {
+    let volume = |about| arg::integer(about);
+    vec![
+        Action::new("select", "Select and preview a volume; the Segmentation workspace then shows it", json!({"volume": volume("Volume number")})).required(&["volume"]),
+        Action::new("slice", "Show a slice of the previewed volume", json!({"slice": arg::integer("Slice number from 0")})).required(&["slice"]),
+        Action::new(
+            "window",
+            "The preview's window / level",
+            json!({"centre": arg::number("Window centre (level)"), "width": arg::number("Window width"), "auto": arg::boolean("Back to the automatic window (1st–99th percentile of the slice)"), "file": arg::boolean("The window stored in the file")}),
+        ),
+        Action::new("add_folder", "Find the images in a folder and everything under it (or in one file)", json!({"path": arg::text("Absolute path")})).required(&["path"]),
+        Action::new("remove_folder", "Stop looking in a folder", json!({"folder": arg::integer("Its number in volume_catalog's sources, from 0")})).required(&["folder"]),
+        Action::plain("rescan", "Scan the folders again (volume numbers may change)"),
+        Action::plain("cancel_scan", "Stop the scan running"),
+        Action::new(
+            "prepare",
+            "Run an image operation on a volume (default: the previewed one): n4 (MR bias correction), denoise, resample, crop (crop / pad), reorient (reorient / fix the header), register (to `reference`, onto its grid), subtract (`reference` from it), normalise, vessels (vesselness filter), slab (MIP / MinIP), time (4D time points), pc (phase contrast → velocities), export (a de-identified copy into options.out)",
+            json!({
+                "op": arg::choice(&Op::ALL.map(Op::key), "The operation"),
+                "volume": volume("Volume number (default: the previewed one)"),
+                "options": {"type": "object", "description": prepare::options_about()},
+                "reference": volume("The other image (register, subtract, normalise with norm match)"),
+                "phases": {"type": "array", "items": {"type": "integer"}, "minItems": 3, "maxItems": 3, "description": "Volume numbers of the x, y and z phase images (pc)"},
+                "magnitude": volume("Volume number of the magnitude image (pc, optional)"),
+            }),
+        )
+        .required(&["op"])
+        .destructive(),
+        Action::plain("cancel_prepare", "Stop the image operation running"),
+    ]
+}
+
+pub fn act(ws: &mut VolumeWorkspace, action: &str, args: &Value, ctx: &egui::Context) -> AgentReply {
+    AgentReply::Now(act_now(ws, action, &Args(args), ctx).map(|done| json!({"done": done})))
+}
+
+fn act_now(ws: &mut VolumeWorkspace, action: &str, a: &Args, ctx: &egui::Context) -> Result<String, String> {
+    let catalog = |ws: &VolumeWorkspace| ws.catalog.clone().ok_or_else(|| "No catalog yet: add a folder (add_folder) or wait for the scan (app_wait).".to_string());
+    let volume = |c: &Catalog, k: usize| if k < c.volumes.len() { Ok(k) } else { Err(format!("No volume {k}: the catalog has {}", c.volumes.len())) };
+    match action {
+        "select" => {
+            let c = catalog(ws)?;
+            let k = volume(&c, a.usize("volume")?)?;
             ws.selection = Selection::Volume(k);
             ws.select_volume(k, ctx);
-            Ok(json!({"done": format!("Selected volume {k}"), "name": ws.agent_privacy.path(&c.volumes[k].name)}))
+            Ok(format!("Selected volume {k}, {}", ws.agent_privacy.path(&c.volumes[k].name)))
         }
-        Some("slice") => {
-            let c = catalog()?;
-            let n = args.get("slice").and_then(Value::as_u64).ok_or("slice needs `slice`")? as usize;
-            let p = ws.preview.as_mut().ok_or("No volume is previewed: select one first.")?;
+        "slice" => {
+            let c = catalog(ws)?;
+            let n = a.usize("slice")?;
+            let p = ws.preview.as_mut().ok_or("No volume is previewed: select one first")?;
             if n >= p.slices {
                 return Err(format!("No slice {n}: the volume has {}", p.slices));
             }
             p.go_to(n, &c.volumes[p.volume], ctx);
-            Ok(json!({"done": format!("Slice {n} of {}", p.slices)}))
+            Ok(format!("Slice {n} of {}", p.slices))
         }
-        Some("add_folder") => {
-            let path = std::path::PathBuf::from(arg_str(args, "path").ok_or("add_folder needs `path`")?);
+        "window" => {
+            let p = ws.preview.as_mut().ok_or("No volume is previewed: select one first")?;
+            if a.opt_bool("auto") == Some(true) {
+                p.set_window(None);
+            } else if a.opt_bool("file") == Some(true) {
+                p.set_window(Some(p.file_window().ok_or("This file stores no window")?));
+            } else {
+                let (c, w) = p.shown_window();
+                p.set_window(Some((a.opt_f64("centre").unwrap_or(c), a.opt_f64("width").unwrap_or(w).max(1e-6))));
+            }
+            let (c, w) = p.shown_window();
+            Ok(format!("Window {w:.1} / level {c:.1}"))
+        }
+        "add_folder" => {
+            let path = PathBuf::from(a.str("path")?);
             if !path.is_absolute() || !path.exists() {
                 return Err(format!("{} is not an absolute path to a folder or file", ws.agent_privacy.path(&path.display().to_string())));
             }
             ws.add_roots(vec![path], ctx);
-            Ok(json!({"done": "Scanning; app_wait, then volume_catalog"}))
+            Ok("Scanning: app_wait, then volume_catalog".into())
         }
-        Some("rescan") => {
+        "remove_folder" => {
+            let k = a.usize("folder")?;
+            if k >= ws.roots.len() {
+                return Err(format!("No folder {k}: there are {}", ws.roots.len()));
+            }
+            let gone = ws.roots.remove(k);
             ws.start_scan(ctx);
-            Ok(json!({"done": "Scanning again; app_wait, then volume_catalog (volume numbers may change)"}))
+            Ok(format!("No longer looking in {}; scanning again (volume numbers may change)", ws.agent_privacy.path(&gone.display().to_string())))
         }
-        other => Err(format!("volume_browse: unknown action {:?}", other.unwrap_or(""))),
+        "rescan" => {
+            ws.start_scan(ctx);
+            Ok("Scanning again: app_wait, then volume_catalog (volume numbers may change)".into())
+        }
+        "cancel_scan" => match &ws.scan {
+            Some(task) => {
+                task.cancel();
+                Ok("Scan cancelled".into())
+            }
+            None => Err("No scan is running".into()),
+        },
+        "cancel_prepare" => if ws.prepare.cancel() { Ok("Image operation cancelled".into()) } else { Err("No image operation is running".into()) },
+        "prepare" => prepare(ws, a, ctx),
+        _ => Err(format!("the Volume workspace has no action {action}")),
     }
+}
+
+fn prepare(ws: &mut VolumeWorkspace, a: &Args, ctx: &egui::Context) -> Result<String, String> {
+    let c = ws.catalog.clone().ok_or("No catalog yet")?;
+    if ws.prepare.busy() {
+        return Err("An image operation is running: app_wait, then try again (or cancel_prepare)".into());
+    }
+    let pick = |k: usize| c.volumes.get(k).ok_or_else(|| format!("No volume {k}: the catalog has {}", c.volumes.len()));
+    let k = match a.opt_usize("volume") {
+        Some(k) => k,
+        None => ws.preview.as_ref().map(|p| p.volume).ok_or("No volume is previewed: give `volume`")?,
+    };
+    let v = pick(k)?;
+    if !prepare::applies_to(v) {
+        return Err(format!("Volume {k} is not an intensity image Polymix can read"));
+    }
+    // The options as the panel's settings (checked before anything changes), over the defaults
+    // for this image.
+    let mut options = vec![format!("op={}", a.str("op")?)];
+    let mut crop = (None, None);
+    for (key, value) in a.0.get("options").and_then(Value::as_object).into_iter().flatten() {
+        let point = || -> Result<[usize; 3], String> {
+            match value.as_array().map(|x| x.iter().filter_map(Value::as_u64).map(|n| n as usize).collect::<Vec<_>>()).as_deref() {
+                Some(&[i, j, k]) => Ok([i, j, k]),
+                _ => Err(format!("options.{key} must be voxel indices [i, j, k]")),
+            }
+        };
+        match key.as_str() {
+            "crop_from" => crop.0 = Some(point()?),
+            "crop_to" => crop.1 = Some(point()?),
+            k if prepare::OPTION_KEYS.contains(&k) => {
+                let text = match value {
+                    Value::Bool(b) => if *b { "on" } else { "off" }.to_string(),
+                    Value::Number(n) => n.to_string(),
+                    Value::String(t) if !t.contains([',', '=']) => t.clone(),
+                    _ => return Err(format!("options.{key} must be a number, true / false or text without , or =")),
+                };
+                if k == "out" && !std::path::Path::new(&text).is_absolute() {
+                    return Err("options.out must be an absolute folder".into());
+                }
+                options.push(format!("{k}={text}"));
+            }
+            k => return Err(format!("prepare has no option {k}; the options are {}, crop_from, crop_to", prepare::OPTION_KEYS.join(", "))),
+        }
+    }
+    ws.prepare.fit_to(v);
+    if let Some(r) = a.opt_usize("reference") {
+        ws.prepare.choose_reference(pick(r)?);
+    }
+    if let Some(ph) = a.0.get("phases").and_then(Value::as_array) {
+        let ks: Vec<usize> = ph.iter().filter_map(Value::as_u64).map(|n| n as usize).collect();
+        let [x, y, z] = ks[..] else { return Err("phases must be three volume numbers".into()) };
+        let magnitude = a.opt_usize("magnitude").map(pick).transpose()?;
+        ws.prepare.choose_phases([pick(x)?, pick(y)?, pick(z)?], magnitude);
+    }
+    if crop != (None, None) {
+        let dims = v.geometry.as_ref().map(|g| g.dims).unwrap_or_default();
+        ws.prepare.set_crop(v, crop.0.unwrap_or([0; 3]), crop.1.unwrap_or([0, 1, 2].map(|a| dims[a].saturating_sub(1))))?;
+    }
+    ws.prepare.set_options(&options.join(","));
+    // The panel shows the volume being prepared.
+    ws.selection = Selection::Volume(k);
+    ws.select_volume(k, ctx);
+    let label = ws.agent_privacy.path(&v.name);
+    ws.prepare.start(&c, k, &label, ctx);
+    if !ws.prepare.busy() {
+        return Err(ws.prepare.last_message().trim_start_matches("error: ").to_string());
+    }
+    Ok(format!("{} of volume {k} started: app_wait, then volume_catalog (prepare.last_run)", a.str("op")?))
 }
 
 /// What the tools need, taken on the UI thread (the catalog is shared, not copied).
@@ -94,13 +220,11 @@ struct Snapshot {
     scan_error: Option<String>,
     selection: Value,
     previewed: Value,
+    prepare: Value,
     hide_ids: bool,
 }
 
-pub fn call(ws: &mut VolumeWorkspace, tool: &str, args: &Value, ctx: &egui::Context) -> AgentReply {
-    if tool == "volume_browse" {
-        return AgentReply::Now(browse(ws, args, ctx));
-    }
+pub fn call(ws: &mut VolumeWorkspace, tool: &str, args: &Value) -> AgentReply {
     let privacy = ws.agent_privacy.clone();
     let scanning = ws.scan.as_ref().map(|s| match s.progress() {
         Some(Progress::Listing { files }) => format!("listing files ({files} so far)"),
@@ -120,7 +244,11 @@ pub fn call(ws: &mut VolumeWorkspace, tool: &str, args: &Value, ctx: &egui::Cont
             Selection::Series(p, s, se) => json!({"patient": p, "study": s, "series": se}),
             Selection::Volume(k) => json!({"volume": k}),
         },
-        previewed: ws.preview.as_ref().map_or(Value::Null, |p| json!({"volume": p.volume, "slice": p.slice, "slices": p.slices})),
+        previewed: ws.preview.as_ref().map_or(Value::Null, |p| {
+            let (c, w) = p.shown_window();
+            json!({"volume": p.volume, "slice": p.slice, "slices": p.slices, "window": {"centre": round(c, 3), "width": round(w, 3)}})
+        }),
+        prepare: ws.prepare.agent_state(),
         hide_ids: ws.hide_ids,
         privacy,
     };
@@ -139,6 +267,7 @@ fn catalog(s: &Snapshot, args: &Value) -> Value {
         "scan_error": s.scan_error,
         "selected": s.selection,
         "previewed": s.previewed,
+        "prepare": s.prepare,
         "identifiers_hidden_in_window": s.hide_ids,
     });
     let Some(c) = &s.catalog else {
@@ -288,7 +417,7 @@ mod tests {
 
     fn snapshot(c: Catalog) -> Snapshot {
         let privacy = Arc::new(Privacy::new(true, Some(&c)));
-        Snapshot { roots: c.roots.iter().map(|r| privacy.path(&r.display().to_string())).collect(), catalog: Some(Arc::new(c)), privacy, scanning: None, scan_error: None, selection: Value::Null, previewed: Value::Null, hide_ids: false }
+        Snapshot { roots: c.roots.iter().map(|r| privacy.path(&r.display().to_string())).collect(), catalog: Some(Arc::new(c)), privacy, scanning: None, scan_error: None, selection: Value::Null, previewed: Value::Null, prepare: Value::Null, hide_ids: false }
     }
 
     #[test]
@@ -311,5 +440,46 @@ mod tests {
         assert_eq!(super::catalog(&s, &json!({"search": "nifti"}))["volumes_matching"], 0);
         assert!(info(&s, &json!({"volume": 5})).unwrap_err().contains("No volume 5"));
         assert!(info(&s, &json!({})).is_err());
+    }
+
+    fn run(ws: &mut VolumeWorkspace, action: &str, args: Value) -> Result<Value, String> {
+        let a = actions().into_iter().find(|a| a.name == action).expect("listed");
+        a.check(&args)?;
+        let AgentReply::Now(r) = act(ws, action, &args, &egui::Context::default()) else { panic!("answered now") };
+        r
+    }
+
+    #[test]
+    fn actions_check_what_they_are_given() {
+        let mut ws = VolumeWorkspace::new(&egui::Context::default(), None);
+        assert!(run(&mut ws, "select", json!({"volume": 0})).unwrap_err().contains("No catalog yet"));
+        let mut c = sample();
+        // A readable image, so preparing it gets as far as its options.
+        let g = mm_volume::geometry::Geometry::from_affine([4, 5, 6, 1], Default::default());
+        c.volumes[0].geometry = Some(g);
+        c.volumes[0].voxels = Voxels::Raw { file: "/nowhere/x.nii".into(), file_offset: 352, gzip: false, skip: 0, interleave: 1, dtype: mm_volume::model::DataType::F32, big_endian: false, slope: 1.0, intercept: 0.0 };
+        ws.finish_scan(Ok(c));
+        assert!(run(&mut ws, "select", json!({"volume": 3})).unwrap_err().contains("No volume 3: the catalog has 1"));
+        assert!(run(&mut ws, "remove_folder", json!({"folder": 2})).unwrap_err().contains("No folder 2"));
+        assert!(run(&mut ws, "cancel_scan", json!({})).unwrap_err().contains("No scan"));
+        assert!(run(&mut ws, "prepare", json!({"op": "n4"})).unwrap_err().contains("give `volume`"));
+        assert!(run(&mut ws, "prepare", json!({"op": "blur", "volume": 0})).is_err());
+        let e = run(&mut ws, "prepare", json!({"op": "n4", "volume": 0, "options": {"strength": 2}})).unwrap_err();
+        assert!(e.contains("no option strength") && e.contains("levels"), "{e}");
+        assert!(run(&mut ws, "prepare", json!({"op": "crop", "volume": 0, "options": {"crop_to": [9, 9, 9]}})).unwrap_err().contains("4 × 5 × 6"));
+        assert!(run(&mut ws, "prepare", json!({"op": "export", "volume": 0, "options": {"out": "relative"}})).unwrap_err().contains("absolute"));
+        assert!(run(&mut ws, "prepare", json!({"op": "pc", "volume": 0, "phases": [0, 0]})).unwrap_err().contains("must be"));
+        // The catalog says how preparing stands.
+        let AgentReply::Later(f) = call(&mut ws, "volume_catalog", &json!({})) else { panic!() };
+        assert_eq!(f().unwrap()["prepare"]["running"], false);
+    }
+
+    #[test]
+    fn the_options_list_names_every_key() {
+        let about = prepare::options_about();
+        for k in prepare::OPTION_KEYS {
+            assert!(about.contains(&format!("{k} (")) || about.contains(&format!("{k},")) || about.contains(&format!(" {k} ")) || about.contains(&format!("{k}:")), "{k} is not described: {about}");
+        }
+        assert!(about.contains("windowed sinc") && about.contains("curvature diffusion") && about.contains("frangi"), "{about}");
     }
 }

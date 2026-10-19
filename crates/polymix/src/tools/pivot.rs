@@ -204,9 +204,94 @@ pub fn paint_pivot(painter: &egui::Painter, cx: &ToolCx, p: &Pivot, highlight: b
     painter.circle(c, 5.0, fill, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
 }
 
+fn placement_key(p: Placement) -> String {
+    p.label().trim_start_matches("Snap To ").to_lowercase().replace(' ', "_")
+}
+
 impl Tool for PivotTool {
     fn name(&self) -> &'static str {
         "Create Pivot"
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        let frame = match self.frame {
+            FrameMode::Geometry => "geometry",
+            FrameMode::EyeRay => "eye_ray",
+            FrameMode::World => "world",
+        };
+        Some(serde_json::json!({"placement": placement_key(self.placement), "frame": frame}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "placement": {"type": "string", "enum": Placement::ALL.map(placement_key), "description": "Where the pivot goes relative to the picked point: the nearest vertex, edge point, edge midpoint, face centre, face-group centre, group-border centre, opening (boundary) centre, the middle of the object along the ray or the normal, or the bounding-box centre"},
+            "frame": {"type": "string", "enum": ["geometry", "eye_ray", "world"], "description": "The pivot's axes: z along the surface normal (or the opening's axis), toward the viewer, or the world's"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.placement = Placement::ALL.into_iter().find(|p| v["placement"] == placement_key(*p).as_str()).ok_or("unknown placement")?;
+        self.frame = match v["frame"].as_str() {
+            Some("geometry") => FrameMode::Geometry,
+            Some("eye_ray") => FrameMode::EyeRay,
+            Some("world") => FrameMode::World,
+            _ => return Err("frame must be geometry, eye_ray or world".into()),
+        };
+        Ok(())
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::vec3;
+        let o = scene.active();
+        serde_json::json!({
+            "object": o.map(|o| o.id),
+            "pivots": o.map(|o| o.pivots.iter().enumerate().map(|(i, p)| serde_json::json!({"pivot": i + 1, "at_mm": vec3(p.position.to_array(), 4), "z_axis": vec3((p.frame * DVec3::Z).to_array(), 4), "x_axis": vec3((p.frame * DVec3::X).to_array(), 4)})).collect::<Vec<_>>()),
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("create_at", "Drop a pivot by the placement setting at the surface point of the active object nearest `at` (as clicking there does)", json!({"at": arg::point("A point on or near the surface, mm"), "along": arg::point("The ray's direction for placement midpoint_along_ray (default: into the surface)")})).required(&["at"]),
+            Action::plain("remove_last", "Remove the active object's last pivot"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        let id = cx.scene.active.ok_or("no active object")?;
+        match action {
+            "create_at" => {
+                let o = cx.scene.get_mut(id).unwrap();
+                let bvh = o.bvh();
+                let h = bvh.nearest(&o.mesh, DVec3::from_array(a.point("at")?), f64::INFINITY).ok_or("no surface")?;
+                let n = o.mesh.tri_normal(h.tid);
+                let dir = a.opt_point("along").map(DVec3::from_array).and_then(|d| d.try_normalize()).unwrap_or(-n);
+                let ray = Ray::new(h.point - dir * 1e-3, dir);
+                let hit = mm_core::bvh::RayHit { tid: h.tid, t: 1e-3, point: h.point, bary: h.bary };
+                let (p, z, x) = place(&o.mesh, &bvh, &hit, &ray, self.placement).ok_or("no pivot can be placed there in this placement mode")?;
+                let frame = match self.frame {
+                    FrameMode::Geometry => frame_from(z, x),
+                    FrameMode::EyeRay => frame_from(-cx.camera.forward(), Some(cx.camera.right())),
+                    FrameMode::World => DQuat::IDENTITY,
+                };
+                cx.history.push("Create Pivot", cx.scene);
+                let o = cx.scene.get_mut(id).unwrap();
+                o.pivots.push(Pivot { position: p, frame });
+                Ok(format!("Pivot {} at [{:.3}, {:.3}, {:.3}]", o.pivots.len(), p.x, p.y, p.z))
+            }
+            "remove_last" => {
+                if cx.scene.get(id).unwrap().pivots.is_empty() {
+                    return Err("the active object has no pivots".into());
+                }
+                cx.history.push("Remove pivot", cx.scene);
+                cx.scene.get_mut(id).unwrap().pivots.pop();
+                Ok("Last pivot removed".into())
+            }
+            _ => Err(format!("Create Pivot has no action {action}")),
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {

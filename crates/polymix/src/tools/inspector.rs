@@ -157,9 +157,106 @@ impl InspectorTool {
     }
 }
 
+const FILL_MODES: [(&str, FillMode); 3] = [("minimal", FillMode::Minimal), ("flat", FillMode::Flat), ("smooth", FillMode::Smooth)];
+
 impl Tool for InspectorTool {
     fn survives_scene_change(&self) -> bool {
         true
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        let mode = FILL_MODES.iter().find(|(_, m)| *m == self.fill_mode).map_or("smooth", |(k, _)| *k);
+        Some(serde_json::json!({"fill_mode": mode, "small_part_fraction": self.small_fraction, "keep_flat_ends": self.keep_flat_ends}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "fill_mode": {"type": "string", "enum": FILL_MODES.map(|(k, _)| k), "description": "How holes are filled: minimal (no new vertices), flat (refined membrane) or smooth (refined, continuing the surrounding curvature)"},
+            "small_part_fraction": {"type": "number", "description": "Parts with less than this fraction of the total area are small parts (0.0001..0.2; 0.01 = 1 %)"},
+            "keep_flat_ends": {"type": "boolean", "description": "Treat flat open boundaries as intentional vessel inlets / outlets: not listed as holes, not filled"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let mode = v["fill_mode"].as_str().unwrap_or_default();
+        self.fill_mode = FILL_MODES.iter().find(|(k, _)| *k == mode).map(|(_, m)| *m).ok_or_else(|| format!("fill_mode must be one of {:?}", FILL_MODES.map(|(k, _)| k)))?;
+        self.small_fraction = v["small_part_fraction"].as_f64().ok_or("small_part_fraction must be a number")?.clamp(0.0001, 0.2);
+        self.keep_flat_ends = v["keep_flat_ends"].as_bool().ok_or("keep_flat_ends must be true or false")?;
+        self.report = None;
+        Ok(())
+    }
+
+    fn pending(&self) -> bool {
+        self.report.is_none() && self.job.is_none() && self.object.is_some()
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::{round, vec3};
+        use serde_json::json;
+        let o = self.object.and_then(|id| scene.get(id));
+        let current = o.is_some_and(|o| self.analyzed == (std::sync::Arc::as_ptr(&o.mesh) as usize as u64, o.mesh.shape_version()));
+        json!({
+            "object": self.object,
+            "repairing": self.job.as_ref().map(|j| round(j.progress() as f64, 2)),
+            "report": self.report.as_ref().map(|r| json!({
+                "for_current_mesh": current,
+                "clean": r.is_clean(),
+                "holes": r.holes.iter().enumerate().map(|(i, h)| json!({"hole": i + 1, "centre_mm": vec3(h.centroid.to_array(), 3), "edges": h.num_edges, "perimeter_mm": round(h.perimeter, 3), "touches_non_manifold": h.touches_bowtie})).collect::<Vec<_>>(),
+                "non_manifold_vertices": r.bowtie_vertices.iter().enumerate().map(|(i, &v)| json!({"vertex": i + 1, "at_mm": o.map(|o| vec3(o.mesh.vertex(v).to_array(), 3))})).collect::<Vec<_>>(),
+                "small_parts": r.small_components.iter().enumerate().map(|(i, c)| json!({"part": i + 1, "centre_mm": vec3(c.centroid.to_array(), 3), "triangles": c.triangles.len(), "area_mm2": round(c.area, 3)})).collect::<Vec<_>>(),
+                "shells": r.num_components,
+                "degenerate_triangles": r.degenerate_triangles.len(),
+                "inconsistently_oriented_edges": r.inconsistent_orientation_edges,
+                "crack_vertices": r.crack_vertices,
+            })),
+            "message": self.last_message,
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::plain("inspect", "Look for defects now (also done by itself while the panel is shown)"),
+            Action::plain("repair_all", "Auto Repair All: fill holes (keeping flat ends if set), remove small parts, split non-manifold vertices, weld cracks, fix orientation"),
+            Action::new("repair", "Repair one defect from the report", json!({"defect": arg::choice(&["hole", "non_manifold_vertex", "small_part"], "Which list"), "number": arg::integer("Its number in that list (from 1)")})).required(&["defect", "number"]),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        if self.job.is_some() {
+            return Err("a repair is running: app_wait".into());
+        }
+        let a = Args(args);
+        match action {
+            "inspect" => {
+                self.report = None;
+                self.analyze(cx);
+                let r = self.report.as_ref().ok_or("no active object")?;
+                Ok(format!("{} hole(s), {} non-manifold vertex(es), {} small part(s), {} shell(s)", r.holes.len(), r.bowtie_vertices.len(), r.small_components.len(), r.num_components))
+            }
+            "repair_all" => {
+                self.object.and_then(|id| cx.scene.get(id)).ok_or("no active object")?;
+                self.auto_repair(cx);
+                Ok("Repairing; app_wait, then read the message and report".into())
+            }
+            "repair" => {
+                self.analyze(cx);
+                let r = self.report.as_ref().ok_or("no active object")?;
+                let k = a.usize("number")?.checked_sub(1).ok_or("numbers start at 1")?;
+                let defect = match a.str("defect")? {
+                    "hole" => r.holes.get(k).map(|h| Defect::Hole(h.edge_loop.clone())),
+                    "non_manifold_vertex" => r.bowtie_vertices.get(k).map(|&v| Defect::BowtieVertex(v)),
+                    _ => r.small_components.get(k).map(|c| Defect::SmallComponent(c.triangles.clone())),
+                }
+                .ok_or_else(|| format!("there is no {} {}", a.str("defect").unwrap_or_default(), k + 1))?;
+                self.repair_one(cx, defect);
+                self.analyze(cx);
+                Ok(self.last_message.clone().unwrap_or_default())
+            }
+            _ => Err(format!("Inspector has no action {action}")),
+        }
     }
 
     fn name(&self) -> &'static str {

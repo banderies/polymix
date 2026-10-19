@@ -79,6 +79,28 @@ impl PlaneCutTool {
         self.normal = (DQuat::from_axis_angle(axis.normalize(), deg.to_radians()) * self.normal).normalize();
     }
 
+    /// Vessel mode: the plane square to the vessel at wall point `p`, cutting only that
+    /// branch. The estimated axis points toward the branch tip, the side that is removed.
+    fn square_to_vessel(&mut self, p: DVec3) -> Result<f64, String> {
+        let x = mm_edit::estimate_vessel_cross_section(&self.source, None, p, None).map_err(|e| format!("{e}"))?;
+        self.normal = x.axis;
+        self.origin = x.center;
+        self.local_radius = x.radius * 4.0;
+        self.local_seed = Some(p);
+        Ok(2.0 * x.radius)
+    }
+
+    fn key(c: CutType, f: FillType) -> (&'static str, &'static str) {
+        let cut = if c == CutType::Discard { "discard" } else { "slice" };
+        let fill = match f {
+            FillType::None => "none",
+            FillType::Minimal => "minimal",
+            FillType::Fixed => "fixed",
+            FillType::Remeshed => "remeshed",
+        };
+        (cut, fill)
+    }
+
     fn start(&mut self, cx: &mut ToolCx) {
         let src = self.source.clone();
         let plane = self.plane();
@@ -156,6 +178,114 @@ fn run_cut(m: &mut Mesh, plane: Plane, cut_type: CutType, fill: FillType, seed: 
 impl Tool for PlaneCutTool {
     fn name(&self) -> &'static str {
         "Plane Cut"
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        use polymix_workspace::agent::vec3;
+        let (cut, fill) = Self::key(self.cut_type, self.fill);
+        Some(serde_json::json!({
+            "origin_mm": vec3(self.origin.to_array(), 5),
+            "normal": vec3(self.normal.to_array(), 6),
+            "cut_type": cut,
+            "fill": fill,
+            "slice_groups": self.slice_groups,
+            "only_nearest_cross_section": self.local_seed.is_some(),
+        }))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "origin_mm": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "A point of the plane, mm"},
+            "normal": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "The plane's normal, pointing to the side that is removed (discard)"},
+            "cut_type": {"type": "string", "enum": ["discard", "slice"], "description": "discard: remove the side the normal points to; slice: cut through and keep both"},
+            "fill": {"type": "string", "enum": ["none", "minimal", "fixed", "remeshed"], "description": "How the cut is capped: none, minimal (fewest triangles), fixed (remeshed cap, cut edge kept), remeshed (cap blended into the side)"},
+            "slice_groups": {"type": "boolean", "description": "slice: the far half gets its own face group"},
+            "only_nearest_cross_section": {"type": "boolean", "description": "Cut only the cross-section nearest the origin (a vessel branch), not everything the plane crosses"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let a = Args(&v);
+        self.origin = DVec3::from_array(a.point("origin_mm")?);
+        self.normal = DVec3::from_array(a.point("normal")?).try_normalize().ok_or("normal cannot be zero")?;
+        self.cut_type = if a.opt_str("cut_type") == Some("slice") { CutType::Slice } else { CutType::Discard };
+        self.fill = match a.opt_str("fill") {
+            Some("none") => FillType::None,
+            Some("minimal") => FillType::Minimal,
+            Some("fixed") => FillType::Fixed,
+            _ => FillType::Remeshed,
+        };
+        self.slice_groups = a.opt_bool("slice_groups").unwrap_or(false);
+        let local = a.opt_bool("only_nearest_cross_section").unwrap_or(false);
+        if !local {
+            self.local_seed = None;
+        } else if self.local_seed.is_none() || changes.get("origin_mm").is_some() {
+            self.local_seed = Some(self.origin);
+        }
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::vec3;
+        serde_json::json!({
+            "object": self.object,
+            "plane": {"origin_mm": vec3(self.origin.to_array(), 4), "normal_toward_removed_side": vec3(self.normal.to_array(), 5)},
+            "only_near_mm": self.local_seed.map(|s| vec3(s.to_array(), 4)),
+            "cutting": self.job.is_some(),
+            "error": self.error,
+            "next": "place the plane (settings origin_mm / normal, or square_to_vessel), then accept (mesh_tool accept) to cut",
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("square_to_vessel", "Put the plane square to the vessel through the wall point nearest `at`, cutting only that branch; the tip side is removed (as Shift+clicking the vessel does)", json!({"at": arg::point("A point on or near the vessel wall, mm")})).required(&["at"]),
+            Action::new("move", "Move the plane along its normal", json!({"mm": arg::number("Distance in mm (positive toward the removed side)")})).required(&["mm"]),
+            Action::new("tilt", "Turn the plane about an axis through its origin", json!({"axis": arg::point("Axis direction"), "degrees": arg::number("Angle, degrees")})).required(&["axis", "degrees"]),
+            Action::plain("flip", "Remove the other side"),
+            Action::plain("recentre", "Move the origin to the centre of the object's bounds"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "square_to_vessel" => {
+                let id = self.object.ok_or("no active object")?;
+                let o = cx.scene.get_mut(id).ok_or("no object")?;
+                let p = o.bvh().nearest(&o.mesh, DVec3::from_array(a.point("at")?), f64::INFINITY).ok_or("no surface")?.point;
+                let d = self.square_to_vessel(p)?;
+                Ok(format!("Plane square to a ⌀ {d:.2} mm vessel; the tip side will be removed"))
+            }
+            "move" => {
+                let d = a.f64("mm")?;
+                self.origin += self.normal * d;
+                if let Some(s) = &mut self.local_seed {
+                    *s += self.normal * d;
+                }
+                Ok(format!("Plane moved {d} mm"))
+            }
+            "tilt" => {
+                let axis = DVec3::from_array(a.point("axis")?);
+                if axis.length_squared() < 1e-24 {
+                    return Err("the axis cannot be zero".into());
+                }
+                self.rotate(axis, a.f64("degrees")?);
+                Ok("Plane tilted".into())
+            }
+            "flip" => {
+                self.normal = -self.normal;
+                Ok("The other side will be removed".into())
+            }
+            "recentre" => {
+                self.origin = self.source.bounds().center();
+                Ok("Plane recentred".into())
+            }
+            _ => Err(format!("Plane Cut has no action {action}")),
+        }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
@@ -282,14 +412,7 @@ impl Tool for PlaneCutTool {
         if input.clicked && input.shift {
             // Vessel mode: orient perpendicular to the clicked branch.
             if let Some((_, hit)) = cx.pick(pos, self.object) {
-                // The estimated axis points away from the mesh centroid, i.e. toward the
-                // branch tip, which is the side that gets removed.
-                if let Ok(x) = mm_edit::estimate_vessel_cross_section(&self.source, None, hit.point, None) {
-                    self.normal = x.axis;
-                    self.origin = x.center;
-                    self.local_radius = x.radius * 4.0;
-                    self.local_seed = Some(hit.point);
-                }
+                let _ = self.square_to_vessel(hit.point);
                 self.drag = None;
             }
             return;

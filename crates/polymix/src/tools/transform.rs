@@ -360,6 +360,30 @@ impl TransformTool {
         self.dirty = false;
     }
 
+    fn reset(&mut self) {
+        self.translate = DVec3::ZERO;
+        self.rotation = DQuat::IDENTITY;
+        self.scale = DVec3::ONE;
+        self.dirty = true;
+    }
+
+    /// Move the lowest point onto the ground plane (the plane through the origin square to
+    /// the up axis).
+    fn drop_to_ground(&mut self, up: DVec3) {
+        let b = self.source.bounds();
+        let low = if up == DVec3::Z { b.min.z } else { b.min.y };
+        self.translate = -up * low;
+        self.dirty = true;
+    }
+
+    fn align_principal_axes(&mut self) {
+        let mut tmp = (*self.source).clone();
+        let m = mm_edit::align_to_principal_axes(&mut tmp);
+        let (_, r, _) = m.to_scale_rotation_translation();
+        self.rotation = r;
+        self.dirty = true;
+    }
+
     fn is_identity(&self) -> bool {
         self.translate == DVec3::ZERO && self.rotation.angle_between(DQuat::IDENTITY) < 1e-12 && self.scale == DVec3::ONE
     }
@@ -740,28 +764,19 @@ impl Tool for TransformTool {
                 }
                 return;
             }
+            let _ = b;
             if ui.button("Center at origin").on_hover_text("Move the pivot (box centre) to the origin").clicked() {
                 self.translate = -self.pivot;
                 changed = true;
             }
             if ui.button("Drop to ground").on_hover_text("Move the lowest point onto the ground plane").clicked() {
-                let up = cx.camera.world_up();
-                let low = if up == DVec3::Z { b.min.z } else { b.min.y };
-                self.translate = -up * low;
-                changed = true;
+                self.drop_to_ground(cx.camera.world_up());
             }
             if ui.button("Align principal axes").on_hover_text("Rotate so the object's longest extent lies along X").clicked() {
-                let mut tmp = (*self.source).clone();
-                let m = mm_edit::align_to_principal_axes(&mut tmp);
-                let (_, r, _) = m.to_scale_rotation_translation();
-                self.rotation = r;
-                changed = true;
+                self.align_principal_axes();
             }
             if ui.button("Reset").clicked() {
-                self.translate = DVec3::ZERO;
-                self.rotation = DQuat::IDENTITY;
-                self.scale = DVec3::ONE;
-                changed = true;
+                self.reset();
             }
         });
         if changed {
@@ -846,6 +861,124 @@ impl Tool for TransformTool {
         }
         let sq = egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0));
         painter.rect_filled(sq, 1.0, if active == Some(Handle::UniformScale) { egui::Color32::YELLOW } else { egui::Color32::from_gray(230) });
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        use polymix_workspace::agent::{round, vec3};
+        let f = self.scale_frame();
+        let (rx, ry, rz) = (f.inverse() * self.rotation * f).to_euler(EulerRot::XYZ);
+        let deg = [rx, ry, rz].map(|r| if r.abs() < 1e-9 { 0.0 } else { round(r.to_degrees(), 4) });
+        Some(serde_json::json!({
+            "space": if self.space == Space::Local { "local" } else { "world" },
+            "translate_mm": vec3(self.translate.to_array(), 5),
+            "rotate_deg": deg,
+            "scale": vec3(self.scale.to_array(), 6),
+            "uniform_scaling": self.uniform,
+        }))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        let v3 = |d: &str| serde_json::json!({"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": d});
+        Some(serde_json::json!({"type": "object", "properties": {
+            "space": {"type": "string", "enum": ["local", "world"], "description": "Axes of the rotation and scale: the object's own frame (turning with it) or the world's. Switching keeps what was done so far"},
+            "translate_mm": v3("Move by, mm"),
+            "rotate_deg": v3("Rotation about X, Y, Z (applied in that order), degrees, about the centre"),
+            "scale": v3("Scale along the axes, about the centre"),
+            "uniform_scaling": {"type": "boolean", "description": "set_size scales all axes alike"},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let a = Args(&v);
+        let space = if a.opt_str("space") == Some("world") { Space::World } else { Space::Local };
+        if space != self.space {
+            // As in the panel: what was done so far stays, from here on in the new axes.
+            self.bake();
+            self.space = space;
+            self.reset_pivot();
+        }
+        if changes.get("translate_mm").is_some() {
+            self.translate = DVec3::from_array(a.point("translate_mm")?);
+        }
+        if changes.get("rotate_deg").is_some() {
+            let d = a.point("rotate_deg")?;
+            let f = self.scale_frame();
+            self.rotation = f * DQuat::from_euler(EulerRot::XYZ, d[0].to_radians(), d[1].to_radians(), d[2].to_radians()) * f.inverse();
+        }
+        if changes.get("scale").is_some() {
+            let s = DVec3::from_array(a.point("scale")?);
+            if s.min_element() <= 0.0 {
+                return Err("scale must be positive".into());
+            }
+            self.scale = s;
+        }
+        self.uniform = a.opt_bool("uniform_scaling").unwrap_or(self.uniform);
+        self.dirty = true;
+        self.rebuild();
+        Ok(())
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::vec3;
+        serde_json::json!({
+            "object": self.object,
+            "moves": match &self.region {
+                None => "the whole object",
+                Some(r) if r.soft.is_some() => "the selection, fading into the rest (soft transform)",
+                Some(_) => "the selected faces",
+            },
+            "centre_mm": vec3((self.pivot + self.translate).to_array(), 4),
+            "axes": self.axes().map(|a| vec3(a.to_array(), 5)),
+            "sizes_mm": vec3(self.sizes.to_array(), 4),
+            "changed": !self.is_identity(),
+            "next": "change the settings (or use the actions), then accept (mesh_tool accept)",
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        let mut v = vec![
+            Action::new("set_size", "Scale so the size along one axis becomes `size` (all axes alike with uniform_scaling)", json!({"axis": arg::choice(&["x", "y", "z"], "Which axis"), "size": arg::number("Size in mm")})).required(&["axis", "size"]),
+            Action::plain("reset", "Undo the pending move, rotation and scale"),
+        ];
+        if self.region.is_none() {
+            v.extend([
+                Action::plain("centre_at_origin", "Move the centre (box centre) to the origin"),
+                Action::plain("drop_to_ground", "Move the lowest point onto the ground plane"),
+                Action::plain("align_principal_axes", "Rotate so the longest extent lies along X"),
+            ]);
+        }
+        v
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "set_size" => {
+                let i = ["x", "y", "z"].iter().position(|x| Some(*x) == a.opt_str("axis")).ok_or("axis must be x, y or z")?;
+                let size = a.f64("size")?;
+                if size <= 0.0 {
+                    return Err("size must be positive".into());
+                }
+                if self.dirty || self.preview.is_none() {
+                    self.rebuild();
+                }
+                let (sizes, scale) = (self.sizes, self.scale);
+                self.set_size(i, size, sizes, scale);
+            }
+            "reset" => self.reset(),
+            "centre_at_origin" if self.region.is_none() => {
+                self.translate = -self.pivot;
+                self.dirty = true;
+            }
+            "drop_to_ground" if self.region.is_none() => self.drop_to_ground(cx.camera.world_up()),
+            "align_principal_axes" if self.region.is_none() => self.align_principal_axes(),
+            _ => return Err(format!("{} has no action {action}", self.name())),
+        }
+        self.rebuild();
+        Ok(format!("Previewing; sizes {:.3} × {:.3} × {:.3} mm", self.sizes.x, self.sizes.y, self.sizes.z))
     }
 
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {

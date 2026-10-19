@@ -746,9 +746,182 @@ fn apply_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, d: &Dab) {
     mesh.bump_shape_version();
 }
 
+fn brush_key(b: Brush) -> String {
+    b.label().to_lowercase().replace([' ', '-'], "_")
+}
+
+impl SculptTool {
+    /// Dabs along `path` (points in mm, spaced a quarter of the brush radius apart) with the
+    /// current brush, as one stroke: what dragging the brush along it does.
+    fn stroke_along(&mut self, cx: &mut ToolCx, path: &[DVec3], invert: bool) -> Result<usize, String> {
+        let id = cx.scene.active.ok_or("no active object")?;
+        let r = brush_radius(cx.scene, id, self.size_pct);
+        if r <= 0.0 {
+            return Err("the brush has no size".into());
+        }
+        let mut pts = Vec::new();
+        for w in path.windows(2) {
+            let n = ((w[0].distance(w[1]) / (0.25 * r)).ceil() as usize).max(1);
+            pts.extend((0..n).map(|k| w[0].lerp(w[1], k as f64 / n as f64)));
+        }
+        pts.extend(path.last());
+        cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
+        let view = cx.camera.forward();
+        let target = cx.scene.target_surface(Some(id));
+        let (mut start, mut last) = (std::collections::HashMap::new(), None);
+        for p in &pts {
+            let o = cx.scene.get_mut(id).ok_or("no object")?;
+            let bvh = o.bvh();
+            let Some(h) = bvh.nearest(&o.mesh, *p, f64::INFINITY) else { continue };
+            let center = h.point - o.mesh.tri_normal(h.tid) * (self.depth / 100.0 * r);
+            let motion = last.map_or(DVec3::ZERO, |c| center - c);
+            last = Some(center);
+            if o.moved_vertices.is_empty() {
+                o.moved_from = o.mesh.shape_version();
+            }
+            let stamp = Stamp { brush: self.brush, center, seed: h.tid, motion, view, r, invert };
+            if self.stamp(o, &stamp, &mut start, target.as_ref()) {
+                o.moved_vertices.clear();
+                let m = o.mesh.clone();
+                o.selection.sync(&m);
+                o.touch_selection();
+            }
+        }
+        Ok(pts.len())
+    }
+
+    /// The Move brush: carry the surface under the brush at `from` by `to − from` (and its
+    /// mirror image with symmetry on), as dragging it does.
+    fn drag_from_to(&mut self, cx: &mut ToolCx, from: DVec3, to: DVec3) -> Result<usize, String> {
+        let id = cx.scene.active.ok_or("no active object")?;
+        let r = brush_radius(cx.scene, id, self.size_pct);
+        let fp = self.footprint();
+        let sym = self.symmetry.then_some(self.sym);
+        cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
+        let o = cx.scene.get_mut(id).ok_or("no object")?;
+        let bvh = o.bvh();
+        let h = bvh.nearest(&o.mesh, from, f64::INFINITY).ok_or("no surface")?;
+        let delta = to - h.point;
+        let verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
+        let mirror = sym.and_then(|s| bvh.nearest(&o.mesh, s.reflect(h.point), r).map(|n| (s, brush_vertices(&o.mesh, &bvh, s.reflect(h.point), r, Some(n.tid), &fp)))).unwrap_or((SymPlane { axis: 0, offset: 0.0 }, Vec::new()));
+        let mut moved: std::collections::HashMap<u32, DVec3> = verts.iter().chain(&mirror.1).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
+        let start = moved.clone();
+        for (vs, step) in [(&verts, delta), (&mirror.1, mirror.0.reflect_dir(delta))] {
+            for &(v, w) in vs {
+                if let Some(p) = moved.get_mut(&v) {
+                    *p += step * w;
+                }
+            }
+        }
+        if o.moved_vertices.is_empty() {
+            o.moved_from = o.mesh.shape_version();
+        }
+        let m = o.mesh_mut();
+        for (&v, &p) in &moved {
+            m.positions_mut()[v as usize] = p;
+        }
+        m.bump_shape_version();
+        if let (Some(sym), true) = (sym, self.sym_snap) {
+            sym_snap(m, moved.keys().copied(), &start, sym, r * SYM_SNAP_TOL);
+        }
+        o.moved_vertices.extend(moved.keys().copied());
+        Ok(moved.len())
+    }
+}
+
 impl Tool for SculptTool {
     fn brush_size(&mut self) -> Option<&mut f32> {
         Some(&mut self.size_pct)
+    }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "brush": brush_key(self.brush),
+            "size_percent": self.size_pct,
+            "strength": self.strength,
+            "depth": self.depth,
+            "hold_boundary": self.hold_boundary,
+            "hold_groups": self.hold_groups,
+            "symmetry": self.symmetry,
+            "symmetry_axis": (["x", "y", "z"][self.sym.axis.min(2)]),
+        }))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {
+            "brush": {"type": "string", "enum": Brush::ALL.map(brush_key), "description": "The brush (robust_smooth for smoothing bumps; draw / inflate / flatten / pinch to shape; move drags)"},
+            "size_percent": {"type": "number", "description": "Brush radius as a percentage of the object's size (0.1..25); the state gives it in mm"},
+            "strength": {"type": "number", "description": "0..1"},
+            "depth": {"type": "number", "description": "-100..100: moves the brush centre into (+) or out of (−) the surface"},
+            "hold_boundary": {"type": "boolean", "description": "Open-boundary vertices stay put"},
+            "hold_groups": {"type": "boolean", "description": "Face-group border vertices stay put"},
+            "symmetry": {"type": "boolean", "description": "Mirror every dab across the symmetry plane (through the object's centre)"},
+            "symmetry_axis": {"type": "string", "enum": ["x", "y", "z"]},
+        }}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        let a = Args(&v);
+        self.brush = Brush::ALL.into_iter().find(|b| a.opt_str("brush") == Some(brush_key(*b).as_str())).ok_or("unknown brush")?;
+        self.size_pct = (a.f64("size_percent")? as f32).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        self.strength = a.f64("strength")?.clamp(0.0, 1.0);
+        self.depth = a.f64("depth")?.clamp(-100.0, 100.0);
+        self.hold_boundary = a.opt_bool("hold_boundary").unwrap_or(self.hold_boundary);
+        self.hold_groups = a.opt_bool("hold_groups").unwrap_or(self.hold_groups);
+        self.symmetry = a.opt_bool("symmetry").unwrap_or(false);
+        let axis = ["x", "y", "z"].iter().position(|x| a.opt_str("symmetry_axis") == Some(*x)).unwrap_or(self.sym.axis);
+        if axis != self.sym.axis || changes.get("symmetry").is_some() {
+            if let Some(o) = cx.scene.active() {
+                self.sym = SymPlane::centered(&o.mesh, axis);
+            }
+        }
+        Ok(())
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        let radius = scene.active().map(|o| o.bounds().diagonal() * self.size_pct as f64 / 100.0);
+        serde_json::json!({
+            "object": scene.active,
+            "brush": brush_key(self.brush),
+            "brush_radius_mm": radius.map(|r| polymix_workspace::agent::round(r, 4)),
+            "next": if self.brush.grabs() { "drag the surface from a point to another" } else { "stroke along points on the surface" },
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("stroke", "Brush along a path over the active object, as dragging the brush does: one undo step (not for the move brush)", json!({"path": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "description": "Points in mm on or near the surface, in order; one point is a single dab"}, "invert": arg::boolean("The brush's opposite (Ctrl held): draw in, deflate…")})).required(&["path"]),
+            Action::new("drag", "The move brush: carry the surface under the brush at `from` to `to`", json!({"from": arg::point("A point on or near the surface, mm"), "to": arg::point("Where it goes, mm")})).required(&["from", "to"]),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        match action {
+            "stroke" => {
+                if self.brush.grabs() {
+                    return Err("the move brush drags: use drag, or choose another brush".into());
+                }
+                let path: Vec<DVec3> = a.0.get("path").and_then(serde_json::Value::as_array).ok_or("`path` must be a list of points")?.iter().map(|p| Args(&serde_json::json!({"p": p})).point("p").map(DVec3::from_array)).collect::<Result<_, _>>()?;
+                if path.is_empty() {
+                    return Err("the path is empty".into());
+                }
+                let invert = a.opt_bool("invert").unwrap_or(false);
+                let n = self.stroke_along(cx, &path, invert)?;
+                Ok(format!("{}: {n} dabs", self.brush.label()))
+            }
+            "drag" => {
+                if !self.brush.grabs() {
+                    return Err("drag is for the move brush (setting brush: move)".into());
+                }
+                let n = self.drag_from_to(cx, DVec3::from_array(a.point("from")?), DVec3::from_array(a.point("to")?))?;
+                Ok(format!("Moved {n} vertices"))
+            }
+            _ => Err(format!("{} has no action {action}", self.name())),
+        }
     }
 
     fn brush_strength(&mut self) -> Option<&mut f64> {

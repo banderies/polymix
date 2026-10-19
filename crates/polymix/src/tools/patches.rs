@@ -86,9 +86,132 @@ pub fn write_patch_files(dir: &std::path::Path, o: &SceneObject) -> anyhow::Resu
     Ok(by_group.len())
 }
 
+impl PatchesTool {
+    /// Group 0 = wall; among flat caps the largest = inlet, the rest = outlet_1..n by area.
+    fn auto_name(o: &mut SceneObject) -> usize {
+        let stats = group_stats(&o.mesh);
+        let cap_groups: Vec<i32> = crate::tools::vessel::find_vessel_ends(&o.mesh)
+            .iter()
+            .filter_map(|e| if let crate::tools::vessel::EndKind::Cap(g) = e.kind { Some(g) } else { None })
+            .collect();
+        let mut caps: Vec<(i32, f64)> = stats.iter().filter(|(g, _)| **g != 0 && cap_groups.contains(g)).map(|(g, (_, a))| (*g, *a)).collect();
+        caps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        o.group_names.insert(0, "wall".into());
+        for (k, (g, _)) in caps.iter().enumerate() {
+            o.group_names.insert(*g, if k == 0 { "inlet".into() } else { format!("outlet_{k}") });
+        }
+        caps.len()
+    }
+
+    fn select_group(cx: &mut ToolCx, id: ObjectId, g: i32) {
+        cx.history.push("Select patch", cx.scene);
+        let o = cx.scene.get_mut(id).unwrap();
+        let m = o.mesh.clone();
+        o.selection.sync(&m);
+        o.selection.clear();
+        for t in m.triangle_ids().filter(|&t| m.tri_group(t) == g) {
+            o.selection.insert(t);
+        }
+        o.touch_selection();
+    }
+}
+
+/// An absolute path for an agent's export (existing files kept unless `overwrite`).
+fn export_path(args: &serde_json::Value, key: &str) -> Result<std::path::PathBuf, String> {
+    let a = Args(args);
+    let p = std::path::PathBuf::from(a.str(key)?);
+    if !p.is_absolute() {
+        return Err(format!("{} is not an absolute path", p.display()));
+    }
+    if p.is_file() && !a.opt_bool("overwrite").unwrap_or(false) {
+        return Err(format!("{} exists: pass overwrite: true to replace it", p.display()));
+    }
+    Ok(p)
+}
+
 impl Tool for PatchesTool {
     fn survives_scene_change(&self) -> bool {
         true
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        use serde_json::json;
+        let Some(o) = self.object.and_then(|id| scene.get(id)) else { return json!({"object": null}) };
+        let caps: Vec<i32> = crate::tools::vessel::find_vessel_ends(&o.mesh).iter().filter_map(|e| if let crate::tools::vessel::EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
+        json!({
+            "object": o.id,
+            "patches": group_stats(&o.mesh).iter().map(|(g, (n, area))| json!({
+                "group": g,
+                "name": patch_name(o, *g),
+                "named": o.group_names.contains_key(g),
+                "triangles": n,
+                "area_mm2": polymix_workspace::agent::round(*area, 3),
+                "flat_cap": caps.contains(g),
+            })).collect::<Vec<_>>(),
+            "message": (!self.status.is_empty()).then(|| self.status.clone()),
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("rename", "Name a patch (face group)", json!({"group": arg::integer("Face group number"), "name": arg::text("New name (inlet, outlet_1, wall, …)")})).required(&["group", "name"]),
+            Action::new("select", "Select a patch's triangles", json!({"group": arg::integer("Face group number")})).required(&["group"]),
+            Action::plain("auto_name", "Group 0 becomes wall; among flat caps the largest becomes inlet, the rest outlet_1..n by decreasing area"),
+            Action::new("export_multisolid", "Write a multi-solid ASCII STL, one solid per patch (OpenFOAM snappyHexMesh, Fluent, CFX, SimVascular)", json!({"path": arg::text("Absolute path ending in .stl"), "overwrite": arg::boolean("Replace an existing file")})).required(&["path"]),
+            Action::new("export_per_patch", "Write one binary STL per patch, named after it, into a folder", json!({"folder": arg::text("Absolute path of an existing folder"), "overwrite": arg::boolean("Replace existing files")})).required(&["folder"]),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        let id = self.object.filter(|id| cx.scene.get(*id).is_some()).ok_or("no active object")?;
+        let group = || -> Result<i32, String> {
+            let g = a.0.get("group").and_then(serde_json::Value::as_i64).ok_or("`group` (a face group number) is needed")? as i32;
+            if group_stats(&cx.scene.get(id).unwrap().mesh).contains_key(&g) { Ok(g) } else { Err(format!("the object has no face group {g}")) }
+        };
+        match action {
+            "rename" => {
+                let g = group()?;
+                let name = a.str("name")?.trim().to_string();
+                if name.is_empty() {
+                    return Err("a patch name cannot be empty".into());
+                }
+                cx.scene.get_mut(id).unwrap().group_names.insert(g, name.clone());
+                Ok(format!("Group {g} is now {name}"))
+            }
+            "select" => {
+                let g = group()?;
+                Self::select_group(cx, id, g);
+                Ok(format!("Selected patch {}", patch_name(cx.scene.get(id).unwrap(), g)))
+            }
+            "auto_name" => {
+                let n = Self::auto_name(cx.scene.get_mut(id).unwrap());
+                Ok(format!("Named group 0 wall and {n} flat cap(s) inlet / outlet_N"))
+            }
+            "export_multisolid" => {
+                let path = export_path(args, "path")?;
+                let n = write_multisolid_stl(&path, cx.scene.get(id).unwrap()).map_err(|e| format!("Export failed: {e:#}"))?;
+                self.status = format!("Wrote {n} patches to {}", path.display());
+                Ok(self.status.clone())
+            }
+            "export_per_patch" => {
+                let dir = std::path::PathBuf::from(a.str("folder")?);
+                if !dir.is_absolute() || !dir.is_dir() {
+                    return Err(format!("{} is not an absolute path to a folder", dir.display()));
+                }
+                let o = cx.scene.get(id).unwrap();
+                if !a.opt_bool("overwrite").unwrap_or(false) {
+                    if let Some(g) = group_stats(&o.mesh).keys().find(|g| dir.join(format!("{}.stl", sanitize(&patch_name(o, **g)))).exists()) {
+                        return Err(format!("{}.stl exists there: pass overwrite: true to replace", sanitize(&patch_name(o, *g))));
+                    }
+                }
+                let n = write_patch_files(&dir, o).map_err(|e| format!("Export failed: {e:#}"))?;
+                self.status = format!("Wrote {n} files to {}", dir.display());
+                Ok(self.status.clone())
+            }
+            _ => Err(format!("Boundary patches has no action {action}")),
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -132,29 +255,10 @@ impl Tool for PatchesTool {
             }
         }
         if let Some(g) = select_group {
-            cx.history.push("Select patch", cx.scene);
-            let o = cx.scene.get_mut(id).unwrap();
-            let m = o.mesh.clone();
-            o.selection.sync(&m);
-            o.selection.clear();
-            for t in m.triangle_ids().filter(|&t| m.tri_group(t) == g) {
-                o.selection.insert(t);
-            }
-            o.touch_selection();
+            Self::select_group(cx, id, g);
         }
         if ui.button("Auto-name caps (largest = inlet)").on_hover_text("Group 0 = wall; among flat caps the largest = inlet, the rest = outlet_1..n by decreasing area").clicked() {
-            let o = cx.scene.get_mut(id).unwrap();
-            // Only flat cap groups are inlet/outlet candidates.
-            let cap_groups: Vec<i32> = crate::tools::vessel::find_vessel_ends(&o.mesh)
-                .iter()
-                .filter_map(|e| if let crate::tools::vessel::EndKind::Cap(g) = e.kind { Some(g) } else { None })
-                .collect();
-            let mut caps: Vec<(i32, f64)> = stats.iter().filter(|(g, _)| **g != 0 && cap_groups.contains(g)).map(|(g, (_, a))| (*g, *a)).collect();
-            caps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            o.group_names.insert(0, "wall".into());
-            for (k, (g, _)) in caps.iter().enumerate() {
-                o.group_names.insert(*g, if k == 0 { "inlet".into() } else { format!("outlet_{k}") });
-            }
+            Self::auto_name(cx.scene.get_mut(id).unwrap());
         }
         ui_util::section(ui, "Export");
         if ui.button("Multi-solid ASCII STL…").clicked() {

@@ -168,6 +168,8 @@ pub struct SegmentationWorkspace {
     message: Option<(String, bool)>,
     /// Meshes for the Mesh workspace.
     outbox: Vec<(String, Mesh)>,
+    /// They were made for an agent (Mesh adds them without asking).
+    outbox_by_agent: bool,
     /// A volume selected in the Volume workspace whose grid does not fit the segmentation:
     /// waiting for the user to discard the segmentation or keep working.
     pending: Option<(Source, Volume)>,
@@ -176,6 +178,8 @@ pub struct SegmentationWorkspace {
     /// The segment being renamed, the name typed so far and whether its field has had the
     /// keyboard focus.
     renaming: Option<(usize, String, bool)>,
+    /// The operation running was an agent's: its outcome's message says so.
+    agent_op: bool,
 }
 
 impl SegmentationWorkspace {
@@ -207,9 +211,11 @@ impl SegmentationWorkspace {
             overlay: (None, 0),
             message: None,
             outbox: Vec::new(),
+            outbox_by_agent: false,
             pending: None,
             declined: None,
             renaming: None,
+            agent_op: false,
         }
     }
 
@@ -248,6 +254,7 @@ impl SegmentationWorkspace {
         self.pending = None;
         self.declined = None;
         self.running = None;
+        self.agent_op = false;
         self.stroke = None;
         self.preview = None;
         if !keep {
@@ -259,9 +266,10 @@ impl SegmentationWorkspace {
         self.loading = Some(Loading::start(v, keep, ctx));
     }
 
-    /// Meshes made for the Mesh workspace (Make mesh), taken by the shell.
-    pub fn take_meshes(&mut self) -> Vec<(String, Mesh)> {
-        std::mem::take(&mut self.outbox)
+    /// Meshes made for the Mesh workspace (Make mesh), taken by the shell, and whether they
+    /// were made for an agent.
+    pub fn take_meshes(&mut self) -> (Vec<(String, Mesh)>, bool) {
+        (std::mem::take(&mut self.outbox), std::mem::take(&mut self.outbox_by_agent))
     }
 
     fn finish_loading(&mut self, result: anyhow::Result<LoadedVolume>, keep: bool) {
@@ -325,6 +333,7 @@ impl SegmentationWorkspace {
     }
 
     fn finish_op(&mut self, result: anyhow::Result<Outcome>) {
+        let agent = std::mem::take(&mut self.agent_op);
         let (Some(vol), Some(seg)) = (self.volume.clone(), &mut self.seg) else { return };
         let message = match result {
             Ok(Outcome::Edit { label, mask, mode, what }) => {
@@ -352,6 +361,7 @@ impl SegmentationWorkspace {
             Ok(Outcome::Meshes(meshes)) => {
                 let n = meshes.len();
                 self.outbox.extend(meshes);
+                self.outbox_by_agent = agent;
                 (format!("{n} mesh(es) sent to the Mesh tab"), false)
             }
             Ok(Outcome::Saved { path, version }) => {
@@ -362,7 +372,7 @@ impl SegmentationWorkspace {
             }
             Err(e) => (format!("{e:#}"), true),
         };
-        self.message = Some(message);
+        self.message = Some(if agent { (format!("Agent: {}", message.0), message.1) } else { message });
     }
 
     /// A brush dab at `at` (voxel coordinates) in the view of `plane`; the first one of a
@@ -925,5 +935,17 @@ impl Workspace for SegmentationWorkspace {
 
     fn agent_call(&mut self, tool: &str, args: &serde_json::Value, ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
         agent::call(self, tool, args, ctx)
+    }
+
+    fn agent_actions() -> Vec<polymix_workspace::agent::Action> {
+        agent::actions()
+    }
+
+    fn agent_actions_about() -> &'static str {
+        agent::ABOUT
+    }
+
+    fn agent_act(&mut self, action: &str, args: &serde_json::Value, ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
+        agent::act(self, action, args, ctx)
     }
 }

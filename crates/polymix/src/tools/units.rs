@@ -92,7 +92,111 @@ impl UnitsTool {
     }
 }
 
+impl UnitsTool {
+    /// Apply the scale that best fits the measurements' real lengths.
+    fn apply_fit(&mut self, cx: &mut ToolCx) -> Result<f64, String> {
+        let pairs: Vec<(f64, f64)> = self.measures.iter().filter(|m| m.target > 0.0).map(|m| (m.length(), m.target)).collect();
+        let (s, _, _) = fit_scale(&pairs).ok_or("give at least one measurement its real length")?;
+        self.scale_by(cx, s, "Scale from measurements");
+        for m in &mut self.measures {
+            m.target = m.length();
+        }
+        Ok(s)
+    }
+}
+
 impl Tool for UnitsTool {
+    fn settings(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"unit": self.unit.label()}))
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object", "properties": {"unit": {"type": "string", "enum": Unit::ALL.map(|u| u.label()), "description": "Unit the dimensions and lengths are shown and given in (the model is in mm)"}}}))
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        let mut v = self.settings().unwrap_or_default();
+        merge_settings(&mut v, changes)?;
+        self.unit = Unit::ALL.into_iter().find(|u| v["unit"] == u.label()).ok_or("unit must be mm, cm, m or in")?;
+        Ok(())
+    }
+
+    fn state(&self, scene: &Scene) -> serde_json::Value {
+        use polymix_workspace::agent::round;
+        let k = self.unit.mm();
+        let e = self.object.and_then(|id| scene.get(id)).map(|o| o.bounds().extents());
+        let pairs: Vec<(f64, f64)> = self.measures.iter().filter(|m| m.target > 0.0).map(|m| (m.length(), m.target)).collect();
+        serde_json::json!({
+            "object": self.object,
+            "unit": self.unit.label(),
+            "dimensions": e.map(|e| [e.x, e.y, e.z].map(|x| round(x / k, 5))),
+            "measurements": self.measures.iter().enumerate().map(|(i, m)| serde_json::json!({"measurement": i + 1, "length": round(m.length() / k, 5), "real_length": round(m.target / k, 5)})).collect::<Vec<_>>(),
+            "fitted_scale": fit_scale(&pairs).map(|(s, avg, max)| serde_json::json!({"scale": round(s, 8), "average_deviation": round(avg / k, 5), "max_deviation": round(max / k, 5)})),
+        })
+    }
+
+    fn actions(&self) -> Vec<Action> {
+        use serde_json::json;
+        vec![
+            Action::new("set_dimension", "Scale the object uniformly so one dimension has this size (in the unit setting)", json!({"axis": arg::choice(&["x", "y", "z"], "Which dimension"), "size": arg::number("Its new size")})).required(&["axis", "size"]),
+            Action::new("scale", "Scale the object uniformly about its centre (e.g. 1000 for m → mm, 25.4 for in → mm)", json!({"factor": arg::number("Scale factor")})).required(&["factor"]),
+            Action::new("measure", "Add a measurement between two points (as dragging on the model does), optionally with its real length", json!({"a": arg::point("First point, mm"), "b": arg::point("Second point, mm"), "real_length": arg::number("Its real length (in the unit setting)")})).required(&["a", "b"]),
+            Action::new("set_real_length", "Give a measurement its real length (in the unit setting)", json!({"measurement": arg::integer("Its number (from 1)"), "real_length": arg::number("The real length")})).required(&["measurement", "real_length"]),
+            Action::new("remove", "Remove a measurement", json!({"measurement": arg::integer("Its number (from 1)")})).required(&["measurement"]),
+            Action::plain("apply_fitted_scale", "Scale the object by the scale that best fits the measurements' real lengths"),
+        ]
+    }
+
+    fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        let a = Args(args);
+        let k = self.unit.mm();
+        let index = |len: usize| -> Result<usize, String> { a.usize("measurement")?.checked_sub(1).filter(|i| *i < len).ok_or_else(|| "there is no such measurement".to_string()) };
+        match action {
+            "set_dimension" => {
+                let o = self.object.and_then(|id| cx.scene.get(id)).ok_or("no active object")?;
+                let e = o.bounds().extents();
+                let i = ["x", "y", "z"].iter().position(|x| Some(*x) == a.opt_str("axis")).ok_or("axis must be x, y or z")?;
+                let size = a.f64("size")? * k;
+                if !(size > 0.0 && e[i] > 0.0) {
+                    return Err("the size and the current dimension must be positive".into());
+                }
+                self.scale_by(cx, size / e[i], "Set dimensions");
+                Ok(cx.status.clone())
+            }
+            "scale" => {
+                let f = a.f64("factor")?;
+                if !(f > 0.0 && f.is_finite()) {
+                    return Err("the factor must be positive".into());
+                }
+                self.scale_by(cx, f, "Scale");
+                Ok(cx.status.clone())
+            }
+            "measure" => {
+                let (pa, pb) = (DVec3::from_array(a.point("a")?), DVec3::from_array(a.point("b")?));
+                let target = a.opt_f64("real_length").map_or(pa.distance(pb), |t| t * k);
+                self.measures.push(Measure { a: pa, b: pb, target });
+                self.selected = Some(self.measures.len() - 1);
+                Ok(format!("Measurement {}: {:.4} {}", self.measures.len(), pa.distance(pb) / k, self.unit.label()))
+            }
+            "set_real_length" => {
+                let i = index(self.measures.len())?;
+                self.measures[i].target = a.f64("real_length")? * k;
+                Ok(format!("Measurement {} should be {} {}", i + 1, a.f64("real_length")?, self.unit.label()))
+            }
+            "remove" => {
+                let i = index(self.measures.len())?;
+                self.measures.remove(i);
+                self.selected = None;
+                Ok(format!("Measurement {} removed", i + 1))
+            }
+            "apply_fitted_scale" => {
+                let s = self.apply_fit(cx)?;
+                Ok(format!("Scaled by {s:.6}"))
+            }
+            _ => Err(format!("Units / Dimensions has no action {action}")),
+        }
+    }
+
     fn survives_scene_change(&self) -> bool {
         true
     }
@@ -175,10 +279,7 @@ impl Tool for UnitsTool {
                 ui.label(format!("Avg deviation {:.4} {u}, max {:.4} {u}", avg / k, max / k, u = self.unit.label()));
             }
             if ui.add_enabled((s - 1.0).abs() > 1e-12, egui::Button::new("Apply scale")).clicked() {
-                self.scale_by(cx, s, "Scale from measurements");
-                for m in &mut self.measures {
-                    m.target = m.length();
-                }
+                let _ = self.apply_fit(cx);
             }
         }
         ui.add_space(8.0);

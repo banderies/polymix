@@ -56,6 +56,26 @@ pub trait Workspace {
     {
         Vec::new()
     }
+    /// What agents can ask this workspace to do: the shell offers them as the agent tool
+    /// `<workspace>_do` ([`agent::do_tool`]), its description listing their signatures.
+    fn agent_actions() -> Vec<agent::Action>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
+    /// What `<workspace>_do` is for, and what holds for all its actions (the start of its
+    /// description).
+    fn agent_actions_about() -> &'static str
+    where
+        Self: Sized,
+    {
+        ""
+    }
+    /// Do one of [`Workspace::agent_actions`] (its arguments already checked).
+    fn agent_act(&mut self, action: &str, _args: &serde_json::Value, _ctx: &egui::Context) -> agent::AgentReply {
+        agent::AgentReply::error(format!("the {} workspace has no action {action}", self.name()))
+    }
     /// An agent is about to work this workspace's panels (a click or value through the
     /// accessibility tree, applied next frame): label the changes that follow as the agent's.
     fn agent_acting(&mut self) {}
