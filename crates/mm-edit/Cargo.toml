@@ -16,4 +16,7 @@ smallvec.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 robust = "1"
+# Parameter types describe themselves to agents (Polymix agent access).
+serde = { version = "1", features = ["derive"] }
+schemars = "1"
 

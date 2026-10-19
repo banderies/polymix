@@ -5,7 +5,7 @@ use mm_core::{Mesh, INVALID};
 use std::collections::HashMap;
 
 /// How regions are grown.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum FaceGroupMode {
     /// Regions end at edges whose dihedral angle exceeds the threshold.
     EdgeAngle,

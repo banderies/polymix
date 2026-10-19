@@ -20,7 +20,7 @@ const TYPES: [(PatternType, &str); 10] = [
     (PatternType::GroupBorders, "FaceGroup Borders"),
 ];
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct PatternUi {
     pub p: PatternParams,
     /// Grid Smoothing, 0..10.

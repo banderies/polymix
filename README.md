@@ -70,16 +70,19 @@ others keep working. Dropped files go to the workspace that opens them (meshes a
 
 ## Agent access (MCP)
 
-AI agents such as Claude Code can read the open session over the [Model Context
-Protocol](https://modelcontextprotocol.io). They see the mesh scene with per-object statistics
-and the selection, the image catalog and headers, the segmentation, the log and a screenshot.
-Use it to debug Polymix or to ask about the data on screen. To turn it on, click **Agents** at
-the right of the tab bar, tick *Let AI agents read this session* and run the `claude mcp add …`
-command it copies.
+AI agents such as Claude Code can work with the open session over the [Model Context
+Protocol](https://modelcontextprotocol.io). They can read the mesh scene with per-object
+statistics and the selection, the image catalog and headers, the segmentation, the log, a
+screenshot and the panels on screen. If you allow changes, they can also select, edit, run
+tools (typed settings such as Remesh's edge length, clicks on the model, or any panel's
+buttons and sliders), undo, and open and export files. Use it to debug Polymix or to have an
+agent help with the data on screen. To turn it on, click **Agents** at the right of the tab
+bar, tick *Let AI agents read this session* (and *Let agents make changes* if you want them
+to), then run the `claude mcp add …` command it copies.
 
-Agents only read. The server listens on this computer only and needs a token. Patient
-identifiers are always masked for agents and dates are cut to the year. Tools, privacy rules
-and design: [docs/agent_access.md](docs/agent_access.md).
+The server listens on this computer only and needs a token. Every change an agent makes is an
+undo step labelled "Agent: …". Patient identifiers are always masked for agents and dates are
+cut to the year. Tools, privacy rules and design: [docs/agent_access.md](docs/agent_access.md).
 
 ## Build & run
 

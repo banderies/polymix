@@ -10,7 +10,7 @@ use std::time::Duration;
 const TOKEN: &str = "test-token";
 
 fn start() -> Server {
-    let tools = ["echo", "later", "fails", "ignored"].map(|n| ToolSpec { name: n.into(), description: format!("{n} tool"), input_schema: json!({"type": "object", "properties": {"x": {"type": "integer"}}}), read_only: true });
+    let tools = ["echo", "later", "fails", "ignored"].map(|n| ToolSpec { name: n.into(), description: format!("{n} tool"), input_schema: json!({"type": "object", "properties": {"x": {"type": "integer"}}}), read_only: true, destructive: false });
     let config = Config { port: 0, token: TOKEN.into(), timeout: Duration::from_millis(500), instructions: "test server".into() };
     Server::start(config, tools.to_vec(), || {}).expect("server starts")
 }

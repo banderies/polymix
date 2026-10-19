@@ -9,17 +9,17 @@ use crate::privacy::Privacy;
 use crate::{relative, Selection, VolumeWorkspace};
 use mm_volume::model::{Catalog, Field, Volume};
 use mm_volume::scan::Progress;
-use polymix_workspace::agent::{arg_str, arg_usize, round, year_only, AgentReply, AgentResult, AgentTool};
+use polymix_workspace::agent::{arg_str, arg_usize, round, year_only, AgentReply, AgentResult, AgentTool, ToolKind};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 pub fn tools() -> Vec<AgentTool> {
-    let mut info = AgentTool::new(
+    let info = AgentTool::new(
         "volume_info",
         "One volume of the Volume workspace's catalog: kind, format, voxel grid (dimensions, spacing in mm, orientation code, voxel → RAS affine), data type, warnings, files and the header fields by group. Identifiers are masked and dates cut to the year.",
         json!({"volume": {"type": "integer", "description": "Volume number from volume_catalog"}}),
-    );
-    info.input_schema["required"] = json!(["volume"]);
+    )
+    .required(&["volume"]);
     vec![
         AgentTool::new(
             "volume_catalog",
@@ -30,7 +30,59 @@ pub fn tools() -> Vec<AgentTool> {
             }),
         ),
         info,
+        AgentTool::new(
+            "volume_browse",
+            "Work the Volume workspace: select (`volume`: select and preview it; the Segmentation tab then loads it), slice (`slice`: the previewed slice), add_folder (`path`: an absolute folder or file path to scan), rescan (scan the folders again; volume numbers may change). Scans run in the background: app_wait, then volume_catalog.",
+            json!({
+                "action": {"type": "string", "enum": ["select", "slice", "add_folder", "rescan"]},
+                "volume": {"type": "integer", "description": "Volume number from volume_catalog (action select)"},
+                "slice": {"type": "integer", "description": "Slice number from 0 (action slice)"},
+                "path": {"type": "string", "description": "Absolute path (action add_folder)"}
+            }),
+        )
+        .required(&["action"])
+        .kind(ToolKind::Change),
     ]
+}
+
+/// `volume_browse`.
+fn browse(ws: &mut VolumeWorkspace, args: &Value, ctx: &egui::Context) -> AgentResult {
+    let catalog = || ws.catalog.clone().ok_or("No catalog yet: add a folder (action add_folder) or wait for the scan.");
+    match arg_str(args, "action") {
+        Some("select") => {
+            let c = catalog()?;
+            let k = args.get("volume").and_then(Value::as_u64).ok_or("select needs `volume`")? as usize;
+            if k >= c.volumes.len() {
+                return Err(format!("No volume {k}: the catalog has {}", c.volumes.len()));
+            }
+            ws.selection = Selection::Volume(k);
+            ws.select_volume(k, ctx);
+            Ok(json!({"done": format!("Selected volume {k}"), "name": ws.agent_privacy.path(&c.volumes[k].name)}))
+        }
+        Some("slice") => {
+            let c = catalog()?;
+            let n = args.get("slice").and_then(Value::as_u64).ok_or("slice needs `slice`")? as usize;
+            let p = ws.preview.as_mut().ok_or("No volume is previewed: select one first.")?;
+            if n >= p.slices {
+                return Err(format!("No slice {n}: the volume has {}", p.slices));
+            }
+            p.go_to(n, &c.volumes[p.volume], ctx);
+            Ok(json!({"done": format!("Slice {n} of {}", p.slices)}))
+        }
+        Some("add_folder") => {
+            let path = std::path::PathBuf::from(arg_str(args, "path").ok_or("add_folder needs `path`")?);
+            if !path.is_absolute() || !path.exists() {
+                return Err(format!("{} is not an absolute path to a folder or file", ws.agent_privacy.path(&path.display().to_string())));
+            }
+            ws.add_roots(vec![path], ctx);
+            Ok(json!({"done": "Scanning; app_wait, then volume_catalog"}))
+        }
+        Some("rescan") => {
+            ws.start_scan(ctx);
+            Ok(json!({"done": "Scanning again; app_wait, then volume_catalog (volume numbers may change)"}))
+        }
+        other => Err(format!("volume_browse: unknown action {:?}", other.unwrap_or(""))),
+    }
 }
 
 /// What the tools need, taken on the UI thread (the catalog is shared, not copied).
@@ -45,7 +97,10 @@ struct Snapshot {
     hide_ids: bool,
 }
 
-pub fn call(ws: &VolumeWorkspace, tool: &str, args: &Value) -> AgentReply {
+pub fn call(ws: &mut VolumeWorkspace, tool: &str, args: &Value, ctx: &egui::Context) -> AgentReply {
+    if tool == "volume_browse" {
+        return AgentReply::Now(browse(ws, args, ctx));
+    }
     let privacy = ws.agent_privacy.clone();
     let scanning = ws.scan.as_ref().map(|s| match s.progress() {
         Some(Progress::Listing { files }) => format!("listing files ({files} so far)"),

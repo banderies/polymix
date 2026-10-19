@@ -56,8 +56,12 @@ pub trait Workspace {
     {
         Vec::new()
     }
-    /// Answer an agent's call of one of [`Workspace::agent_tools`] (on the UI thread).
-    fn agent_call(&mut self, tool: &str, _args: &serde_json::Value) -> agent::AgentReply {
+    /// An agent is about to work this workspace's panels (a click or value through the
+    /// accessibility tree, applied next frame): label the changes that follow as the agent's.
+    fn agent_acting(&mut self) {}
+    /// Answer an agent's call of one of [`Workspace::agent_tools`] (on the UI thread, between
+    /// frames).
+    fn agent_call(&mut self, tool: &str, _args: &serde_json::Value, _ctx: &egui::Context) -> agent::AgentReply {
         agent::AgentReply::error(format!("the {} workspace has no tool {tool}", self.name()))
     }
 }

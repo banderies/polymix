@@ -35,7 +35,9 @@ pub struct OpInfo<'a> {
 }
 
 pub trait OpSpec: Send + 'static {
-    type Params: Clone + PartialEq + Send + 'static;
+    /// Also what agents read and set (serde), described by its JSON Schema (doc comments
+    /// included).
+    type Params: Clone + PartialEq + Send + serde::Serialize + serde::de::DeserializeOwned + schemars::JsonSchema + 'static;
     const NAME: &'static str;
     /// Whether the op restricts itself to the selection when one exists.
     const USES_SELECTION: bool = true;
@@ -353,6 +355,36 @@ impl<S: OpSpec> Tool for OpTool<S> {
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|(_, j)| (S::NAME.to_string(), j.progress()))
     }
+
+    fn settings(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(&self.params).ok().filter(|v| v.is_object())
+    }
+
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        self.settings().map(|_| schema_of::<S::Params>())
+    }
+
+    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        if self.invalid {
+            return Err(format!("{}: no active object", S::NAME));
+        }
+        let mut v = self.settings().ok_or_else(|| format!("{} has no settings", S::NAME))?;
+        merge_settings(&mut v, changes)?;
+        self.params = serde_json::from_value(v).map_err(|e| format!("{}: {e}", S::NAME))?;
+        // Recompute now, not after the usual typing pause.
+        self.changed_at = Some(Instant::now() - Duration::from_secs(1));
+        Ok(())
+    }
+
+    fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "computing": self.job.as_ref().map(|(_, j)| j.progress()),
+            "acting_on_selected_triangles": self.selection.as_ref().map(|s| s.len()),
+            "result": self.result.as_ref().map(|(p, out)| serde_json::json!({"message": out.message, "triangles": out.mesh.triangle_count(), "for_current_settings": *p == self.params})),
+            "error": self.error,
+            "updates": if S::LIVE { "live (recomputed after every change)" } else { "on accept" },
+        })
+    }
 }
 
 /// Helper for informational text styling.
@@ -375,7 +407,7 @@ pub use crate::tools::vessel::BridgeTool;
 // Extrude / Offset (selection)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum ExtrudeMode {
     /// Move the region and stitch side walls (Meshmixer Extrude, D).
     Extrude,
@@ -385,7 +417,7 @@ pub enum ExtrudeMode {
     Extract,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum ExtrudeDir {
     Normal,
     /// The region's average normal.
@@ -393,7 +425,7 @@ pub enum ExtrudeDir {
     Axis(usize),
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ExtrudeParamsUi {
     pub mode: ExtrudeMode,
     pub distance: f64,
@@ -556,7 +588,7 @@ impl ExtrudeTool {
 // Mirror
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct MirrorParams {
     pub axis: usize,
     /// Plane position as a fraction of the bounding box along the axis (0 = min, 1 = max).
@@ -598,7 +630,7 @@ pub type MirrorTool = OpTool<MirrorSpec>;
 // Remesh (Meshmixer Edit > Remesh, hotkey R)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum RemeshMode {
     RelativeDensity,
     AdaptiveDensity,
@@ -618,14 +650,14 @@ impl RemeshMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum RemeshBoundary {
     Fixed,
     Refined,
     Free,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct RemeshUi {
     pub mode: RemeshMode,
     /// -100..100 %: 0 keeps the current mean edge length, +50 halves it, −50 doubles it.
@@ -871,7 +903,7 @@ pub type RemeshTool = OpTool<RemeshSpec>;
 // Smooth Boundary (B with a selection; Meshmixer "Smooth Loop")
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SmoothBoundaryUi {
     /// 0..100: how strongly the border curve is smoothed each pass.
     pub smoothness: f64,
@@ -995,7 +1027,7 @@ pub type SmoothBoundaryTool = OpTool<SmoothBoundarySpec>;
 // Close Cracks (Edit)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct CloseCracksUi {
     /// Weld tolerance as log10 of a fraction of the model size.
     pub tolerance_exp: f64,
@@ -1042,7 +1074,7 @@ fn selection_open_edges(m: &Mesh, tris: &[u32]) -> (Vec<u32>, Vec<u32>) {
     (verts, edges)
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct WeldBoundariesUi {
     /// Tolerance in multiples of the mean open-edge length near the selection.
     pub tolerance: f64,
@@ -1078,7 +1110,7 @@ impl OpSpec for WeldBoundariesSpec {
 }
 pub type WeldBoundariesTool = OpTool<WeldBoundariesSpec>;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct JoinUi;
 
 pub struct JoinSpec;
@@ -1120,7 +1152,7 @@ pub type JoinTool = OpTool<JoinSpec>;
 
 /// The tube is a loft ([`LoftUi`]): Bridge is straight, Tube Handle a smooth tube leaving
 /// each opening along its normal.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct RegionBridgeUi {
     pub loft: LoftUi,
     /// 0..100: ring density; 50 matches the regions' edge length, +25 halves it.
@@ -1203,7 +1235,7 @@ pub type RegionBridgeTool = OpTool<RegionBridgeSpec>;
 // Generate Face Groups (Edit)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct FaceGroupsUi {
     pub mode: mm_edit::FaceGroupMode,
     pub angle: f64,
@@ -1246,14 +1278,14 @@ pub type FaceGroupsTool = OpTool<FaceGroupsSpec>;
 // Reduce (Shift+R)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum ReduceGoal {
     Percentage,
     TriangleBudget,
     MaxDeviation,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReduceUi {
     pub goal: ReduceGoal,
     /// Uniform (even triangles) instead of Shape Preserving (quadric error).
@@ -1363,7 +1395,7 @@ pub type ReduceTool = OpTool<ReduceSpec>;
 // Make Solid
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum SolidType {
     Blocky,
     Fast,
@@ -1371,7 +1403,7 @@ pub enum SolidType {
     SharpEdges,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct MakeSolidUi {
     pub solid_type: SolidType,
     /// 0..1 → 64..1024 cells along the largest dimension.
@@ -1391,7 +1423,7 @@ pub struct MakeSolidUi {
 }
 
 /// Make Solid's "Color Transfer Mode".
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum ColorTransfer {
     /// Vertex-to-vertex when the input has vertex colours.
     Automatic,
@@ -1526,7 +1558,7 @@ pub type MakeSolidTool = OpTool<MakeSolidSpec>;
 // Offset / Hollow (robust, SDF based)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct OffsetUi {
     pub hollow: bool,
     pub distance: f64,
@@ -1570,7 +1602,7 @@ pub type OffsetSolidTool = OpTool<OffsetSolidSpec>;
 // Erase & Fill (F)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum FillKind {
     /// Fewest triangles, no new vertices.
     FlatMinimal,
@@ -1595,7 +1627,7 @@ impl FillKind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct EraseFillUi {
     pub kind: FillKind,
     /// 0..100: patch density; 50 matches the surrounding edge length, +25 halves it.
@@ -1816,7 +1848,7 @@ fn remove_cut_off_fragments(m: &mut Mesh, border: &std::collections::HashSet<u32
 /// Loft settings, shared by Erase & Fill's Loft, Bridge / Tube Handle (Cmd+B) and Vessel →
 /// Bridge boundaries. Refine and bulge belong to each tool (Erase & Fill shares them with
 /// its patch fills), so they are passed to [`LoftUi::ui`] and [`LoftUi::params`].
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct LoftUi {
     pub shape: mm_edit::LoftShape,
     pub ends: [mm_edit::LoftEnd; 2],
@@ -2143,7 +2175,7 @@ pub type EraseFillTool = OpTool<EraseFillSpec>;
 // Smooth (Deform > Smooth, B with a selection)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum SmoothType {
     /// Volume-preserving Taubin iterations: removes noise / staircase artefacts.
     ShapePreserving,
@@ -2170,7 +2202,7 @@ impl SmoothType {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SmoothUi {
     pub kind: SmoothType,
     /// 0..1: strength (blend toward the fully smoothed result).
@@ -2305,7 +2337,7 @@ pub type SmoothTool = OpTool<SmoothSpec>;
 
 const NO_TARGET: &str = "No target surface set: set one with Edit → Set as target or the object list.";
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct AttractToTargetUi {
     pub offset: f64,
     /// 0..100: relaxation between projections.
@@ -2376,13 +2408,13 @@ impl OpSpec for AttractToTargetSpec {
 }
 pub type AttractToTargetTool = OpTool<AttractToTargetSpec>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum AlignSource {
     SelectedFaces,
     AllFaces,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct AlignToTargetUi {
     pub source: AlignSource,
     pub rotate: bool,
@@ -2452,7 +2484,7 @@ pub type AlignToTargetTool = OpTool<AlignToTargetSpec>;
 // Fit Primitive
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct FitPrimitiveUi {
     pub kind: mm_edit::PrimitiveType,
     pub density: usize,
@@ -3162,4 +3194,30 @@ mod color_transfer_tests {
         let none = MakeSolidSpec::run(&m, None, &MakeSolidUi { color_transfer: ColorTransfer::NoColors, ..base }, &|_| true).unwrap().mesh;
         assert!(!none.has_vertex_colors());
     }
+}
+
+/// JSON Schema of the settings of the operation tool opened as `tool` (see `app::TOOLS`), for
+/// agents choosing a tool before opening it; `None` for tools without typed settings.
+pub fn settings_schema(tool: &str) -> Option<serde_json::Value> {
+    Some(match tool {
+        "remesh" => schema_of::<RemeshUi>(),
+        "reduce" => schema_of::<ReduceUi>(),
+        "smooth" => schema_of::<SmoothUi>(),
+        "smoothboundary" => schema_of::<SmoothBoundaryUi>(),
+        "closecracks" => schema_of::<CloseCracksUi>(),
+        "regionbridge" | "tubehandle" => schema_of::<RegionBridgeUi>(),
+        "facegroups" => schema_of::<FaceGroupsUi>(),
+        "weldboundaries" => schema_of::<WeldBoundariesUi>(),
+        "makesolid" => schema_of::<MakeSolidUi>(),
+        "makepattern" => schema_of::<crate::tools::pattern::PatternUi>(),
+        "convex" => schema_of::<mm_edit::ConvexParams>(),
+        "erasefill" => schema_of::<EraseFillUi>(),
+        "extrude" | "extract" => schema_of::<ExtrudeParamsUi>(),
+        "mirror" => schema_of::<MirrorParams>(),
+        "offset" => schema_of::<OffsetUi>(),
+        "attracttotarget" => schema_of::<AttractToTargetUi>(),
+        "aligntotarget" => schema_of::<AlignToTargetUi>(),
+        "fitprimitive" => schema_of::<FitPrimitiveUi>(),
+        _ => return None,
+    })
 }

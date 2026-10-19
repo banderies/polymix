@@ -15,7 +15,7 @@ pub fn tools() -> Vec<AgentTool> {
     )]
 }
 
-pub fn call(ws: &mut SegmentationWorkspace, tool: &str, _args: &Value) -> AgentReply {
+pub fn call(ws: &mut SegmentationWorkspace, tool: &str, _args: &Value, _ctx: &egui::Context) -> AgentReply {
     match tool {
         "segmentation_state" => AgentReply::Now(Ok(state(ws))),
         _ => AgentReply::error(format!("the Segmentation workspace has no tool {tool}")),

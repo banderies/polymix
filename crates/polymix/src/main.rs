@@ -19,6 +19,7 @@ mod scene;
 mod shell;
 mod spacemouse;
 mod tools;
+mod ui_access;
 mod ui_util;
 mod view_cube;
 

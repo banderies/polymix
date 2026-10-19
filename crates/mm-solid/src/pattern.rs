@@ -16,7 +16,7 @@ use glam::DVec3;
 use mm_core::{Aabb, Mesh, INVALID};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum PatternType {
     /// A tube along every mesh edge.
     Edges,
@@ -47,14 +47,14 @@ impl PatternType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum Tiling {
     Regular,
     Hex,
 }
 
 /// How volume patterns combine with the object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum Composition {
     /// Object minus the elements.
     Subtract,
@@ -63,7 +63,7 @@ pub enum Composition {
 }
 
 /// Element size varying across the object.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum Gradient {
     None,
     /// Along the object's longest axis, `start` at its minimum end.
@@ -72,7 +72,7 @@ pub enum Gradient {
     Sphere,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct PatternParams {
     pub kind: PatternType,
     pub tiling: Tiling,

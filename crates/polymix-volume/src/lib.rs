@@ -823,8 +823,8 @@ impl Workspace for VolumeWorkspace {
         agent::tools()
     }
 
-    fn agent_call(&mut self, tool: &str, args: &serde_json::Value) -> polymix_workspace::agent::AgentReply {
-        agent::call(self, tool, args)
+    fn agent_call(&mut self, tool: &str, args: &serde_json::Value, ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
+        agent::call(self, tool, args, ctx)
     }
 }
 

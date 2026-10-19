@@ -229,11 +229,13 @@ pub struct History {
     budget: usize,
     /// Bumped by every push, undo and redo: a cheap "the scene changed" signal (autosave).
     generation: u64,
+    /// An agent is making the changes: their steps are labelled "Agent: …".
+    pub by_agent: bool,
 }
 
 impl Default for History {
     fn default() -> Self {
-        Self { undo: Vec::new(), redo: Vec::new(), budget: 4 << 30, generation: 0 }
+        Self { undo: Vec::new(), redo: Vec::new(), budget: 4 << 30, generation: 0, by_agent: false }
     }
 }
 
@@ -256,7 +258,9 @@ impl History {
 
     pub fn push(&mut self, label: impl Into<String>, scene: &Scene) {
         self.generation += 1;
-        self.undo.push((label.into(), scene.clone()));
+        let label = label.into();
+        let label = if self.by_agent { format!("Agent: {label}") } else { label };
+        self.undo.push((label, scene.clone()));
         self.redo.clear();
         self.enforce_budget();
     }
@@ -366,5 +370,8 @@ mod history_tests {
         assert!(h.can_redo());
         h.clear();
         assert!(!h.can_undo() && !h.can_redo());
+        h.by_agent = true;
+        h.push("Remesh", &s);
+        assert_eq!(h.undo_label(), Some("Agent: Remesh"));
     }
 }

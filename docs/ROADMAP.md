@@ -294,13 +294,21 @@ the Model Context Protocol, for debugging and for help with the data on screen
       `volume_info`, `segmentation_state`; identifiers always masked for agents, dates cut to
       the year, catalog name tokens masked in every reply, screenshots of the image tabs only
       with Hide identifiers; Agents button and window in the tab bar.
-- [ ] **M17.2 Commands**: one typed `Command` list shared by menus, hotkeys, test scripts and
-      agents (serde, JSON Schema from it); agents select, open and run tools with parameters,
-      undo / redo, open files, switch tabs; every change an undo step labelled "Agent: …";
-      tools marked destructive so clients ask first; tool panel settings readable.
+- [x] **M17.2 Commands**: `MeshCommand` (`app/command.rs`), the one list of what the Mesh
+      workspace does without the mouse, run by menus, hotkeys, test scripts and agents through
+      `MeshWorkspace::execute`; agent tools `mesh_select`, `mesh_objects`, `mesh_edit`,
+      `mesh_history`, `mesh_view`, `mesh_tool` (open / set / accept / cancel / click a surface
+      point, facing it if hidden), `mesh_file`, `mesh_tool_state`, `mesh_tools`,
+      `volume_browse`, `app_show`, `app_wait`; typed settings for every operation tool
+      (`OpSpec::Params`: serde + schemars, doc comments as descriptions); every panel read and
+      worked through egui's AccessKit tree (`app_ui`, `app_ui_action`); a second permission,
+      *Let agents make changes*, agents cannot grant themselves; changes shown in their
+      workspace and labelled "Agent: …" in the undo history; read / change / destructive hints
+      for clients.
 - [ ] **M17.3 Long work and batch**: job handles for long operations (start → poll
       `job_status`, cancel); a headless `polymix --mcp-stdio` mode on the `mm-*` crates for
-      batch pipelines without a window.
+      batch pipelines without a window; typed Segmentation commands (segments, threshold,
+      effects, make mesh).
 
 ## Later
 

@@ -1,6 +1,9 @@
 //! Application shell: layout, viewport navigation, tool dispatch, file IO.
 
 mod agent;
+mod command;
+
+pub use command::{MeshCommand, Shape, STANDARD_VIEWS};
 
 use crate::camera::{Camera, UpAxis, ViewHistory};
 use crate::commands::{self, CmdCx};
@@ -372,6 +375,11 @@ pub struct MeshWorkspace {
     boundary_cache: HashMap<ObjectId, (BoundaryKey, Vec<ColorVertex>)>,
     /// Synthetic pointer events queued by scripts (consumed one per frame).
     synthetic: std::collections::VecDeque<PointerInput>,
+    /// Files an agent opened: imported without prompts, like test scripts.
+    agent_import: bool,
+    /// Frames without anything left to happen since an agent's last change; after three, undo
+    /// steps are the user's again (see `History::by_agent`).
+    agent_quiet_frames: u32,
 }
 
 /// Scripted UI actions for automated testing (`POLYMIX_SCRIPT`), e.g.
@@ -438,6 +446,8 @@ impl MeshWorkspace {
             synthetic: Default::default(),
             boundary_cache: HashMap::new(),
             script: None,
+            agent_import: false,
+            agent_quiet_frames: 0,
         };
         if let Some(st) = storage.filter(|_| std::env::var_os("POLYMIX_SCRIPT").is_none()) {
             let flag = |k: &str, d: bool| st.get_string(k).map(|v| v == "1").unwrap_or(d);
@@ -756,8 +766,8 @@ impl MeshWorkspace {
 
     /// Import prompts (Append / Replace, odd sizes), then add the meshes to the scene.
     fn finish_import(&mut self, ctx: &egui::Context) {
-        // Test scripts never wait on prompts: they append and keep sizes.
-        let scripted = polymix_workspace::scripted() && !self.script_prompts;
+        // Test scripts and agents never wait on prompts: they append and keep sizes.
+        let scripted = (polymix_workspace::scripted() && !self.script_prompts) || self.agent_import;
         let Some(pending) = &mut self.pending_import else { return };
         if scripted && pending.placement.is_none() {
             pending.placement = Some(false);
@@ -831,6 +841,7 @@ impl MeshWorkspace {
         };
         let Some(factor) = factor else { return };
         let Some(pending) = self.pending_import.take() else { return };
+        self.agent_import = false;
         if pending.meshes.is_empty() {
             self.status = "Import cancelled".into();
             return;
@@ -929,6 +940,16 @@ impl MeshWorkspace {
                 p
             }
         };
+        if let Err(e) = self.save_project_to(path, ctx) {
+            self.status = e;
+        }
+    }
+
+    /// Save the scene as a project at `path` (in the background).
+    fn save_project_to(&mut self, path: PathBuf, ctx: &egui::Context) -> Result<String, String> {
+        if self.scene.is_empty() {
+            return Err("Nothing to save.".into());
+        }
         let index = |id: Option<ObjectId>| id.and_then(|id| self.scene.objects.iter().position(|o| o.id == id));
         let objects: Vec<crate::project::ProjectObject> = self
             .scene
@@ -957,10 +978,12 @@ impl MeshWorkspace {
             view: Some(self.camera.view_state()),
         };
         self.project_path = Some(path.clone());
+        let msg = format!("Saving the project to {}", path.display());
         self.export_job = Some(Job::spawn("Saving", ctx.clone(), move |_| {
             crate::project::save(&path, &project)?;
             Ok(format!("Saved {}", path.display()))
         }));
+        Ok(msg)
     }
 
     fn import_dialog(&mut self, ctx: &egui::Context) {
@@ -998,6 +1021,22 @@ impl MeshWorkspace {
         }
         let Some(path) = dlg.save_file() else { return };
         self.last_export_dir = path.parent().map(|p| p.to_path_buf());
+        if let Err(e) = self.export_to(path, scope, ctx) {
+            self.status = e;
+        }
+    }
+
+    /// Export to `path` (format from the extension) in the background.
+    fn export_to(&mut self, path: PathBuf, scope: ExportScope, ctx: &egui::Context) -> Result<String, String> {
+        let Some(active) = self.scene.active() else {
+            return Err("Nothing to export.".into());
+        };
+        if scope == ExportScope::Selection && active.selection.is_empty() {
+            return Err("Select the triangles to export first.".into());
+        }
+        if mm_io::Format::from_path(&path).is_none() {
+            return Err(format!("Unknown mesh format for {} (use .stl, .obj, .ply, .off, .3mf, .amf, .dae, .wrl or .smesh)", path.display()));
+        }
         let mesh: Mesh = match scope {
             ExportScope::AllVisible => {
                 let mut m = Mesh::new();
@@ -1026,10 +1065,12 @@ impl MeshWorkspace {
             _ => None,
         };
         let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, uvs, ..Default::default() };
+        let msg = format!("Exporting {} triangles to {}", mesh.triangle_count(), p2.display());
         self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |_| {
             mm_io::write_mesh(&p2, &mesh, &opts)?;
             Ok(format!("Exported {} triangles to {}", mesh.triangle_count(), p2.display()))
         }));
+        Ok(msg)
     }
 
     // ------------------------------------------------------------------
@@ -1199,26 +1240,10 @@ impl MeshWorkspace {
                 }
                 ui.menu_button("Add shape", |ui| {
                     // Meshmixer's Import Sphere / Plane (no bunny: Polymix ships no sample scans).
-                    type Make = fn() -> Mesh;
-                    let shapes: [(&str, Make); 4] = [
-                        ("Sphere", || mm_core::primitives::icosphere(12.5, 4)),
-                        ("Plane", || mm_core::primitives::plane_grid(25.0, 25.0, 32, 32)),
-                        ("Cube", || mm_core::primitives::cube(25.0, 8)),
-                        ("Cylinder", || {
-                            let mut m = mm_core::primitives::cylinder(12.5, 25.0, 64, 16, true);
-                            m.transform(|p| glam::DVec3::new(p.x, p.z - 12.5, -p.y));
-                            m
-                        }),
-                    ];
-                    for (name, make) in shapes {
-                        if ui.button(name).clicked() {
+                    for shape in Shape::ALL {
+                        if ui.button(shape.label()).clicked() {
                             ui.close();
-                            self.history.push(format!("Add {name}"), &self.scene);
-                            let first = self.scene.is_empty();
-                            self.scene.add(name.to_lowercase(), make());
-                            if first || self.prefs.reset_camera_on_import {
-                                self.focus_scene();
-                            }
+                            self.run(MeshCommand::AddShape(shape), &ctx, vp);
                         }
                     }
                 });
@@ -1247,22 +1272,19 @@ impl MeshWorkspace {
                 ui.separator();
                 if ui.button("Clear scene").clicked() {
                     ui.close();
-                    self.history.push("Clear scene", &self.scene);
-                    self.scene.objects.clear();
-                    self.scene.active = None;
-                    self.scene_changed(&ctx, vp);
+                    self.run(MeshCommand::ClearScene, &ctx, vp);
                 }
             });
             ui.menu_button("Edit", |ui| {
                 let ul = self.history.undo_label().map(|s| format!("Undo {s}")).unwrap_or("Undo".into());
                 if ui.add_enabled(self.history.can_undo(), egui::Button::new(format!("{ul}   ⌘Z"))).clicked() {
                     ui.close();
-                    self.undo(&ctx);
+                    self.run(MeshCommand::Undo, &ctx, vp);
                 }
                 let rl = self.history.redo_label().map(|s| format!("Redo {s}")).unwrap_or("Redo".into());
                 if ui.add_enabled(self.history.can_redo(), egui::Button::new(format!("{rl}   ⇧⌘Z"))).clicked() {
                     ui.close();
-                    self.redo(&ctx);
+                    self.run(MeshCommand::Redo, &ctx, vp);
                 }
                 if ui.button("Copy   ⌘C").on_hover_text("Copy the open tool's readout (measurements, query) or the object's statistics as text").clicked() {
                     ui.close();
@@ -1276,23 +1298,15 @@ impl MeshWorkspace {
                 ui.separator();
                 if ui.button("Duplicate object").clicked() {
                     ui.close();
-                    if self.accept_tools_for_command(&ctx, vp) {
-                        commands::duplicate_object(&mut self.cmd_cx());
-                    }
+                    self.run(MeshCommand::Duplicate, &ctx, vp);
                 }
                 if ui.button("Combine visible objects").clicked() {
                     ui.close();
-                    if self.accept_tools_for_command(&ctx, vp) {
-                        commands::combine_visible(&mut self.cmd_cx());
-                        self.scene_changed(&ctx, vp);
-                    }
+                    self.run(MeshCommand::CombineVisible, &ctx, vp);
                 }
                 if ui.button("Separate shells").clicked() {
                     ui.close();
-                    if self.accept_tools_for_command(&ctx, vp) {
-                        commands::separate_shells(&mut self.cmd_cx());
-                        self.scene_changed(&ctx, vp);
-                    }
+                    self.run(MeshCommand::SeparateShells, &ctx, vp);
                 }
                 ui.separator();
                 let can_target = self.scene.objects.len() >= 2 && self.scene.active.is_some();
@@ -1303,11 +1317,11 @@ impl MeshWorkspace {
                 {
                     ui.close();
                     let active = self.scene.active;
-                    commands::set_target(&mut self.cmd_cx(), active);
+                    self.run(MeshCommand::SetTarget(active), &ctx, vp);
                 }
                 if ui.add_enabled(self.scene.target.is_some(), egui::Button::new("Clear target")).clicked() {
                     ui.close();
-                    commands::set_target(&mut self.cmd_cx(), None);
+                    self.run(MeshCommand::SetTarget(None), &ctx, vp);
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1356,7 +1370,7 @@ impl MeshWorkspace {
                 ui.separator();
                 if ui.button("Focus on scene  (F)").clicked() {
                     ui.close();
-                    self.focus_scene();
+                    self.run(MeshCommand::Focus, &ctx, vp);
                 }
                 if ui.button("Recenter at cursor  (Alt+click)").on_hover_text("Pivot the view on the surface point last under the mouse").clicked() {
                     ui.close();
@@ -1386,18 +1400,10 @@ impl MeshWorkspace {
                 });
                 ui.checkbox(&mut self.view.transparent_target, "Transparent target").on_hover_text("Draw the target surface see-through");
                 ui.menu_button("Standard views", |ui| {
-                    use std::f64::consts::{FRAC_PI_2, PI};
-                    for (name, yaw, pitch) in [
-                        ("Front", 0.0, 0.0),
-                        ("Back", PI, 0.0),
-                        ("Left", -FRAC_PI_2, 0.0),
-                        ("Right", FRAC_PI_2, 0.0),
-                        ("Top", 0.0, FRAC_PI_2),
-                        ("Bottom", 0.0, -FRAC_PI_2),
-                    ] {
-                        if ui.button(name).clicked() {
+                    for (k, (name, _, _)) in STANDARD_VIEWS.iter().enumerate() {
+                        if ui.button(*name).clicked() {
                             ui.close();
-                            self.standard_view(yaw, pitch);
+                            self.run(MeshCommand::StandardView(k), &ctx, vp);
                         }
                     }
                 });
@@ -1408,7 +1414,6 @@ impl MeshWorkspace {
                     self.show_help = true;
                 }
             });
-            let _ = vp;
         });
     }
 
@@ -1456,6 +1461,7 @@ impl MeshWorkspace {
         let ctx = ui.ctx().clone();
         let has_obj = self.scene.active().is_some();
         let mut open: Option<&str> = None;
+        let mut command: Option<MeshCommand> = None;
         match cat {
             Category::Meshmix => {
                 let lib = self.library.get_or_insert_with(crate::parts::Library::load);
@@ -1490,7 +1496,6 @@ impl MeshWorkspace {
             Category::Edit => {
                 ui_util::section(ui, "Edit");
                 ui.add_enabled_ui(has_obj, |ui| {
-                    let cx = self.tool_cx(&ctx, vp);
                     if ui.button("Transform  (T)").clicked() {
                         open = Some("transform");
                     }
@@ -1547,25 +1552,25 @@ impl MeshWorkspace {
                     }
                     ui.separator();
                     if ui.button("Separate Shells  (Shift+Y)").clicked() {
-                        commands::separate_shells(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                        command = Some(MeshCommand::SeparateShells);
                     }
                     if ui.button("Combine visible").clicked() {
-                        commands::combine_visible(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                        command = Some(MeshCommand::CombineVisible);
                     }
                     if ui.button("Generate Complex").on_hover_text("Cells of the overlapping visible closed objects (A − B, A ∩ B, B − A, …), one face group each").clicked() {
-                        commands::generate_complex(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                        command = Some(MeshCommand::GenerateComplex);
                     }
                     if ui.button("Split Complex").on_hover_text("One object per face group").clicked() {
-                        commands::split_complex(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                        command = Some(MeshCommand::SplitComplex);
                     }
                     if ui.button("Convex Decomposition").on_hover_text("Approximate the object by convex pieces (new object, one face group per piece)").clicked() {
                         open = Some("convex");
                     }
                     if ui.button("Duplicate").clicked() {
-                        commands::duplicate_object(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                        command = Some(MeshCommand::Duplicate);
                     }
                     if ui.button("Flip normals").clicked() {
-                        commands::flip_selection_normals(&mut CmdCx { scene: cx.scene, history: cx.history, status: cx.status });
+                        command = Some(MeshCommand::FlipNormals);
                     }
                 });
             }
@@ -1686,7 +1691,10 @@ impl MeshWorkspace {
             }
         }
         if let Some(name) = open {
-            self.switch_to(SwitchTo::Tool(name.into()), &ctx, vp);
+            command = Some(MeshCommand::OpenTool(name.into()));
+        }
+        if let Some(c) = command {
+            self.run(c, &ctx, vp);
         }
     }
 
@@ -2840,16 +2848,16 @@ impl MeshWorkspace {
                 }
                 script.wait = 2;
             }
-            "open" => self.start_import(vec![PathBuf::from(arg)], ctx),
-            "wire" => self.view.wireframe = !self.view.wireframe,
-            "flat" => self.view.normals = if self.view.normals == NormalMode::Face { NormalMode::Group } else { NormalMode::Face },
-            "normals" => self.view.normals = NormalMode::from_key(arg.as_str()).unwrap_or(self.view.normals),
-            "grid" => self.view.show_grid = !self.view.show_grid,
+            "open" => self.run(MeshCommand::Open(vec![PathBuf::from(arg)]), ctx, vp),
+            "wire" => self.run(MeshCommand::Wireframe(!self.view.wireframe), ctx, vp),
+            "flat" => self.run(MeshCommand::Normals(if self.view.normals == NormalMode::Face { NormalMode::Group } else { NormalMode::Face }), ctx, vp),
+            "normals" => self.run(MeshCommand::Normals(NormalMode::from_key(arg.as_str()).unwrap_or(self.view.normals)), ctx, vp),
+            "grid" => self.run(MeshCommand::Grid(!self.view.show_grid), ctx, vp),
             "crease" => match arg.parse() {
                 Ok(d) => (self.view.sharp_edges, self.view.crease_deg) = (true, d),
                 Err(_) => self.view.sharp_edges = false,
             },
-            "groups" => self.view.colors = if self.view.colors == ColorMode::Group { ColorMode::Vertex } else { ColorMode::Group },
+            "groups" => self.run(MeshCommand::Colors(if self.view.colors == ColorMode::Group { ColorMode::Vertex } else { ColorMode::Group }), ctx, vp),
             "focus" => self.camera.focus(&self.scene.bounds()),
             "zoom" => {
                 // zoom:x,y,factor — zoom toward the surface under a viewport-relative point.
@@ -2868,7 +2876,7 @@ impl MeshWorkspace {
                     self.camera.set_view(v[0].to_radians(), v[1].to_radians());
                 }
             }
-            "zup" => self.camera.up_axis = UpAxis::Z,
+            "zup" => self.run(MeshCommand::Up(UpAxis::Z), ctx, vp),
             "tumble" => {
                 // tumble:dx,dy — rotate as if dragged by (dx, dy) points.
                 let v: Vec<f64> = arg.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -2878,8 +2886,8 @@ impl MeshWorkspace {
                     }
                 }
             }
-            "select_all" => commands::selection_command(&mut self.cmd_cx(), commands::SelectCmd::All),
-            "duplicate" => commands::duplicate_object(&mut self.cmd_cx()),
+            "select_all" => self.run(MeshCommand::Select(commands::SelectCmd::All), ctx, vp),
+            "duplicate" => self.run(MeshCommand::Duplicate, ctx, vp),
             "material" => {
                 if let (Ok(i), Some(o)) = (arg.parse::<usize>(), self.scene.active_mut()) {
                     let m = crate::materials::MATERIALS[i.min(crate::materials::MATERIALS.len() - 1)];
@@ -2895,34 +2903,25 @@ impl MeshWorkspace {
                     ui_util::apply_theme(ctx, t);
                 }
             }
-            "save" => {
-                self.project_path = Some(PathBuf::from(arg));
-                self.save_project(ctx, false);
-            }
+            "save" => self.run(MeshCommand::SaveProject(PathBuf::from(arg)), ctx, vp),
             "prompts" => self.script_prompts = arg == "on",
             "prefs" => {
                 self.show_prefs = true;
                 self.prefs_tab = arg.parse().unwrap_or(0);
             }
             "hotbox" => self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) },
+            // target / activate / hide:<index in the object list>
             "target" => {
                 let id = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id);
-                commands::set_target(&mut self.cmd_cx(), id);
+                self.run(MeshCommand::SetTarget(id), ctx, vp);
             }
-            "activate" => {
-                if let Ok(i) = arg.parse::<usize>() {
-                    self.scene.active = self.scene.objects.get(i).map(|o| o.id);
+            "activate" | "hide" => {
+                if let Some(id) = arg.parse::<usize>().ok().and_then(|i| self.scene.objects.get(i)).map(|o| o.id) {
+                    self.run(if cmd == "hide" { MeshCommand::SetVisible(id, false) } else { MeshCommand::Activate(id) }, ctx, vp);
                 }
             }
-            "hide" => {
-                if let Ok(i) = arg.parse::<usize>() {
-                    if let Some(o) = self.scene.objects.get_mut(i) {
-                        o.visible = false;
-                    }
-                }
-            }
-            "undo" => self.undo(ctx),
-            "redo" => self.redo(ctx),
+            "undo" => self.run(MeshCommand::Undo, ctx, vp),
+            "redo" => self.run(MeshCommand::Redo, ctx, vp),
             "log" => {
                 // Print scene statistics to stdout (automated checks).
                 println!("[polymix] {} camera distance={:.3} tool={}", arg, self.camera.distance, self.tools.last().map(|t| t.name()).unwrap_or("none"));
@@ -2961,15 +2960,8 @@ impl MeshWorkspace {
                     self.tools.push(t);
                 }
             }
-            "accept" => {
-                if let Some(mut t) = self.tools.pop() {
-                    let mut cx = self.tool_cx(ctx, vp);
-                    if !t.accept(&mut cx) {
-                        self.tools.push(t);
-                    }
-                }
-            }
-            "tool" => self.switch_to(SwitchTo::Tool(arg.clone()), ctx, vp),
+            "accept" => self.run(MeshCommand::AcceptTool, ctx, vp),
+            "tool" => self.run(MeshCommand::OpenTool(arg.clone()), ctx, vp),
             other => log::warn!("unknown script step {other}"),
         }
     }
@@ -2988,11 +2980,11 @@ impl MeshWorkspace {
         // ("skip tool changes" in Meshmixer) behave the same: tools add no history entries
         // of their own.
         if (i.key_pressed(Key::Z) && cmd && !i.modifiers.shift) || (i.key_pressed(Key::ArrowLeft) && i.modifiers.alt) {
-            self.undo(ctx);
+            self.run(MeshCommand::Undo, ctx, vp);
             return;
         }
         if (i.key_pressed(Key::Z) && cmd && i.modifiers.shift) || (i.key_pressed(Key::Y) && cmd) || (i.key_pressed(Key::ArrowRight) && i.modifiers.alt) {
-            self.redo(ctx);
+            self.run(MeshCommand::Redo, ctx, vp);
             return;
         }
         if i.key_pressed(Key::OpenBracket) && cmd {
@@ -3076,20 +3068,19 @@ impl MeshWorkspace {
             if is_select && !brush_key {
                 // The select tool consumes most letter keys.
                 if i.key_pressed(Key::W) {
-                    self.view.wireframe = !self.view.wireframe;
+                    self.run(MeshCommand::Wireframe(!self.view.wireframe), ctx, vp);
                 }
-                if i.key_pressed(Key::Y) && i.modifiers.shift && self.accept_tools_for_command(ctx, vp) {
-                    commands::separate_shells(&mut self.cmd_cx());
-                    self.scene_changed(ctx, vp);
+                if i.key_pressed(Key::Y) && i.modifiers.shift {
+                    self.run(MeshCommand::SeparateShells, ctx, vp);
                 }
                 return;
             }
         }
         if i.key_pressed(Key::W) && !cmd {
-            self.view.wireframe = !self.view.wireframe;
+            self.run(MeshCommand::Wireframe(!self.view.wireframe), ctx, vp);
         }
         if i.key_pressed(Key::F) && !cmd {
-            self.focus_scene();
+            self.run(MeshCommand::Focus, ctx, vp);
         }
         if self.scene.active().is_some() && !cmd {
             // Tool hotkeys work from inside other tools too: the open tool is accepted first.
@@ -3114,9 +3105,8 @@ impl MeshWorkspace {
             };
             if let Some(to) = to {
                 self.switch_to(to, ctx, vp);
-            } else if i.key_pressed(Key::Y) && i.modifiers.shift && self.accept_tools_for_command(ctx, vp) {
-                commands::separate_shells(&mut self.cmd_cx());
-                self.scene_changed(ctx, vp);
+            } else if i.key_pressed(Key::Y) && i.modifiers.shift {
+                self.run(MeshCommand::SeparateShells, ctx, vp);
             }
         }
     }
@@ -3130,6 +3120,15 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     fn tick(&mut self, ctx: &egui::Context, active: bool) {
         self.poll_jobs();
         self.autosave_tick(ctx);
+        if self.history.by_agent {
+            self.agent_quiet_frames = if self.agent_quiet() { self.agent_quiet_frames + 1 } else { 0 };
+            // An action through the panels lands a frame after the call: leave room for it.
+            if self.agent_quiet_frames >= 3 {
+                self.history.by_agent = false;
+            } else {
+                ctx.request_repaint();
+            }
+        }
         if !active {
             // 3D-mouse buttons meant for the Mesh view must not pile up while another
             // workspace is shown.
@@ -3171,8 +3170,13 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         agent::tools()
     }
 
-    fn agent_call(&mut self, tool: &str, args: &serde_json::Value) -> polymix_workspace::agent::AgentReply {
-        agent::call(self, tool, args)
+    fn agent_call(&mut self, tool: &str, args: &serde_json::Value, ctx: &egui::Context) -> polymix_workspace::agent::AgentReply {
+        agent::call(self, tool, args, ctx)
+    }
+
+    fn agent_acting(&mut self) {
+        self.history.by_agent = true;
+        self.agent_quiet_frames = 0;
     }
 
     fn emergency_save(&mut self) {

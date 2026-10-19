@@ -48,7 +48,7 @@ pub fn generate_complex(solids: &[Mesh]) -> EditResult<Vec<Mesh>> {
     Ok(cells)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ConvexParams {
     /// Stop at this many pieces.
     pub max_pieces: usize,

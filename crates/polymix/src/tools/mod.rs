@@ -290,4 +290,47 @@ pub trait Tool {
     fn busy(&self) -> Option<(String, f32)> {
         None
     }
+    /// The settings agents can read and change, as a JSON object (none for most interactive
+    /// tools: agents work their panels instead).
+    fn settings(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// JSON Schema of [`Tool::settings`] (with each setting's description).
+    fn settings_schema(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Change settings for an agent: the keys given replace those values.
+    fn set_settings(&mut self, _settings: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+        Err(format!("{} has no settings agents can set directly; work its panel with app_ui / app_ui_action", self.name()))
+    }
+    /// What the panel shows besides the settings (result, errors), for agents.
+    fn report(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+}
+
+/// `changes` merged into `settings` (both JSON objects; nested objects merge too). Every key
+/// must already exist, so a misspelt setting is an error rather than ignored.
+pub fn merge_settings(settings: &mut serde_json::Value, changes: &serde_json::Value) -> Result<(), String> {
+    let (Some(cur), Some(new)) = (settings.as_object_mut(), changes.as_object()) else {
+        return Err("settings must be a JSON object".into());
+    };
+    let known = cur.keys().cloned().collect::<Vec<_>>().join(", ");
+    for (k, v) in new {
+        match cur.get_mut(k) {
+            None => return Err(format!("no setting \"{k}\" (the settings are {known})")),
+            Some(old) if old.is_object() && v.is_object() => merge_settings(old, v).map_err(|e| format!("{k}: {e}"))?,
+            Some(old) => *old = v.clone(),
+        }
+    }
+    Ok(())
+}
+
+/// A type's JSON Schema for agents.
+pub fn schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
+    let mut v = serde_json::to_value(schemars::schema_for!(T)).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("$schema");
+    }
+    v
 }

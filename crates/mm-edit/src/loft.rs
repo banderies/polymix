@@ -25,7 +25,7 @@ use mm_core::mesh::tri_other_vertex;
 use mm_core::{DVec3, Mesh, INVALID};
 
 /// Shape of a loft, like the fill types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum LoftShape {
     /// One band of triangles straight across, no new vertices.
     Minimal,
@@ -43,7 +43,7 @@ pub enum LoftShape {
 }
 
 /// How a [`LoftShape::Smooth`] tube meets an opening.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum EndContinuity {
     /// Position only: the tube meets the opening, with a crease if the directions differ.
     G0,
@@ -61,7 +61,7 @@ impl EndContinuity {
 }
 
 /// Which way a G1 / G2 end leaves its opening.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum EndDirection {
     /// Along the surrounding wall, per boundary vertex: an opening cut across a vessel.
     #[default]
@@ -71,7 +71,7 @@ pub enum EndDirection {
     Normal,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct LoftEnd {
     pub continuity: EndContinuity,
     /// Length of the end tangent relative to the gap (G1 / G2); larger keeps the tube

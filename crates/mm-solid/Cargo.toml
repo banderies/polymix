@@ -12,4 +12,6 @@ rayon.workspace = true
 smallvec.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
-
+# Parameter types describe themselves to agents (Polymix agent access).
+serde = { version = "1", features = ["derive"] }
+schemars = "1"

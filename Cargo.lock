@@ -1950,6 +1950,8 @@ dependencies = [
  "mm-solid",
  "rayon",
  "robust",
+ "schemars",
+ "serde",
  "smallvec",
  "thiserror 2.0.21",
 ]
@@ -2025,6 +2027,8 @@ dependencies = [
  "glam 0.34.1",
  "mm-core",
  "rayon",
+ "schemars",
+ "serde",
  "smallvec",
  "thiserror 2.0.21",
 ]
@@ -2828,6 +2832,8 @@ dependencies = [
  "polymix-workspace",
  "rayon",
  "rfd",
+ "schemars",
+ "serde",
  "serde_json",
  "winit",
  "zip",

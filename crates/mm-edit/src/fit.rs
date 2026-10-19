@@ -12,7 +12,7 @@ use mm_core::{primitives, Bvh, DMat3, DVec2, DVec3, Mesh, Ray};
 use std::collections::HashMap;
 
 /// Shape to fit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum PrimitiveType {
     Square,
     Rectangle,

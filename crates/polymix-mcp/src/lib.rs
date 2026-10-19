@@ -41,6 +41,8 @@ pub struct ToolSpec {
     pub input_schema: Value,
     /// Changes nothing (lets clients run it without asking).
     pub read_only: bool,
+    /// May change meshes, the scene or files (clients should ask first).
+    pub destructive: bool,
 }
 
 /// A tool's answer.
@@ -197,7 +199,7 @@ fn tool(spec: &ToolSpec) -> Tool {
         Value::Object(o) => o.clone(),
         _ => serde_json::Map::from_iter([("type".to_string(), Value::from("object"))]),
     };
-    let annotations = if spec.read_only { ToolAnnotations::new().read_only(true).destructive(false).idempotent(true).open_world(false) } else { ToolAnnotations::new().read_only(false).open_world(false) };
+    let annotations = if spec.read_only { ToolAnnotations::new().read_only(true).destructive(false).idempotent(true).open_world(false) } else { ToolAnnotations::new().read_only(false).destructive(spec.destructive).open_world(false) };
     Tool::new(spec.name.clone(), spec.description.clone(), schema).with_annotations(annotations)
 }
 

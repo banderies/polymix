@@ -375,6 +375,20 @@ impl Camera {
     pub fn set_view(&mut self, yaw: f64, pitch: f64) {
         self.orient = view_orientation(yaw, pitch);
     }
+
+    /// Look along `forward`, keeping the world up axis up on screen as far as possible.
+    pub fn look_along(&mut self, forward: DVec3) {
+        let f = forward.normalize_or_zero();
+        if f == DVec3::ZERO {
+            return;
+        }
+        let up0 = if f.cross(self.world_up()).length_squared() > 1e-6 { self.world_up() } else { self.world_up().any_orthonormal_vector() };
+        let right = f.cross(up0).normalize();
+        let up = right.cross(f);
+        // Camera axes: x right, y up, looking down -z.
+        let r = DQuat::from_mat3(&glam::DMat3::from_cols(right, up, -f));
+        self.orient = self.base().inverse() * r;
+    }
 }
 
 fn view_orientation(yaw: f64, pitch: f64) -> DQuat {

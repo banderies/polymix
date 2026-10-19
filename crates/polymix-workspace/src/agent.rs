@@ -7,9 +7,22 @@
 //! workspace snapshots what it needs (meshes are `Arc`s, so that is cheap) and the work runs on
 //! a worker thread, so the UI never waits on an agent.
 //!
-//! The tools only read: none changes a scene, a selection or the view.
+//! Most tools only read. Tools of kind [`ToolKind::Change`] or [`ToolKind::Destructive`] change
+//! the session; the shell refuses them unless the user let agents make changes, and every
+//! change they make is an undo step labelled "Agent: …".
 
 use serde_json::{json, Value};
+
+/// What a tool may do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    /// Only reads.
+    Read,
+    /// Changes the session in ways that are easily undone (selection, view, opening a tool).
+    Change,
+    /// Changes meshes, the scene or files.
+    Destructive,
+}
 
 /// One tool, as listed to agents.
 #[derive(Clone, Debug)]
@@ -19,12 +32,25 @@ pub struct AgentTool {
     pub description: &'static str,
     /// JSON Schema of the arguments (an object schema).
     pub input_schema: Value,
+    pub kind: ToolKind,
 }
 
 impl AgentTool {
-    /// A tool whose arguments are `properties` (a JSON Schema `properties` object), all optional.
+    /// A reading tool whose arguments are `properties` (a JSON Schema `properties` object),
+    /// all optional.
     pub fn new(name: &'static str, description: &'static str, properties: Value) -> Self {
-        Self { name, description, input_schema: json!({"type": "object", "properties": properties, "additionalProperties": false}) }
+        Self { name, description, input_schema: json!({"type": "object", "properties": properties, "additionalProperties": false}), kind: ToolKind::Read }
+    }
+
+    pub fn kind(mut self, kind: ToolKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Arguments that must be given.
+    pub fn required(mut self, names: &[&str]) -> Self {
+        self.input_schema["required"] = json!(names);
+        self
     }
 }
 

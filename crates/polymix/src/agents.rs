@@ -3,13 +3,16 @@
 //! and the privacy pass over everything agents are sent.
 //!
 //! Off by default. On, it listens on 127.0.0.1 and needs a token kept in the data folder
-//! (`agent-token`), so only programs of this user on this computer can connect. Tools only
-//! read. `POLYMIX_MCP=1` turns it on for one session (scripted runs, development);
-//! `POLYMIX_MCP_PORT` picks the port.
+//! (`agent-token`), so only programs of this user on this computer can connect. Agents read;
+//! they change things only once the user also ticks *Let agents make changes*, and every
+//! change is an undo step labelled "Agent: …". `POLYMIX_MCP=1` turns access on for one
+//! session (scripted runs, development), `POLYMIX_MCP_WRITE=1` changes too; `POLYMIX_MCP_PORT`
+//! picks the port.
 
 use polymix_mcp::{Reply, Server, ToolSpec};
-use polymix_workspace::agent::{AgentReply, AgentTool};
+use polymix_workspace::agent::{AgentReply, AgentTool, ToolKind};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -19,7 +22,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Masks patients' identifiers in text (see `VolumeWorkspace::agent_mask`).
 pub type Mask = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-const INSTRUCTIONS: &str = "Polymix is a desktop app for medical images and meshes: the Volume workspace finds and previews images (DICOM, NIfTI, …), Segmentation segments one in three planes, and Mesh edits surface meshes (vessel cleanup for CFD). These tools read the session the user has open; none changes anything. Start with app_status; app_screenshot shows the window as the user sees it. Lengths are in millimetres. Patient identifiers are masked and dates cut to the year: do not try to recover them.";
+const INSTRUCTIONS: &str = "Polymix is a desktop app for medical images and meshes: the Volume workspace finds and previews images (DICOM, NIfTI, …), Segmentation segments one in three planes, and Mesh edits surface meshes (vessel cleanup for CFD). The tools work on the session the user has open, in front of them. Start with app_status; app_screenshot shows the window as the user sees it, app_ui lists the widgets of the shown panels. Tools that change things work only if the user allowed changes (Agents window); each change is an undo step labelled \"Agent: …\" and shows the workspace it changes. Typed tools first (mesh_select, mesh_edit, mesh_tool with settings, mesh_file); app_ui_action for anything only a panel offers. Work that takes time (tools computing, files loading, clicks) finishes after the call returns: call app_wait, then read the result. Lengths are in millimetres. Patient identifiers are masked and dates cut to the year: do not try to recover them.";
 
 pub fn shell_tools() -> Vec<AgentTool> {
     vec![
@@ -29,6 +32,37 @@ pub fn shell_tools() -> Vec<AgentTool> {
             "A PNG of the Polymix window as the user sees it now (the shown workspace tab only). Refused for the Volume and Segmentation tabs unless Hide identifiers is on in the Volume tab.",
             json!({"max_size": {"type": "integer", "description": "Longest side in pixels (default 1568, 256 to 4096)"}}),
         ),
+        AgentTool::new(
+            "app_wait",
+            "Wait until Polymix has finished what was asked (tools computing, files loading or saving, clicks), up to `seconds`. Returns whether it is idle, and app_status.",
+            json!({"seconds": {"type": "integer", "description": "Longest wait (default 10, up to 25)"}}),
+        ),
+        AgentTool::new(
+            "app_ui",
+            "The widgets of the panels shown now (the shown tab, its tool panel and any open windows), as indented lines: role \"label\" = value, state (checked, selected, disabled…) and an #id to act on with app_ui_action. Refused for the Volume and Segmentation tabs unless Hide identifiers is on.",
+            json!({
+                "contains": {"type": "string", "description": "Only lines containing this text (case-insensitive)"},
+                "limit": {"type": "integer", "description": "Most lines (default 400)"}
+            }),
+        ),
+        AgentTool::new(
+            "app_ui_action",
+            "Act on a widget listed by app_ui, as a screen reader would: click (buttons, checkboxes, menu entries, combo boxes and their options), set_value (`value`: a number for sliders and number fields, text for text boxes), increment, decrement, expand, collapse, focus. Changes nothing until the user allowed changes; never in the Agent access window. Buttons that open a file dialog wait for the user.",
+            json!({
+                "id": {"type": "string", "description": "The widget's #id from app_ui"},
+                "action": {"type": "string", "enum": ["click", "set_value", "increment", "decrement", "expand", "collapse", "focus", "scroll_into_view"], "description": "Default click"},
+                "value": {"type": ["number", "string"], "description": "For set_value"}
+            }),
+        )
+        .required(&["id"])
+        .kind(ToolKind::Destructive),
+        AgentTool::new(
+            "app_show",
+            "Show a workspace tab (volume, segmentation or mesh). Tools that change a workspace show it themselves.",
+            json!({"workspace": {"type": "string", "enum": ["volume", "segmentation", "mesh"]}}),
+        )
+        .required(&["workspace"])
+        .kind(ToolKind::Change),
         AgentTool::new(
             "app_log",
             "Recent log messages: Polymix's own from info up, other libraries' warnings and errors. File paths are replaced with <path>.",
@@ -41,7 +75,7 @@ pub fn shell_tools() -> Vec<AgentTool> {
 }
 
 pub fn spec(t: AgentTool) -> ToolSpec {
-    ToolSpec { name: t.name.into(), description: t.description.into(), input_schema: t.input_schema, read_only: true }
+    ToolSpec { name: t.name.into(), description: t.description.into(), input_schema: t.input_schema, read_only: t.kind == ToolKind::Read, destructive: t.kind == ToolKind::Destructive }
 }
 
 /// A workspace's answer as the server takes it, masked.
@@ -153,10 +187,13 @@ fn load_token(fresh: bool) -> anyhow::Result<String> {
 
 pub struct AgentAccess {
     enabled: bool,
+    /// Agents may change things (tools other than [`ToolKind::Read`]).
+    allow_changes: bool,
     port: u16,
     /// Turned on by `POLYMIX_MCP` for this session only: never saved.
     from_env: bool,
     tools: Vec<ToolSpec>,
+    kinds: HashMap<String, ToolKind>,
     server: Option<Server>,
     token: Option<String>,
     error: Option<String>,
@@ -164,15 +201,18 @@ pub struct AgentAccess {
 }
 
 impl AgentAccess {
-    pub fn new(storage: Option<&dyn eframe::Storage>, tools: Vec<ToolSpec>) -> Self {
-        let env_on = std::env::var("POLYMIX_MCP").is_ok_and(|v| v == "1");
+    pub fn new(storage: Option<&dyn eframe::Storage>, tools: Vec<AgentTool>) -> Self {
+        let env = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
+        let (env_on, env_write) = (env("POLYMIX_MCP"), env("POLYMIX_MCP_WRITE"));
         let env_port = std::env::var("POLYMIX_MCP_PORT").ok().and_then(|p| p.parse().ok());
         let stored = |k: &str| storage.filter(|_| !polymix_workspace::scripted()).and_then(|s| s.get_string(k));
         Self {
             enabled: env_on || stored("agents.enabled").is_some_and(|v| v == "1"),
+            allow_changes: env_write || stored("agents.changes").is_some_and(|v| v == "1"),
             port: env_port.or_else(|| stored("agents.port").and_then(|p| p.parse().ok())).unwrap_or(polymix_mcp::DEFAULT_PORT),
-            from_env: env_on || env_port.is_some(),
-            tools,
+            from_env: env_on || env_write || env_port.is_some(),
+            kinds: tools.iter().map(|t| (t.name.to_string(), t.kind)).collect(),
+            tools: tools.into_iter().map(spec).collect(),
             server: None,
             token: None,
             error: None,
@@ -182,6 +222,16 @@ impl AgentAccess {
 
     pub fn server(&self) -> Option<&Server> {
         self.server.as_ref()
+    }
+
+    /// Why an agent may not call `tool` now, if it may not.
+    pub fn refusal(&self, tool: &str) -> Option<String> {
+        let kind = self.kinds.get(tool).copied().unwrap_or(ToolKind::Destructive);
+        (kind != ToolKind::Read && !self.allow_changes).then(|| format!("{tool} changes the session, and the user has not allowed changes: ask them to tick \"Let agents make changes\" in Polymix's Agents window (Agents button, top right). Reading tools work meanwhile."))
+    }
+
+    pub fn kind(&self, tool: &str) -> ToolKind {
+        self.kinds.get(tool).copied().unwrap_or(ToolKind::Destructive)
     }
 
     /// Start the server if agent access is on.
@@ -228,6 +278,7 @@ impl AgentAccess {
             return;
         }
         storage.set_string("agents.enabled", if self.enabled { "1" } else { "0" }.into());
+        storage.set_string("agents.changes", if self.allow_changes { "1" } else { "0" }.into());
         storage.set_string("agents.port", self.port.to_string());
     }
 
@@ -241,7 +292,7 @@ impl AgentAccess {
     pub fn indicator(&mut self, ui: &mut egui::Ui) {
         let recent = self.last_call().filter(|s| *s < 2.0);
         let (dot, colour, tip) = match (&self.server, &self.error) {
-            (Some(s), _) => ("●", if recent.is_some() { egui::Color32::from_rgb(120, 220, 255) } else { egui::Color32::from_rgb(90, 200, 120) }, format!("Agents can read this session at {}", s.url())),
+            (Some(s), _) => ("●", if recent.is_some() { egui::Color32::from_rgb(120, 220, 255) } else { egui::Color32::from_rgb(90, 200, 120) }, format!("Agents can {} this session at {}", if self.allow_changes { "read and change" } else { "read" }, s.url())),
             (None, Some(e)) => ("⚠", egui::Color32::from_rgb(240, 150, 80), format!("Agent access failed: {e}")),
             (None, None) => ("○", ui.visuals().weak_text_color(), "Agent access is off".to_string()),
         };
@@ -274,6 +325,10 @@ impl AgentAccess {
                     self.error = None;
                 }
             }
+            ui.add_enabled_ui(self.enabled, |ui| {
+                ui.checkbox(&mut self.allow_changes, "Let agents make changes")
+                    .on_hover_text("Select, edit, run tools, open and export files, work the panels. Each change is an undo step labelled \"Agent: …\"; the workspace being changed is shown.");
+            });
             ui.add_enabled_ui(self.server.is_none(), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Port");
@@ -309,7 +364,12 @@ impl AgentAccess {
                 self.start(ctx, true);
             }
             ui.add_space(6.0);
-            ui.weak("Agents only read: nothing they do changes your work. Patient names, IDs, birth dates and accession numbers are masked and dates cut to the year; screenshots of the Volume and Segmentation tabs need Hide identifiers on. What an agent reads goes to its provider.");
+            ui.weak(if self.allow_changes {
+                "Agents can change your work: every change is an undo step labelled \"Agent: …\" (Edit → Undo). They cannot change these settings."
+            } else {
+                "Agents only read: nothing they do changes your work."
+            });
+            ui.weak("Patient names, IDs, birth dates and accession numbers are masked and dates cut to the year; screenshots and panel reads of the Volume and Segmentation tabs need Hide identifiers on. What an agent reads goes to its provider.");
             if let Some(s) = &self.server {
                 let recent = s.recent();
                 if !recent.is_empty() {
@@ -357,5 +417,45 @@ mod tests {
         let Reply::Png(bytes) = png(&img, 1568) else { panic!("png expected") };
         let info = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap().info().clone();
         assert_eq!((info.width, info.height), (1500, 500));
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn every_tool_has_a_unique_name_and_a_plain_object_schema() {
+        let all: Vec<AgentTool> = shell_tools().into_iter().chain(polymix_volume::VolumeWorkspace::agent_tools()).chain(polymix_segmentation::SegmentationWorkspace::agent_tools()).chain(crate::app::MeshWorkspace::agent_tools()).collect();
+        let mut names: Vec<&str> = all.iter().map(|t| t.name).collect();
+        names.sort();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "duplicate tool names");
+        for t in &all {
+            let s = &t.input_schema;
+            assert_eq!(s["type"], "object", "{}", t.name);
+            // The Claude API refuses oneOf / anyOf / allOf at the top of an input schema.
+            assert!(["oneOf", "anyOf", "allOf"].iter().all(|k| s.get(k).is_none()), "{}", t.name);
+            for r in s["required"].as_array().into_iter().flatten() {
+                assert!(s["properties"].get(r.as_str().unwrap()).is_some(), "{}: required {r} is not a property", t.name);
+            }
+            // Reading tools are named for what they read; changing ones say what they change.
+            if t.kind != ToolKind::Read {
+                assert!(!t.description.is_empty());
+            }
+        }
+        use polymix_workspace::Workspace;
+    }
+
+    #[test]
+    fn changes_need_permission() {
+        let tools = vec![AgentTool::new("mesh_scene", "", json!({})), AgentTool::new("mesh_edit", "", json!({})).kind(ToolKind::Destructive)];
+        let mut a = AgentAccess::new(None, tools);
+        assert!(a.refusal("mesh_scene").is_none());
+        assert!(a.refusal("mesh_edit").unwrap().contains("Let agents make changes"));
+        assert!(a.refusal("unknown_tool").is_some());
+        a.allow_changes = true;
+        assert!(a.refusal("mesh_edit").is_none());
     }
 }
