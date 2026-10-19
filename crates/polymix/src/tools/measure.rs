@@ -544,4 +544,33 @@ mod tests {
         assert!((e.x - 4.0).abs() < 1e-9, "{e}");
         assert!((t.items[0].length.unwrap() - 4.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn vessel_diameters_become_stent_ends() {
+        // Two vessel cross-sections on a tube carry what a stent needs; the button opens
+        // Virtual stent with them.
+        let mut scene = Scene::default();
+        let tube = scene.add("tube", primitives::cylinder(2.0, 40.0, 48, 80, false));
+        let (mut history, mut camera, mut status) = (History::default(), Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let mut cx = ToolCx {
+            scene: &mut scene,
+            history: &mut history,
+            camera: &mut camera,
+            status: &mut status,
+            egui: &ctx,
+            vp: Viewport { rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)) },
+            brush_scroll: crate::navigation::BrushScroll::Shift,
+        };
+        let mut t = MeasureTool::new(&mut cx);
+        for z in [12.0, 28.0] {
+            let h = hit_at(cx.scene, tube, DVec3::new(2.0, 0.0, z), DVec3::X);
+            t.measure_at(&mut cx, tube, h);
+        }
+        let ends: Vec<&super::super::stent::Section> = t.items.iter().filter_map(|m| m.section.as_ref()).collect();
+        assert_eq!(ends.len(), 2);
+        for (e, z) in ends.iter().zip([12.0, 28.0]) {
+            assert!((e.diameter - 4.0).abs() < 0.05 && (e.center.z - z).abs() < 0.3 && e.normal.z.abs() > 0.99, "{e:?}");
+        }
+    }
 }

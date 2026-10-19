@@ -243,7 +243,8 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 
 Trim branch (square vessel cut + cap) · Flow extensions · Cap open ends · Centerline with
 branch lengths/diameters (CSV/VTK) · Check for CFD (incl. self-intersections, triangle
-quality) · Boundary patches + multi-solid STL · Measure cross-section diameter ·
+quality) · Boundary patches + multi-solid STL · Measure cross-section diameter · Virtual
+stent (bare or covered, straightness and stiffness) ·
 crease-angle sharp-edge shading · laser selection on 1M+ triangle meshes · Z-up (RAS) mode ·
 free/turntable camera toggle.
 

@@ -115,6 +115,15 @@ cargo run -p polymix --example gen_test_meshes --release -- test_meshes
    inlet) and export a multi-solid ASCII STL (OpenFOAM `snappyHexMesh`, Fluent, CFX,
    SimVascular) or one STL per patch. Plain export: **Export** (`Cmd+E`).
 
+Treatment variants: **Vessel → Virtual stent** places a stent between two clicked
+cross-sections (or two *Measure → Vessel diameter* rings) and reshapes the vessel around it:
+diameter and length (centred on the two ends along the stent's own axis), *Straightness*
+(follow the centerline ↔ the smoothest G0 / G1 / G2 path between the ends), *Stiffness* (how
+far narrower wall opens to the stent; wider wall is left alone), *End blend*, and *Covered*
+(the lumen becomes the stent's tube: dilated stretches narrowed, side branches sealed off).
+Previewed live; kept in place or as a copy. Details and limits:
+[docs/virtual_stenting.md](docs/virtual_stenting.md).
+
 Analysis extras: **Centerline** (vessel tree, per-branch length and diameters, CSV / VTK export
 for ParaView/VMTK), **Measure** (cross-section equivalent diameter, distances), **Deviation**
 (signed distance to a reference with colour map, mean/RMS/95th percentile/Hausdorff — handy for
@@ -151,7 +160,7 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 | Select | Sphere brush (fixed size on the model), lasso and laser lasso (through or visible only), hole-border ring, grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
 | Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag |
 | Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid, Remesh, Reduce, Smooth, Offset / Hollow, Boolean (union/difference/intersection; exact or volumetric), Add Tube, Fit Primitive (`P` in Select), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
-| Vessel | Trim branch, Flow extensions, Cap open ends, Measure diameter, Centerline, Boundary patches / CFD export, Check for CFD |
+| Vessel | Trim branch, Flow extensions, Cap open ends, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
 | Analysis | Inspector, Measure (distance, thickness, gaps, cylinder fit, vessel diameter, snapping), Mesh Query (normals, quality, curvature), Units / Dimensions (incl. scale from measurements), Clearance, Check for CFD, Deviation |
 
 ## Project layout

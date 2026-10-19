@@ -256,6 +256,29 @@ the Volume tab and the viewer features they share), with engine and UI status:
       slabs, 4D time points, phase-contrast velocities, de-identified export. Results are
       NIfTI images in `<data dir>/volume/derived`, listed and selectable like any image.
 
+## M16 — Virtual stenting
+
+Treated-anatomy variants for flow studies: a stent placed between two vessel cross-sections
+reshapes the vessel around it ([virtual_stenting.md](virtual_stenting.md)). First use: dural
+venous sinus stenosis with bare self-expanding stents.
+
+- [x] **M16.1 Placement**: ends clicked as cross-sections (or Measure's last two vessel
+      diameters); the vessel's centerline traced from end 1 through end 2 and on past both;
+      the stent centred on the ends along its own axis. *Straightness* blends the centerline
+      with the smoothest path between the ends (G0 line, G1 / G2 Hermite spline of least
+      length × ∫κ²).
+- [x] **M16.2 Bare stent**: gripped slices carried onto the stent's axis (none where the stent
+      floats in a wider lumen), the vessel returning past each end along a least-bending path
+      gentle for its radius; wall inside the stent pushed out by *Stiffness*, faded over *End
+      blend*; side branches follow with distance; stretched wall remeshed.
+- [x] **M16.3 Covered stent**: the stretch cut out and replaced by the stent's tube (wider wall
+      narrowed to the stent, side branches and aneurysms sealed off and removed).
+- [x] **M16.4 Tool**: live preview with the stent as a wireframe, readouts (lengths,
+      overhangs, narrowest lumen before → after) and warnings (axis outside the vessel, new
+      crossings, sharp return, moved open ends); edit in place or as a copy.
+- [ ] **M16.5** Covered-stent refinements, braided foreshortening, struts, mechanics, device
+      catalogue, several stents: see [virtual_stenting.md § Future work](virtual_stenting.md#future-work).
+
 ## Later
 
 - **DICOM extras**: Siemens mosaics, DICOM SEG and RT structure sets, High-Throughput JPEG
