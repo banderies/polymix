@@ -314,6 +314,16 @@ impl PolymixApp {
             // points), move to (x1, y1) in `steps` frames, release: real mouse input for any
             // workspace. Buttons: left, right, middle, joined with `+`; `,hold` at the end keeps
             // them down until `pointer:release,x,y`.
+            // wheel:x,y,lines — the mouse wheel at (x, y) (window points), one notch per line
+            // (positive = up).
+            "wheel" => {
+                let n: Vec<f32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let [x, y, lines] = n[..] {
+                    let at = egui::pos2(x, y);
+                    let notch = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, lines.signum()), modifiers: Default::default(), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
+                    script.pointer = std::iter::once(vec![egui::Event::PointerMoved(at)]).chain((0..lines.abs() as usize).map(|_| vec![notch.clone()])).chain((0..15).map(|_| Vec::new())).collect();
+                }
+            }
             "pointer" => match pointer_frames(arg) {
                 Some(frames) => script.pointer = frames,
                 None => log::warn!("bad pointer step {step}"),

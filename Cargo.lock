@@ -1686,6 +1686,7 @@ dependencies = [
  "anyhow",
  "glam 0.34.1",
  "mm-core",
+ "mm-remesh",
  "mm-repair",
  "mm-solid",
  "rayon",

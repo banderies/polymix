@@ -1820,15 +1820,20 @@ fn remove_cut_off_fragments(m: &mut Mesh, border: &std::collections::HashSet<u32
 pub struct LoftUi {
     pub shape: mm_edit::LoftShape,
     pub ends: [mm_edit::LoftEnd; 2],
-    /// Extra twist (degrees); roundness of the middle and fairing (percent).
+    /// Extra twist (degrees); roundness of the middle, fairing, how much of the vessels
+    /// behind the openings steers the tube and how far it is blended into them (percent).
     pub twist: f64,
     pub round: f64,
     pub fair: f64,
+    pub context: f64,
+    pub blend: f64,
+    /// Even triangles over the tube and the blended bands.
+    pub remesh: bool,
 }
 
 impl Default for LoftUi {
     fn default() -> Self {
-        Self { shape: mm_edit::LoftShape::Smooth, ends: [mm_edit::LoftEnd::default(); 2], twist: 0.0, round: 0.0, fair: 0.0 }
+        Self { shape: mm_edit::LoftShape::Smooth, ends: [mm_edit::LoftEnd::default(); 2], twist: 0.0, round: 0.0, fair: 0.0, context: 50.0, blend: 50.0, remesh: true }
     }
 }
 
@@ -1852,6 +1857,9 @@ impl LoftUi {
             bulge: (bulge / 100.0).max(-0.9),
             round: (self.round / 100.0).clamp(0.0, 1.0),
             fair: (self.fair / 100.0).clamp(0.0, 1.0),
+            context: (self.context / 100.0).clamp(0.0, 1.0),
+            blend: (self.blend / 100.0).clamp(0.0, 1.0),
+            remesh: self.remesh && self.shape != mm_edit::LoftShape::Minimal,
             group,
         }
     }
@@ -1899,10 +1907,17 @@ impl LoftUi {
         ui.add_enabled(tube, egui::Slider::new(&mut self.round, 0.0..=100.0).suffix("%").text("Round")).on_hover_text("Make the middle of the tube circular, however ragged the openings are");
         ui.add_enabled(smooth, egui::Slider::new(&mut self.fair, 0.0..=100.0).suffix("%").text("Fair"))
             .on_hover_text("Smooth the tube's middle with its ends kept: thin-plate for G0 / G1 ends, curvature-continuous (G2) when an end is G2");
+        ui.add_enabled(smooth && self.ends.iter().any(|e| e.direction == EndDirection::Wall), egui::Slider::new(&mut self.context, 0.0..=100.0).suffix("%").text("Context"))
+            .on_hover_text("How far back along each vessel the tube takes its direction and bend from: 0 = the edge of the opening only; more = the vessel's axis fitted further back (up to five diameters at 100 %), so a ragged or lumpy end does not steer the tube")
+            .on_disabled_hover_text("For tubes leaving along the wall (Smooth)");
+        ui.add_enabled(tube, egui::Slider::new(&mut self.blend, 0.0..=100.0).suffix("%").text("Blend"))
+            .on_hover_text("Blend the tube into the vessels: ragged openings are tidied first, and the join is smoothed over a band of each vessel behind it (up to a diameter at 100 %). 0 leaves the vessels untouched");
+        ui.add_enabled(tube, egui::Checkbox::new(&mut self.remesh, "Remesh the join")).on_hover_text("Even triangles over the tube and the blended bands, so no thin slivers show as lines along the seams");
     }
 
     /// Test-script settings: `loft:smooth`, `end1:g2`, `tension2:1.5`, `dir:normal`,
-    /// `round:50`, `fair:100`, `twist:30`. Returns false for other keys.
+    /// `round:50`, `fair:100`, `twist:30`, `context:50`, `blend:50`, `remesh:off`. Returns
+    /// false for other keys.
     pub fn script(&mut self, key: &str, val: &str) -> bool {
         use mm_edit::{EndContinuity, EndDirection, LoftShape};
         let num = val.parse::<f64>().ok();
@@ -1936,6 +1951,9 @@ impl LoftUi {
             "round" => self.round = num.unwrap_or(self.round),
             "fair" => self.fair = num.unwrap_or(self.fair),
             "twist" => self.twist = num.unwrap_or(self.twist),
+            "context" => self.context = num.unwrap_or(self.context),
+            "blend" => self.blend = num.unwrap_or(self.blend),
+            "remesh" => self.remesh = val != "off",
             _ => return false,
         }
         true
@@ -2705,7 +2723,9 @@ mod tests {
         let top = tube_verts.iter().map(|p| p.z).fold(f64::MIN, f64::max);
         let inner = tube_verts.iter().map(|p| p.length()).fold(f64::MAX, f64::min);
         assert!(top > 2.15, "the handle arches above the sphere ({top:.2})");
-        assert!(inner > 1.99, "and stays outside it ({inner:.3})");
+        // The selection also holds the sphere's blended bands around the feet, smoothed in
+        // by about half a percent.
+        assert!(inner > 1.98, "and stays outside it ({inner:.3})");
         let mut along_wall = RegionBridgeUi::tube_handle();
         RegionBridgeSpec::script(&mut along_wall, "dir:wall");
         assert_eq!(along_wall.loft.ends.map(|e| e.direction), [mm_edit::EndDirection::Wall; 2]);

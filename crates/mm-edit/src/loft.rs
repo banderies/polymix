@@ -9,8 +9,13 @@
 //! is free (zero curvature there), so it only meets the opening. The cross-section blends from A's shape to B's along the way, optionally
 //! rounded towards a circle in the middle, and the tube can be faired with the surroundings
 //! held fixed (order 2 or 3, so G1 / G2 ends stay smooth).
+//!
+//! With *context* the directions and the bend come from the vessel's axis fitted further
+//! behind each opening instead of its last row of triangles (which a ragged or lumpy opening
+//! skews); with *blend* ragged openings are tidied first and the join is smoothed into the
+//! vessels afterwards; *remesh* evens out the triangles of the join.
 
-use crate::bridge::{aligned_loops, commit, mean_edge, quad_band, strip, AlignedLoops, BridgeResult};
+use crate::bridge::{aligned_loops, commit, mean_edge, quad_band, strip, strip_with, AlignedLoops, BridgeResult};
 use crate::util::*;
 use crate::{EditError, EditResult};
 use mm_core::mesh::tri_other_vertex;
@@ -91,6 +96,22 @@ pub struct LoftParams {
     /// 0..1: blend towards the tube faired with the surroundings held fixed
     /// ([`LoftShape::Smooth`] only).
     pub fair: f64,
+    /// 0..1: how much of the vessel behind each opening sets the direction a G1 / G2 end
+    /// leaves in and its bend ([`EndDirection::Wall`] only): 0 is the edge of the opening
+    /// alone (its last row of triangles; the bend from one and a half radii back), more takes
+    /// the axis fitted to the vessel further back — its direction from a quarter on, and from
+    /// there out to five diameters of vessel at 1. A ragged or lumpy opening then no longer
+    /// steers the tube.
+    pub context: f64,
+    /// 0..1: blend the tube into the vessels. Above 0 each opening is tidied first (narrow
+    /// teeth cut off, narrow notches filled, its outline relaxed along the wall), so a ragged
+    /// opening does not fold the tube's first band; afterwards the tube and a band of each
+    /// vessel behind its opening (a diameter back at 1) are smoothed, fading out across the
+    /// band, so the join has no seam and the lumps right at it are evened out.
+    pub blend: f64,
+    /// Remesh the tube and the blended bands to even triangles of the tube's edge length
+    /// (the result's triangles are then all of them).
+    pub remesh: bool,
     /// Face group of the tube; `None` = a new group.
     pub group: Option<i32>,
 }
@@ -105,6 +126,9 @@ impl Default for LoftParams {
             bulge: 0.0,
             round: 0.0,
             fair: 0.0,
+            context: 0.0,
+            blend: 0.0,
+            remesh: false,
             group: None,
         }
     }
@@ -120,10 +144,24 @@ fn middle_weight(t: f64) -> f64 {
 /// orientation, possibly different vertex counts) with a tube.
 pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams) -> EditResult<BridgeResult> {
     let unit = |x: f64| (0.0..=1.0).contains(&x);
-    if params.bulge.is_nan() || params.bulge <= -1.0 || params.ends.iter().any(|e| e.tension.is_nan() || e.tension <= 0.0) || !unit(params.round) || !unit(params.fair) {
-        return Err(EditError::InvalidParameter("bulge must exceed −100 %, tension must be positive, round and fair lie in 0..1".into()));
+    if params.bulge.is_nan() || params.bulge <= -1.0 || params.ends.iter().any(|e| e.tension.is_nan() || e.tension <= 0.0) || !unit(params.round) || !unit(params.fair) || !unit(params.context) || !unit(params.blend) {
+        return Err(EditError::InvalidParameter("bulge must exceed −100 %, tension must be positive, round, fair, context and blend lie in 0..1".into()));
     }
-    let dirs = [end_axis(mesh, loop_a, params.ends[0].direction), end_axis(mesh, loop_b, params.ends[1].direction)];
+    let (loop_a, loop_b) = if params.blend > 0.0 && params.shape != LoftShape::Minimal {
+        let relax = (5.0 + 25.0 * params.blend).round() as usize;
+        (tidy_opening(mesh, loop_a, relax)?, tidy_opening(mesh, loop_b, relax)?)
+    } else {
+        (loop_a.to_vec(), loop_b.to_vec())
+    };
+    let (loop_a, loop_b) = (&loop_a[..], &loop_b[..]);
+    let smooth = params.shape == LoftShape::Smooth;
+    // The vessels' axes behind the openings (with some context, along the wall).
+    let axis = |c: &[u32], e: &LoftEnd| (smooth && params.context > 0.0 && e.direction == EndDirection::Wall).then(|| vessel_axis(mesh, c, context_reach(params.context))).flatten();
+    let axes = [axis(loop_a, &params.ends[0]), axis(loop_b, &params.ends[1])];
+    let dirs = [
+        axes[0].as_ref().map_or_else(|| end_axis(mesh, loop_a, params.ends[0].direction), |x| x.dir),
+        axes[1].as_ref().map_or_else(|| end_axis(mesh, loop_b, params.ends[1].direction), |x| x.dir),
+    ];
     let AlignedLoops { p, q, .. } = aligned_loops(mesh, loop_a, loop_b, Some(dirs))?;
     let group = params.group.unwrap_or_else(|| new_group(mesh));
     let close = |v: &[u32]| {
@@ -137,13 +175,14 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     }
 
     let h = params.edge_length.unwrap_or_else(|| 0.5 * (mean_edge(mesh, &p, true) + mean_edge(mesh, &q, true))).max(1e-300);
-    let perimeter = |c: &[u32]| mean_edge(mesh, c, true) * c.len() as f64;
-    let n = ((perimeter(&p).max(perimeter(&q)) / h).round() as usize).clamp(3, 10_000);
+    // Points around: the openings' length smoothed (a ragged opening's notches would
+    // otherwise crowd the tube with columns) over the edge length.
+    let n = ((smoothed_perimeter(&positions(mesh, &p)).max(smoothed_perimeter(&positions(mesh, &q))) / h).round() as usize).clamp(3, 10_000);
     // A's points start at p[0]; B's are shifted by the twist.
     let twist = params.twist_deg.rem_euclid(360.0) / 360.0;
-    let smooth = params.shape == LoftShape::Smooth;
-    let mut ea = EndData::sample(mesh, &p, n, 0.0, smooth, params.ends[0].direction);
-    let mut eb = EndData::sample(mesh, &q, n, twist, smooth, params.ends[1].direction);
+    let weight = context_weight(params.context);
+    let mut ea = EndData::sample(mesh, &p, n, 0.0, smooth, params.ends[0].direction, axes[0].as_ref().map(|x| (x, weight)));
+    let mut eb = EndData::sample(mesh, &q, n, twist, smooth, params.ends[1].direction, axes[1].as_ref().map(|x| (x, weight)));
     // The columns run between smoothed openings; each opening's own raggedness is added
     // back near it only (see `end_detail`).
     let detail = [ea.smooth_profile(), eb.smooth_profile()];
@@ -173,8 +212,16 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
         new_vertices.extend_from_slice(&row);
         rows.push(row);
     }
-    let first = strip(mesh, &close(&p), &close(&rows[0]));
-    let last = strip(mesh, &close(&rows[rows.len() - 1]), &close(&q));
+    // The end bands avoid triangles facing against the surface they join (folded over a
+    // ragged opening's tooth or notch) wherever the rows allow.
+    let unfolded = |t: [u32; 3]| {
+        let pts = t.map(|v| mesh.vertex(v));
+        let normal = (pts[1] - pts[0]).cross(pts[2] - pts[0]);
+        let surface: DVec3 = t.iter().filter(|&&v| !mesh.vertex_triangles(v).is_empty()).map(|&v| mesh.vertex_normal(v)).sum();
+        if normal.dot(surface) < 0.0 { 1e3 * h } else { 0.0 }
+    };
+    let first = strip_with(mesh, &close(&p), &close(&rows[0]), &unfolded);
+    let last = strip_with(mesh, &close(&rows[rows.len() - 1]), &close(&q), &unfolded);
     let (Some(first), Some(last)) = (first, last) else {
         mesh.remove_isolated_vertices();
         return Err(EditError::Failed("no valid strip between the openings".into()));
@@ -184,11 +231,108 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
         tris.extend(quad_band(mesh, &close(&w[0]), &close(&w[1])));
     }
     tris.extend(last);
-    let result = commit(mesh, tris, new_vertices, group)?;
+    let mut result = commit(mesh, tris, new_vertices, group)?;
     if smooth && params.fair > 0.0 {
         fair_tube(mesh, &rows, params);
     }
+    let band = if params.blend > 0.0 { blend_join(mesh, &result.triangles, [&p, &q], params.blend) } else { Vec::new() };
+    if params.remesh {
+        remesh_join(mesh, &mut result, band, h);
+    }
     Ok(result)
+}
+
+/// Smooth the join between a new tube (`tube`) and the vessels at its `openings`: the tube
+/// and a band of each vessel behind its opening, `blend` diameters wide, get Taubin λ|μ
+/// steps (which smooth without shrinking) at full strength on the tube and its seams, fading
+/// to nothing across the band (smootherstep of the distance along the surface). Other open
+/// edges stay where they are. Returns the vessels' triangles in the bands.
+fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: f64) -> Vec<u32> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap, HashSet};
+    let tube_verts: HashSet<u32> = tube.iter().flat_map(|&t| mesh.triangle(t)).collect();
+    let on_openings: HashSet<u32> = openings.iter().flat_map(|c| c.iter().copied()).collect();
+    let mut weight: HashMap<u32, f64> = tube_verts.iter().map(|&v| (v, 1.0)).collect();
+    for c in openings {
+        let pts = positions(mesh, c);
+        let c0 = mean(&pts);
+        let width = blend * 2.0 * pts.iter().map(|p| p.distance(c0)).sum::<f64>() / pts.len() as f64;
+        if width <= 0.0 {
+            continue;
+        }
+        // Along the vessel only: not through the tube.
+        let mut dist: HashMap<u32, f64> = c.iter().map(|&v| (v, 0.0)).collect();
+        let mut heap: BinaryHeap<Reverse<(u64, u32)>> = c.iter().map(|&v| Reverse((0f64.to_bits(), v))).collect();
+        while let Some(Reverse((bits, u))) = heap.pop() {
+            let d = f64::from_bits(bits);
+            if d > dist[&u] {
+                continue;
+            }
+            let pu = mesh.vertex(u);
+            for v in mesh.vertex_neighbors(u) {
+                if tube_verts.contains(&v) && !on_openings.contains(&v) {
+                    continue;
+                }
+                let nd = d + pu.distance(mesh.vertex(v));
+                if nd < width && dist.get(&v).is_none_or(|&old| nd < old) {
+                    dist.insert(v, nd);
+                    heap.push(Reverse((nd.to_bits(), v)));
+                }
+            }
+        }
+        for (v, d) in dist {
+            let x = d / width;
+            let w = 1.0 - x * x * x * (10.0 - 15.0 * x + 6.0 * x * x);
+            let e = weight.entry(v).or_insert(0.0);
+            *e = e.max(w);
+        }
+    }
+    let tube_set: HashSet<u32> = tube.iter().copied().collect();
+    let band: Vec<u32> = {
+        let mut b: Vec<u32> = weight.keys().flat_map(|&v| mesh.vertex_triangles(v)).filter(|t| !tube_set.contains(t)).collect();
+        b.sort_unstable();
+        b.dedup();
+        b
+    };
+    let movable: Vec<(u32, f64, Vec<u32>)> = weight
+        .into_iter()
+        .filter(|&(v, w)| w > 0.0 && !mesh.is_boundary_vertex(v))
+        .map(|(v, w)| (v, w, mesh.vertex_neighbors(v).collect()))
+        .collect();
+    let iterations = (10.0 + 30.0 * blend).round() as usize;
+    for _ in 0..iterations {
+        for step in [0.5, -0.53] {
+            let moved: Vec<DVec3> = movable
+                .iter()
+                .map(|(v, w, nb)| {
+                    let p = mesh.vertex(*v);
+                    let avg = nb.iter().map(|&u| mesh.vertex(u)).sum::<DVec3>() / nb.len().max(1) as f64;
+                    p + (avg - p) * (step * w)
+                })
+                .collect();
+            for ((v, _, _), p) in movable.iter().zip(moved) {
+                mesh.set_vertex(*v, p);
+            }
+        }
+    }
+    band
+}
+
+/// Remesh a tube and the bands around it (`band`) to even triangles of edge length `h`,
+/// the region's border held; the tube's own group border stays a curve. `result` then lists
+/// every triangle of the remeshed region and the vertices inside it.
+fn remesh_join(mesh: &mut Mesh, result: &mut BridgeResult, band: Vec<u32>, h: f64) {
+    let mut region = result.triangles.clone();
+    region.extend(band);
+    let params = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(region), ..mm_remesh::RemeshParams::with_target(h) };
+    let Ok(report) = mm_remesh::remesh(mesh, &params, None) else { return };
+    let Some(tris) = report.region_triangles else { return };
+    let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+    let mut inside: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).filter(|&v| mesh.vertex_triangles(v).iter().all(|t| set.contains(t))).collect();
+    inside.sort_unstable();
+    inside.dedup();
+    result.triangles = tris;
+    result.new_vertices = inside;
 }
 
 /// How much of an opening's raggedness a row at `t` (0 at the opening) keeps, with `segs`
@@ -270,18 +414,29 @@ struct EndData {
 }
 
 impl EndData {
-    fn sample(mesh: &Mesh, c: &[u32], n: usize, offset: f64, with_bend: bool, direction: EndDirection) -> Self {
+    /// `axis`: the vessel's fitted axis behind the opening and how much it sets the
+    /// directions (0..1; the bend comes from it whenever it is given).
+    fn sample(mesh: &Mesh, c: &[u32], n: usize, offset: f64, with_bend: bool, direction: EndDirection, axis: Option<(&Axis, f64)>) -> Self {
         let (mut dirs, depths) = match direction {
             EndDirection::Wall => wall_directions(mesh, c),
             EndDirection::Normal => (vec![opening_normal(mesh, c); c.len()], vec![0.0; c.len()]),
         };
-        let bend = if with_bend && direction == EndDirection::Wall { vessel_bend(mesh, c) } else { None };
+        let bend = match axis {
+            _ if !with_bend || direction != EndDirection::Wall => None,
+            Some((x, _)) => Some(x.bend()),
+            None => vessel_bend(mesh, c),
+        };
         let pts = positions(mesh, c);
         if let Some(b) = &bend {
             // A direction measured across the last row of triangles is the wall's direction
             // half a row back; turn it on by the bend over that half row.
             for k in 0..dirs.len() {
                 dirs[k] = (dirs[k] + b.at(pts[k]) * (0.5 * depths[k])).normalize_or_zero();
+            }
+        }
+        if let Some((x, w)) = axis {
+            for k in 0..dirs.len() {
+                dirs[k] = dirs[k].lerp(x.wall_direction(pts[k]), w).normalize_or_zero();
             }
         }
         let m = pts.len();
@@ -356,6 +511,282 @@ fn loop_parameter(pts: &[DVec3]) -> Vec<f64> {
     }).collect();
     let total = by_angle[m].max(1e-300);
     (0..=m).map(|k| 0.9 * by_angle[k] / total + 0.1 * by_length[k]).collect()
+}
+
+/// Tidy a ragged opening (the edge of a brush-deleted region) before lofting from it: a few
+/// passes cut off its one-triangle teeth and fill its narrow notches, judged by the surface's
+/// angle at each of its vertices (under 75°: a tooth; over 285°: a notch, closed with a
+/// triangle across), then `relax` passes straighten its outline along the wall
+/// ([`crate::smooth::smooth_boundary`]). A cut or fill that would pinch the surface at a
+/// vertex (leaving it two open edges apart) is undone, so the opening stays one loop.
+/// Returns the opening's loop afterwards.
+fn tidy_opening(mesh: &mut Mesh, c: &[u32], relax: usize) -> EditResult<Vec<u32>> {
+    let surface_angle = |mesh: &Mesh, v: u32| -> f64 {
+        mesh.vertex_triangles(v)
+            .iter()
+            .map(|&t| {
+                let tv = mesh.triangle(t);
+                let k = tv.iter().position(|&x| x == v).unwrap_or(0);
+                let (p, a, b) = (mesh.vertex(v), mesh.vertex(tv[(k + 1) % 3]), mesh.vertex(tv[(k + 2) % 3]));
+                (a - p).angle_between(b - p)
+            })
+            .sum()
+    };
+    let pinched = |mesh: &Mesh, vs: &[u32]| vs.iter().any(|&v| mesh.is_vertex(v) && mm_repair::ops::vertex_fans(mesh, v).len() > 1);
+    let mut lp = orient_boundary_loop(mesh, c)?;
+    for _ in 0..3 {
+        if lp.len() < 8 {
+            break;
+        }
+        let mut changed = false;
+        // Teeth: a loop vertex whose only triangle comes to a sharp point.
+        for &v in &lp {
+            let tris = mesh.vertex_triangles(v);
+            if tris.len() != 1 || !mesh.is_vertex(v) || surface_angle(mesh, v) >= 75f64.to_radians() {
+                continue;
+            }
+            let (t, tv) = (tris[0], mesh.triangle(tris[0]));
+            let group = mesh.tri_group(t);
+            if mesh.remove_triangle(t, false).is_err() {
+                continue;
+            }
+            let others: Vec<u32> = tv.iter().copied().filter(|&x| x != v).collect();
+            if pinched(mesh, &others) || others.iter().any(|&x| mesh.vertex_triangles(x).is_empty()) {
+                let _ = mesh.append_triangle(tv, group);
+            } else {
+                mesh.remove_isolated_vertices();
+                changed = true;
+            }
+        }
+        let start = lp.iter().copied().find(|&v| mesh.is_vertex(v) && mesh.is_boundary_vertex(v)).ok_or_else(|| EditError::Failed("the opening closed up".into()))?;
+        lp = boundary_loop_through(mesh, start)?;
+        // Notches: a loop vertex the surface wraps nearly all the way round.
+        let n = lp.len();
+        let mut used = std::collections::HashSet::new();
+        for i in 0..n {
+            let (a, b, c) = (lp[(i + n - 1) % n], lp[i], lp[(i + 1) % n]);
+            if used.contains(&a) || used.contains(&b) || used.contains(&c) || mesh.find_edge(a, c).is_some() || surface_angle(mesh, b) <= 285f64.to_radians() {
+                continue;
+            }
+            let group = mesh.find_edge(a, b).map_or(0, |e| mesh.tri_group(mesh.edge_triangles(e)[0]));
+            if let Ok(t) = mesh.append_triangle([b, a, c], group) {
+                if pinched(mesh, &[a, b, c]) {
+                    let _ = mesh.remove_triangle(t, false);
+                } else {
+                    used.extend([a, b, c]);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+        let start = lp.iter().copied().find(|&v| mesh.is_vertex(v) && mesh.is_boundary_vertex(v)).ok_or_else(|| EditError::Failed("the opening closed up".into()))?;
+        lp = boundary_loop_through(mesh, start)?;
+    }
+    crate::smooth::smooth_boundary(mesh, &lp, relax)?;
+    Ok(lp)
+}
+
+/// The boundary loop through boundary vertex `v`, in boundary orientation.
+fn boundary_loop_through(mesh: &Mesh, v: u32) -> EditResult<Vec<u32>> {
+    mm_core::topology::boundary_loops(mesh)
+        .into_iter()
+        .find(|l| l.vertices.contains(&v))
+        .map(|l| l.vertices)
+        .ok_or_else(|| EditError::InvalidLoop("the opening is no longer a boundary".into()))
+}
+
+/// How far back along a vessel [`LoftParams::context`] looks, in opening radii: one and a
+/// half at none, ten (five diameters) at all.
+fn context_reach(context: f64) -> f64 {
+    1.5 + 8.5 * context
+}
+
+/// How much of the fitted axis sets the end directions: all of it from a context of a
+/// quarter on.
+fn context_weight(context: f64) -> f64 {
+    (context / 0.25).min(1.0)
+}
+
+/// Length of the closed loop `pts` with its zigzags smoothed away (as [`EndData::smooth_profile`]
+/// does): a ragged opening counts about as long as its outline.
+fn smoothed_perimeter(pts: &[DVec3]) -> f64 {
+    let n = pts.len();
+    let mut p = pts.to_vec();
+    for k in 0..40 {
+        let w = if k % 2 == 0 { 0.5 } else { -0.53 };
+        p = (0..n).map(|i| p[i] + ((p[(i + n - 1) % n] + p[(i + 1) % n]) * 0.5 - p[i]) * w).collect();
+    }
+    (0..n).map(|i| p[i].distance(p[(i + 1) % n])).sum()
+}
+
+/// A vessel's axis just behind an opening, fitted over a length of it: the axis is
+/// `origin + s dir + ½ s² bend` with `s` the distance towards the opening (0 at it), and the
+/// wall's radius changes by `taper` per unit of `s`.
+struct Axis {
+    origin: DVec3,
+    /// Out of the opening (along the vessel, away from it).
+    dir: DVec3,
+    /// Curvature vector, towards the bend's centre.
+    bend: DVec3,
+    taper: f64,
+}
+
+impl Axis {
+    /// The direction the wall continues in past wall point `p`: along the axis where `p`
+    /// is (an obliquely cut opening reaches along it), tilted by the taper.
+    fn wall_direction(&self, p: DVec3) -> DVec3 {
+        let s = (p - self.origin).dot(self.dir);
+        let t = (self.dir + self.bend * s).normalize_or_zero();
+        let q = p - (self.origin + self.dir * s + self.bend * (0.5 * s * s));
+        let radial = (q - t * q.dot(t)).normalize_or_zero();
+        (t + radial * self.taper).normalize_or_zero()
+    }
+
+    fn bend(&self) -> Bend {
+        Bend { centre: self.origin, normal: self.bend.normalize_or_zero(), curvature: self.bend.length() }
+    }
+}
+
+/// The axis of the vessel behind opening `c` (closed), from slices of its wall by distance
+/// along the surface from the opening, out to `reach` opening radii: a least-squares
+/// parabola through the slices' centres (a line through fewer than five) and a line through
+/// their radii. Stops where the wall no longer looks like the same vessel (a slice twice or
+/// half the opening's radius: a branch, an aneurysm, the end of the mesh). `None` with fewer
+/// than three slices.
+fn vessel_axis(mesh: &Mesh, c: &[u32], reach: f64) -> Option<Axis> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap};
+    let pts = positions(mesh, c);
+    let c0 = mean(&pts);
+    let radius = pts.iter().map(|p| p.distance(c0)).sum::<f64>() / pts.len() as f64;
+    if radius <= 0.0 {
+        return None;
+    }
+    let limit = reach * radius;
+    // Distance along the surface from the opening (non-negative f64 bits order as the values).
+    let mut dist: HashMap<u32, f64> = c.iter().map(|&v| (v, 0.0)).collect();
+    let mut heap: BinaryHeap<Reverse<(u64, u32)>> = c.iter().map(|&v| Reverse((0f64.to_bits(), v))).collect();
+    while let Some(Reverse((bits, u))) = heap.pop() {
+        let d = f64::from_bits(bits);
+        if d > dist[&u] || d > limit {
+            continue;
+        }
+        let pu = mesh.vertex(u);
+        for v in mesh.vertex_neighbors(u) {
+            let nd = d + pu.distance(mesh.vertex(v));
+            if nd <= limit && dist.get(&v).is_none_or(|&old| nd < old) {
+                dist.insert(v, nd);
+                heap.push(Reverse((nd.to_bits(), v)));
+            }
+        }
+    }
+    // Slices a twelfth of the reach wide, each vertex weighted by its share of area.
+    const SLICES: usize = 12;
+    let width = limit / SLICES as f64;
+    let mut acc = vec![(0.0, DVec3::ZERO, 0.0); SLICES];
+    let mut members: Vec<Vec<(DVec3, f64)>> = vec![Vec::new(); SLICES];
+    for (&v, &d) in &dist {
+        let k = ((d / width) as usize).min(SLICES - 1);
+        let a: f64 = mesh.vertex_triangles(v).iter().map(|&t| mesh.tri_area(t)).sum::<f64>() / 3.0;
+        let p = mesh.vertex(v);
+        acc[k].0 += a;
+        acc[k].1 += p * a;
+        acc[k].2 += d * a;
+        members[k].push((p, a));
+    }
+    // (position along the axis, centre, the slice's points with their areas)
+    type Slice<'a> = (f64, DVec3, &'a [(DVec3, f64)]);
+    let mut slices: Vec<Slice> = Vec::new();
+    for k in 0..SLICES {
+        let (a, sum, ds) = acc[k];
+        if a <= 0.0 {
+            break;
+        }
+        let centre = sum / a;
+        let r = members[k].iter().map(|(p, w)| p.distance(centre) * w).sum::<f64>() / a;
+        if !(0.5..=2.0).contains(&(r / radius)) {
+            break;
+        }
+        slices.push((-ds / a, centre, &members[k]));
+    }
+    if slices.len() < 3 {
+        return None;
+    }
+    // Weighted least squares for x(s) = X + s D (+ ½ s² K), a 3 × 3 (or 2 × 2) system with
+    // vector right-hand sides.
+    let quadratic = slices.len() >= 5;
+    let m = if quadratic { 3 } else { 2 };
+    let mut a = [[0.0f64; 3]; 3];
+    let mut b = [DVec3::ZERO; 3];
+    for &(s, x, _) in &slices {
+        let f = [1.0, s, 0.5 * s * s];
+        for i in 0..m {
+            for (j, fj) in f.iter().take(m).enumerate() {
+                a[i][j] += f[i] * fj;
+            }
+            b[i] += x * f[i];
+        }
+    }
+    let sol = solve_small(&a, &b, m)?;
+    let (origin, d, k) = (sol[0], sol[1], if quadratic { sol[2] } else { DVec3::ZERO });
+    let speed2 = d.length_squared();
+    if speed2 <= 1e-12 {
+        return None;
+    }
+    let dir = d / speed2.sqrt();
+    let bend = (k - dir * k.dot(dir)) / speed2;
+    // The wall's radius about the axis per slice, and a line through it.
+    let (mut sw, mut ss, mut sr, mut sss, mut ssr) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(s, _, pts) in &slices {
+        let on_axis = origin + d * s + k * (0.5 * s * s);
+        let t = (d + k * s).normalize_or_zero();
+        let (mut r, mut w) = (0.0, 0.0);
+        for &(p, a) in pts {
+            let q = p - on_axis;
+            r += (q - t * q.dot(t)).length() * a;
+            w += a;
+        }
+        let r = r / w;
+        sw += 1.0;
+        ss += s;
+        sr += r;
+        sss += s * s;
+        ssr += s * r;
+    }
+    let det = sw * sss - ss * ss;
+    let taper = if det > 1e-300 { ((sw * ssr - ss * sr) / det).clamp(-0.5, 0.5) } else { 0.0 };
+    (dir.is_finite() && bend.is_finite()).then_some(Axis { origin, dir, bend, taper })
+}
+
+/// Solve the `m` × `m` (2 or 3) system `a x = b` with vector right-hand sides (Gaussian
+/// elimination with partial pivoting); `None` when it is singular.
+fn solve_small(a: &[[f64; 3]; 3], b: &[DVec3; 3], m: usize) -> Option<[DVec3; 3]> {
+    let (mut a, mut b) = (*a, *b);
+    for col in 0..m {
+        let piv = (col..m).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[piv][col].abs() < 1e-300 {
+            return None;
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        for row in 0..m {
+            if row != col {
+                let f = a[row][col] / a[col][col];
+                let pivot_row = a[col];
+                for (x, p) in a[row].iter_mut().zip(pivot_row).take(m) {
+                    *x -= f * p;
+                }
+                b[row] -= b[col] * f;
+            }
+        }
+    }
+    let mut x = [DVec3::ZERO; 3];
+    for i in 0..m {
+        x[i] = b[i] / a[i][i];
+    }
+    Some(x)
 }
 
 /// A vessel's bend just behind an opening.
@@ -547,6 +978,17 @@ fn vessel_bend(mesh: &Mesh, c: &[u32]) -> Option<Bend> {
     let kv = (k - dn * k.dot(dn)) / speed2;
     let curvature = kv.length();
     curvature.is_finite().then(|| Bend { centre: c0, normal: kv.normalize_or_zero(), curvature })
+}
+
+/// The fitted axis behind an opening for tests elsewhere in the crate: its direction and
+/// curvature.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    pub(crate) fn vessel_axis(mesh: &Mesh, c: &[u32], reach: f64) -> Option<(DVec3, f64)> {
+        super::vessel_axis(mesh, c, reach).map(|x| (x.dir, x.bend.length()))
+    }
 }
 
 #[cfg(test)]

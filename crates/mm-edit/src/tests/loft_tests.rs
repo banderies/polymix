@@ -232,3 +232,72 @@ fn normal_ends_stand_up_from_a_surface() {
     assert!(normal > 2.0, "out of the openings: above the surface ({normal:.3})");
     assert!(wall < 1.9, "along the wall: into the sphere ({wall:.3})");
 }
+
+/// A lumpy tube along z with its middle cut out along jagged lines, as a brush selection
+/// leaves it, and the wall flaring just before the lower cut: returns the mesh and the two
+/// openings of the gap.
+fn ragged_gap() -> (Mesh, Vec<u32>, Vec<u32>) {
+    let path: Vec<DVec3> = (0..=80).map(|k| DVec3::new(0.0, 0.0, k as f64 * 0.25)).collect();
+    let radii: Vec<f64> = path.iter().map(|p| 1.0 + 0.05 * (p.z * 2.3).sin() + 0.35 * (-((p.z - 8.6) / 0.6).powi(2)).exp()).collect();
+    let mut m = primitives::tube_along(&path, &radii, 40);
+    let jag = |p: DVec3, k: f64| 0.35 * (p.y.atan2(p.x) * k).sin() * (p.y.atan2(p.x) * 3.0).cos();
+    let cut: Vec<u32> = m.triangle_ids().filter(|&t| {
+        let c = m.tri_centroid(t);
+        c.z > 9.0 + jag(c, 7.0) && c.z < 11.0 + jag(c, 5.0)
+    }).collect();
+    m.remove_triangles(cut);
+    let mut gap: Vec<Vec<u32>> = boundary_loops(&m).into_iter().map(|l| l.vertices).filter(|l| l.iter().all(|&v| (5.0..15.0).contains(&m.vertex(v).z))).collect();
+    assert_eq!(gap.len(), 2);
+    let (b, a) = (gap.pop().unwrap(), gap.pop().unwrap());
+    (m, a, b)
+}
+
+/// Sharpest bend (degrees) between neighbouring triangles of `tris`.
+fn sharpest_bend(m: &Mesh, tris: &[u32]) -> f64 {
+    let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+    m.edge_ids()
+        .filter_map(|e| {
+            let [s, t] = m.edge_triangles(e);
+            (t != mm_core::INVALID && set.contains(&s) && set.contains(&t)).then(|| m.tri_normal(s).angle_between(m.tri_normal(t)).to_degrees())
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn context_and_blend_join_ragged_openings_without_folds() {
+    // Ragged openings fold the edge-only loft (each point's direction comes from one row of
+    // triangles, and a notch's edges point round the tube, not along it). With the vessel's
+    // axis behind each opening steering the tube, tidied openings and a smoothed, remeshed
+    // join, the tube neither folds nor crosses the openings' notches.
+    let (mut m, a, b) = ragged_gap();
+    let params = LoftParams { context: 0.5, blend: 0.5, remesh: true, ..Default::default() };
+    let r = loft(&mut m, &a, &b, &params).unwrap();
+    assert_valid(&m);
+    assert_eq!(boundary_loops(&m).len(), 2, "only the tube's far ends stay open");
+    let bend = sharpest_bend(&m, &r.triangles);
+    assert!(bend < 40.0, "no folds or creases ({bend:.1}°)");
+    // The tube follows the vessel (along z), not the flare just below the gap.
+    let off_axis = r.new_vertices.iter().map(|&v| m.vertex(v).truncate().length()).fold(0.0, f64::max);
+    assert!(off_axis < 1.45, "stays about the axis ({off_axis:.2})");
+    // Without the vessel behind the openings, the same openings fold the tube.
+    let (mut m, a, b) = ragged_gap();
+    let r = loft(&mut m, &a, &b, &LoftParams::default()).unwrap();
+    assert!(sharpest_bend(&m, &r.triangles) > 90.0);
+}
+
+#[test]
+fn axis_fit_follows_a_bent_vessel() {
+    // A tube bent along an arc of radius 10: the axis fitted behind its open end leaves along
+    // the arc's tangent there and bends with curvature 1 / 10, whatever the end's own last
+    // row of triangles does.
+    let arc: Vec<DVec3> = (0..=40).map(|k| {
+        let a = k as f64 / 40.0 * 1.2;
+        DVec3::new(10.0 * a.cos(), 10.0 * a.sin(), 0.0)
+    }).collect();
+    let m = primitives::tube_along(&arc, &[1.0; 41], 32);
+    let end = boundary_loops(&m).into_iter().map(|l| l.vertices).find(|l| l.iter().all(|&v| m.vertex(v).y > 5.0)).unwrap();
+    let axis = super::super::loft::tests_support::vessel_axis(&m, &end, 8.0).unwrap();
+    let tangent = DVec3::new(-(1.2f64).sin(), 1.2f64.cos(), 0.0);
+    assert!(axis.0.angle_between(tangent).to_degrees() < 3.0, "direction {:?}", axis.0);
+    assert!((axis.1 - 0.1).abs() < 0.02, "curvature {:.3}", axis.1);
+}

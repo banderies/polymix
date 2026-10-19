@@ -2925,6 +2925,7 @@ impl MeshWorkspace {
             "redo" => self.redo(ctx),
             "log" => {
                 // Print scene statistics to stdout (automated checks).
+                println!("[polymix] {} camera distance={:.3} tool={}", arg, self.camera.distance, self.tools.last().map(|t| t.name()).unwrap_or("none"));
                 for o in &self.scene.objects {
                     println!(
                         "[polymix] {} {}: tris={} verts={} open_edges={} closed={} valid={} shells={} selected={} tool={}",

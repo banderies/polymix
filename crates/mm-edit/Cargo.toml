@@ -9,6 +9,7 @@ license.workspace = true
 mm-core = { path = "../mm-core" }
 mm-solid = { path = "../mm-solid" }
 mm-repair = { path = "../mm-repair" }
+mm-remesh = { path = "../mm-remesh" }
 glam.workspace = true
 rayon.workspace = true
 smallvec.workspace = true

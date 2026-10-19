@@ -154,6 +154,16 @@ two holes (double-click each open edge, then `F`).
       opening's shape the way the tube turns (handles no longer half-twist), ragged openings
       are sampled by angle and smoothed away from the ends (no folded rows), and every join
       warns when the tube crosses the surface.
+- [x] **M10.4 Natural joins**: *Context* (default 50 %) takes each end's direction, bend and
+      taper from the vessel's axis fitted behind the opening (slices of the wall by distance
+      along the surface, up to five diameters back) instead of the opening's last row of
+      triangles, so a ragged or lumpy end no longer steers the tube; *Blend* (default 50 %)
+      tidies ragged openings (one-triangle teeth cut, notches filled, outline relaxed along the
+      wall; nothing that would pinch the surface) and smooths the tube and a band of each
+      vessel behind it with Taubin steps fading across the band; *Remesh the join* (default
+      on) gives the tube and the bands even triangles. The end bands are stitched avoiding
+      folded triangles. On a ragged, lumpy test vessel: 1,613 crossings and 268 folded edges
+      before, none after.
 
 ## M11 — Workspaces and shell
 

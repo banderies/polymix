@@ -38,6 +38,11 @@ pub struct BridgeResult {
 /// (edges used backward, q_{j+1} → q_j), from the pair (p_0, q_0) to (p_m, q_k), minimising
 /// the total length of the new diagonals. Shared end vertices are handled.
 pub(crate) fn strip(mesh: &Mesh, p: &[u32], q: &[u32]) -> Option<Vec<[u32; 3]>> {
+    strip_with(mesh, p, q, &|_| 0.0)
+}
+
+/// [`strip`] with an extra cost per candidate triangle (e.g. against folding it over).
+pub(crate) fn strip_with(mesh: &Mesh, p: &[u32], q: &[u32], extra: &dyn Fn([u32; 3]) -> f64) -> Option<Vec<[u32; 3]>> {
     if p.len() < 2 && q.len() < 2 {
         return None;
     }
@@ -81,7 +86,7 @@ pub(crate) fn strip(mesh: &Mesh, p: &[u32], q: &[u32]) -> Option<Vec<[u32; 3]>> 
             if i < i1 && distinct(p[i], p[i + 1], q[j]) {
                 let terminal = i + 1 == i1 && j == j1;
                 if terminal || mesh.find_edge(p[i + 1], q[j]).is_none() {
-                    let nc = c + pos(p[i + 1]).distance(pos(q[j]));
+                    let nc = c + pos(p[i + 1]).distance(pos(q[j])) + extra([p[i], p[i + 1], q[j]]);
                     if nc < cost[idx(i + 1, j)] {
                         cost[idx(i + 1, j)] = nc;
                         from[idx(i + 1, j)] = 1;
@@ -91,7 +96,7 @@ pub(crate) fn strip(mesh: &Mesh, p: &[u32], q: &[u32]) -> Option<Vec<[u32; 3]>> 
             if j < j1 && distinct(p[i], q[j + 1], q[j]) {
                 let terminal = i == i1 && j + 1 == j1;
                 if terminal || mesh.find_edge(p[i], q[j + 1]).is_none() {
-                    let nc = c + pos(p[i]).distance(pos(q[j + 1]));
+                    let nc = c + pos(p[i]).distance(pos(q[j + 1])) + extra([p[i], q[j + 1], q[j]]);
                     if nc < cost[idx(i, j + 1)] {
                         cost[idx(i, j + 1)] = nc;
                         from[idx(i, j + 1)] = 2;
