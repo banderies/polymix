@@ -169,7 +169,8 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
     for (n, (s, w)) in nodes.iter_mut().zip(&rsum) {
         n.radius = if *w > 0.0 { s / w } else { 0.0 };
     }
-    // Links between rings of consecutive bands.
+    // Links between rings of later bands (consecutive ones, or further apart where an edge
+    // is longer than a band on a coarse mesh).
     let mut edges: Vec<(usize, usize)> = Vec::new();
     for e in mesh.edge_ids() {
         let [a, b] = mesh.edge_vertices(e);
@@ -178,7 +179,7 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
             continue;
         }
         let (lo, hi) = if nodes[ca].band < nodes[cb].band { (ca, cb) } else { (cb, ca) };
-        if nodes[hi].band == nodes[lo].band + 1 {
+        if nodes[hi].band > nodes[lo].band {
             edges.push((lo, hi));
         }
     }
@@ -194,17 +195,23 @@ fn build_branches(cl: &mut Centerline, params: &CenterlineParams) {
     if n == 0 {
         return;
     }
-    // Directed tree: children are nodes one band further.
+    // Directed tree: children are nodes one band further (or further on, where a coarse
+    // mesh skips bands and there is no nearer parent).
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut has_parent = vec![false; n];
-    for &(a, b) in &cl.edges {
+    let mut links = cl.edges.clone();
+    links.sort_by_key(|&(a, b)| (cl.nodes[b].band - cl.nodes[a].band, a, b));
+    for &(a, b) in &links {
         if !has_parent[b] {
             children[a].push(b);
             has_parent[b] = true;
         }
     }
     // Root: band-0 node with the most descendants.
-    let roots: Vec<usize> = (0..n).filter(|&i| !has_parent[i]).collect();
+    let roots: Vec<usize> = match (0..n).filter(|&i| !has_parent[i] && cl.nodes[i].band == 0).collect::<Vec<_>>() {
+        r if !r.is_empty() => r,
+        _ => (0..n).filter(|&i| !has_parent[i]).collect(),
+    };
     let count = |r: usize, children: &Vec<Vec<usize>>| {
         let mut stack = vec![r];
         let mut k = 0;

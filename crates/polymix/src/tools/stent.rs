@@ -194,7 +194,9 @@ impl StentTool {
         let placement = mm_edit::place_stent(&trace.path, sections, &params)?;
         let mut mesh = source.clone();
         let report = mm_edit::apply_stent(&mut mesh, &placement, &params, Some(&trace.owner))?;
-        let crossings = ops::crossings(&mesh, &report.triangles);
+        // Only crossings the stent made (a mesh may cross itself already, e.g. where
+        // vessels were merged without a union).
+        let crossings = ops::crossings(&mesh, &report.triangles).saturating_sub(ops::crossings(source, &report.source_triangles));
         Ok((mesh, placement, report, crossings))
     }
 
@@ -595,11 +597,18 @@ impl Tool for StentTool {
                 ui.label(sealed.trim_start_matches("; "));
             }
             let warn = egui::Color32::from_rgb(240, 170, 80);
+            if let Some(e) = (0..2).filter(|&e| pl.return_bend[e] > 0.7).max_by(|&a, &b| pl.return_bend[a].total_cmp(&pl.return_bend[b])) {
+                ui.colored_label(warn, format!("Past end {} the vessel has to bend back sharply onto its course, so its wall may crease: lower the straightness.", e + 1));
+            }
+            let moved = out.report.moved_openings.saturating_sub(out.report.sealed_openings);
+            if moved > 0 {
+                ui.colored_label(warn, format!("The reshaping reaches {moved} open end{} of the mesh and moves {}: check the inlets and outlets, or lower the straightness.", if moved == 1 { "" } else { "s" }, if moved == 1 { "it" } else { "them" }));
+            }
             if out.report.outside {
                 ui.colored_label(warn, "The stent's axis runs outside the vessel (a tight bend): lower the straightness.");
             }
             if out.crossings > 0 {
-                ui.colored_label(warn, format!("The reshaped wall runs into itself ({} crossings): lower the straightness or the stent's length.", out.crossings));
+                ui.colored_label(warn, format!("The reshaped wall runs into itself ({} new crossings): lower the straightness or the stent's length.", out.crossings));
             }
         }
         let ready = current.is_some();
@@ -743,12 +752,115 @@ mod tests {
             out.check_validity().unwrap();
             assert!(out.is_consistently_oriented());
             let bend = sharpest(&out, &rep.triangles);
-            eprintln!("{label}: narrowest {:.2} -> {:.2}, crossings {crossings}, sharpest bend {bend:.1}°, overhang {:?}", 2.0 * rep.narrowest[0], 2.0 * rep.narrowest[1], pl.overhang());
+            let [a, b] = pl.overhang();
+            assert!((a - b).abs() < 1e-6 && a > 0.0, "{label}: centred ({a:.3} / {b:.3})");
             assert_eq!(crossings, 0, "{label}");
             assert!(bend < 30.0, "{label}: {bend:.1}°");
             let want = 4.0 + (ui.stiffness / 100.0) * 4.0;
             assert!(2.0 * rep.narrowest[1] > want - 0.3, "{label}: {:?}", rep.narrowest);
             assert_eq!(mm_core::topology::boundary_loops(&out).len(), 2, "{label}");
+        }
+    }
+
+    /// A real mesh (`POLYMIX_STENT_MESH`, local only): stents along the longest branch of its
+    /// centerline, traced from the widest opening. Prints counts and timings only.
+    #[test]
+    #[ignore]
+    fn stent_on_a_real_mesh() {
+        let Some(path) = std::env::var_os("POLYMIX_STENT_MESH") else { return };
+        let m = mm_io::read_mesh(std::path::Path::new(&path)).unwrap().mesh;
+        let loops = mm_core::topology::boundary_loops(&m);
+        let (sources, r) = match loops.iter().max_by(|a, b| a.perimeter(&m).total_cmp(&b.perimeter(&m))) {
+            Some(inlet) => (inlet.vertices.clone(), inlet.perimeter(&m) / std::f64::consts::TAU),
+            None => {
+                // Closed: from the widest flat cap.
+                let ends = super::super::vessel::find_vessel_ends(&m);
+                let Some(e) = ends.iter().max_by(|a, b| a.diameter.total_cmp(&b.diameter)) else {
+                    eprintln!("{} triangles, closed with no flat caps: skipped", m.triangle_count());
+                    return;
+                };
+                let super::super::vessel::EndKind::Cap(g) = e.kind else { panic!("no cap") };
+                let mut v: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_group(t) == g).flat_map(|t| m.triangle(t)).collect();
+                v.sort_unstable();
+                v.dedup();
+                (v, 0.5 * e.diameter)
+            }
+        };
+        let cl = centerline::compute(&m, &sources, r, &CenterlineParams::default());
+        let branch = cl.branches.iter().max_by(|a, b| a.length.total_cmp(&b.length)).unwrap();
+        let all: Vec<u32> = m.triangle_ids().collect();
+        eprintln!("input crossings {}", ops::crossings(&m, &all));
+        eprintln!("{} triangles, {} open ends, longest branch {:.1} mm over {} nodes", m.triangle_count(), loops.len(), branch.length, branch.nodes.len());
+        let bvh = mm_core::Bvh::build(&m);
+        // Ends where the cross-section matches the centerline's ring (a clean stretch of tube).
+        let clean: Vec<(f64, Section)> = {
+            let mut along = 0.0;
+            let mut out = Vec::new();
+            for (k, &i) in branch.nodes.iter().enumerate() {
+                if k > 0 {
+                    along += cl.nodes[i].position.distance(cl.nodes[branch.nodes[k - 1]].position);
+                }
+                let node = cl.nodes[i];
+                let wall = bvh.nearest(&m, node.position, f64::INFINITY).unwrap().point;
+                if let Some(sec) = Section::at(&m, &bvh, wall) {
+                    if (sec.diameter / (2.0 * node.radius) - 1.0).abs() < 0.25 && sec.center.distance(node.position) < 0.5 * node.radius {
+                        out.push((along, sec));
+                    }
+                }
+            }
+            out
+        };
+        eprintln!("{} clean sections along it", clean.len());
+        let mut pairs = Vec::new();
+        let inner = |i: usize| clean[i].0 > 0.15 * branch.length && clean[i].0 < 0.85 * branch.length;
+        for want in [3.0, 5.0] {
+            let d = clean.first().map_or(1.0, |c| c.1.diameter);
+            if let Some((i, j)) = (0..clean.len()).flat_map(|i| (i + 1..clean.len()).map(move |j| (i, j))).filter(|&(i, j)| inner(i) && inner(j)).min_by(|&(a, b), &(c, e)| ((clean[b].0 - clean[a].0) - want * d).abs().total_cmp(&((clean[e].0 - clean[c].0) - want * d).abs())) {
+                pairs.push((clean[i].1.clone(), clean[j].1.clone()));
+            }
+        }
+        for (a, b) in pairs {
+            let t0 = std::time::Instant::now();
+            let sections = [a, b];
+            eprintln!("sections {:.1} mm apart", sections[0].center.distance(sections[1].center));
+            let trace = match trace_vessel(&m, &sections) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("trace failed: {e:#}");
+                    continue;
+                }
+            };
+            eprintln!("ends: ⌀ {:.2} / {:.2}, span {:.1} mm, traced in {:.0} ms", sections[0].diameter, sections[1].diameter, trace.span, t0.elapsed().as_secs_f64() * 1e3);
+            let d = ((sections[0].diameter.max(sections[1].diameter) * 2.0).round() / 2.0).max(0.5);
+            let length = (trace.span / 5.0).ceil() * 5.0 + 5.0;
+            for (ui, label) in [
+                (StentUi { diameter: d, length, straightness: 0.0, ..Default::default() }, "bare, follows"),
+                (StentUi { diameter: d, length, straightness: 100.0, ..Default::default() }, "bare, G1 smoothest"),
+                (StentUi { diameter: d, length, straightness: 100.0, continuity: EndContinuity::G0, ..Default::default() }, "bare, straight"),
+                (StentUi { diameter: d, length, straightness: 50.0, covered: true, ..Default::default() }, "covered"),
+            ] {
+                let t0 = std::time::Instant::now();
+                let key = StentKey { sections: 1, ui };
+                match StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &key) {
+                    Ok((out, pl, rep, crossings)) => eprintln!(
+                        "  {label}: {:.0} ms, valid {}, oriented {}, crossings {crossings}, sharpest {:.1}°, narrowest ⌀ {:.2} -> {:.2}, moved {}, overhang {:.1}/{:.1}, outside {}, open ends {} -> {}, sealed {}",
+                        t0.elapsed().as_secs_f64() * 1e3,
+                        out.check_validity().is_ok(),
+                        out.is_consistently_oriented(),
+                        sharpest(&out, &rep.triangles),
+                        2.0 * rep.narrowest[0],
+                        2.0 * rep.narrowest[1],
+                        rep.moved,
+                        pl.overhang()[0],
+                        pl.overhang()[1],
+                        rep.outside,
+                        loops.len(),
+                        mm_core::topology::boundary_loops(&out).len(),
+                        rep.sealed_openings
+                    ),
+                    Err(e) => eprintln!("  {label}: failed: {e:#}"),
+                }
+            }
         }
     }
 }
