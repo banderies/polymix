@@ -1639,7 +1639,7 @@ fn is_two_hole_rings(mesh: &Mesh, sel: &[u32]) -> bool {
 
 /// Pairs of triangles where `part` crosses the rest of the mesh or itself (neighbours
 /// sharing a vertex are not counted).
-fn crossings(m: &Mesh, part: &[u32]) -> usize {
+pub(crate) fn crossings(m: &Mesh, part: &[u32]) -> usize {
     if part.is_empty() {
         return 0;
     }

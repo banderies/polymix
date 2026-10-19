@@ -291,7 +291,7 @@ pub fn loft_guided(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &Lof
 /// steps (which smooth without shrinking) at full strength on the tube and its seams, fading
 /// to nothing across the band (smootherstep of the distance along the surface). Other open
 /// edges stay where they are. Returns the vessels' triangles in the bands.
-fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: f64) -> Vec<u32> {
+pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: f64) -> Vec<u32> {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, HashSet};
     let tube_verts: HashSet<u32> = tube.iter().flat_map(|&t| mesh.triangle(t)).collect();

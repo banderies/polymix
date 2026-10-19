@@ -11,6 +11,7 @@ mod loft_tests;
 mod misc_tests;
 mod perf;
 mod soft_tests;
+mod stent_tests;
 mod target_tests;
 
 use mm_core::topology::{boundary_loops, connected_components};

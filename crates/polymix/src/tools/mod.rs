@@ -35,6 +35,7 @@ pub mod boolean;
 pub mod deviation;
 pub mod cfd_check;
 pub mod centerline_tool;
+pub mod stent;
 
 /// Screen-space description of the 3D viewport.
 #[derive(Clone, Copy, Debug)]

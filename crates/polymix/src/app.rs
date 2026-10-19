@@ -292,6 +292,7 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "deviation" => Box::new(tools::deviation::DeviationTool::new(cx)),
         "cfdcheck" => Box::new(tools::cfd_check::CfdCheckTool::new(cx)),
         "centerline" => Box::new(tools::centerline_tool::CenterlineTool::new(cx)),
+        "stent" => Box::new(tools::stent::StentTool::new(cx)),
         _ => return None,
     })
 }
@@ -1583,6 +1584,9 @@ impl MeshWorkspace {
                     }
                     if ui.button("Centerline").on_hover_text("Vessel centerline tree with branch lengths and diameters; export CSV/VTK").clicked() {
                         open = Some("centerline");
+                    }
+                    if ui.button("Virtual stent").on_hover_text("Place a bare or covered stent between two cross-sections and reshape the vessel around it").clicked() {
+                        open = Some("stent");
                     }
                     if ui.button("Boundary patches / CFD export").on_hover_text("Name wall/inlet/outlet patches and export multi-solid STL").clicked() {
                         open = Some("patches");

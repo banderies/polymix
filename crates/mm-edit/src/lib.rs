@@ -13,6 +13,8 @@
 //! * [`mod@mirror`], [`mod@bridge`] (bridge spans, join loops), [`mod@loft`] (tube between two
 //!   openings with G0 / G1 ends), [`smooth`] (smooth boundary),
 //!   [`transform`] (affine transforms, drop to ground, principal-axis alignment).
+//! * [`stent`] — virtual stenting: place a bare or covered stent between two vessel
+//!   cross-sections and reshape the vessel around it.
 //!
 //! Every operation edits an [`mm_core::Mesh`] in place and keeps a manifold,
 //! consistently oriented input manifold and consistently oriented.
@@ -37,6 +39,7 @@ pub mod region;
 pub mod smooth;
 pub mod soft;
 pub mod stamp;
+pub mod stent;
 pub mod target;
 pub mod transform;
 pub mod tube;
@@ -65,6 +68,7 @@ pub use region::{discard, duplicate, flip_normals, separate};
 pub use smooth::smooth_boundary;
 pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion};
 pub use stamp::{stamp_polygon, StampFrame, StampResult, Stencil};
+pub use stent::{apply_stent, place_stent, StentParams, StentPlacement, StentReport, StentSection, VesselPath};
 pub use target::{attract_to_target, icp_align, project_to_target, AttractParams, IcpParams, IcpResult};
 pub use tube::{add_tube, tube_mesh, tube_path, TubeEnd, TubeParams, TubePath};
 pub use uv::{unwrap, Packing, UnwrapElements, UnwrapParams, UnwrapType, UvLayout};

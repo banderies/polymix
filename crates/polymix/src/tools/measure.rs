@@ -70,6 +70,8 @@ struct Measurement {
     length: Option<f64>,
     label: String,
     ring: Vec<[DVec3; 2]>,
+    /// Vessel diameter: the cross-section (for placing a stent between two of them).
+    section: Option<super::stent::Section>,
 }
 
 pub struct MeasureTool {
@@ -83,6 +85,7 @@ pub struct MeasureTool {
     items: Vec<Measurement>,
     selected: Option<usize>,
     target_length: f64,
+    request: Option<Box<dyn Tool>>,
 }
 
 impl MeasureTool {
@@ -98,6 +101,7 @@ impl MeasureTool {
             items: Vec::new(),
             selected: None,
             target_length: 0.0,
+            request: None,
         }
     }
 
@@ -175,10 +179,10 @@ impl MeasureTool {
                 }
                 Some((_, a)) => {
                     let d = a.distance(p);
-                    Measurement { object: id, a, b: p, length: Some(d), label: format!("↔ {d:.3}"), ring: Vec::new() }
+                    Measurement { object: id, a, b: p, length: Some(d), label: format!("↔ {d:.3}"), ring: Vec::new(), section: None }
                 }
             },
-            MeasureType::PointCoordinates => Measurement { object: id, a: p, b: p, length: None, label: format!("({:.3}, {:.3}, {:.3})", p.x, p.y, p.z), ring: Vec::new() },
+            MeasureType::PointCoordinates => Measurement { object: id, a: p, b: p, length: None, label: format!("({:.3}, {:.3}, {:.3})", p.x, p.y, p.z), ring: Vec::new(), section: None },
             MeasureType::MinInterior | MeasureType::MaxInterior | MeasureType::MinExterior | MeasureType::MaxExterior => {
                 let axis = match self.direction {
                     Direction::Normal => n,
@@ -194,7 +198,7 @@ impl MeasureTool {
                 };
                 let d = p.distance(b);
                 let word = if interior { "interior" } else { "exterior" };
-                Measurement { object: id, a: p, b, length: Some(d), label: format!("{} {word} {d:.3}", if far { "max" } else { "min" }), ring: Vec::new() }
+                Measurement { object: id, a: p, b, length: Some(d), label: format!("{} {word} {d:.3}", if far { "max" } else { "min" }), ring: Vec::new(), section: None }
             }
             MeasureType::FitCylinder => {
                 let Some(o) = cx.scene.get_mut(id) else { return };
@@ -230,7 +234,7 @@ impl MeasureTool {
                     })
                     .collect();
                 let d = 2.0 * f.radius;
-                Measurement { object: id, a: c, b: p, length: Some(d), label: format!("⌀ {d:.3} (cylinder fit)"), ring }
+                Measurement { object: id, a: c, b: p, length: Some(d), label: format!("⌀ {d:.3} (cylinder fit)"), ring, section: None }
             }
             MeasureType::VesselDiameter => {
                 let wall = opposite_wall(cx.scene, id, p, hit.tid);
@@ -245,6 +249,7 @@ impl MeasureTool {
                     .map(|c| c.segments)
                     .unwrap_or_default();
                 let eq = section.as_ref().and_then(|x| x.area).map(|a| 2.0 * (a / std::f64::consts::PI).sqrt());
+                let stent_end = section.as_ref().zip(eq).filter(|_| !ring.is_empty()).map(|(x, d)| super::stent::Section { center: x.center, normal: x.axis, diameter: d, ring: ring.clone() });
                 let wall_d = wall.map(|q| p.distance(q));
                 let (label, length) = match (eq, wall_d) {
                     (Some(e), Some(w)) => (format!("⌀ {e:.3} (wall-to-wall {w:.3})"), e),
@@ -252,7 +257,7 @@ impl MeasureTool {
                     (None, Some(w)) => (format!("⌀ {w:.3} (wall-to-wall)"), w),
                     (None, None) => return,
                 };
-                Measurement { object: id, a: p, b: wall.unwrap_or(p), length: Some(length), label, ring }
+                Measurement { object: id, a: p, b: wall.unwrap_or(p), length: Some(length), label, ring, section: stent_end }
             }
         };
         *cx.status = format!("{}: {}", self.kind.label(), item.label);
@@ -311,6 +316,10 @@ pub fn opposite_wall(scene: &mut crate::scene::Scene, id: ObjectId, p: DVec3, ti
 impl Tool for MeasureTool {
     fn survives_scene_change(&self) -> bool {
         true
+    }
+
+    fn take_request(&mut self) -> Option<Box<dyn Tool>> {
+        self.request.take()
     }
 
     fn copy_text(&self) -> Option<String> {
@@ -396,6 +405,14 @@ impl Tool for MeasureTool {
                 }
             });
         });
+        // The last two vessel cross-sections on one object can be the ends of a stent.
+        let ends: Vec<&Measurement> = self.items.iter().rev().filter(|m| m.section.is_some()).take(2).collect();
+        if let [b, a] = ends[..] {
+            if a.object == b.object && ui.button("Place stent between the last two").on_hover_text("Open Virtual stent with the last two vessel cross-sections as its ends").clicked() {
+                let sections = [a.section.clone().unwrap(), b.section.clone().unwrap()];
+                self.request = Some(Box::new(super::stent::StentTool::with_sections(cx, a.object, sections)));
+            }
+        }
         if !self.items.is_empty() && ui.button("Clear all").clicked() {
             self.items.clear();
             self.selected = None;
@@ -420,7 +437,7 @@ impl Tool for MeasureTool {
         // Point to point by dragging from one point to another.
         if self.kind == MeasureType::PointToPoint && p0.distance(pos) > 5.0 {
             let d = a.distance(hit.point);
-            self.items.push(Measurement { object: id0, a, b: hit.point, length: Some(d), label: format!("↔ {d:.3}"), ring: Vec::new() });
+            self.items.push(Measurement { object: id0, a, b: hit.point, length: Some(d), label: format!("↔ {d:.3}"), ring: Vec::new(), section: None });
             self.selected = Some(self.items.len() - 1);
             self.target_length = d;
             self.first = None;

@@ -24,10 +24,13 @@ pub fn triangles_intersect(t1: [DVec3; 3], t2: [DVec3; 3]) -> bool {
     if dv.iter().all(|&d| d > 0.0) || dv.iter().all(|&d| d < 0.0) {
         return false;
     }
-    if du.iter().all(|&d| d == 0.0) {
+    let dir = n1.cross(n2);
+    // Planes within 1e-6 rad of parallel (neighbouring facets of a smooth surface): the line
+    // where they meet is too ill-defined to measure the triangles along, so they are
+    // compared in their common plane.
+    if du.iter().all(|&d| d == 0.0) || dir.length() <= 1e-6 * n1.length() * n2.length() {
         return coplanar_intersect(n1, t1, t2);
     }
-    let dir = n1.cross(n2);
     // Project onto the largest axis of the intersection line direction.
     let axis = dir.abs().max_position();
     let p1 = t1.map(|p| p[axis]);

@@ -38,6 +38,8 @@ pub struct Centerline {
     pub nodes: Vec<CenterlineNode>,
     pub edges: Vec<(usize, usize)>,
     pub branches: Vec<Branch>,
+    /// The node (ring) each vertex belongs to, by vertex id (`usize::MAX`: unreached).
+    pub vertex_node: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,7 +184,7 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
     }
     edges.sort_unstable();
     edges.dedup();
-    let mut cl = Centerline { nodes, edges, branches: Vec::new() };
+    let mut cl = Centerline { nodes, edges, branches: Vec::new(), vertex_node: vcomp };
     build_branches(&mut cl, params);
     cl
 }
