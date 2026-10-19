@@ -164,6 +164,16 @@ two holes (double-click each open edge, then `F`).
       on) gives the tube and the bands even triangles. The end bands are stitched avoiding
       folded triangles. On a ragged, lumpy test vessel: 1,613 crossings and 268 folded edges
       before, none after.
+- [x] **M10.5 Along the axis, centerlines, preview**: *Along the axis* sweeps the tube along
+      a Hermite spine joining the two vessels' axes (each end's continuity and tension), its
+      columns polar offsets about the spine in rotation-minimising frames that morph from one
+      opening's to the other's (radius with each vessel's taper, angle and axial offset), so
+      turned or differently shaped openings do not pinch (a quarter-turned pair keeps its
+      radius where straight blending shrinks it to 70 %). *Context* is set per end. *Follow
+      the vessel centerlines* traces each vessel's centerline from its opening (the
+      Centerline tool's algorithm) and fits the end's axis to it (`mm_edit::loft_guided`).
+      Vessel → Bridge boundaries previews the tube live (built in the background once the
+      settings settle); Join keeps it.
 
 ## M11 — Workspaces and shell
 

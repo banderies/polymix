@@ -10,10 +10,13 @@
 //! rounded towards a circle in the middle, and the tube can be faired with the surroundings
 //! held fixed (order 2 or 3, so G1 / G2 ends stay smooth).
 //!
-//! With *context* the directions and the bend come from the vessel's axis fitted further
-//! behind each opening instead of its last row of triangles (which a ragged or lumpy opening
-//! skews); with *blend* ragged openings are tidied first and the join is smoothed into the
-//! vessels afterwards; *remesh* evens out the triangles of the join.
+//! With *context* (per end) the directions and the bend come from the vessel's axis fitted
+//! further behind each opening instead of its last row of triangles (which a ragged or lumpy
+//! opening skews) — fitted to slices of the wall, or to the vessel's centerline when one is
+//! given ([`loft_guided`]); with *blend* ragged openings are tidied first and the join is
+//! smoothed into the vessels afterwards; *remesh* evens out the triangles of the join.
+//! [`LoftShape::Sweep`] runs the tube along a curve joining the two axes instead of column by
+//! column, its cross-section morphing in polar form about that curve.
 
 use crate::bridge::{aligned_loops, commit, mean_edge, quad_band, strip, strip_with, AlignedLoops, BridgeResult};
 use crate::util::*;
@@ -31,6 +34,12 @@ pub enum LoftShape {
     /// Curved tube following each end's continuity.
     #[default]
     Smooth,
+    /// Along the vessels' axes: the tube follows a curve joining the axes behind the two
+    /// openings (fitted to the wall, or to given centerlines), each end as set, and its
+    /// cross-section morphs from one opening's shape to the other's in polar form about that
+    /// curve (radius and angle apart), so openings of different shapes, or turned against
+    /// each other, do not pinch the middle. Needs a vessel behind each opening.
+    Sweep,
 }
 
 /// How a [`LoftShape::Smooth`] tube meets an opening.
@@ -69,12 +78,28 @@ pub struct LoftEnd {
     /// following the end's direction for longer.
     pub tension: f64,
     pub direction: EndDirection,
+    /// 0..1: how much of the vessel behind the opening sets the direction the end leaves in
+    /// and its bend ([`EndDirection::Wall`] only): 0 is the edge of the opening alone (its
+    /// last row of triangles; the bend from one and a half radii back), more takes the axis
+    /// fitted to the vessel further back — its direction from a quarter on, and from there
+    /// out to five diameters of vessel at 1. A ragged or lumpy opening then no longer steers
+    /// the tube.
+    pub context: f64,
 }
 
 impl Default for LoftEnd {
     fn default() -> Self {
-        Self { continuity: EndContinuity::G1, tension: 1.0, direction: EndDirection::Wall }
+        Self { continuity: EndContinuity::G1, tension: 1.0, direction: EndDirection::Wall, context: 0.0 }
     }
+}
+
+/// A vessel's centerline behind an opening, from the opening into the vessel, for
+/// [`loft_guided`] to fit the end's axis to instead of slices of the wall.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AxisGuide {
+    pub points: Vec<DVec3>,
+    /// The vessel's radius at each point.
+    pub radii: Vec<f64>,
 }
 
 /// Parameters for [`loft`].
@@ -96,13 +121,6 @@ pub struct LoftParams {
     /// 0..1: blend towards the tube faired with the surroundings held fixed
     /// ([`LoftShape::Smooth`] only).
     pub fair: f64,
-    /// 0..1: how much of the vessel behind each opening sets the direction a G1 / G2 end
-    /// leaves in and its bend ([`EndDirection::Wall`] only): 0 is the edge of the opening
-    /// alone (its last row of triangles; the bend from one and a half radii back), more takes
-    /// the axis fitted to the vessel further back — its direction from a quarter on, and from
-    /// there out to five diameters of vessel at 1. A ragged or lumpy opening then no longer
-    /// steers the tube.
-    pub context: f64,
     /// 0..1: blend the tube into the vessels. Above 0 each opening is tidied first (narrow
     /// teeth cut off, narrow notches filled, its outline relaxed along the wall), so a ragged
     /// opening does not fold the tube's first band; afterwards the tube and a band of each
@@ -126,7 +144,6 @@ impl Default for LoftParams {
             bulge: 0.0,
             round: 0.0,
             fair: 0.0,
-            context: 0.0,
             blend: 0.0,
             remesh: false,
             group: None,
@@ -143,8 +160,16 @@ fn middle_weight(t: f64) -> f64 {
 /// Connect boundary loops `loop_a` and `loop_b` (vertex lists of the same mesh, either
 /// orientation, possibly different vertex counts) with a tube.
 pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams) -> EditResult<BridgeResult> {
+    loft_guided(mesh, loop_a, loop_b, params, [None, None])
+}
+
+/// [`loft`], with each end's axis fitted to the vessel's centerline behind it where one is
+/// given (`guides`, from the opening into the vessel; more faithful than slices of the wall
+/// around a bend or near a branch), out to the end's context (at least a quarter). Such an
+/// end's directions then come from the centerline entirely.
+pub fn loft_guided(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams, guides: [Option<&AxisGuide>; 2]) -> EditResult<BridgeResult> {
     let unit = |x: f64| (0.0..=1.0).contains(&x);
-    if params.bulge.is_nan() || params.bulge <= -1.0 || params.ends.iter().any(|e| e.tension.is_nan() || e.tension <= 0.0) || !unit(params.round) || !unit(params.fair) || !unit(params.context) || !unit(params.blend) {
+    if params.bulge.is_nan() || params.bulge <= -1.0 || params.ends.iter().any(|e| e.tension.is_nan() || e.tension <= 0.0 || !unit(e.context)) || !unit(params.round) || !unit(params.fair) || !unit(params.blend) {
         return Err(EditError::InvalidParameter("bulge must exceed −100 %, tension must be positive, round, fair, context and blend lie in 0..1".into()));
     }
     let (loop_a, loop_b) = if params.blend > 0.0 && params.shape != LoftShape::Minimal {
@@ -154,10 +179,27 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
         (loop_a.to_vec(), loop_b.to_vec())
     };
     let (loop_a, loop_b) = (&loop_a[..], &loop_b[..]);
-    let smooth = params.shape == LoftShape::Smooth;
-    // The vessels' axes behind the openings (with some context, along the wall).
-    let axis = |c: &[u32], e: &LoftEnd| (smooth && params.context > 0.0 && e.direction == EndDirection::Wall).then(|| vessel_axis(mesh, c, context_reach(params.context))).flatten();
-    let axes = [axis(loop_a, &params.ends[0]), axis(loop_b, &params.ends[1])];
+    let sweep = params.shape == LoftShape::Sweep;
+    let smooth = params.shape == LoftShape::Smooth || sweep;
+    // The vessels' axes behind the openings (with some context, or a centerline, along the
+    // wall; a sweep always needs them), and how much they set each end's directions.
+    let axis = |c: &[u32], e: &LoftEnd, guide: Option<&AxisGuide>| -> (Option<Axis>, f64) {
+        if !smooth || e.direction != EndDirection::Wall || (e.context <= 0.0 && guide.is_none() && !sweep) {
+            return (None, 0.0);
+        }
+        let floor = if guide.is_some() || sweep { 0.25 } else { 0.0 };
+        let reach = context_reach(e.context.max(floor));
+        match guide {
+            Some(g) => (axis_from_guide(mesh, c, g, reach).or_else(|| vessel_axis(mesh, c, reach)), 1.0),
+            None => (vessel_axis(mesh, c, reach), context_weight(e.context)),
+        }
+    };
+    let ((axis_a, weight_a), (axis_b, weight_b)) = (axis(loop_a, &params.ends[0], guides[0]), axis(loop_b, &params.ends[1], guides[1]));
+    if sweep && (axis_a.is_none() || axis_b.is_none()) {
+        return Err(EditError::Failed("Along the axis needs a vessel behind each opening (an open end of a tube, left along the wall)".into()));
+    }
+    let axes = [axis_a, axis_b];
+    let weights = [weight_a, weight_b];
     let dirs = [
         axes[0].as_ref().map_or_else(|| end_axis(mesh, loop_a, params.ends[0].direction), |x| x.dir),
         axes[1].as_ref().map_or_else(|| end_axis(mesh, loop_b, params.ends[1].direction), |x| x.dir),
@@ -180,16 +222,18 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     let n = ((smoothed_perimeter(&positions(mesh, &p)).max(smoothed_perimeter(&positions(mesh, &q))) / h).round() as usize).clamp(3, 10_000);
     // A's points start at p[0]; B's are shifted by the twist.
     let twist = params.twist_deg.rem_euclid(360.0) / 360.0;
-    let weight = context_weight(params.context);
-    let mut ea = EndData::sample(mesh, &p, n, 0.0, smooth, params.ends[0].direction, axes[0].as_ref().map(|x| (x, weight)));
-    let mut eb = EndData::sample(mesh, &q, n, twist, smooth, params.ends[1].direction, axes[1].as_ref().map(|x| (x, weight)));
+    let mut ea = EndData::sample(mesh, &p, n, 0.0, smooth, params.ends[0].direction, axes[0].as_ref().map(|x| (x, weights[0])));
+    let mut eb = EndData::sample(mesh, &q, n, twist, smooth, params.ends[1].direction, axes[1].as_ref().map(|x| (x, weights[1])));
     // The columns run between smoothed openings; each opening's own raggedness is added
     // back near it only (see `end_detail`).
     let detail = [ea.smooth_profile(), eb.smooth_profile()];
 
-    let columns: Vec<Column> = (0..n).map(|i| Column::new(&ea, &eb, i, params, smooth)).collect();
+    let path = match (&axes, sweep) {
+        ([Some(xa), Some(xb)], true) => Path::Sweep(Sweep::new(&ea, &eb, [xa, xb], params)),
+        _ => Path::Columns((0..n).map(|i| Column::new(&ea, &eb, i, params, smooth)).collect()),
+    };
     // Rows along the tube: the length of its middle curve over the edge length.
-    let mid = |t: f64| columns.iter().map(|c| c.at(t)).sum::<DVec3>() / n as f64;
+    let mid = |t: f64| path.mid(t);
     let length: f64 = (0..32).map(|k| mid(k as f64 / 32.0).distance(mid((k + 1) as f64 / 32.0))).sum();
     let segs = ((length / h).round() as usize).clamp(1, 10_000);
     // B's chain starts at its vertex nearest the first row point, so the last band is untwisted.
@@ -206,7 +250,7 @@ pub fn loft(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &LoftParams
     for r in 1..segs {
         let t = r as f64 / segs as f64;
         let (wa, wb) = (end_detail(t, segs), end_detail(1.0 - t, segs));
-        let pts = columns.iter().enumerate().map(|(i, c)| c.at(t) + detail[0][i] * wa + detail[1][i] * wb).collect();
+        let pts = (0..n).map(|i| path.at(i, t) + detail[0][i] * wa + detail[1][i] * wb).collect();
         let pts = shape_row(pts, (mid(t + 1e-3) - mid(t - 1e-3)).normalize_or_zero(), middle_weight(t), params);
         let row: Vec<u32> = pts.into_iter().map(|x| mesh.append_vertex(x)).collect();
         new_vertices.extend_from_slice(&row);
@@ -714,13 +758,66 @@ fn vessel_axis(mesh: &Mesh, c: &[u32], reach: f64) -> Option<Axis> {
     if slices.len() < 3 {
         return None;
     }
-    // Weighted least squares for x(s) = X + s D (+ ½ s² K), a 3 × 3 (or 2 × 2) system with
-    // vector right-hand sides.
-    let quadratic = slices.len() >= 5;
+    let centres: Vec<(f64, DVec3)> = slices.iter().map(|&(s, x, _)| (s, x)).collect();
+    let (origin, d, k) = fit_curve(&centres)?;
+    // The wall's radius about the axis per slice.
+    let radii: Vec<(f64, f64)> = slices
+        .iter()
+        .map(|&(s, _, pts)| {
+            let on_axis = origin + d * s + k * (0.5 * s * s);
+            let t = (d + k * s).normalize_or_zero();
+            let (mut r, mut w) = (0.0, 0.0);
+            for &(p, a) in pts {
+                let q = p - on_axis;
+                r += (q - t * q.dot(t)).length() * a;
+                w += a;
+            }
+            (s, r / w)
+        })
+        .collect();
+    make_axis(origin, d, k, &radii)
+}
+
+/// The axis of the vessel behind opening `c` from its centerline `g` (from the opening into
+/// the vessel): the fit of [`vessel_axis`] to the centerline's points out to `reach` opening
+/// radii, its radii giving the taper. `None` with fewer than three points within reach.
+fn axis_from_guide(mesh: &Mesh, c: &[u32], g: &AxisGuide, reach: f64) -> Option<Axis> {
+    let pts = positions(mesh, c);
+    let c0 = mean(&pts);
+    let radius = pts.iter().map(|p| p.distance(c0)).sum::<f64>() / pts.len() as f64;
+    if g.points.len() < 3 || g.points.len() != g.radii.len() || radius <= 0.0 {
+        return None;
+    }
+    // From the opening's end of the centerline.
+    let flip = g.points[0].distance(c0) > g.points[g.points.len() - 1].distance(c0);
+    let order: Vec<usize> = if flip { (0..g.points.len()).rev().collect() } else { (0..g.points.len()).collect() };
+    let mut s = -g.points[order[0]].distance(c0);
+    let (mut centres, mut radii) = (Vec::new(), Vec::new());
+    for (j, &k) in order.iter().enumerate() {
+        if j > 0 {
+            s -= g.points[k].distance(g.points[order[j - 1]]);
+        }
+        if -s > reach * radius {
+            break;
+        }
+        centres.push((s, g.points[k]));
+        radii.push((s, g.radii[k]));
+    }
+    if centres.len() < 3 {
+        return None;
+    }
+    let (origin, d, k) = fit_curve(&centres)?;
+    make_axis(origin, d, k, &radii)
+}
+
+/// Least squares for the curve x(s) = X + s D (+ ½ s² K with five points or more) through
+/// `samples` (position along the curve, point): (X, D, K).
+fn fit_curve(samples: &[(f64, DVec3)]) -> Option<(DVec3, DVec3, DVec3)> {
+    let quadratic = samples.len() >= 5;
     let m = if quadratic { 3 } else { 2 };
     let mut a = [[0.0f64; 3]; 3];
     let mut b = [DVec3::ZERO; 3];
-    for &(s, x, _) in &slices {
+    for &(s, x) in samples {
         let f = [1.0, s, 0.5 * s * s];
         for i in 0..m {
             for (j, fj) in f.iter().take(m).enumerate() {
@@ -730,25 +827,20 @@ fn vessel_axis(mesh: &Mesh, c: &[u32], reach: f64) -> Option<Axis> {
         }
     }
     let sol = solve_small(&a, &b, m)?;
-    let (origin, d, k) = (sol[0], sol[1], if quadratic { sol[2] } else { DVec3::ZERO });
+    Some((sol[0], sol[1], if quadratic { sol[2] } else { DVec3::ZERO }))
+}
+
+/// The [`Axis`] of a fitted curve (X, D, K), with the taper from a line through `radii`
+/// (position along the curve, radius).
+fn make_axis(origin: DVec3, d: DVec3, k: DVec3, radii: &[(f64, f64)]) -> Option<Axis> {
     let speed2 = d.length_squared();
     if speed2 <= 1e-12 {
         return None;
     }
     let dir = d / speed2.sqrt();
     let bend = (k - dir * k.dot(dir)) / speed2;
-    // The wall's radius about the axis per slice, and a line through it.
     let (mut sw, mut ss, mut sr, mut sss, mut ssr) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for &(s, _, pts) in &slices {
-        let on_axis = origin + d * s + k * (0.5 * s * s);
-        let t = (d + k * s).normalize_or_zero();
-        let (mut r, mut w) = (0.0, 0.0);
-        for &(p, a) in pts {
-            let q = p - on_axis;
-            r += (q - t * q.dot(t)).length() * a;
-            w += a;
-        }
-        let r = r / w;
+    for &(s, r) in radii {
         sw += 1.0;
         ss += s;
         sr += r;
@@ -815,7 +907,14 @@ struct Column {
 
 impl Column {
     fn new(ea: &EndData, eb: &EndData, i: usize, params: &LoftParams, smooth: bool) -> Self {
-        let (p0, p1) = (ea.pos[i], eb.pos[i]);
+        // B's wall direction points out of B's surface; the tube arrives against it.
+        Self::hermite([ea.pos[i], eb.pos[i]], [ea.dir[i], -eb.dir[i]], [ea.bend_at(i), eb.bend_at(i)], params, smooth)
+    }
+
+    /// The curve from `p[0]` leaving along `travel[0]` to `p[1]` arriving along
+    /// `travel[1]`, with curvature vectors `bend` at G2 ends (per arc length).
+    fn hermite(p: [DVec3; 2], travel: [DVec3; 2], bend: [DVec3; 2], params: &LoftParams, smooth: bool) -> Self {
+        let [p0, p1] = p;
         let d = p1 - p0;
         let len = d.length();
         // Free (G0) ends of a cubic have zero curvature: T = (3d − T_other) / 2.
@@ -824,13 +923,11 @@ impl Column {
         } else {
             // Tangent lengths: the length of the circular arc leaving A and arriving at B in
             // the end directions (the chord when an end is free), so tension 1 follows an arc.
-            let travel = [ea.dir[i], -eb.dir[i]];
             let free = params.ends.iter().any(|e| e.continuity == EndContinuity::G0);
             let turn = travel[0].angle_between(travel[1]);
             let arc = if free || !turn.is_finite() || turn < 1e-6 { len } else { len * (0.5 * turn) / (0.5 * turn).sin() };
             let end = |e: &LoftEnd, dir: DVec3| (e.continuity != EndContinuity::G0 && dir != DVec3::ZERO).then(|| dir * e.tension * arc);
-            // B's wall direction points out of B's surface; the tube arrives against it.
-            match (end(&params.ends[0], ea.dir[i]), end(&params.ends[1], -eb.dir[i])) {
+            match (end(&params.ends[0], travel[0]), end(&params.ends[1], travel[1])) {
                 (Some(t0), Some(t1)) => (t0, t1),
                 (Some(t0), None) => (t0, (3.0 * d - t0) * 0.5),
                 (None, Some(t1)) => ((3.0 * d - t1) * 0.5, t1),
@@ -843,10 +940,10 @@ impl Column {
         let mut a = [6.0 * d - 4.0 * t0 - 2.0 * t1, -6.0 * d + 2.0 * t0 + 4.0 * t1];
         if smooth {
             if params.ends[0].continuity == EndContinuity::G2 {
-                a[0] = ea.bend_at(i) * t0.length_squared();
+                a[0] = bend[0] * t0.length_squared();
             }
             if params.ends[1].continuity == EndContinuity::G2 {
-                a[1] = eb.bend_at(i) * t1.length_squared();
+                a[1] = bend[1] * t1.length_squared();
             }
         }
         Column { p: [p0, p1], t: [t0, t1], a }
@@ -861,6 +958,148 @@ impl Column {
         let h4 = -4.0 * t3 + 7.0 * t4 - 3.0 * t5;
         let h5 = 10.0 * t3 - 15.0 * t4 + 6.0 * t5;
         self.p[0] * h0 + self.t[0] * h1 + self.a[0] * h2 + self.a[1] * h3 + self.t[1] * h4 + self.p[1] * h5
+    }
+
+    /// Unit tangent at `t` (by central differences, one-sided at the ends).
+    fn tangent(&self, t: f64) -> DVec3 {
+        let e = 1e-4;
+        let (a, b) = ((t - e).max(0.0), (t + e).min(1.0));
+        (self.at(b) - self.at(a)).normalize_or_zero()
+    }
+}
+
+/// The tube's columns: Hermite curves between the openings, or a sweep along the vessels'
+/// axes.
+enum Path {
+    Columns(Vec<Column>),
+    Sweep(Sweep),
+}
+
+impl Path {
+    fn at(&self, i: usize, t: f64) -> DVec3 {
+        match self {
+            Path::Columns(c) => c[i].at(t),
+            Path::Sweep(s) => s.at(i, t),
+        }
+    }
+
+    /// The middle of the tube at `t`.
+    fn mid(&self, t: f64) -> DVec3 {
+        match self {
+            Path::Columns(c) => c.iter().map(|c| c.at(t)).sum::<DVec3>() / c.len() as f64,
+            Path::Sweep(s) => s.spine.at(t),
+        }
+    }
+}
+
+/// The tube for [`LoftShape::Sweep`]: a spine from A's axis to B's (a Hermite curve with each
+/// end's continuity), and each column an offset from it in a rotation-minimising frame —
+/// radius, angle about the spine and distance along it — morphing from the column's offset at
+/// A to its offset at B: the radius as a cubic whose end slopes continue each vessel's taper,
+/// angle and distance along with zero slope at the ends (and zero second derivative for G2),
+/// so the columns leave along the vessels' walls.
+struct Sweep {
+    spine: Column,
+    /// Frames (tangent, normal, binormal) at `FRAMES + 1` evenly spaced `t`.
+    frames: Vec<[DVec3; 3]>,
+    /// Per column: (radius, angle, along) at A and at B (B's angle unwrapped next to A's).
+    ends: Vec<[(f64, f64, f64); 2]>,
+    /// Per column: the radius's slopes per unit `t` at A and at B.
+    slopes: Vec<[f64; 2]>,
+    g2: bool,
+}
+
+const FRAMES: usize = 128;
+
+impl Sweep {
+    fn new(ea: &EndData, eb: &EndData, axes: [&Axis; 2], params: &LoftParams) -> Self {
+        // The spine runs between the axes where they pass the openings' centres, leaving A
+        // and arriving at B along them.
+        let at_opening = |x: &Axis, c: DVec3| {
+            let s = (c - x.origin).dot(x.dir);
+            (x.origin + x.dir * s + x.bend * (0.5 * s * s), (x.dir + x.bend * s).normalize_or_zero())
+        };
+        let (pa, ta) = at_opening(axes[0], mean(&ea.pos));
+        let (pb, tb) = at_opening(axes[1], mean(&eb.pos));
+        let spine = Column::hermite([pa, pb], [ta, -tb], [axes[0].bend, axes[1].bend], params, true);
+        // Rotation-minimising frames by double reflection (Wang et al. 2008), starting with
+        // the normal towards A's first point.
+        let t0 = spine.tangent(0.0);
+        let r = ea.pos[0] - pa;
+        let mut normal = (r - t0 * r.dot(t0)).normalize_or_zero();
+        if normal == DVec3::ZERO {
+            normal = t0.any_orthonormal_vector();
+        }
+        let mut frames = Vec::with_capacity(FRAMES + 1);
+        let (mut x, mut t) = (spine.at(0.0), t0);
+        frames.push([t, normal, t.cross(normal)]);
+        for k in 1..=FRAMES {
+            let u = k as f64 / FRAMES as f64;
+            let (x1, t1) = (spine.at(u), spine.tangent(u));
+            let v1 = x1 - x;
+            let c1 = v1.length_squared().max(1e-300);
+            let (rl, tl) = (normal - v1 * (2.0 / c1 * v1.dot(normal)), t - v1 * (2.0 / c1 * v1.dot(t)));
+            let v2 = t1 - tl;
+            let c2 = v2.length_squared();
+            normal = if c2 > 1e-300 { rl - v2 * (2.0 / c2 * v2.dot(rl)) } else { rl };
+            normal = (normal - t1 * normal.dot(t1)).normalize_or_zero();
+            frames.push([t1, normal, t1.cross(normal)]);
+            (x, t) = (x1, t1);
+        }
+        let polar = |p: DVec3, origin: DVec3, f: &[DVec3; 3]| {
+            let o = p - origin;
+            let along = o.dot(f[0]);
+            let (x, y) = (o.dot(f[1]), o.dot(f[2]));
+            ((x * x + y * y).sqrt(), y.atan2(x), along)
+        };
+        let n = ea.pos.len();
+        let (fa, fb) = (frames[0], frames[FRAMES]);
+        let ends: Vec<[(f64, f64, f64); 2]> = (0..n)
+            .map(|i| {
+                let a = polar(ea.pos[i], pa, &fa);
+                let mut b = polar(eb.pos[i], pb, &fb);
+                b.1 = a.1 + (b.1 - a.1 + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+                [a, b]
+            })
+            .collect();
+        // Each vessel's taper, as a fraction of its mean radius, scaled per column.
+        let mean_r = |k: usize| ends.iter().map(|e| e[k].0).sum::<f64>() / n as f64;
+        let rel = [axes[0].taper / mean_r(0).max(1e-300), axes[1].taper / mean_r(1).max(1e-300)];
+        let speed = [spine.t[0].length(), spine.t[1].length()];
+        let slopes = ends
+            .iter()
+            .map(|e| {
+                let secant = e[1].0 - e[0].0;
+                let a = if params.ends[0].continuity == EndContinuity::G0 { secant } else { rel[0] * e[0].0 * speed[0] };
+                // Arriving at B runs against B's axis, so its taper's sign turns.
+                let b = if params.ends[1].continuity == EndContinuity::G0 { secant } else { -rel[1] * e[1].0 * speed[1] };
+                [a, b]
+            })
+            .collect();
+        let g2 = params.ends.iter().any(|e| e.continuity == EndContinuity::G2);
+        Sweep { spine, frames, ends, slopes, g2 }
+    }
+
+    /// The frame at `t`: the stored normals blended, made perpendicular to the tangent there.
+    fn frame(&self, t: f64) -> [DVec3; 3] {
+        let x = t.clamp(0.0, 1.0) * FRAMES as f64;
+        let k = (x as usize).min(FRAMES - 1);
+        let f = x - k as f64;
+        let tangent = self.spine.tangent(t);
+        let n = self.frames[k][1].lerp(self.frames[k + 1][1], f);
+        let n = (n - tangent * n.dot(tangent)).normalize_or_zero();
+        [tangent, n, tangent.cross(n)]
+    }
+
+    fn at(&self, i: usize, t: f64) -> DVec3 {
+        let [(ra, pa, za), (rb, pb, zb)] = self.ends[i];
+        let [sa, sb] = self.slopes[i];
+        let (t2, t3) = (t * t, t * t * t);
+        let r = ra * (2.0 * t3 - 3.0 * t2 + 1.0) + sa * (t3 - 2.0 * t2 + t) + rb * (-2.0 * t3 + 3.0 * t2) + sb * (t3 - t2);
+        let w = if self.g2 { t3 * (10.0 - 15.0 * t + 6.0 * t2) } else { t2 * (3.0 - 2.0 * t) };
+        let (phi, along) = (pa + (pb - pa) * w, za + (zb - za) * w);
+        let [ft, fnorm, fb] = self.frame(t);
+        self.spine.at(t) + ft * along + (fnorm * phi.cos() + fb * phi.sin()) * r.max(0.0)
     }
 }
 

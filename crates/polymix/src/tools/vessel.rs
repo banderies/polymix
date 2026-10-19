@@ -737,7 +737,9 @@ impl Tool for CapTool {
 // ---------------------------------------------------------------------------
 
 /// Join two open boundary loops with a tube (Meshmixer Bridge / Join), lofted like Erase &
-/// Fill's Loft: the first marker picked is End 1.
+/// Fill's Loft: the first marker picked is End 1. The tube is previewed live once two ends
+/// are picked (built in the background a moment after the settings stop changing); Join
+/// keeps it.
 pub struct BridgeTool {
     object: Option<ObjectId>,
     ends: Vec<VesselEnd>,
@@ -745,33 +747,134 @@ pub struct BridgeTool {
     loft: ops::LoftUi,
     refine: f64,
     bulge: f64,
-    error: Option<String>,
+    job: Option<(BridgeKey, crate::jobs::Job<BridgeOut>)>,
+    preview: Option<(BridgeKey, BridgeOut)>,
+    /// Settings waiting to settle before they are previewed, and since when.
+    changed: Option<(BridgeKey, std::time::Instant)>,
+    error: Option<(BridgeKey, String)>,
 }
+
+/// What a preview was made from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct BridgeKey {
+    picked: [usize; 2],
+    loft: ops::LoftUi,
+    refine: f64,
+    bulge: f64,
+}
+
+struct BridgeOut {
+    source: std::sync::Arc<Mesh>,
+    mesh: Mesh,
+    message: String,
+}
+
+/// How long the settings must stay put before they are previewed (slider drags).
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
 
 impl BridgeTool {
     pub fn new(cx: &mut ToolCx) -> Self {
         let ends = cx.scene.active().map(|o| find_vessel_ends(&o.mesh)).unwrap_or_default().into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
-        Self { object: cx.scene.active, ends, picked: Vec::new(), loft: ops::LoftUi::default(), refine: 50.0, bulge: 0.0, error: None }
+        Self { object: cx.scene.active, ends, picked: Vec::new(), loft: ops::LoftUi::default(), refine: 50.0, bulge: 0.0, job: None, preview: None, changed: None, error: None }
     }
 
-    /// Loft the picked boundaries together; returns the status message.
-    fn join(&mut self, id: ObjectId, cx: &mut ToolCx) -> Result<String, String> {
-        let o = cx.scene.get(id).ok_or("no active object")?;
-        let mut m = (*o.mesh).clone();
-        let (Some(a), Some(b)) = (nearest_loop(&m, self.ends[self.picked[0]].center), nearest_loop(&m, self.ends[self.picked[1]].center)) else {
-            return Err("boundary not found".into());
+    fn key(&self) -> Option<BridgeKey> {
+        (self.picked.len() == 2).then(|| BridgeKey { picked: [self.picked[0], self.picked[1]], loft: self.loft, refine: self.refine, bulge: self.bulge })
+    }
+
+    /// The tube for `key` on `source` (in the background, or at once for scripts).
+    fn build(source: &Mesh, ends: [DVec3; 2], key: &BridgeKey) -> anyhow::Result<(Mesh, String)> {
+        let mut m = source.clone();
+        let (Some(a), Some(b)) = (nearest_loop(&m, ends[0]), nearest_loop(&m, ends[1])) else {
+            anyhow::bail!("boundary not found");
         };
         if a == b {
-            return Err("pick two different boundaries".into());
+            anyhow::bail!("pick two different boundaries");
         }
         let mean_edge = |l: &[u32]| (0..l.len()).map(|i| m.vertex(l[i]).distance(m.vertex(l[(i + 1) % l.len()]))).sum::<f64>() / l.len() as f64;
-        let h = ops::refined_edge_length(0.5 * (mean_edge(&a) + mean_edge(&b)), self.refine);
-        let r = mm_edit::loft(&mut m, &a, &b, &self.loft.params(h, self.bulge, None)).map_err(|e| e.to_string())?;
+        let h = ops::refined_edge_length(0.5 * (mean_edge(&a) + mean_edge(&b)), key.refine);
+        let r = ops::run_loft(&mut m, &a, &b, &key.loft, h, key.bulge, None)?;
         let message = format!("Bridged with {} triangles{}", r.triangles.len(), ops::crossing_warning(&m, &r.triangles));
+        m.bump_shape_version();
+        Ok((m, message))
+    }
+
+    /// Keep the preview up to date: collect a finished build, and start one for settings
+    /// that have settled.
+    fn update(&mut self, cx: &mut ToolCx) {
+        if let Some((k, j)) = &self.job {
+            if let Some(r) = j.poll() {
+                let k = *k;
+                self.job = None;
+                match r {
+                    Ok(out) => {
+                        self.preview = Some((k, out));
+                        self.error = None;
+                    }
+                    Err(e) => self.error = Some((k, format!("{e:#}"))),
+                }
+            }
+        }
+        let Some(key) = self.key() else {
+            self.preview = None;
+            self.changed = None;
+            if let Some((_, j)) = self.job.take() {
+                j.cancel();
+            }
+            return;
+        };
+        let current = |k: Option<&BridgeKey>| k == Some(&key);
+        if current(self.preview.as_ref().map(|p| &p.0)) || current(self.job.as_ref().map(|j| &j.0)) || current(self.error.as_ref().map(|e| &e.0)) {
+            self.changed = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.changed {
+            Some((k, since)) if k == key && now - since >= SETTLE => self.start(key, cx),
+            Some((k, since)) if k == key => cx.egui.request_repaint_after(SETTLE - (now - since)),
+            _ => {
+                self.changed = Some((key, now));
+                cx.egui.request_repaint_after(SETTLE);
+            }
+        }
+    }
+
+    fn start(&mut self, key: BridgeKey, cx: &mut ToolCx) {
+        self.changed = None;
+        let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
+        if let Some((_, j)) = self.job.take() {
+            j.cancel();
+        }
+        let source = o.mesh.clone();
+        let ends = [self.ends[key.picked[0]].center, self.ends[key.picked[1]].center];
+        self.job = Some((
+            key,
+            crate::jobs::Job::spawn("Bridge", cx.egui.clone(), move |_| {
+                let (mesh, message) = Self::build(&source, ends, &key)?;
+                Ok(BridgeOut { source, mesh, message })
+            }),
+        ));
+    }
+
+    /// Keep the tube: the preview if it is up to date, else built now. Returns the status.
+    fn join(&mut self, id: ObjectId, cx: &mut ToolCx) -> Result<String, String> {
+        let key = self.key().ok_or("pick two ends")?;
+        let o = cx.scene.get(id).ok_or("no active object")?;
+        let (mesh, message) = match self.preview.take() {
+            Some((k, out)) if k == key && std::sync::Arc::ptr_eq(&out.source, &o.mesh) => (out.mesh, out.message),
+            _ => {
+                let ends = [self.ends[key.picked[0]].center, self.ends[key.picked[1]].center];
+                Self::build(&o.mesh, ends, &key).map_err(|e| format!("{e:#}"))?
+            }
+        };
+        if let Some((_, j)) = self.job.take() {
+            j.cancel();
+        }
         cx.history.push("Bridge", cx.scene);
-        cx.scene.get_mut(id).unwrap().set_mesh(m);
+        cx.scene.get_mut(id).unwrap().set_mesh(mesh);
         self.ends = find_vessel_ends(&cx.scene.get(id).unwrap().mesh).into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
         self.picked.clear();
+        self.error = None;
         Ok(message)
     }
 }
@@ -807,6 +910,29 @@ impl Tool for BridgeTool {
                 self.loft.script(key, val);
             }
         }
+        self.update(cx);
+    }
+
+    fn preview(&self) -> Option<(ObjectId, &Mesh)> {
+        let (k, out) = self.preview.as_ref()?;
+        (Some(*k) == self.key()).then_some((self.object?, &out.mesh))
+    }
+
+    fn accept(&mut self, cx: &mut ToolCx) -> bool {
+        if self.job.is_some() {
+            return false;
+        }
+        if let (Some(id), true) = (self.object, self.picked.len() == 2) {
+            match self.join(id, cx) {
+                Ok(msg) => *cx.status = msg,
+                Err(e) => *cx.status = format!("Bridge: {e}"),
+            }
+        }
+        true
+    }
+
+    fn busy(&self) -> Option<(String, f32)> {
+        self.job.as_ref().map(|(_, j)| ("Bridge".to_string(), j.progress()))
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
@@ -815,19 +941,28 @@ impl Tool for BridgeTool {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
         };
-        ui.small("Click two open-boundary markers to connect them with a tube: the first is End 1.");
+        ui.small("Click two open-boundary markers to connect them with a tube: the first is End 1. The tube is previewed as you change the settings.");
         self.loft.ui(ui, &mut self.refine, &mut self.bulge);
+        self.update(cx);
         ui.label(format!("Picked: {:?}", self.picked.iter().map(|i| i + 1).collect::<Vec<_>>()));
-        if ui.add_enabled(self.picked.len() == 2, egui::Button::new("Join")).clicked() {
-            match self.join(id, cx) {
-                Ok(msg) => {
-                    *cx.status = msg;
-                    self.error = None;
+        let key = self.key();
+        let ready = key.is_some() && self.preview.as_ref().map(|p| p.0) == key;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ready, egui::Button::new("Join")).on_hover_text("Keep the previewed tube").clicked() {
+                match self.join(id, cx) {
+                    Ok(msg) => *cx.status = msg,
+                    Err(e) => self.error = key.map(|k| (k, e)),
                 }
-                Err(e) => self.error = Some(e),
             }
+            if key.is_some() && !ready && self.error.as_ref().map(|e| e.0) != key {
+                ui.spinner();
+                ui.weak("Previewing…");
+            }
+        });
+        if let Some(message) = self.preview.as_ref().filter(|p| Some(p.0) == key).map(|p| p.1.message.clone()) {
+            ui.weak(message);
         }
-        if let Some(e) = &self.error {
+        if let Some((_, e)) = self.error.as_ref().filter(|e| Some(e.0) == key) {
             ui.colored_label(egui::Color32::from_rgb(240, 110, 90), e);
         }
         ui.add_space(8.0);

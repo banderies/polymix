@@ -270,7 +270,7 @@ fn context_and_blend_join_ragged_openings_without_folds() {
     // axis behind each opening steering the tube, tidied openings and a smoothed, remeshed
     // join, the tube neither folds nor crosses the openings' notches.
     let (mut m, a, b) = ragged_gap();
-    let params = LoftParams { context: 0.5, blend: 0.5, remesh: true, ..Default::default() };
+    let params = LoftParams { ends: [LoftEnd { context: 0.5, ..Default::default() }; 2], blend: 0.5, remesh: true, ..Default::default() };
     let r = loft(&mut m, &a, &b, &params).unwrap();
     assert_valid(&m);
     assert_eq!(boundary_loops(&m).len(), 2, "only the tube's far ends stay open");
@@ -300,4 +300,84 @@ fn axis_fit_follows_a_bent_vessel() {
     let tangent = DVec3::new(-(1.2f64).sin(), 1.2f64.cos(), 0.0);
     assert!(axis.0.angle_between(tangent).to_degrees() < 3.0, "direction {:?}", axis.0);
     assert!((axis.1 - 0.1).abs() < 0.02, "curvature {:.3}", axis.1);
+}
+
+/// A tube of radius 1 bent along an arc of radius 10 about z (0.0 to 1.4 rad), with the
+/// stretch from 0.6 to 0.8 rad cut out: the mesh and the gap's two openings.
+fn arc_gap() -> (Mesh, Vec<u32>, Vec<u32>) {
+    let at = |a: f64| DVec3::new(10.0 * a.cos(), 10.0 * a.sin(), 0.0);
+    let piece = |a0: f64, a1: f64| {
+        let path: Vec<DVec3> = (0..=30).map(|k| at(a0 + (a1 - a0) * k as f64 / 30.0)).collect();
+        primitives::tube_along(&path, &[1.0; 31], 32)
+    };
+    let mut m = piece(0.0, 0.6);
+    m.append_mesh(&piece(0.8, 1.4), 1);
+    let gap: Vec<Vec<u32>> = boundary_loops(&m).into_iter().map(|l| l.vertices).filter(|l| {
+        let c = ring_centre(&m, l);
+        let a = c.y.atan2(c.x);
+        (0.5..0.9).contains(&a)
+    }).collect();
+    assert_eq!(gap.len(), 2);
+    (m, gap[0].clone(), gap[1].clone())
+}
+
+/// Largest distance of the tube's new points from the arc of radius 10 (the true axis),
+/// less the tube's radius 1.
+fn off_arc(m: &Mesh, verts: &[u32]) -> f64 {
+    verts.iter().map(|&v| {
+        let p = m.vertex(v);
+        let axis = DVec3::new(p.x, p.y, 0.0).normalize() * 10.0;
+        (p.distance(axis) - 1.0).abs()
+    }).fold(0.0, f64::max)
+}
+
+#[test]
+fn sweep_follows_a_bent_vessel() {
+    // Along the axis, the tube continues the arc across the gap — with the axes fitted to
+    // the wall, or to the vessels' centerlines given as guides.
+    let (mut m, a, b) = arc_gap();
+    let params = LoftParams { shape: LoftShape::Sweep, ends: [LoftEnd { context: 0.5, ..Default::default() }; 2], ..Default::default() };
+    let r = loft(&mut m, &a, &b, &params).unwrap();
+    assert_valid(&m);
+    let fitted = off_arc(&m, &r.new_vertices);
+    assert!(fitted < 0.05, "on the vessel's wall ({fitted:.3})");
+    let (mut m, a, b) = arc_gap();
+    let guide = |a0: f64, step: f64| AxisGuide {
+        points: (0..20).map(|k| {
+            let t = a0 + step * k as f64;
+            DVec3::new(10.0 * t.cos(), 10.0 * t.sin(), 0.0)
+        }).collect(),
+        radii: vec![1.0; 20],
+    };
+    // Which opening is at the lower angle decides which way each guide runs.
+    let lower_first = { let c = ring_centre(&m, &a); c.y.atan2(c.x) < 0.7 };
+    let (ga, gb) = if lower_first { (guide(0.6, -0.03), guide(0.8, 0.03)) } else { (guide(0.8, 0.03), guide(0.6, -0.03)) };
+    let r = loft_guided(&mut m, &a, &b, &params, [Some(&ga), Some(&gb)]).unwrap();
+    assert_valid(&m);
+    let guided = off_arc(&m, &r.new_vertices);
+    assert!(guided < 0.05, "guided by the centerlines ({guided:.3})");
+    // Without a vessel behind an opening there is no axis to follow.
+    let mut sphere = primitives::icosphere(2.0, 3);
+    let caps: Vec<u32> = sphere.triangle_ids().filter(|&t| sphere.tri_centroid(t).z.abs() > 1.7).collect();
+    sphere.remove_triangles(caps);
+    let holes: Vec<Vec<u32>> = boundary_loops(&sphere).into_iter().map(|l| l.vertices).collect();
+    let flat = loft(&mut sphere, &holes[0], &holes[1], &LoftParams { shape: LoftShape::Sweep, ..Default::default() });
+    assert!(flat.is_err() || sphere.check_validity().is_ok());
+}
+
+#[test]
+fn sweep_morphs_without_pinching_turned_openings() {
+    // Two coaxial tubes, the second turned a quarter round against the first (twist 90°):
+    // columns blended straight across cut the corner (the middle shrinks to about 70 % of
+    // the radius); the sweep turns them round the axis and keeps the radius.
+    let middle_radius = |shape: LoftShape| {
+        let (mut m, a, b) = gap_tubes(24, 24, 2.0, 0.0);
+        let params = LoftParams { shape, ends: [LoftEnd { context: 0.5, ..Default::default() }; 2], twist_deg: 90.0, edge_length: Some(0.1), ..Default::default() };
+        let r = loft(&mut m, &a, &b, &params).unwrap();
+        assert_valid(&m);
+        r.new_vertices.iter().map(|&v| m.vertex(v)).filter(|p| (p.z - 3.0).abs() < 0.06).map(|p| p.truncate().length()).fold(f64::MAX, f64::min)
+    };
+    let (smooth, sweep) = (middle_radius(LoftShape::Smooth), middle_radius(LoftShape::Sweep));
+    assert!(smooth < 0.45, "straight blending pinches ({smooth:.3}; ends 0.5 and 0.6)");
+    assert!(sweep > 0.5, "the sweep keeps the size ({sweep:.3})");
 }

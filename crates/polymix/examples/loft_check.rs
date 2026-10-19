@@ -1,9 +1,12 @@
 //! Loft the two closest openings of a mesh and measure the tube (for tuning `mm_edit::loft`).
 //!
-//! `cargo run --release --example loft_check -- <mesh> [key=value …]`. Keys: `context`,
-//! `fair`, `round`, `blend` (0..1), `end=g0|g1|g2`, `tension`, `dir=wall|normal`,
+//! `cargo run --release --example loft_check -- <mesh> [key=value …]`. Keys:
+//! `shape=minimal|straight|smooth|sweep`, `context` (both ends) or `context1` / `context2`,
+//! `fair`, `round`, `blend` (0..1), `remesh=1`, `end=g0|g1|g2`, `tension`, `dir=wall|normal`,
 //! `helix=R,rise` (the true vessel axis of a test mesh: an arc of radius R about z rising
-//! `rise` per radian, for the distance column), `out=<file>` to save the result.
+//! `rise` per radian, for the distance column), `guide=1` (with `helix`: the true axis as each
+//! end's centerline), `out=<file>` to save the result. With LOFT_FOLDS=1 in the environment
+//! every fold is listed.
 //!
 //! Prints the tube's self-crossings, the sharpest bends between neighbouring triangles on
 //! the tube and across its seams (degrees), and with `helix` how far the tube strays from
@@ -19,12 +22,24 @@ fn main() -> anyhow::Result<()> {
     let mut params = mm_edit::LoftParams::default();
     let mut helix = None;
     let mut out = None;
+    let mut guide = false;
     for a in &args[1..] {
         let (k, v) = a.split_once('=').unwrap_or((a, ""));
         let x = v.parse::<f64>().ok();
         match k {
             "fair" => params.fair = x.unwrap_or(0.0),
-            "context" => params.context = x.unwrap_or(0.0),
+            "context" => params.ends.iter_mut().for_each(|e| e.context = x.unwrap_or(0.0)),
+            "context1" => params.ends[0].context = x.unwrap_or(0.0),
+            "context2" => params.ends[1].context = x.unwrap_or(0.0),
+            "shape" => {
+                params.shape = match v {
+                    "minimal" => mm_edit::LoftShape::Minimal,
+                    "straight" => mm_edit::LoftShape::Straight,
+                    "sweep" => mm_edit::LoftShape::Sweep,
+                    _ => mm_edit::LoftShape::Smooth,
+                }
+            }
+            "guide" => guide = true,
             "blend" => params.blend = x.unwrap_or(0.0),
             "remesh" => params.remesh = v != "0",
             "round" => params.round = x.unwrap_or(0.0),
@@ -59,8 +74,26 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let (a, b) = (loops[best.1].vertices.clone(), loops[best.2].vertices.clone());
+    // The true axis near each opening as its centerline (test meshes made along a helix).
+    let guides: Vec<mm_edit::AxisGuide> = match (guide, helix) {
+        (true, Some((rr, rise))) => [&a, &b]
+            .iter()
+            .map(|l| {
+                let c = l.iter().map(|&v| mesh.vertex(v)).sum::<DVec3>() / l.len() as f64;
+                let at = |t: f64| DVec3::new(rr * t.cos(), rr * t.sin(), rise * t);
+                let t0 = (0..=2200).map(|k| k as f64 / 1000.0).min_by(|x, y| at(*x).distance(c).total_cmp(&at(*y).distance(c))).unwrap();
+                // Into the vessel: away from the other opening.
+                let other = if std::ptr::eq(*l, &a) { &b } else { &a };
+                let co = other.iter().map(|&v| mesh.vertex(v)).sum::<DVec3>() / other.len() as f64;
+                let away = if at(t0 + 0.01).distance(co) > at(t0).distance(co) { 1.0 } else { -1.0 };
+                let points: Vec<DVec3> = (0..60).map(|k| at(t0 + away * k as f64 * 0.01)).collect();
+                mm_edit::AxisGuide { radii: vec![2.5; points.len()], points }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     let started = std::time::Instant::now();
-    let r = mm_edit::loft(&mut mesh, &a, &b, &params)?;
+    let r = mm_edit::loft_guided(&mut mesh, &a, &b, &params, [guides.first(), guides.get(1)])?;
     let ms = started.elapsed().as_secs_f64() * 1e3;
     let tube: HashSet<u32> = r.triangles.iter().copied().collect();
     // Seams: the original triangles touching the tube.
@@ -96,6 +129,11 @@ fn main() -> anyhow::Result<()> {
         let ts = mesh.edge_triangles(e);
         if ts[1] == mm_core::INVALID || mesh.tri_normal(ts[0]).angle_between(mesh.tri_normal(ts[1])).to_degrees() < 90.0 {
             continue;
+        }
+        if std::env::var_os("LOFT_FOLDS").is_some() {
+            let kind = |t: u32| mesh.triangle(t).iter().filter(|v| ends.contains(v)).count();
+            let [u, w] = mesh.edge_vertices(e);
+            eprintln!("fold {:.1}° at {:?}: seam vertices {} / {}", mesh.tri_normal(ts[0]).angle_between(mesh.tri_normal(ts[1])).to_degrees(), (mesh.vertex(u) + mesh.vertex(w)) * 0.5, kind(ts[0]), kind(ts[1]));
         }
         match (tube.contains(&ts[0]), tube.contains(&ts[1])) {
             (true, true) => in_tube += 1,

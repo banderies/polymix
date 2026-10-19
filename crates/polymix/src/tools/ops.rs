@@ -1192,7 +1192,7 @@ impl OpSpec for RegionBridgeSpec {
         // End 1 is the opening with the lowest vertex id, as in Erase & Fill's Loft.
         ends.sort_by_key(|l| l.vertices.iter().min().copied());
         let labels = ends.iter().enumerate().map(|(k, l)| (l.centroid(&m), format!("{}", k + 1))).collect();
-        let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &p.loft.params(target, p.bulge, None))?;
+        let r = run_loft(&mut m, &ends[0].vertices, &ends[1].vertices, &p.loft, target, p.bulge, None)?;
         let message = format!("bridged with {} triangles{}", r.triangles.len(), crossing_warning(&m, &r.triangles));
         Ok(OpOutput { message, selection: Some(r.triangles), mesh: m, labels, ..Default::default() })
     }
@@ -1754,7 +1754,7 @@ impl OpSpec for EraseFillSpec {
                 labels.push((lp.centroid(&m), format!("{}", k + 1)));
             }
             let group = if p.create_new_groups { new_group } else { surrounding_group(&m, &ends[0]) };
-            let r = mm_edit::loft(&mut m, &ends[0].vertices, &ends[1].vertices, &p.loft.params(target, p.bulge, Some(group)))?;
+            let r = run_loft(&mut m, &ends[0].vertices, &ends[1].vertices, &p.loft, target, p.bulge, Some(group))?;
             warning = crossing_warning(&m, &r.triangles);
             new_tris.extend(r.triangles);
         }
@@ -1825,15 +1825,19 @@ pub struct LoftUi {
     pub twist: f64,
     pub round: f64,
     pub fair: f64,
-    pub context: f64,
+    /// Per end.
+    pub context: [f64; 2],
     pub blend: f64,
     /// Even triangles over the tube and the blended bands.
     pub remesh: bool,
+    /// Fit each end's axis to its vessel's centerline (traced from the opening) instead of
+    /// slices of the wall.
+    pub centerline: bool,
 }
 
 impl Default for LoftUi {
     fn default() -> Self {
-        Self { shape: mm_edit::LoftShape::Smooth, ends: [mm_edit::LoftEnd::default(); 2], twist: 0.0, round: 0.0, fair: 0.0, context: 50.0, blend: 50.0, remesh: true }
+        Self { shape: mm_edit::LoftShape::Smooth, ends: [mm_edit::LoftEnd::default(); 2], twist: 0.0, round: 0.0, fair: 0.0, context: [50.0; 2], blend: 50.0, remesh: true, centerline: false }
     }
 }
 
@@ -1849,15 +1853,18 @@ impl LoftUi {
     /// The library's parameters; `edge_length` is the target edge length (Refine applied),
     /// `bulge` in percent.
     pub fn params(&self, edge_length: f64, bulge: f64, group: Option<i32>) -> mm_edit::LoftParams {
+        let mut ends = self.ends;
+        for (e, c) in ends.iter_mut().zip(self.context) {
+            e.context = (c / 100.0).clamp(0.0, 1.0);
+        }
         mm_edit::LoftParams {
             shape: self.shape,
-            ends: self.ends,
+            ends,
             edge_length: Some(edge_length),
             twist_deg: self.twist,
             bulge: (bulge / 100.0).max(-0.9),
             round: (self.round / 100.0).clamp(0.0, 1.0),
             fair: (self.fair / 100.0).clamp(0.0, 1.0),
-            context: (self.context / 100.0).clamp(0.0, 1.0),
             blend: (self.blend / 100.0).clamp(0.0, 1.0),
             remesh: self.remesh && self.shape != mm_edit::LoftShape::Minimal,
             group,
@@ -1871,9 +1878,10 @@ impl LoftUi {
             ui.selectable_value(&mut self.shape, LoftShape::Minimal, "Minimal").on_hover_text("One band of triangles straight across, no new vertices");
             ui.selectable_value(&mut self.shape, LoftShape::Straight, "Straight").on_hover_text("Straight tube, like a cylinder, blending from one opening's shape to the other's");
             ui.selectable_value(&mut self.shape, LoftShape::Smooth, "Smooth").on_hover_text("Curved tube that meets each opening as set below");
+            ui.selectable_value(&mut self.shape, LoftShape::Sweep, "Along the axis").on_hover_text("The tube follows a curve joining the two vessels' axes, its cross-section morphing from one opening's shape to the other's (no pinching between differently shaped or turned openings). Needs a vessel behind each opening");
         });
         let tube = self.shape != LoftShape::Minimal;
-        let smooth = self.shape == LoftShape::Smooth;
+        let smooth = matches!(self.shape, LoftShape::Smooth | LoftShape::Sweep);
         ui.add_enabled(tube, egui::Slider::new(refine, 0.0..=100.0).text("Refine"));
         ui.add_enabled_ui(smooth, |ui| {
             ui.horizontal(|ui| {
@@ -1907,17 +1915,34 @@ impl LoftUi {
         ui.add_enabled(tube, egui::Slider::new(&mut self.round, 0.0..=100.0).suffix("%").text("Round")).on_hover_text("Make the middle of the tube circular, however ragged the openings are");
         ui.add_enabled(smooth, egui::Slider::new(&mut self.fair, 0.0..=100.0).suffix("%").text("Fair"))
             .on_hover_text("Smooth the tube's middle with its ends kept: thin-plate for G0 / G1 ends, curvature-continuous (G2) when an end is G2");
-        ui.add_enabled(smooth && self.ends.iter().any(|e| e.direction == EndDirection::Wall), egui::Slider::new(&mut self.context, 0.0..=100.0).suffix("%").text("Context"))
-            .on_hover_text("How far back along each vessel the tube takes its direction and bend from: 0 = the edge of the opening only; more = the vessel's axis fitted further back (up to five diameters at 100 %), so a ragged or lumpy end does not steer the tube")
-            .on_disabled_hover_text("For tubes leaving along the wall (Smooth)");
+        let along_wall = smooth && self.ends.iter().any(|e| e.direction == EndDirection::Wall);
+        let context_tip = "How far back along each vessel its end of the tube takes its direction and bend from: 0 = the edge of the opening only; more = the vessel's axis fitted further back (up to five diameters at 100 %), so a ragged or lumpy end does not steer the tube";
+        ui.add_enabled_ui(along_wall, |ui| {
+            egui::Grid::new("loft_context").num_columns(2).spacing([8.0, 2.0]).show(ui, |ui| {
+                for k in 0..2 {
+                    if k == 0 {
+                        ui.label("Context").on_hover_text(context_tip);
+                    } else {
+                        ui.label("");
+                    }
+                    ui.add(egui::Slider::new(&mut self.context[k], 0.0..=100.0).suffix("%").text(format!("end {}", k + 1))).on_hover_text(context_tip);
+                    ui.end_row();
+                }
+            });
+            ui.checkbox(&mut self.centerline, "Follow the vessel centerlines")
+                .on_hover_text("Trace each vessel's centerline from its opening and fit the end to it (more faithful round bends and near branches than the wall; slower on big meshes)");
+        })
+        .response
+        .on_disabled_hover_text("For tubes leaving along the wall (Smooth, Along the axis)");
         ui.add_enabled(tube, egui::Slider::new(&mut self.blend, 0.0..=100.0).suffix("%").text("Blend"))
             .on_hover_text("Blend the tube into the vessels: ragged openings are tidied first, and the join is smoothed over a band of each vessel behind it (up to a diameter at 100 %). 0 leaves the vessels untouched");
         ui.add_enabled(tube, egui::Checkbox::new(&mut self.remesh, "Remesh the join")).on_hover_text("Even triangles over the tube and the blended bands, so no thin slivers show as lines along the seams");
     }
 
-    /// Test-script settings: `loft:smooth`, `end1:g2`, `tension2:1.5`, `dir:normal`,
-    /// `round:50`, `fair:100`, `twist:30`, `context:50`, `blend:50`, `remesh:off`. Returns
-    /// false for other keys.
+    /// Test-script settings: `loft:smooth` (or `minimal`, `straight`, `axis`), `end1:g2`,
+    /// `tension2:1.5`, `dir:normal`, `round:50`, `fair:100`, `twist:30`, `context:50` (both
+    /// ends) or `context1:30`, `blend:50`, `remesh:off`, `centerline:on`. Returns false for
+    /// other keys.
     pub fn script(&mut self, key: &str, val: &str) -> bool {
         use mm_edit::{EndContinuity, EndDirection, LoftShape};
         let num = val.parse::<f64>().ok();
@@ -1927,6 +1952,7 @@ impl LoftUi {
                 self.shape = match val {
                     "minimal" => LoftShape::Minimal,
                     "straight" => LoftShape::Straight,
+                    "axis" => LoftShape::Sweep,
                     _ => LoftShape::Smooth,
                 };
             }
@@ -1951,7 +1977,13 @@ impl LoftUi {
             "round" => self.round = num.unwrap_or(self.round),
             "fair" => self.fair = num.unwrap_or(self.fair),
             "twist" => self.twist = num.unwrap_or(self.twist),
-            "context" => self.context = num.unwrap_or(self.context),
+            "context" => self.context = [num.unwrap_or(self.context[0]); 2],
+            k if k.starts_with("context") => {
+                if let (Some(i), Some(x)) = (end(k), num) {
+                    self.context[i] = x;
+                }
+            }
+            "centerline" => self.centerline = val == "on",
             "blend" => self.blend = num.unwrap_or(self.blend),
             "remesh" => self.remesh = val != "off",
             _ => return false,
@@ -1968,6 +2000,28 @@ fn script_refine_bulge(refine: &mut f64, bulge: &mut f64, key: &str, val: &str) 
         "bulge" => *bulge = x,
         _ => {}
     }
+}
+
+/// Loft openings `a` and `b` with the panel's settings, fitting the ends to their vessels'
+/// centerlines (traced from each opening) when that is on.
+pub(crate) fn run_loft(m: &mut Mesh, a: &[u32], b: &[u32], loft: &LoftUi, edge_length: f64, bulge: f64, group: Option<i32>) -> Result<mm_edit::BridgeResult, mm_edit::EditError> {
+    let params = loft.params(edge_length, bulge, group);
+    let along_wall = matches!(params.shape, mm_edit::LoftShape::Smooth | mm_edit::LoftShape::Sweep);
+    let guides = if loft.centerline && along_wall { [a, b].map(|l| opening_centerline(m, l)) } else { [None, None] };
+    mm_edit::loft_guided(m, a, b, &params, [guides[0].as_ref(), guides[1].as_ref()])
+}
+
+/// The centerline of the vessel behind opening `lp`: the first branch of a centerline grown
+/// from the opening (up to the vessel's first fork), as a loft guide.
+fn opening_centerline(m: &Mesh, lp: &[u32]) -> Option<mm_edit::AxisGuide> {
+    let pts: Vec<DVec3> = lp.iter().map(|&v| m.vertex(v)).collect();
+    let c = pts.iter().sum::<DVec3>() / pts.len().max(1) as f64;
+    let radius = pts.iter().map(|p| p.distance(c)).sum::<f64>() / pts.len().max(1) as f64;
+    let cl = crate::centerline::compute(m, lp, radius, &crate::centerline::CenterlineParams::default());
+    let root = cl.branches.iter().find(|b| b.parent.is_none())?;
+    let points: Vec<DVec3> = root.nodes.iter().map(|&k| cl.nodes[k].position).collect();
+    let radii: Vec<f64> = root.nodes.iter().map(|&k| cl.nodes[k].radius).collect();
+    (points.len() >= 3).then_some(mm_edit::AxisGuide { points, radii })
 }
 
 /// Edge length for a tube with `refine` (0..100; 50 keeps `base`, +25 halves it).
