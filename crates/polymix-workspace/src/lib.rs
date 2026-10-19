@@ -3,8 +3,10 @@
 //! Each workspace lives in its own crate and implements [`Workspace`]; the shell in the
 //! `polymix` binary draws the tab bar and calls the workspaces through [`guard::run_guarded`],
 //! so a panic in one workspace stops only that workspace. This crate holds what they all
-//! need: the trait, the crash guard, background [`jobs`] and the per-user [`data_dir`].
+//! need: the trait, the crash guard, background [`jobs`], what workspaces show [`agent`]s and
+//! the per-user [`data_dir`].
 
+pub mod agent;
 pub mod guard;
 pub mod jobs;
 pub mod style;
@@ -46,6 +48,18 @@ pub trait Workspace {
     /// Called (under the crash guard) on a workspace that just crashed, before it is
     /// dropped: save what can be saved for the restarted workspace to recover.
     fn emergency_save(&mut self) {}
+    /// Tools this workspace offers agents (see [`agent`]), the same every time (they are
+    /// listed even while the workspace is stopped).
+    fn agent_tools() -> Vec<agent::AgentTool>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
+    /// Answer an agent's call of one of [`Workspace::agent_tools`] (on the UI thread).
+    fn agent_call(&mut self, tool: &str, _args: &serde_json::Value) -> agent::AgentReply {
+        agent::AgentReply::error(format!("the {} workspace has no tool {tool}", self.name()))
+    }
 }
 
 /// Where Polymix keeps per-user files (autosave, parts, logs, catalogs).

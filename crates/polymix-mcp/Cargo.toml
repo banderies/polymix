@@ -1,0 +1,17 @@
+[package]
+name = "polymix-mcp"
+description = "Polymix agent access: a local Model Context Protocol server that hands tool calls to the app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+tokio-util = "0.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+serde_json = "1"
+base64 = "0.23"
+getrandom = "0.4"
+anyhow.workspace = true
+log.workspace = true

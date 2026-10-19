@@ -9,6 +9,7 @@
 //! selection through [`SegmentationWorkspace::show_volume`] and takes its meshes through
 //! [`SegmentationWorkspace::take_meshes`].
 
+mod agent;
 mod effects;
 mod panel;
 mod segmentation;
@@ -916,5 +917,13 @@ impl Workspace for SegmentationWorkspace {
 
     fn script_idle(&self) -> bool {
         self.script.is_empty() && self.loading.is_none() && self.running.is_none()
+    }
+
+    fn agent_tools() -> Vec<polymix_workspace::agent::AgentTool> {
+        agent::tools()
+    }
+
+    fn agent_call(&mut self, tool: &str, args: &serde_json::Value) -> polymix_workspace::agent::AgentReply {
+        agent::call(self, tool, args)
     }
 }

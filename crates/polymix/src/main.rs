@@ -1,5 +1,6 @@
 //! Polymix — an open-source mesh editor in the spirit of Autodesk Meshmixer.
 
+mod agents;
 mod app;
 mod camera;
 mod centerline;
@@ -12,6 +13,7 @@ mod materials;
 mod navigation;
 mod parts;
 mod project;
+mod recent_log;
 mod renderer;
 mod scene;
 mod shell;
@@ -24,7 +26,7 @@ mod view_cube;
 mod pipeline_tests;
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    recent_log::install("warn");
     if std::env::args().any(|a| a == "--probe-3dmouse") {
         probe_3d_mouse();
         return Ok(());

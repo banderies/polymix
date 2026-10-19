@@ -279,6 +279,29 @@ venous sinus stenosis with bare self-expanding stents.
 - [ ] **M16.5** Covered-stent refinements, braided foreshortening, struts, mechanics, device
       catalogue, several stents: see [virtual_stenting.md § Future work](virtual_stenting.md#future-work).
 
+## M17 — Agent access (MCP)
+
+LLM agents (Claude Code, Claude Desktop, Cursor, …) read and later drive the running app over
+the Model Context Protocol, for debugging and for help with the data on screen
+([agent_access.md](agent_access.md)).
+
+- [x] **M17.1 Read-only tools**: `polymix-mcp` crate (`rmcp` Streamable HTTP server on
+      127.0.0.1, bearer token in the data folder, Origin / Host checks, stateless for both
+      the 2026-07-28 and older protocols); calls queued to the UI thread and answered between
+      frames, heavy work snapshotted and run off it (`AgentReply::Later`);
+      `Workspace::agent_tools` / `agent_call`; tools `app_status`, `app_screenshot`,
+      `app_log`, `mesh_scene`, `mesh_object`, `mesh_selection`, `volume_catalog`,
+      `volume_info`, `segmentation_state`; identifiers always masked for agents, dates cut to
+      the year, catalog name tokens masked in every reply, screenshots of the image tabs only
+      with Hide identifiers; Agents button and window in the tab bar.
+- [ ] **M17.2 Commands**: one typed `Command` list shared by menus, hotkeys, test scripts and
+      agents (serde, JSON Schema from it); agents select, open and run tools with parameters,
+      undo / redo, open files, switch tabs; every change an undo step labelled "Agent: …";
+      tools marked destructive so clients ask first; tool panel settings readable.
+- [ ] **M17.3 Long work and batch**: job handles for long operations (start → poll
+      `job_status`, cancel); a headless `polymix --mcp-stdio` mode on the `mm-*` crates for
+      batch pipelines without a window.
+
 ## Later
 
 - **DICOM extras**: Siemens mosaics, DICOM SEG and RT structure sets, High-Throughput JPEG

@@ -89,7 +89,7 @@ pub fn install_panic_hook() {
 
 /// Replace file paths in a message with `<path>`: file names can carry patient names, and logs
 /// get shared.
-fn scrub_paths(message: &str) -> String {
+pub fn scrub_paths(message: &str) -> String {
     let chars: Vec<char> = message.chars().collect();
     let mut out = String::with_capacity(message.len());
     let mut i = 0;

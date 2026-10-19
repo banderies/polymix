@@ -293,6 +293,10 @@ impl History {
     pub fn redo_label(&self) -> Option<&str> {
         self.redo.last().map(|(l, _)| l.as_str())
     }
+    /// Every undo and redo step's label, oldest first (the last is undone / redone next).
+    pub fn labels(&self) -> (Vec<&str>, Vec<&str>) {
+        (self.undo.iter().map(|(l, _)| l.as_str()).collect(), self.redo.iter().map(|(l, _)| l.as_str()).collect())
+    }
 
     pub fn undo(&mut self, scene: &mut Scene) -> Option<String> {
         self.generation += 1;

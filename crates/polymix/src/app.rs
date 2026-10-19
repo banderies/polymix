@@ -1,5 +1,7 @@
 //! Application shell: layout, viewport navigation, tool dispatch, file IO.
 
+mod agent;
+
 use crate::camera::{Camera, UpAxis, ViewHistory};
 use crate::commands::{self, CmdCx};
 use crate::jobs::Job;
@@ -3163,6 +3165,14 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     fn needs_attention(&self) -> bool {
         // The recovery prompt is drawn by this workspace, and autosave waits for an answer.
         self.recovery.is_some()
+    }
+
+    fn agent_tools() -> Vec<polymix_workspace::agent::AgentTool> {
+        agent::tools()
+    }
+
+    fn agent_call(&mut self, tool: &str, args: &serde_json::Value) -> polymix_workspace::agent::AgentReply {
+        agent::call(self, tool, args)
     }
 
     fn emergency_save(&mut self) {

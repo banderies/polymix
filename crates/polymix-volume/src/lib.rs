@@ -6,6 +6,7 @@
 //! and a thumbnail. It depends only on `polymix-workspace` and `mm-volume`, never on the Mesh
 //! workspace, so the two cannot break each other.
 
+mod agent;
 mod prepare;
 mod preview;
 mod privacy;
@@ -58,6 +59,8 @@ pub struct VolumeWorkspace {
     search: String,
     hide_ids: bool,
     privacy: Privacy,
+    /// Always hiding: what agents get, whatever the window shows.
+    agent_privacy: Arc<Privacy>,
     preview: Option<Preview>,
     script: VecDeque<String>,
     /// A file opened from outside (Finder, command line): select its volume after the scan.
@@ -83,6 +86,7 @@ impl VolumeWorkspace {
             search: String::new(),
             hide_ids,
             privacy: Privacy::new(hide_ids, None),
+            agent_privacy: Arc::new(Privacy::new(true, None)),
             preview: None,
             script: VecDeque::new(),
             open_select: None,
@@ -128,6 +132,7 @@ impl VolumeWorkspace {
                 }
                 self.selection = keep.unwrap_or(Selection::None);
                 self.privacy = Privacy::new(self.hide_ids, Some(&c));
+                self.agent_privacy = Arc::new(Privacy::new(true, Some(&c)));
                 self.catalog = Some(Arc::new(c));
             }
             Err(e) => {
@@ -162,6 +167,19 @@ impl VolumeWorkspace {
         }?;
         let label = self.privacy.path(&c.volumes.get(k)?.name);
         Some((c, k, label))
+    }
+
+    /// Whether *Hide identifiers* is on (the shell lets agents take screenshots of the image
+    /// tabs only then).
+    pub fn hides_identifiers(&self) -> bool {
+        self.hide_ids
+    }
+
+    /// Masks the parts of the catalog's patients' names and IDs in any text, for everything
+    /// agents are sent (object names in Mesh come from file names too).
+    pub fn agent_mask(&self) -> Arc<dyn Fn(&str) -> String + Send + Sync> {
+        let p = self.agent_privacy.clone();
+        Arc::new(move |s: &str| p.path(s))
     }
 
     fn set_hide(&mut self, hide: bool) {
@@ -799,6 +817,14 @@ impl Workspace for VolumeWorkspace {
 
     fn script_idle(&self) -> bool {
         self.script.is_empty() && self.scan.is_none() && !self.scan_soon && !self.preview.as_ref().is_some_and(|p| p.busy()) && !self.prepare.busy()
+    }
+
+    fn agent_tools() -> Vec<polymix_workspace::agent::AgentTool> {
+        agent::tools()
+    }
+
+    fn agent_call(&mut self, tool: &str, args: &serde_json::Value) -> polymix_workspace::agent::AgentReply {
+        agent::call(self, tool, args)
     }
 }
 

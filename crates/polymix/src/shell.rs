@@ -7,12 +7,16 @@
 //! workspace is called through its [`Slot`], so a panic inside one stops only that one: its
 //! tab shows a crash card with a Restart button while the others keep working.
 
+use crate::agents::{self, AgentAccess};
 use crate::app::MeshWorkspace;
+use polymix_mcp::{Call, Reply};
 use polymix_segmentation::SegmentationWorkspace;
 use polymix_volume::VolumeWorkspace;
 use polymix_workspace::guard::{self, CardAction, Slot};
 use polymix_workspace::style::{apply_theme, Theme};
+use polymix_workspace::agent::AgentReply;
 use polymix_workspace::Workspace;
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +76,8 @@ pub struct PolymixApp {
     /// `restart:<workspace>` (test scripts): press its crash card's Restart.
     restart_next: Option<Tab>,
     title: String,
+    /// LLM clients reading the session over MCP (see [`agents`]).
+    agents: AgentAccess,
 }
 
 /// The shell's part of a test script: waits, key presses, screenshots, tab switches.
@@ -120,7 +126,11 @@ impl PolymixApp {
         } else if volume.live().is_some_and(|w| w.needs_attention()) {
             active = Tab::Volume;
         }
-        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new() }
+        // Every workspace's agent tools are listed, even those of a workspace that failed to start.
+        let tools = agents::shell_tools().into_iter().chain(VolumeWorkspace::agent_tools()).chain(SegmentationWorkspace::agent_tools()).chain(MeshWorkspace::agent_tools()).map(agents::spec).collect();
+        let mut agents = AgentAccess::new(storage, tools);
+        agents.start_if_enabled(ctx);
+        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -169,6 +179,7 @@ impl PolymixApp {
                         self.active = tab;
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.agents.indicator(ui));
             });
         });
     }
@@ -241,6 +252,71 @@ impl PolymixApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+    }
+
+    /// Answer the calls agents made since the last frame. Answers are quick here: work that
+    /// takes longer was left by the workspaces to run on the server's worker threads.
+    fn serve_agents(&mut self, ctx: &egui::Context) {
+        let Some(server) = self.agents.server() else { return };
+        let calls: Vec<Call> = std::iter::from_fn(|| server.try_recv()).take(32).collect();
+        if calls.len() == 32 {
+            ctx.request_repaint();
+        }
+        for call in calls {
+            self.answer_agent(call, ctx);
+        }
+    }
+
+    fn answer_agent(&mut self, call: Call, ctx: &egui::Context) {
+        // Patients' names can turn up in any text (object names come from file names).
+        let mask = self.volume.live().map(|w| w.agent_mask());
+        let reply = match call.tool.as_str() {
+            "app_status" => agents::masked(Ok(self.agent_status(ctx)), mask.as_ref()),
+            "app_log" => agents::masked(Ok(agents::log(&call.args)), mask.as_ref()),
+            "app_screenshot" => return self.agent_screenshot(call, ctx),
+            tool => {
+                let (name, r) = match tool.split('_').next().unwrap_or("") {
+                    "volume" => ("Volume", self.volume.call(|w| w.agent_call(tool, &call.args))),
+                    "segmentation" => ("Segmentation", self.segmentation.call(|w| w.agent_call(tool, &call.args))),
+                    "mesh" => ("Mesh", self.mesh.call(|w| w.agent_call(tool, &call.args))),
+                    _ => ("", Some(AgentReply::error(format!("unknown tool {tool}")))),
+                };
+                match r {
+                    Some(r) => agents::reply(r, mask),
+                    None => Reply::Error(format!("The {name} workspace has stopped after an internal error (see app_status); the user can restart it from its tab.")),
+                }
+            }
+        };
+        call.answer(reply);
+    }
+
+    fn agent_status(&self, ctx: &egui::Context) -> Value {
+        fn state<W: Workspace>(s: &Slot<W>) -> Value {
+            match s {
+                Slot::Live(w) => json!({"running": true, "busy": !w.script_idle()}),
+                Slot::Crashed(r) => json!({"running": false, "stopped_by": polymix_workspace::guard::scrub_paths(&r.message), "at": r.location}),
+            }
+        }
+        let r = ctx.content_rect();
+        json!({
+            "app": "Polymix",
+            "version": env!("CARGO_PKG_VERSION"),
+            "workspace_shown": self.active.key(),
+            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh)},
+            "window": {"width": r.width().round(), "height": r.height().round(), "pixels_per_point": ctx.pixels_per_point()},
+            "identifiers_hidden_in_volume": self.volume.live().is_some_and(|w| w.hides_identifiers()),
+        })
+    }
+
+    /// Ask for a screenshot of the next frame; the callback hands it to the server to encode.
+    fn agent_screenshot(&mut self, call: Call, ctx: &egui::Context) {
+        let hiding = self.volume.live().is_some_and(|w| w.hides_identifiers());
+        if matches!(self.active, Tab::Volume | Tab::Segmentation) && !hiding {
+            return call.answer(Reply::Error(format!("The {} tab can show patient identifiers: screenshots of it need Hide identifiers on (Volume tab toolbar). Mesh tab screenshots are allowed.", self.active.label())));
+        }
+        let max = polymix_workspace::agent::arg_usize(&call.args, "max_size", 1568, 256, 4096);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| call.answer(Reply::Later(Box::new(move || agents::png(&img, max)))))));
+        ctx.request_repaint();
     }
 
     /// Whether the shown workspace has finished the script steps handed to it.
@@ -387,6 +463,7 @@ impl eframe::App for PolymixApp {
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
         self.segmentation.call(|w| w.tick(ctx, active == Tab::Segmentation));
         self.mesh.call(|w| w.tick(ctx, active == Tab::Mesh));
+        self.serve_agents(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -406,6 +483,7 @@ impl eframe::App for PolymixApp {
         }
         self.tab_bar(ui);
         self.workspace_ui(ui, frame);
+        self.agents.window(&ctx);
         self.update_title(&ctx);
         self.run_script(&ctx);
     }
@@ -415,12 +493,14 @@ impl eframe::App for PolymixApp {
             return;
         }
         storage.set_string("shell.tab", self.active.key().to_string());
+        self.agents.save(storage);
         self.volume.call(|w| w.save(storage));
         self.segmentation.call(|w| w.save(storage));
         self.mesh.call(|w| w.save(storage));
     }
 
     fn on_exit(&mut self) {
+        self.agents.on_exit();
         self.volume.call(|w| w.on_exit());
         self.segmentation.call(|w| w.on_exit());
         self.mesh.call(|w| w.on_exit());
