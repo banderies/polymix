@@ -294,9 +294,19 @@ impl Camera {
     /// shrinks as the camera nears the surface.
     pub fn zoom_about(&mut self, factor: f64, point: DVec3) {
         let old = self.distance;
+        // No closer to the point than the closest zoom.
+        let gap = (self.eye() - point).length();
+        let eye = point + (self.eye() - point) * factor.max((self.scene_radius * 1e-4 / gap.max(1e-300)).min(1.0));
         self.zoom(factor);
-        let f = self.distance / old;
-        self.target = point + (self.target - point) * f;
+        if self.orthographic {
+            // The distance is the view's scale: at its limit the view stays.
+            let f = self.distance / old;
+            self.target = point + (self.target - point) * f;
+        } else {
+            // The eye moves even when the distance to the target is at its limit (the target
+            // is then pushed ahead), so the wheel never stops working near a surface.
+            self.target = eye + self.forward() * self.distance;
+        }
     }
 
     /// Fit the view to bounds.

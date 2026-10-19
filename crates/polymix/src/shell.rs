@@ -65,6 +65,8 @@ pub struct PolymixApp {
     /// Paths from the command line, opened on the first frame.
     pending_open: Vec<PathBuf>,
     script: Option<Script>,
+    /// Frames drawn (`frames:` script step).
+    frames: u64,
     /// `crash:<workspace>` (test scripts): make that workspace panic on its next frame.
     crash_next: Option<Tab>,
     /// `restart:<workspace>` (test scripts): press its crash card's Restart.
@@ -82,6 +84,9 @@ struct Script {
     keys: Vec<egui::Key>,
     /// Raw mouse events (`pointer:`), one frame's worth per frame.
     pointer: VecDeque<Vec<egui::Event>>,
+    /// `idle:<seconds>`: no repaints forced until then (input time), as when nobody runs a
+    /// script — whatever still needs frames must ask for them itself.
+    idle_until: Option<f64>,
 }
 
 impl PolymixApp {
@@ -103,6 +108,7 @@ impl PolymixApp {
             awaiting_shot: None,
             keys: Vec::new(),
             pointer: VecDeque::new(),
+            idle_until: None,
         });
         // Workspaces that fail to start are shown stopped, like a crash later on.
         let volume = slot("Volume", || VolumeWorkspace::new(ctx, storage));
@@ -114,7 +120,7 @@ impl PolymixApp {
         } else if volume.live().is_some_and(|w| w.needs_attention()) {
             active = Tab::Volume;
         }
-        Self { active, volume, segmentation, mesh, pending_open: files, script, crash_next: None, restart_next: None, title: String::new() }
+        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new() }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -248,7 +254,16 @@ impl PolymixApp {
 
     fn run_script(&mut self, ctx: &egui::Context) {
         let idle = self.active_idle();
+        let frames = self.frames;
         let Some(script) = &mut self.script else { return };
+        if let Some(until) = script.idle_until {
+            let now = ctx.input(|i| i.time);
+            if now < until {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(until - now));
+                return;
+            }
+            script.idle_until = None;
+        }
         ctx.request_repaint();
         // Wait for an in-flight screenshot to be written.
         if let Some(done) = &script.awaiting_shot {
@@ -274,6 +289,9 @@ impl PolymixApp {
         let (cmd, arg) = step.split_once(':').unwrap_or((step.as_str(), ""));
         match cmd {
             "wait" => script.wait = arg.parse().unwrap_or(1),
+            "idle" => script.idle_until = Some(ctx.input(|i| i.time) + arg.parse::<f64>().unwrap_or(1.0)),
+            // frames:<label> — how many frames have been drawn so far.
+            "frames" => println!("[shell] {arg} frames={frames}"),
             "key" => {
                 if let Some(k) = egui::Key::from_name(arg) {
                     script.keys.push(k);
@@ -321,7 +339,7 @@ impl PolymixApp {
                 if let [x, y, lines] = n[..] {
                     let at = egui::pos2(x, y);
                     let notch = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, lines.signum()), modifiers: Default::default(), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel };
-                    script.pointer = std::iter::once(vec![egui::Event::PointerMoved(at)]).chain((0..lines.abs() as usize).map(|_| vec![notch.clone()])).chain((0..15).map(|_| Vec::new())).collect();
+                    script.pointer = std::iter::once(vec![egui::Event::PointerMoved(at)]).chain((0..lines.abs() as usize).map(|_| vec![notch.clone()])).collect();
                 }
             }
             "pointer" => match pointer_frames(arg) {
@@ -373,6 +391,7 @@ impl eframe::App for PolymixApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.frames += 1;
         let mut open: Vec<PathBuf> = std::mem::take(&mut self.pending_open);
         #[cfg(target_os = "macos")]
         open.extend(crate::macos_open::take());

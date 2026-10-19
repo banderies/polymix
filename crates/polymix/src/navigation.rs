@@ -295,9 +295,51 @@ pub fn brush_wheel_delta(events: &[egui::Event]) -> f32 {
         .sum()
 }
 
+/// View zoom from this frame's raw input, applied at once: the vertical wheel in points
+/// (`line_points` per line, as egui counts them; positive = up = closer) and the pinch factor
+/// (above 1 = closer). egui eases a wheel notch in over the next frames, and when those
+/// frames come late (the window not redrawn until the mouse moves) the zoom shows only then;
+/// Cmd + wheel, which egui turns into its zoom, counts as the plain wheel.
+pub fn wheel_zoom(events: &[egui::Event], line_points: f32) -> (f32, f32) {
+    let mut wheel = 0.0;
+    let mut pinch = 1.0;
+    for e in events {
+        match e {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                wheel += match unit {
+                    egui::MouseWheelUnit::Point => delta.y,
+                    egui::MouseWheelUnit::Line => delta.y * line_points,
+                    egui::MouseWheelUnit::Page => delta.y * line_points * 10.0,
+                }
+            }
+            egui::Event::Zoom(f) => pinch *= f,
+            _ => {}
+        }
+    }
+    (wheel, pinch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_zoom_takes_whole_notches_at_once() {
+        let wheel = |unit, y: f32, command: bool| egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(0.0, y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers { command, mac_cmd: command, ..Default::default() },
+        };
+        use egui::MouseWheelUnit::{Line, Point};
+        // Two notches up, a trackpad nudge down, Cmd + a notch, a pinch.
+        let events = [wheel(Line, 1.0, false), wheel(Line, 1.0, false), wheel(Point, -6.0, false), wheel(Line, 1.0, true), egui::Event::Zoom(1.1)];
+        let (w, p) = wheel_zoom(&events, 40.0);
+        assert_eq!(w, 3.0 * 40.0 - 6.0);
+        assert!((p - 1.1).abs() < 1e-6);
+        assert_eq!(wheel_zoom(&[], 40.0), (0.0, 1.0));
+    }
     use NavAction::*;
 
     fn m(alt: bool, shift: bool, command: bool) -> Modifiers {

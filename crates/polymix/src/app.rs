@@ -329,8 +329,6 @@ pub struct MeshWorkspace {
     nav_drag: Option<PointerButton>,
     /// Cmd/Ctrl+middle-drag resizing the brush.
     brush_drag: bool,
-    /// When the brush last took a wheel notch (its eased remainder must not zoom).
-    brush_wheel_at: f64,
     /// Width / height of the viewport last frame (for framing the scene).
     vp_aspect: f64,
     /// Point the current navigation drag holds on to (picked when it started): orbits turn
@@ -411,7 +409,6 @@ impl MeshWorkspace {
             recovery: None,
             nav_drag: None,
             brush_drag: false,
-            brush_wheel_at: f64::NEG_INFINITY,
             vp_aspect: 1.6,
             nav_anchor: None,
             com_cache: None,
@@ -2322,8 +2319,9 @@ impl MeshWorkspace {
         let ctx = ui.ctx().clone();
 
         // --- navigation -------------------------------------------------
-        let (mods, scroll, mut zoom_delta, pointer_delta, hover) = ctx.input(|i| {
-            (i.modifiers, i.smooth_scroll_delta(), i.zoom_delta(), i.pointer.delta(), i.pointer.hover_pos())
+        let line_points = ctx.options(|o| o.input_options.line_scroll_speed);
+        let (mods, (wheel, pinch), pointer_delta, hover) = ctx.input(|i| {
+            (i.modifiers, crate::navigation::wheel_zoom(&i.raw.events, line_points), i.pointer.delta(), i.pointer.hover_pos())
         });
         // `hovered` respects layering, so popups over the viewport don't leak input into it.
         let in_rect = hover.map(|p| rect.contains(p)).unwrap_or(false) && (response.hovered() || response.dragged());
@@ -2407,25 +2405,21 @@ impl MeshWorkspace {
             // The brush-scroll modifier (Shift by default) + wheel sets brush tools' size, from
             // the raw events (one step per notch, no easing lag); the plain wheel always zooms.
             let now = ctx.input(|i| i.time);
-            let mut scroll_y = scroll.y;
+            // Whole notches at once, from the raw events (see `navigation::wheel_zoom`); a
+            // notch the brush took does not zoom.
+            let mut wheel_y = wheel;
             if self.view.brush_scroll.held(mods) {
                 let d = ctx.input(|i| crate::navigation::brush_wheel_delta(&i.raw.events));
                 if d != 0.0 && self.tool_wheel(&ctx, vp, d) {
-                    self.brush_wheel_at = now;
+                    wheel_y = 0.0;
                 }
             }
-            // egui eases each notch in over ~0.1 s, as a vertical scroll (Ctrl, Option) or a
-            // zoom (Cmd); the rest of a notch the brush took must not zoom the view.
-            if now - self.brush_wheel_at < 0.25 {
-                scroll_y = 0.0;
-                zoom_delta = 1.0;
-            }
             let mut factor = 1.0f64;
-            if scroll_y != 0.0 {
-                factor *= (-scroll_y as f64 * 0.0025 * self.view.zoom_speed as f64).exp();
+            if wheel_y != 0.0 {
+                factor *= (-wheel_y as f64 * 0.0025 * self.view.zoom_speed as f64).exp();
             }
-            if zoom_delta != 1.0 {
-                factor /= zoom_delta as f64;
+            if pinch != 1.0 {
+                factor /= pinch as f64;
             }
             if factor != 1.0 {
                 if now - self.last_wheel > 0.6 {
