@@ -1717,15 +1717,27 @@ impl MeshWorkspace {
         let mut new_target: Option<Option<ObjectId>> = None;
         let target = self.scene.target;
         let rename_id = egui::Id::NULL.with("renaming");
-        let mut renaming: Option<ObjectId> = ui.ctx().data(|d| d.get_temp(rename_id));
+        // The object being renamed, its name before (Esc puts it back) and whether its field
+        // has been given the keyboard focus.
+        let mut renaming: Option<(ObjectId, String, bool)> = ui.ctx().data(|d| d.get_temp(rename_id));
         for o in self.scene.objects.iter_mut() {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut o.visible, "").on_hover_text("Visible");
                 let active = Some(o.id) == self.scene.active;
-                if renaming == Some(o.id) {
+                if let Some((_, before, focused)) = renaming.as_mut().filter(|r| r.0 == o.id) {
                     let r = ui.add(egui::TextEdit::singleline(&mut o.name).desired_width(120.0));
-                    r.request_focus();
-                    if r.lost_focus() {
+                    // Focus once only: Enter, Esc, Tab or a click elsewhere then ends the rename
+                    // (egui's focus, not `has_focus`, which is also false while another app is
+                    // in front).
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    } else if !ui.memory(|m| m.has_focus(r.id)) {
+                        if o.name.trim().is_empty() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            o.name = std::mem::take(before);
+                        } else {
+                            o.name = o.name.trim().to_string();
+                        }
                         renaming = None;
                     }
                     return;
@@ -1737,11 +1749,11 @@ impl MeshWorkspace {
                     make_active = Some(o.id);
                 }
                 if r.double_clicked() {
-                    renaming = Some(o.id);
+                    renaming = Some((o.id, o.name.clone(), false));
                 }
                 r.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
-                        renaming = Some(o.id);
+                        renaming = Some((o.id, o.name.clone(), false));
                         ui.close();
                     }
                     if ui.button("Show only this").clicked() {
@@ -1785,10 +1797,10 @@ impl MeshWorkspace {
             self.scene.active = Some(id);
         }
         ui.ctx().data_mut(|d| match renaming {
-            Some(id) => {
-                d.insert_temp(rename_id, id);
+            Some(r) => {
+                d.insert_temp(rename_id, r);
             }
-            None => d.remove::<ObjectId>(rename_id),
+            None => d.remove::<(ObjectId, String, bool)>(rename_id),
         });
         if let Some(id) = solo {
             for o in self.scene.objects.iter_mut() {

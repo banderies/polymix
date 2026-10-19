@@ -87,11 +87,16 @@ impl SegmentationWorkspace {
                     redraw = true;
                 }
                 match &mut self.renaming {
-                    Some((r, name)) if *r == k => {
+                    Some((r, name, focused)) if *r == k => {
                         let edit = ui.add(egui::TextEdit::singleline(name).desired_width(120.0));
-                        edit.request_focus();
-                        if edit.lost_focus() {
-                            if !name.trim().is_empty() {
+                        // Focus once only: Enter, Esc (keeps the old name), Tab or a click
+                        // elsewhere then ends the rename (egui's focus, not `has_focus`, which
+                        // is also false while another app is in front).
+                        if !*focused {
+                            edit.request_focus();
+                            *focused = true;
+                        } else if !ui.memory(|m| m.has_focus(edit.id)) {
+                            if !name.trim().is_empty() && !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 s.name = name.trim().to_string();
                                 redraw = true;
                             }
@@ -104,7 +109,7 @@ impl SegmentationWorkspace {
                             seg.selected = Some(k);
                         }
                         if r.double_clicked() {
-                            self.renaming = Some((k, seg.segments[k].name.clone()));
+                            self.renaming = Some((k, seg.segments[k].name.clone(), false));
                         }
                     }
                 }

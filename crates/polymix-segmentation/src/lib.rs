@@ -172,7 +172,9 @@ pub struct SegmentationWorkspace {
     pending: Option<(Source, Volume)>,
     /// A selection the user chose not to switch to.
     declined: Option<Source>,
-    renaming: Option<(usize, String)>,
+    /// The segment being renamed, the name typed so far and whether its field has had the
+    /// keyboard focus.
+    renaming: Option<(usize, String, bool)>,
 }
 
 impl SegmentationWorkspace {
