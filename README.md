@@ -78,7 +78,7 @@ tools (typed settings such as Remesh's edge length, clicks on the model, or any 
 buttons and sliders), undo, and open and export files. Use it to debug Polymix or to have an
 agent help with the data on screen. To turn it on, click **Agents** at the right of the tab
 bar, tick *Let AI agents read this session* (and *Let agents make changes* if you want them
-to), then run the `claude mcp add …` command it copies.
+to), then press **Add to Claude Code**.
 
 The server listens on this computer only and needs a token. Every change an agent makes is an
 undo step labelled "Agent: …". Patient identifiers are always masked for agents and dates are

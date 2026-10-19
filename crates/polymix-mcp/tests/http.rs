@@ -11,7 +11,7 @@ const TOKEN: &str = "test-token";
 
 fn start() -> Server {
     let tools = ["echo", "later", "fails", "ignored"].map(|n| ToolSpec { name: n.into(), description: format!("{n} tool"), input_schema: json!({"type": "object", "properties": {"x": {"type": "integer"}}}), read_only: true, destructive: false });
-    let config = Config { port: 0, token: TOKEN.into(), timeout: Duration::from_millis(500), instructions: "test server".into() };
+    let config = Config { port: 0, token: Some(TOKEN.into()), timeout: Duration::from_millis(500), instructions: "test server".into() };
     Server::start(config, tools.to_vec(), || {}).expect("server starts")
 }
 
@@ -169,7 +169,16 @@ fn stateless_protocol() {
 #[test]
 fn port_in_use_is_reported() {
     let a = start();
-    let config = Config { port: a.addr().port(), token: TOKEN.into(), timeout: Duration::from_secs(1), instructions: String::new() };
+    let config = Config { port: a.addr().port(), token: Some(TOKEN.into()), timeout: Duration::from_secs(1), instructions: String::new() };
     let err = Server::start(config, vec![], || {}).err().expect("second server on the same port fails");
     assert!(err.to_string().contains("in use"), "{err}");
+}
+
+#[test]
+fn without_a_token_any_local_program_connects_but_web_pages_still_cannot() {
+    let config = Config { port: 0, token: None, timeout: Duration::from_millis(500), instructions: String::new() };
+    let server = Server::start(config, vec![], || {}).expect("server starts");
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}});
+    assert_eq!(post(server.addr(), &init, &[]).0, 200);
+    assert_eq!(post(server.addr(), &init, &[("Origin", "https://evil.example")]).0, 403);
 }

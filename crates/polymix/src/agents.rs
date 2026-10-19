@@ -2,14 +2,17 @@
 //! token, the Agents window, the app-wide tools (`app_status`, `app_screenshot`, `app_log`)
 //! and the privacy pass over everything agents are sent.
 //!
-//! Off by default. On, it listens on 127.0.0.1 and needs a token kept in the data folder
-//! (`agent-token`), so only programs of this user on this computer can connect. Agents read;
+//! Off by default. On, it listens on 127.0.0.1 and (unless the user turns it off) needs a token
+//! kept in the data folder (`agent-token`), so only programs of this user on this computer can
+//! connect; web pages never can. *Add to Claude Code* registers it with the `claude` command
+//! for all the user's projects. Agents read;
 //! they change things only once the user also ticks *Let agents make changes*, and every
 //! change is an undo step labelled "Agent: …". `POLYMIX_MCP=1` turns access on for one
 //! session (scripted runs, development), `POLYMIX_MCP_WRITE=1` changes too; `POLYMIX_MCP_PORT`
 //! picks the port.
 
 use polymix_mcp::{Reply, Server, ToolSpec};
+use polymix_workspace::jobs::Job;
 use polymix_workspace::agent::{AgentReply, AgentTool, ToolKind};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -158,6 +161,79 @@ pub fn png(img: &egui::ColorImage, max_side: usize) -> Reply {
     }
 }
 
+/// `claude` arguments that register Polymix with Claude Code for all projects. The header
+/// comes last: `--header` takes every value after it.
+fn claude_args(url: &str, token: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = ["mcp", "add", "--transport", "http", "--scope", "user", "polymix", url].map(String::from).to_vec();
+    if let Some(t) = token {
+        a.extend(["--header".to_string(), format!("Authorization: Bearer {t}")]);
+    }
+    a
+}
+
+/// The same as a command to paste into a terminal.
+fn claude_command(url: &str, token: Option<&str>) -> String {
+    claude_args(url, token).iter().fold("claude".to_string(), |c, a| if a.contains(' ') { format!("{c} \"{a}\"") } else { format!("{c} {a}") })
+}
+
+/// Run `cmd`, giving up after `timeout` (a login shell's profile could hang).
+fn run_for(cmd: &mut std::process::Command, timeout: Duration) -> anyhow::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let start = std::time::Instant::now();
+    while child.try_wait()?.is_none() {
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            anyhow::bail!("timed out");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(child.wait_with_output()?)
+}
+
+/// Claude Code's `claude` command. Apps opened from the Finder get a bare PATH, so its usual
+/// install places and the login shell's PATH are searched too.
+fn find_claude() -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.extend([".local/bin", ".claude/local", ".npm-global/bin", ".bun/bin", ".volta/bin"].map(|d| home.join(d)));
+    }
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    if let Some(p) = dirs.iter().map(|d| d.join(exe)).find(|p| p.is_file()) {
+        return Some(p);
+    }
+    // nvm and the like set PATH in shell profiles.
+    let shell = std::env::var("SHELL").ok().filter(|_| cfg!(unix))?;
+    ["-lc", "-ilc"].into_iter().find_map(|flags| {
+        let out = run_for(std::process::Command::new(&shell).args([flags, "command -v claude"]), Duration::from_secs(10)).ok()?;
+        String::from_utf8_lossy(&out.stdout).lines().rev().map(|l| PathBuf::from(l.trim())).find(|p| p.is_absolute() && p.is_file())
+    })
+}
+
+/// Register Polymix with Claude Code for all projects, replacing an earlier registration.
+fn add_to_claude(url: &str, token: Option<&str>) -> anyhow::Result<String> {
+    let claude = find_claude().ok_or_else(|| anyhow::anyhow!("Claude Code's claude command was not found: install Claude Code, or copy the command below into a terminal"))?;
+    // Whatever `claude` needs (node, for npm installs) is most likely next to it.
+    let mut path: Vec<PathBuf> = claude.parent().map(PathBuf::from).into_iter().chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from)).collect();
+    path.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
+    let path = std::env::join_paths(path)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let claude_cmd = || {
+        let mut c = std::process::Command::new(&claude);
+        c.env("PATH", &path).current_dir(&home);
+        c
+    };
+    // Adding over an existing registration fails: remove it first (there may be none).
+    let _ = run_for(claude_cmd().args(["mcp", "remove", "polymix", "--scope", "user"]), Duration::from_secs(30));
+    let out = run_for(claude_cmd().args(claude_args(url, token)), Duration::from_secs(30))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr }).trim().to_string();
+        anyhow::bail!("claude mcp add failed: {why}");
+    }
+    Ok("Added to Claude Code for all your projects. Start a new Claude Code session to use it.".into())
+}
+
 /// The token file in the data folder.
 fn token_path() -> Option<PathBuf> {
     polymix_workspace::data_dir().map(|d| d.join("agent-token"))
@@ -190,6 +266,14 @@ pub struct AgentAccess {
     /// Agents may change things (tools other than [`ToolKind::Read`]).
     allow_changes: bool,
     port: u16,
+    /// Clients must send the token (otherwise any local program may connect; web pages never).
+    require_token: bool,
+    /// What *Add to Claude Code* last registered ("port:token start"), to notice when Claude
+    /// Code needs updating.
+    claude_setup: Option<String>,
+    claude_job: Option<Job<String>>,
+    /// The last *Add to Claude Code* outcome, and whether it failed.
+    claude_message: Option<(String, bool)>,
     /// Turned on by `POLYMIX_MCP` for this session only: never saved.
     from_env: bool,
     tools: Vec<ToolSpec>,
@@ -210,6 +294,10 @@ impl AgentAccess {
             enabled: env_on || stored("agents.enabled").is_some_and(|v| v == "1"),
             allow_changes: env_write || stored("agents.changes").is_some_and(|v| v == "1"),
             port: env_port.or_else(|| stored("agents.port").and_then(|p| p.parse().ok())).unwrap_or(polymix_mcp::DEFAULT_PORT),
+            require_token: stored("agents.require_token").is_none_or(|v| v != "0"),
+            claude_setup: stored("agents.claude_setup").filter(|s| !s.is_empty()),
+            claude_job: None,
+            claude_message: None,
             from_env: env_on || env_write || env_port.is_some(),
             kinds: tools.iter().map(|t| (t.name.to_string(), t.kind)).collect(),
             tools: tools.into_iter().map(spec).collect(),
@@ -244,7 +332,7 @@ impl AgentAccess {
     fn start(&mut self, ctx: &egui::Context, fresh_token: bool) {
         self.server = None;
         self.error = None;
-        let token = match load_token(fresh_token) {
+        let token = match self.require_token.then(|| load_token(fresh_token)).transpose() {
             Ok(t) => t,
             Err(e) => {
                 self.error = Some(format!("No token: {e}"));
@@ -257,7 +345,7 @@ impl AgentAccess {
             Ok(s) => {
                 log::info!("agent access on at {}", s.url());
                 self.server = Some(s);
-                self.token = Some(token);
+                self.token = token;
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -280,6 +368,13 @@ impl AgentAccess {
         storage.set_string("agents.enabled", if self.enabled { "1" } else { "0" }.into());
         storage.set_string("agents.changes", if self.allow_changes { "1" } else { "0" }.into());
         storage.set_string("agents.port", self.port.to_string());
+        storage.set_string("agents.require_token", if self.require_token { "1" } else { "0" }.into());
+        storage.set_string("agents.claude_setup", self.claude_setup.clone().unwrap_or_default());
+    }
+
+    /// The running setup as *Add to Claude Code* registers it.
+    fn setup(&self) -> String {
+        format!("{}:{}", self.port, self.token.as_deref().map_or("none", |t| &t[..8]))
     }
 
     /// Seconds since the last call, if any.
@@ -313,6 +408,17 @@ impl AgentAccess {
         let mut open = true;
         // Under the Agents button, clear of the workspace tabs.
         let corner = ctx.content_rect().right_top() + egui::vec2(-8.0, 34.0);
+        if let Some(r) = self.claude_job.as_ref().and_then(|j| j.poll()) {
+            self.claude_job = None;
+            self.claude_message = Some(match r {
+                Ok(msg) => {
+                    self.claude_setup = Some(self.setup());
+                    (msg, false)
+                }
+                Err(e) => (format!("{e:#}"), true),
+            });
+        }
+        let mut restart = false;
         egui::Window::new("Agent access").open(&mut open).collapsible(false).resizable(false).default_width(460.0).pivot(egui::Align2::RIGHT_TOP).default_pos(corner).show(ctx, |ui| {
             ui.set_max_width(460.0);
             let mut on = self.enabled;
@@ -328,6 +434,11 @@ impl AgentAccess {
             ui.add_enabled_ui(self.enabled, |ui| {
                 ui.checkbox(&mut self.allow_changes, "Let agents make changes")
                     .on_hover_text("Select, edit, run tools, open and export files, work the panels. Each change is an undo step labelled \"Agent: …\"; the workspace being changed is shown.");
+                restart = ui
+                    .checkbox(&mut self.require_token, "Require a token")
+                    .on_hover_text("On: only programs given the token (in Polymix's data folder, readable by you only) can connect, so not other user accounts on this Mac or sandboxed apps. Off: any program on this computer can. Web pages never can.")
+                    .changed()
+                    && self.server.is_some();
             });
             ui.add_enabled_ui(self.server.is_none(), |ui| {
                 ui.horizontal(|ui| {
@@ -339,25 +450,56 @@ impl AgentAccess {
                 ui.colored_label(egui::Color32::from_rgb(240, 150, 80), format!("⚠ {e}"));
             }
             let mut new_token = false;
-            if let (Some(s), Some(token)) = (&self.server, self.token.clone()) {
+            if let Some(s) = &self.server {
                 let url = s.url();
-                let command = format!("claude mcp add --transport http polymix {url} --header \"Authorization: Bearer {token}\"");
+                let token = self.token.clone();
                 ui.add_space(6.0);
-                ui.label("Connect Claude Code (run once in a terminal):");
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("claude mcp add --transport http polymix {url} --header \"Authorization: Bearer {}…\"", &token[..8])).monospace().small());
+                    let busy = self.claude_job.is_some();
+                    let stale = self.claude_setup.as_ref().is_some_and(|c| *c != self.setup());
+                    let label = if stale { "Update Claude Code" } else { "Add to Claude Code" };
+                    if ui.add_enabled(!busy, egui::Button::new(label)).on_hover_text("Registers Polymix with Claude Code for all your projects (claude mcp add --scope user), replacing an earlier registration").clicked() {
+                        let (url, token) = (url.clone(), token.clone());
+                        self.claude_message = None;
+                        self.claude_job = Some(Job::spawn("Adding to Claude Code", ctx.clone(), move |_| add_to_claude(&url, token.as_deref())));
+                    }
+                    if busy {
+                        ui.spinner();
+                    } else if stale {
+                        ui.colored_label(egui::Color32::from_rgb(240, 150, 80), "Claude Code has an older port or token");
+                    } else if self.claude_setup.is_some() && self.claude_message.is_none() {
+                        ui.weak("Added for all your projects");
+                    }
                 });
+                let stale = self.claude_setup.as_ref().is_some_and(|c| *c != self.setup());
+                match &self.claude_message {
+                    Some((msg, true)) => {
+                        ui.colored_label(egui::Color32::from_rgb(240, 150, 80), format!("⚠ {msg}"));
+                    }
+                    // A success that no longer holds is not shown.
+                    Some((msg, false)) if !stale => {
+                        ui.weak(msg);
+                    }
+                    _ => {}
+                }
+                ui.add_space(4.0);
+                ui.label("Other MCP clients, or by hand in a terminal:");
+                // The token shortened on screen; Copy command has it whole.
+                let shown = claude_command(&url, token.as_deref().map(|t| format!("{}…", &t[..8])).as_deref());
+                ui.label(egui::RichText::new(shown).monospace().small());
                 ui.horizontal(|ui| {
                     if ui.button("Copy command").clicked() {
-                        ctx.copy_text(command);
+                        ctx.copy_text(claude_command(&url, token.as_deref()));
                     }
                     if ui.button("Copy URL").clicked() {
                         ctx.copy_text(url.clone());
                     }
-                    if ui.button("Copy token").on_hover_text("Other clients: send it as Authorization: Bearer <token>").clicked() {
-                        ctx.copy_text(token.clone());
+                    if let Some(t) = &token {
+                        if ui.button("Copy token").on_hover_text("Other clients: send it as Authorization: Bearer <token>").clicked() {
+                            ctx.copy_text(t.clone());
+                        }
+                        new_token = ui.button("New token").on_hover_text("Clients set up with the old token stop working until updated").clicked();
                     }
-                    new_token = ui.button("New token").on_hover_text("Clients set up with the old token stop working").clicked();
                 });
             }
             if new_token {
@@ -390,6 +532,9 @@ impl AgentAccess {
                 }
             }
         });
+        if restart {
+            self.start(ctx, false);
+        }
         if !open {
             self.show_window = false;
         }
@@ -446,6 +591,15 @@ mod catalog_tests {
             }
         }
         use polymix_workspace::Workspace;
+    }
+
+    #[test]
+    fn claude_commands() {
+        let url = "http://127.0.0.1:47390/mcp";
+        assert_eq!(claude_command(url, None), "claude mcp add --transport http --scope user polymix http://127.0.0.1:47390/mcp");
+        assert_eq!(claude_command(url, Some("abc")), "claude mcp add --transport http --scope user polymix http://127.0.0.1:47390/mcp --header \"Authorization: Bearer abc\"");
+        // The header goes last: --header takes every value after it.
+        assert_eq!(claude_args(url, Some("abc")).last().unwrap(), "Authorization: Bearer abc");
     }
 
     #[test]

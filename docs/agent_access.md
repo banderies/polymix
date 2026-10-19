@@ -14,15 +14,20 @@ Tick *Let agents make changes* as well if agents may change things. The button's
 while agents can connect, and blue for a moment after each call. Polymix remembers both
 settings.
 
-To connect Claude Code, press *Copy command* and run it once in a terminal:
+To connect Claude Code, press **Add to Claude Code**. It registers Polymix for all your
+projects with Claude Code's `claude` command, and a new Claude Code session then has the
+tools. Polymix looks for `claude` in the usual install places and in your login shell's
+`PATH`, since apps opened from the Finder get a bare `PATH`. When the port or token changes,
+the button becomes **Update Claude Code**.
+
+The same by hand, or for another MCP client, uses *Copy command*, *Copy URL* and *Copy token*:
 
 ```sh
-claude mcp add --transport http polymix http://127.0.0.1:47390/mcp --header "Authorization: Bearer <token>"
+claude mcp add --transport http --scope user polymix http://127.0.0.1:47390/mcp --header "Authorization: Bearer <token>"
 ```
 
-Other clients need the URL and the token (*Copy URL*, *Copy token*), sent as
-`Authorization: Bearer <token>`. *New token* replaces the token, and clients set up with the
-old one stop working.
+*New token* replaces the token, and clients set up with the old one stop working until they
+are updated.
 
 For development and scripted runs:
 - `POLYMIX_MCP=1` turns access on for one session without saving it.
@@ -131,11 +136,15 @@ masked.
 ## Security
 
 - Off by default. When on, Polymix listens on 127.0.0.1 only.
-- Every request needs the bearer token. The token is kept in the data folder (`agent-token`,
-  readable by this user only).
-- Requests from web pages are refused (anything with an `Origin` header), and so is any `Host`
-  that is not a loopback name. A site open in a browser therefore cannot reach the server,
-  even by DNS rebinding.
+- Requests from web pages are always refused (anything with an `Origin` header), and so is any
+  `Host` that is not a loopback name. A site open in a browser therefore cannot reach the
+  server, even by DNS rebinding.
+- With *Require a token* on (the default), every request needs the bearer token. The token is
+  kept in the data folder (`agent-token`, readable by this user only). It keeps out other user
+  accounts on the same computer, and sandboxed apps that may connect to the network but not
+  read your files. Programs running as you can read the token file, as they can read your
+  images, so on a single-user Mac turning it off costs little. Without it, the server works
+  like most local MCP servers: any program on this computer can connect.
 - Changes need a second, separate permission, and agents cannot grant it to themselves.
 
 ## How it works

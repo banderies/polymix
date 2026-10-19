@@ -7,9 +7,9 @@
 //! the UI thread snapshotted but should not wait on (statistics of a big mesh, PNG encoding),
 //! which then runs on a worker thread here.
 //!
-//! It listens on 127.0.0.1 only and every request needs the bearer token. Requests from web
-//! pages (anything carrying an `Origin` header) and with a non-local `Host` are refused, so a
-//! site open in a browser cannot reach it (DNS rebinding).
+//! It listens on 127.0.0.1 only. With a token configured, every request must carry it.
+//! Requests from web pages (anything carrying an `Origin` header) and with a non-local `Host`
+//! are always refused, so a site open in a browser cannot reach it (DNS rebinding).
 
 use base64::Engine;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations};
@@ -86,8 +86,8 @@ pub struct CallRecord {
 pub struct Config {
     /// 0 picks a free port (tests).
     pub port: u16,
-    /// Bearer token every request must carry.
-    pub token: String,
+    /// Bearer token every request must carry (`None`: any local program may connect).
+    pub token: Option<String>,
     /// How long a call waits for the UI thread before the agent is told the app is busy.
     pub timeout: Duration,
     /// Shown to agents when they connect: what the server is and how to use it.
@@ -203,7 +203,8 @@ fn tool(spec: &ToolSpec) -> Tool {
     Tool::new(spec.name.clone(), spec.description.clone(), schema).with_annotations(annotations)
 }
 
-async fn require_token(axum::extract::State(token): axum::extract::State<Arc<String>>, req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+async fn require_token(axum::extract::State(token): axum::extract::State<Arc<Option<String>>>, req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let Some(token) = token.as_deref() else { return next.run(req).await };
     let given = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
     if given.is_some_and(|g| same(g.as_bytes(), token.as_bytes())) {
         return next.run(req).await;
