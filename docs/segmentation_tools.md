@@ -119,7 +119,8 @@ needs the left button takes it (`SliceOptions::left_drag_scrolls = false` →
 
 Image → image. Each result is a Derived volume (with where it came from, e.g. "N4 of Series 8")
 that the Segmentation tab can segment. **Engine** is GUI-free code (`mm-volume` or a new
-crate), **UI** the Volume tab.
+crate), **UI** the Volume tab. Parked ideas (slice geometry regularization, CT padding, CTA bone
+removal, TOF slab correction, skull stripping, …): [future_work.md](future_work.md).
 
 | Tool | Engine | UI | Notes |
 |---|---|---|---|

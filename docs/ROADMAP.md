@@ -261,3 +261,4 @@ the Volume tab and the viewer features they share), with engine and UI status:
 - **DICOM extras**: Siemens mosaics, DICOM SEG and RT structure sets, High-Throughput JPEG
   2000, DICOMDIR records.
 - **More formats**: see [volume_formats.md](volume_formats.md).
+- **More image preparation**: see [future_work.md](future_work.md).
