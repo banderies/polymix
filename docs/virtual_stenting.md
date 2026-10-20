@@ -30,7 +30,7 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   |---|---|
   | Straightness | 0 %: the stent follows the vessel's centerline. 100 %: it takes the smoothest path between the two ends (where a free stent held at both would settle). In between, a blend. Where the stent grips the wall, the vessel moves with it. |
   | Smoothest path G0 / G1 / G2 | How that path meets the ends. **G0**: a straight line between their centres. **G1**: leaves each end square to its cross-section. **G2**: also continues the vessel's bend there. |
-  | Stiffness | Radial force. Along the stent the lumen becomes a round tube whose diameter lies this share of the way from the vessel's own to the stent's: a 2 mm vessel, a 6 mm stent and 50 % give 4 mm. 100 %: a perfect tube of the stent's diameter. 0 %: the vessel keeps its shape. Wall wider than the stent is never pulled in (unless covered). |
+  | Stiffness | Radial force. Along the stent, in each direction across it, the lumen lies this share of the way from the vessel's own wall to the stent's radius: a 2 mm vessel, a 6 mm stent and 50 % give 4 mm. So the vessel's shape eases into the round stent: 100 %, a perfect tube of the stent's diameter; 0 %, the vessel as it is. Wall wider than the stent is never pulled in (unless covered). |
   | End blend | How far past each end of the stent the opened wall eases back to its own shape. |
   | Covered (stent graft) | The lumen along the stent becomes the stent's tube; see below. |
   | Remesh the reshaped wall | Even triangles where the wall was stretched or squeezed (recommended for CFD). |
@@ -40,6 +40,8 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   wireframe and its ends in orange. **Apply** (or Enter) keeps it.
 - **Readouts:**
   - the centerline length between the ends, and the stent axis' length between them;
+  - the minimal lumen diameter between the ends: the largest sphere inside the lumen at its
+    narrowest (the standard measure of a stenosis);
   - how far the stent reaches past (or stops short of) each end;
   - the narrowest lumen diameter before → after;
   - for a covered stent, the side-branch ends it sealed off.
@@ -59,20 +61,24 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   anything else joined near it follow with distance along the surface.
 - The path is smoothed over half the vessel's radius. Rings kink by open ends and at
   junctions.
-- **Centred in the lumen between the ends.** Ring centroids can lie millimetres off the
-  lumen's centre, even outside it, through a stenosis that bends or narrows eccentrically.
-  The stent would then push the wall open about a point outside the vessel and fold it onto
-  itself. So between the ends the path moves to the lumen's centre:
-  - it is resampled densely enough to follow a narrow channel;
-  - each point goes to the centre of the cross-section square to the path there: its
-    centroid if well inside, else the centre of the largest circle inside (a crescent's
-    centroid is outside it). About that centre, cross-sections are star-shaped, as the push
-    needs;
-  - where no outline is found, or the nearest belongs to another vessel, the move is
-    interpolated from the neighbours';
-  - only lumens about as narrow as the ends move it (a wide chamber's centre says nothing
-    about the vessel's course);
-  - the moves are smoothed over the lumen's radius and ease out just past each end.
+- **Through the centres of inscribed spheres between the ends.** Ring centroids can lie
+  millimetres off the lumen's centre, even outside it, through a stenosis that bends or
+  narrows eccentrically. So between the ends the path is the lumen's centerline through the
+  centres of the largest spheres inside it, as VMTK's Voronoi centerlines run
+  (`centerline::inscribed_path`):
+  - The lumen is voxelized in a tube a few radii around the traced path (inside by the parity
+    of ray crossings, the mesh's open ends capped), and each voxel gets its distance to the
+    wall (an exact distance transform).
+  - The path is the cheapest between the deepest voxels near the two ends, each step costing
+    1 / distance², so it keeps to the middle and cannot wander into another vessel.
+  - It is smoothed, and each point climbs within its cross-section to where the wall is
+    farthest (exact distances, finer than the grid). Its radii are the spheres' radii, which
+    also give the minimal lumen diameter.
+  - Where the lumen does not connect the ends at the grid's resolution, the path is centred
+    on cross-sections instead (their centroids, or their largest inscribed circles).
+  - Where this centerline meets the traced one at each end (the deepest point of the lumen
+    near the end can lie a little aside), the two are eased together over one and a half of
+    the vessel's radii there, so the path has no corner.
 - The stent's ends are where this path crosses each end's plane: the lumen's centre there.
 
 ### Placement (`place_stent`)
@@ -109,15 +115,24 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
 2. **Carry.** Each slice of gripped vessel is carried from the centerline onto the stent's
    axis (and past the ends onto the return path). It turns to face along the new path, so
    the vessel straightens with the stent without shearing.
+   - Where the centerline turns tighter than the wall's distance from it (it jogs through an
+     eccentric narrowing, or bends sharply), wall a few millimetres off it can be nearer one
+     slice or another from one vertex to the next, and the two would be carried apart: a
+     step in the wall. So where the carry would more than double (or halve) an edge, a zone
+     around it takes moves interpolated smoothly from the zone's rim (a harmonic fill),
+     widened until no edge there is torn. The step becomes a smooth change a few
+     millimetres wide; the rest of the carry is untouched.
 3. **Remesh the carry.** Triangles stretched or squeezed by more than 10 % by the carry,
    plus two rings around them, are remeshed to the region's mean edge length.
 4. **Join the stent's tube.** The new lumen is the old one joined with the stent's tube (an
    exact mesh union), so the vessel takes the stent's own surface where the stent opens it:
-   - The tube is lofted from round rings square to the stent's axis, about one edge length
-     apart. Each ring's diameter lies *stiffness*'s share of the way from the native lumen's to
-     the stent's, never wider than the stent. The native lumen there is the widest circle about
-     the axis inside the (straightened) wall, so at 0 % nothing opens. Below 100 % the rings
-     are smoothed a little along the stent, against measuring jitter.
+   - The tube is lofted from rings square to the stent's axis, about one edge length apart.
+     In each direction across, a ring lies *stiffness*'s share of the way from the native wall
+     to the stent's radius, never beyond it: at 100 % a round tube, at 0 % the native lumen,
+     and in between the native shape easing into the round stent (shape-keeping). The native
+     outline is the straightened wall seen from the axis, smoothed a little around the ring
+     (±7°) and along the stent (a quarter of its radius) against the mesh's roughness, but
+     never beyond the wall, so at 0 % nothing opens.
    - Where the wall lies about at a ring (within half a percent of the radius, or twice the
      sag of the wall's own facets), the ring keeps just inside it there, so the two surfaces
      never run along one another (a union cannot join them). A ring opening the lumen by less
@@ -148,9 +163,12 @@ After the grip, carry and push:
 - The vessel is cut across at both ends of the stent.
 - Everything joined to the inside of the cuts is removed: the stented wall, and any aneurysm
   or side branch opening along it. Their open ends are counted as sealed off.
-- The stent's tube is built in its place from the same round rings as the bare stent's,
-  measured on the straightened vessel before the push. Wider wall is narrowed to the stent,
-  narrower wall is open as far as Stiffness allows.
+- The stent's tube is built in its place from the same rings as the bare stent's, measured on
+  the straightened vessel before the push. Wider wall is narrowed to the stent, narrower wall
+  is open as far as Stiffness allows, keeping its shape in between.
+- A graft whose end lands in a lumen far wider than itself is flared to the wall there over a
+  short distance, which can fold; with crossings, the tool says which end and suggests
+  shortening the stent or moving that end (see Future work: landing zones).
 - The tube flares into each cut over half a radius and is blended and remeshed into the
   vessel.
 - Both ends of a covered stent must lie inside the vessel. The covered stretch must not be
@@ -183,6 +201,9 @@ After the grip, carry and push:
   - no self-crossings, valid, consistently oriented meshes;
   - a narrowing entered by a lip that leans back opens with no crossings;
   - a vessel whose course jogs gets a stent axis bending no tighter than its diameter;
+  - at 50 % an elliptical narrowing opens half way each way across and stays elliptical;
+    at 100 % it is round;
+  - a carry torn into a step is evened out (no edge more than doubles), the rest unchanged;
   - outside the end blend, vertices keep their ids and positions;
   - local cross-sections: a point inside a lumen, and the widest point inside a crescent.
 - **App (`tools/stent.rs`):**
@@ -190,7 +211,8 @@ After the grip, carry and push:
     covered stents, centred, opened, no crossings, sharpest crease under 30°;
   - Measure's vessel diameters carry the stent's ends.
   - a trace that passes outside an eccentric narrowing is moved to the lumen's centre, stays
-    smooth, and is unchanged past the ends.
+    smooth, and is unchanged past the ends;
+  - the inscribed-sphere centerline finds an eccentric narrowing's centre and its radius.
 - **Ignored tests on local data**, printing counts and timings only:
   - `POLYMIX_STENT_MESH=<file>`: stents along the longest branch;
   - `POLYMIX_STENT_PROJECT=<.polymix>` with `POLYMIX_STENT_ENDS` (and optionally

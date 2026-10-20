@@ -2823,6 +2823,7 @@ dependencies = [
  "mm-io",
  "mm-remesh",
  "mm-repair",
+ "mm-segment",
  "mm-solid",
  "objc2 0.6.5",
  "png",

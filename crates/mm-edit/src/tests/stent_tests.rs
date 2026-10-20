@@ -163,6 +163,83 @@ fn the_stent_bends_no_tighter_than_its_diameter() {
 }
 
 #[test]
+fn partial_stiffness_keeps_the_lumens_shape() {
+    // A straight vessel of radius 3 narrowed at z = 30 to an ellipse of half-axes 1 (along x)
+    // and 2.5 (along y). A 6 mm stent at 50 % opens each way half way to its radius: about 2
+    // along x and 2.75 along y, still elliptical; at 100 % it is round.
+    let bump = |z: f64| (-((z - 30.0) / 4.0).powi(2)).exp();
+    let n = 64;
+    let mut pos = Vec::new();
+    let mut tris = Vec::new();
+    for k in 0..=240 {
+        let z = 0.25 * k as f64;
+        let (rx, ry) = (3.0 - 2.0 * bump(z), 3.0 - 0.5 * bump(z));
+        for j in 0..n {
+            let a = std::f64::consts::TAU * j as f64 / n as f64;
+            pos.push(DVec3::new(rx * a.cos(), ry * a.sin(), z));
+        }
+        if k > 0 {
+            let (p, q) = (((k - 1) * n) as u32, (k * n) as u32);
+            for j in 0..n as u32 {
+                let jn = (j + 1) % n as u32;
+                tris.push([p + j, p + jn, q + jn]);
+                tris.push([p + j, q + jn, q + j]);
+            }
+        }
+    }
+    let (m0, _) = Mesh::from_triangles(&pos, &tris, None);
+    let points: Vec<DVec3> = (0..=240).map(|k| straight(0.25 * k as f64)).collect();
+    let path = VesselPath { radii: vec![3.0; points.len()], points };
+    let half_widths = |m: &Mesh| {
+        let mid: Vec<DVec3> = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| (p.z - 30.0).abs() < 0.2).collect();
+        let along = |f: fn(DVec3) -> (f64, f64)| mid.iter().filter(|&&p| f(p).1.abs() < 0.25).map(|&p| f(p).0.abs()).fold(0.0, f64::max);
+        (along(|p| (p.x, p.y)), along(|p| (p.y, p.x)))
+    };
+    for (stiffness, want) in [(0.5, (2.0, 2.75)), (1.0, (3.0, 3.0))] {
+        let params = StentParams { stiffness, ..bare(6.0, 30.0) };
+        let mut m = m0.clone();
+        apply_stent(&mut m, &place_stent(&path, sections_at(&path, 15.0, 45.0), &params).unwrap(), &params, None).unwrap();
+        assert_valid(&m);
+        assert_eq!(crossings(&m), 0, "stiffness {stiffness}");
+        let (x, y) = half_widths(&m);
+        assert!((x - want.0).abs() < 0.12 && (y - want.1).abs() < 0.12, "stiffness {stiffness}: half-widths {x:.2} × {y:.2}, want {:.2} × {:.2}", want.0, want.1);
+    }
+}
+
+#[test]
+fn a_torn_move_is_evened_out() {
+    // A flat sheet 20 × 20 (edges 0.25) whose left half is moved 1 up and right half not: a
+    // step. Evened out, no edge more than doubles, and the sheet away from it keeps its moves.
+    let n = 81;
+    let pos: Vec<DVec3> = (0..n * n).map(|i| DVec3::new((i % n) as f64 * 0.25, (i / n) as f64 * 0.25, 0.0)).collect();
+    let mut tris = Vec::new();
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = (j * n + i) as u32;
+            tris.push([a, a + 1, a + n as u32 + 1]);
+            tris.push([a, a + n as u32 + 1, a + n as u32]);
+        }
+    }
+    let (m, _) = Mesh::from_triangles(&pos, &tris, None);
+    let mut moves: Vec<(u32, DVec3)> = m.vertex_ids().map(|v| (v, m.vertex(v) + if m.vertex(v).x < 10.0 { DVec3::Z } else { DVec3::ZERO })).collect();
+    crate::stent::relax(&m, &mut moves);
+    let moved: std::collections::HashMap<u32, DVec3> = moves.iter().copied().collect();
+    let worst = m.edge_ids().map(|e| {
+        let [a, b] = m.edge_vertices(e);
+        moved[&a].distance(moved[&b]) / m.vertex(a).distance(m.vertex(b)) - 1.0
+    }).fold(0.0, f64::max);
+    assert!(worst <= 1.0 + 1e-6, "an edge stretched by {:.0} %", 100.0 * worst);
+    for (&v, p) in &moved {
+        let x = m.vertex(v).x;
+        if x < 6.0 {
+            assert!((p.z - 1.0).abs() < 1e-9, "moved at x = {x}");
+        } else if x > 14.0 {
+            assert!(p.z.abs() < 1e-9, "moved at x = {x}");
+        }
+    }
+}
+
+#[test]
 fn smoothest_path_between_sections_on_an_arc_is_the_arc() {
     // Sections square to an arc: the G1 / G2 path of least bending is the arc itself, G0 the
     // chord.

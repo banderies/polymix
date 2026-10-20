@@ -56,11 +56,11 @@ struct StentUi {
     /// The smoothest path: G0 a straight line between the ends' centres, G1 leaving each end
     /// square to its cross-section, G2 also continuing the vessel's bend.
     continuity: EndContinuity,
-    /// 0..100 %: radial force. Along the stent the lumen becomes a round tube whose diameter
-    /// lies this share of the way from the native lumen's to the stent's (2 mm native, a 6 mm
-    /// stent and 50 % give 4 mm): 100 makes a perfect tube of the stent's diameter, 0 leaves
-    /// the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to
-    /// the tube.
+    /// 0..100 %: radial force. Along the stent, in each direction across it, the lumen lies
+    /// this share of the way from the vessel's own wall to the stent's radius (2 mm across
+    /// natively, a 6 mm stent and 50 % give 4 mm), so the vessel's shape eases into the round
+    /// stent: 100 makes a perfect tube of the stent's diameter, 0 leaves the vessel as it is.
+    /// A bare stent never pulls wider wall in; a covered one narrows it to the stent.
     stiffness: f64,
     /// How far past each end the wall eases back to its own shape, mm (0..10).
     end_blend: f64,
@@ -103,6 +103,9 @@ struct VesselTrace {
     owner: Vec<bool>,
     /// Centerline length between the sections.
     span: f64,
+    /// The minimal lumen diameter between the sections: the largest sphere inside the lumen
+    /// at its narrowest (where the inscribed-sphere centerline was found).
+    min_lumen: Option<f64>,
 }
 
 /// What a preview was made from: the sections (by revision) and the settings.
@@ -375,6 +378,12 @@ fn warnings(out: &StentOut) -> Vec<String> {
     if out.crossings > 0 {
         w.push(format!("The reshaped wall runs into itself ({} new crossings): lower the straightness or the stent's length.", out.crossings));
     }
+    // (Only with crossings: a wide landing often joins cleanly.)
+    for (e, &wide) in out.report.landing.iter().enumerate() {
+        if out.crossings > 0 && wide > 1.5 {
+            w.push(format!("End {} of the covered stent lands in a lumen {wide:.1}× its width, where its flare to the wall can fold (a real graft would leave a gap there): shorten the stent or move that end into vessel about the stent's size.", e + 1));
+        }
+    }
     if let Some(why) = &out.report.pushed {
         w.push(format!("The wall was pushed out to the stent rather than joined to its tube ({why}), so it may be uneven where it was narrowest."));
     }
@@ -445,10 +454,13 @@ fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTr
     let on_path: std::collections::HashSet<usize> = nodes.iter().copied().collect();
     let owner = cl.vertex_node.iter().map(|n| on_path.contains(n)).collect();
     let mut path = mm_edit::VesselPath { points: nodes.iter().map(|&i| pos(i)).collect(), radii: nodes.iter().map(|&i| cl.nodes[i].radius).collect() };
-    recentre(mesh, &mut path, sections);
+    let min_lumen = inscribed_between(mesh, &mut path, sections);
+    if min_lumen.is_none() {
+        recentre(mesh, &mut path, sections);
+    }
     let ends = [a, b].map(|s| crossing(&path.points, s.center, s.normal).filter(|c| c.distance(s.center) < 0.5 * s.diameter).unwrap_or(s.center));
     let span = path.span(ends.map(|center| mm_edit::StentSection { center, normal: DVec3::Z })).unwrap_or(0.0);
-    Ok(VesselTrace { path, ends, owner, span })
+    Ok(VesselTrace { path, ends, owner, span, min_lumen })
 }
 
 /// Where `path` crosses the plane through `c` square to `n`, nearest `c`.
@@ -459,6 +471,77 @@ fn crossing(path: &[DVec3], c: DVec3, n: DVec3) -> Option<DVec3> {
             (da * db <= 0.0 && da != db).then(|| w[0].lerp(w[1], da / (da - db)))
         })
         .min_by(|p, q| p.distance(c).total_cmp(&q.distance(c)))
+}
+
+/// Between the sections, replace the traced path by the lumen's centerline through the
+/// centres of the largest spheres inside it (see [`centerline::inscribed_path`]), with those
+/// spheres' radii. Returns the minimal lumen diameter there; `None` (the path unchanged) where
+/// the centerline cannot be found.
+fn inscribed_between(mesh: &Mesh, path: &mut mm_edit::VesselPath, sections: &[Section; 2]) -> Option<f64> {
+    let near = |c: DVec3| (0..path.points.len()).min_by(|&i, &j| path.points[i].distance(c).total_cmp(&path.points[j].distance(c)));
+    let (ia, ib) = (near(sections[0].center)?, near(sections[1].center)?);
+    let ((ia, a), (ib, b)) = if ia <= ib { ((ia, sections[0].center), (ib, sections[1].center)) } else { ((ib, sections[1].center), (ia, sections[0].center)) };
+    if ib <= ia {
+        return None;
+    }
+    let lumen = centerline::inscribed_path(mesh, &path.points[ia..=ib], &path.radii[ia..=ib], a, b)?;
+    let narrowest = 2.0 * lumen.radii.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut points: Vec<DVec3> = path.points[..ia].iter().chain(&lumen.points).chain(&path.points[ib + 1..]).copied().collect();
+    let radii: Vec<f64> = path.radii[..ia].iter().chain(&lumen.radii).chain(&path.radii[ib + 1..]).copied().collect();
+    // Where the traced path gives way to the lumen's centerline (at each end, the deepest point
+    // of the lumen near it, which can lie a little aside of the traced path), the two are
+    // eased together over about one and a half of the vessel's radii there: a corner in the
+    // path would turn the vessel's slices apart as the stent carries them.
+    let joins = [(ia, 0.5 * sections[0].diameter.max(sections[1].diameter.min(sections[0].diameter))), (ia + lumen.points.len() - 1, 0.5 * sections[1].diameter)];
+    for (j, radius) in joins {
+        ease_corner(&mut points, j, 1.5 * radius);
+    }
+    path.points = points;
+    path.radii = radii;
+    Some(narrowest)
+}
+
+/// Smooth `points` within `reach` (along the path) of point `j`, the points at that distance
+/// held, so a corner at `j` becomes a gentle bend.
+fn ease_corner(points: &mut [DVec3], j: usize, reach: f64) {
+    let n = points.len();
+    if n < 3 || j >= n {
+        return;
+    }
+    let (mut lo, mut d) = (j, 0.0);
+    while lo > 0 && d < reach {
+        d += points[lo].distance(points[lo - 1]);
+        lo -= 1;
+    }
+    let (mut hi, mut d) = (j, 0.0);
+    while hi + 1 < n && d < reach {
+        d += points[hi].distance(points[hi + 1]);
+        hi += 1;
+    }
+    if hi < lo + 2 {
+        return;
+    }
+    // Resampled evenly in between, then relaxed (the ends of the stretch fixed).
+    let stretch: Vec<DVec3> = points[lo..=hi].to_vec();
+    let mut cum = vec![0.0];
+    for w in stretch.windows(2) {
+        cum.push(cum[cum.len() - 1] + w[0].distance(w[1]));
+    }
+    let total = cum[cum.len() - 1].max(1e-12);
+    let at = |s: f64| {
+        let i = cum.partition_point(|&c| c <= s).clamp(1, cum.len() - 1) - 1;
+        let f = ((s - cum[i]) / (cum[i + 1] - cum[i]).max(1e-12)).clamp(0.0, 1.0);
+        stretch[i].lerp(stretch[i + 1], f)
+    };
+    let m = hi - lo;
+    let mut even: Vec<DVec3> = (0..=m).map(|i| at(total * i as f64 / m as f64)).collect();
+    for _ in 0..(4 * m).max(20) {
+        let old = even.clone();
+        for i in 1..m {
+            even[i] = old[i] * 0.5 + (old[i - 1] + old[i + 1]) * 0.25;
+        }
+    }
+    points[lo..=hi].copy_from_slice(&even);
 }
 
 /// Move the path to the lumen's centre between the sections (the stretch the stent treats).
@@ -801,6 +884,7 @@ impl Tool for StentTool {
                 _ => "wait for the preview (app_wait)",
             },
             "centerline_between_ends_mm": self.trace.as_ref().filter(|t| t.0 == self.revision).map(|t| round(t.2.span, 2)),
+            "minimal_lumen_mm": self.trace.as_ref().filter(|t| t.0 == self.revision).and_then(|t| t.2.min_lumen).map(|d| round(d, 2)),
             "sizes_follow_the_ends": {"diameter": !self.sized[0], "length": !self.sized[1]},
             "computing": self.trace_job.as_ref().map(|_| "tracing the centerline").or(self.job.as_ref().map(|_| "previewing")),
             "preview": current.map(|out| {
@@ -883,6 +967,9 @@ impl Tool for StentTool {
         });
         if let Some((_, _, t)) = self.trace.as_ref().filter(|t| t.0 == self.revision) {
             ui.label(format!("Centerline between the ends: {:.1} mm", t.span));
+            if let Some(d) = t.min_lumen {
+                ui.label(format!("Minimal lumen ⌀ {d:.2} mm")).on_hover_text("The largest sphere that fits inside the lumen at its narrowest, between the ends");
+            }
         }
         ui.separator();
         egui::Grid::new("stent_size").num_columns(2).show(ui, |ui| {
@@ -906,7 +993,7 @@ impl Tool for StentTool {
             ui.selectable_value(&mut self.ui.continuity, EndContinuity::G2, "G2").on_hover_text("Also continues the vessel's bend at each end");
         });
         ui.add(egui::Slider::new(&mut self.ui.stiffness, 0.0..=100.0).suffix("%").text("Stiffness"))
-            .on_hover_text("Radial force: along the stent the lumen becomes a round tube whose diameter lies this share of the way from the vessel's own to the stent's (2 mm vessel, 6 mm stent, 50 % → 4 mm). 100 % makes a perfect tube of the stent's diameter; 0 % leaves the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to the tube");
+            .on_hover_text("Radial force: along the stent, each way across, the lumen lies this share of the way from the vessel's own wall to the stent's radius (2 mm vessel, 6 mm stent, 50 % → 4 mm), so the vessel's shape eases into the round stent. 100 % makes a perfect tube of the stent's diameter; 0 % leaves the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to the stent");
         ui.add(egui::Slider::new(&mut self.ui.end_blend, 0.0..=10.0).suffix(" mm").text("End blend"))
             .on_hover_text("How far past each end of the stent the wall eases back to its own shape");
         ui.checkbox(&mut self.ui.covered, "Covered (stent graft)")
@@ -1285,8 +1372,39 @@ mod tests {
             })
             .collect();
         let sections = [sections[0].clone(), sections[1].clone()];
+        {
+            // The lumen's inscribed-sphere centerline between the ends, on its own.
+            let a = &sections[0];
+            let h = m.average_edge_length();
+            let n = a.normal.normalize();
+            let src: Vec<u32> = m.vertex_ids().filter(|&v| (m.vertex(v) - a.center).dot(n).abs() < h && a.ring.iter().any(|sg| point_segment_distance(m.vertex(v), sg[0], sg[1]) < h)).collect();
+            let cl = centerline::compute(&m, &src, 0.5 * a.diameter, &CenterlineParams::default());
+            let pts: Vec<DVec3> = cl.branches.iter().flat_map(|b| b.nodes.iter().map(|&i| cl.nodes[i].position)).collect();
+            let near = |c: DVec3| pts.iter().copied().min_by(|p, q| p.distance(c).total_cmp(&q.distance(c))).unwrap();
+            eprintln!("  (traced centerline: {} nodes; nearest to the ends {:.2} / {:.2} mm)", pts.len(), near(sections[0].center).distance(sections[0].center), near(sections[1].center).distance(sections[1].center));
+        }
         let t0 = std::time::Instant::now();
         let trace = trace_vessel(&m, &sections).unwrap();
+        {
+            let pts = &trace.path.points;
+            let ia = (0..pts.len()).min_by(|&i, &j| pts[i].distance(trace.ends[0]).total_cmp(&pts[j].distance(trace.ends[0]))).unwrap();
+            let ib = (0..pts.len()).min_by(|&i, &j| pts[i].distance(trace.ends[1]).total_cmp(&pts[j].distance(trace.ends[1]))).unwrap();
+            let (lo, hi) = (ia.min(ib), ia.max(ib));
+            let rmin = trace.path.radii[lo..=hi].iter().copied().fold(f64::INFINITY, f64::min);
+            let bvh2 = mm_core::Bvh::build(&m);
+            let outside = (lo..=hi).filter(|&i| {
+                let p = pts[i];
+                let t = (pts[(i + 1).min(pts.len() - 1)] - pts[i.saturating_sub(1)]).normalize();
+                let u = t.any_orthonormal_vector();
+                (0..12).filter(|k| {
+                    let a = *k as f64 * std::f64::consts::TAU / 12.0;
+                    let mut hits = Vec::new();
+                    bvh2.raycast_all(&m, &mm_core::Ray::new(p, u * a.cos() + t.cross(u) * a.sin()), &mut hits);
+                    hits.is_empty()
+                }).count() > 3
+            }).count();
+            eprintln!("  path between the ends: {} points, smallest radius {rmin:.3} mm (minimal lumen ⌀ {:.2}), {outside} points outside the lumen", hi - lo + 1, 2.0 * rmin);
+        }
         eprintln!("ends ⌀ {:.2} / {:.2}, span {:.2} mm, traced in {:.0} ms", sections[0].diameter, sections[1].diameter, trace.span, t0.elapsed().as_secs_f64() * 1e3);
         let d = std::env::var("POLYMIX_STENT_DIAMETER").ok().and_then(|l| l.parse().ok()).unwrap_or(((sections[0].diameter.max(sections[1].diameter) * 2.0).floor() / 2.0).max(0.5));
         let length = std::env::var("POLYMIX_STENT_LENGTH").ok().and_then(|l| l.parse().ok()).unwrap_or(((trace.span / 5.0).ceil() * 5.0).max(5.0));
@@ -1329,7 +1447,7 @@ mod tests {
                             row[3] += 1;
                         }
                     }
-                    eprintln!("  {label}: region {} triangles ({} valid), source region {}; pushed: {:?}", rep.triangles.len(), rep.triangles.iter().filter(|&&t| out.is_triangle(t)).count(), rep.source_triangles.len(), rep.pushed);
+                    eprintln!("  {label}: region {} triangles ({} valid), source region {}; pushed: {:?}; landing {:.2?}", rep.triangles.len(), rep.triangles.iter().filter(|&&t| out.is_triangle(t)).count(), rep.source_triangles.len(), rep.pushed, rep.landing);
                     {
                         // Where the sharpest creases are, by mm along the stent.
                         let set: std::collections::HashSet<u32> = rep.triangles.iter().copied().collect();
@@ -1346,6 +1464,93 @@ mod tests {
                         }).filter(|x| x.0 > 90.0).collect();
                         creases.sort_by(|a, b| b.0.total_cmp(&a.0));
                         eprintln!("  {label}: {} creases over 90°, sharpest at s {:?}", creases.len(), creases.iter().take(6).map(|c| format!("{:.1} ({:.0}°)", c.1, c.0)).collect::<Vec<_>>());
+                    }
+                    if label == "no remesh, no push" {
+                        // Where the move changes most sharply between neighbours (the carry only:
+                        // no push, no union), and where that lies along the stent's samples.
+                        let disp = |v: u32| out.vertex(v) - m.vertex(v);
+                        let mut worst: Vec<(f64, u32)> = m
+                            .vertex_ids()
+                            .filter(|&v| out.is_vertex(v))
+                            .map(|v| {
+                                let s = out.vertex_neighbors(v).into_iter().filter(|&u| m.is_vertex(u)).map(|u| (out.vertex(v).distance(out.vertex(u)) / m.vertex(v).distance(m.vertex(u)).max(1e-9) - 1.0).abs()).fold(0.0, f64::max);
+                                (s, v)
+                            })
+                            .collect();
+                        worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        eprintln!("  carry: samples run s {:.1}..{:.1} (margins {:.1?}, return bend {:.2?})", pl.s[0], pl.s[pl.s.len() - 1], pl.margins, pl.return_bend);
+                        for &(st, v) in worst.iter().take(4) {
+                            let i = (0..pl.s.len()).min_by(|&x, &y| pl.vessel[x].distance(m.vertex(v)).total_cmp(&pl.vessel[y].distance(m.vertex(v)))).unwrap();
+                            eprintln!("    edge stretched by {:.0} % at {:.2?}, moved {:.2?}, nearest sample s {:.1} (axis–vessel there {:.2}), the vessel's own {}", 100.0 * st, m.vertex(v), disp(v), pl.s[i], pl.axis[i].distance(pl.vessel[i]), trace.owner[v as usize]);
+                            for u in out.vertex_neighbors(v) {
+                                eprintln!("        neighbour {:.2?} moved {:.2?}, own {}", m.vertex(u), disp(u), trace.owner[u as usize]);
+                            }
+                        }
+                        // How sharply the vessel's course (as the carry uses it) turns.
+                        let k = pl.s.len();
+                        let mut turns: Vec<(f64, f64)> = (1..k - 1).map(|i| {
+                            let (a, b, c) = (pl.vessel[i - 1], pl.vessel[i], pl.vessel[i + 1]);
+                            let kappa = 2.0 * (b - a).cross(c - b).length() / (a.distance(b) * b.distance(c) * a.distance(c)).max(1e-12);
+                            (kappa * pl.vessel_radius[i], pl.s[i])
+                        }).collect();
+                        turns.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        eprintln!("  vessel course: sharpest radius × curvature {:?}", turns.iter().take(6).map(|t| format!("{:.2} at s {:.1}", t.0, t.1)).collect::<Vec<_>>());
+                        let raw = &trace.path.points;
+                        let mut rt: Vec<(f64, usize)> = (1..raw.len() - 1).map(|i| {
+                            let (a, b, c) = (raw[i - 1], raw[i], raw[i + 1]);
+                            ((b - a).angle_between(c - b).to_degrees(), i)
+                        }).collect();
+                        rt.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        eprintln!("  traced path ({} points): sharpest turns {:?}", raw.len(), rt.iter().take(6).map(|t| format!("{:.0}° at {:.1?} (step {:.2})", t.0, raw[t.1], raw[t.1].distance(raw[t.1 + 1]))).collect::<Vec<_>>());
+                        // Does the course come back near itself (far along it, close in space)?
+                        let mut closest = (f64::INFINITY, 0.0, 0.0);
+                        for i in 0..k {
+                            for j in i + 1..k {
+                                if pl.s[j] - pl.s[i] > 4.0 {
+                                    let d = pl.vessel[i].distance(pl.vessel[j]);
+                                    let gap = d / (pl.s[j] - pl.s[i]);
+                                    if gap < closest.0 {
+                                        closest = (gap, pl.s[i], pl.s[j]);
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("  course self-approach: straight distance over distance along {:.2} between s {:.1} and {:.1} (distance {:.2})", closest.0, closest.1, closest.2, {
+                            let i = pl.s.iter().position(|&x| x == closest.1).unwrap();
+                            let j = pl.s.iter().position(|&x| x == closest.2).unwrap();
+                            pl.vessel[i].distance(pl.vessel[j])
+                        });
+                        for i in (0..k).step_by(4) {
+                            if (-4.0..12.0).contains(&pl.s[i]) {
+                                eprintln!("    s {:>5.1}: vessel {:.2?} axis {:.2?} radius {:.2}", pl.s[i], pl.vessel[i], pl.axis[i], pl.vessel_radius[i]);
+                            }
+                        }
+                        let own = m.vertex_ids().filter(|&v| trace.owner[v as usize]).count();
+                        let near_axis = m.vertex_ids().filter(|&v| pl.axis.iter().any(|a| a.distance(m.vertex(v)) < 8.0)).collect::<Vec<_>>();
+                        eprintln!("  owner: {own} vertices are the vessel's own; within 8 mm of the axis {} of which not own {}", near_axis.len(), near_axis.iter().filter(|&&v| !trace.owner[v as usize]).count());
+                    }
+                    if let Ok(bx) = std::env::var("POLYMIX_DIFF_BOX") {
+                        // How the wall moved in the box (vertices kept by id), and the sharpest
+                        // change in that move between neighbours.
+                        let c: Vec<f64> = bx.split([',', ';']).map(|x| x.trim().parse().unwrap()).collect();
+                        let (lo, hi) = (DVec3::new(c[0], c[1], c[2]), DVec3::new(c[3], c[4], c[5]));
+                        let kept = |v: u32| m.is_vertex(v) && out.is_vertex(v) && out.vertex(v).distance(m.vertex(v)) < 20.0;
+                        let boxed: Vec<u32> = m.vertex_ids().filter(|&v| kept(v) && m.vertex(v).cmpge(lo).all() && m.vertex(v).cmple(hi).all()).collect();
+                        let disp = |v: u32| out.vertex(v) - m.vertex(v);
+                        let mx = boxed.iter().map(|&v| disp(v).length()).fold(0.0, f64::max);
+                        let mut worst = (0.0, 0u32, 0u32);
+                        for &v in &boxed {
+                            for u in out.vertex_neighbors(v) {
+                                if kept(u) {
+                                    let strain = (disp(v) - disp(u)).length() / m.vertex(v).distance(m.vertex(u)).max(1e-9);
+                                    if strain > worst.0 {
+                                        worst = (strain, v, u);
+                                    }
+                                }
+                            }
+                        }
+                        let i = (0..pl.s.len()).min_by(|&x, &y| pl.vessel[x].distance(m.vertex(worst.1)).total_cmp(&pl.vessel[y].distance(m.vertex(worst.1)))).unwrap();
+                        eprintln!("  {label}: box {} vertices, largest move {mx:.2}, sharpest change in move {:.2} (per mm) at {:.2?} (s {:.1} along the stent, which runs 0..{:.0})", boxed.len(), worst.0, m.vertex(worst.1), pl.s[i], pl.length);
                     }
                     eprintln!("  {label}: by mm along the stent: triangles, inside 0.9 r, facing the axis, slivers (height < 0.1 × longest edge)");
                     for (s, r) in rows {
@@ -1366,6 +1571,83 @@ mod tests {
                 }
                 Err(e) => eprintln!("{label}: failed: {e:#}"),
             }
+        }
+    }
+
+    /// Diagnostic (local only): compare `POLYMIX_DIFF_A` (a .polymix project's first object)
+    /// with `POLYMIX_DIFF_B` (an exported mesh) vertex by vertex, in the box
+    /// `POLYMIX_DIFF_BOX="x0,y0,z0;x1,y1,z1"`.
+    #[test]
+    #[ignore]
+    fn diff_meshes() {
+        let (Some(a), Some(b), Ok(bx)) = (std::env::var_os("POLYMIX_DIFF_A"), std::env::var_os("POLYMIX_DIFF_B"), std::env::var("POLYMIX_DIFF_BOX")) else { return };
+        let m0 = crate::project::load(std::path::Path::new(&a)).unwrap().objects[0].mesh.clone();
+        let mut m1 = mm_io::read_mesh(std::path::Path::new(&b)).unwrap().mesh;
+        // Exported with Z and Y flipped.
+        if std::env::var_os("POLYMIX_DIFF_FLIP").is_some() {
+            m1.transform(|p| DVec3::new(p.x, p.z, -p.y));
+        }
+        let c: Vec<f64> = bx.split([',', ';']).map(|x| x.trim().parse().unwrap()).collect();
+        let (lo, hi) = (DVec3::new(c[0], c[1], c[2]), DVec3::new(c[3], c[4], c[5]));
+        eprintln!("bounds A {:.2?}..{:.2?} | B {:.2?}..{:.2?}", m0.bounds().min, m0.bounds().max, m1.bounds().min, m1.bounds().max);
+        eprintln!("first vertices A {:.3?} {:.3?} | B {:.3?} {:.3?}", m0.vertex(0), m0.vertex(1), m1.vertex(0), m1.vertex(1));
+        let n = m0.vertex_count().min(m1.vertex_count());
+        let same = (0..n as u32).filter(|&v| m0.vertex(v).distance(m1.vertex(v)) < 1e-4).count();
+        let moved: Vec<u32> = (0..n as u32).filter(|&v| m0.vertex(v).distance(m1.vertex(v)) > 1e-3).collect();
+        let new_place = (0..n as u32).filter(|&v| m0.vertex(v).distance(m1.vertex(v)) > 5.0).count();
+        let (ml, mh) = moved.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(l, h), &v| (l.min(m0.vertex(v)), h.max(m0.vertex(v))));
+        eprintln!("{} / {} vertices; identical by index {same}; moved > 1 µm: {} within {ml:.1?}..{mh:.1?}; over 5 mm (slots reused): {new_place}", m0.vertex_count(), m1.vertex_count(), moved.len());
+        // Which of B's vertices are A's, untouched (same position, to float precision).
+        let key = |p: DVec3| [p.x as f32, p.y as f32, p.z as f32].map(f32::to_bits);
+        let orig: std::collections::HashSet<[u32; 3]> = m0.vertex_ids().map(|v| key(m0.vertex(v))).collect();
+        let untouched = |v: u32| orig.contains(&key(m1.vertex(v)));
+        let changed: Vec<u32> = m1.vertex_ids().filter(|&v| !untouched(v)).collect();
+        let (cl, ch) = changed.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(l, h), &v| (l.min(m1.vertex(v)), h.max(m1.vertex(v))));
+        let inbox = |p: DVec3| p.cmpge(lo).all() && p.cmple(hi).all();
+        eprintln!("B: {} vertices changed or new, within {cl:.1?}..{ch:.1?}; in the box {} of {}", changed.len(), changed.iter().filter(|&&v| inbox(m1.vertex(v))).count(), m1.vertex_ids().filter(|&v| inbox(m1.vertex(v))).count());
+        // Creases in the box, before and after.
+        let creases = |m: &Mesh, label: &str| {
+            let mut list: Vec<(f64, DVec3)> = m
+                .edge_ids()
+                .filter_map(|e| {
+                    let [a, b] = m.edge_triangles(e);
+                    let [p, q] = m.edge_vertices(e).map(|v| m.vertex(v));
+                    let c = (p + q) * 0.5;
+                    (b != mm_core::INVALID && inbox(c)).then(|| (m.tri_normal(a).angle_between(m.tri_normal(b)).to_degrees(), c))
+                })
+                .collect();
+            list.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let n = |t: f64| list.iter().filter(|x| x.0 > t).count();
+            eprintln!("{label}: {} edges in the box; over 30° {}, over 60° {}, over 90° {}; sharpest {:?}", list.len(), n(30.0), n(60.0), n(90.0), list.iter().take(5).map(|x| format!("{:.0}° at {:.2?}", x.0, x.1)).collect::<Vec<_>>());
+        };
+        creases(&m0, "before");
+        creases(&m1, "after");
+        // Edge lengths in the box, before and after.
+        let lengths = |m: &Mesh, label: &str| {
+            let mut l: Vec<f64> = m.edge_ids().filter(|&e| m.edge_vertices(e).iter().all(|&v| inbox(m.vertex(v)))).map(|e| m.edge_length(e)).collect();
+            l.sort_by(f64::total_cmp);
+            let q = |f: f64| l.get(((l.len().max(1) - 1) as f64 * f) as usize).copied().unwrap_or(0.0);
+            eprintln!("{label}: edge lengths in the box median {:.3}, 99 % {:.3}, longest {:.3}; over 3× the median: {}", q(0.5), q(0.99), q(1.0), l.iter().filter(|&&x| x > 3.0 * q(0.5)).count());
+        };
+        lengths(&m0, "before");
+        lengths(&m1, "after");
+        // In the box: how far the wall moved, and the sharpest change in that move between
+        // neighbouring vertices.
+        let inbox = |p: DVec3| p.cmpge(lo).all() && p.cmple(hi).all();
+        let boxed: Vec<u32> = (0..n as u32).filter(|&v| inbox(m1.vertex(v))).collect();
+        let disp = |v: u32| m1.vertex(v) - m0.vertex(v);
+        let mut stats: Vec<f64> = boxed.iter().map(|&v| disp(v).length()).collect();
+        stats.sort_by(f64::total_cmp);
+        let pct = |q: f64| stats.get(((stats.len().max(1) - 1) as f64 * q) as usize).copied().unwrap_or(0.0);
+        eprintln!("box: {} vertices; move min {:.3} median {:.3} max {:.3}", boxed.len(), pct(0.0), pct(0.5), pct(1.0));
+        let mut jumps: Vec<(f64, u32, u32)> = boxed
+            .iter()
+            .flat_map(|&v| m1.vertex_neighbors(v).into_iter().filter(move |&u| (u as usize) < n).map(move |u| (v, u)))
+            .map(|(v, u)| ((disp(v) - disp(u)).length() / m0.vertex(v).distance(m0.vertex(u)).max(1e-9), v, u))
+            .collect();
+        jumps.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (j, v, u) in jumps.iter().take(8) {
+            eprintln!("  strain {j:.2}: v{v} at {:.2?} moved {:.2?} | v{u} moved {:.2?}", m0.vertex(*v), disp(*v), disp(*u));
         }
     }
 }

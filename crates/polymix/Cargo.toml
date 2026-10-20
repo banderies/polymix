@@ -16,6 +16,7 @@ mm-remesh = { path = "../mm-remesh" }
 mm-repair = { path = "../mm-repair" }
 mm-edit = { path = "../mm-edit" }
 mm-solid = { path = "../mm-solid" }
+mm-segment = { path = "../mm-segment" }
 glam.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
