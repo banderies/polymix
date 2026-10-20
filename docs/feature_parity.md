@@ -122,6 +122,7 @@ The ordered work queue is [ROADMAP.md](ROADMAP.md).
 | Rename | ✅ | |
 | Show only this / Show all | ✅ | |
 | Pivots (show/hide) | ⚪ ✅ | View > Show pivots: a ball with its frame axes, drawn on top of the model |
+| — | ✅ | Polymix extras: click the *Objects* title to fold the browser to a tab (⌘⇧O or View → Object browser hides it altogether); drag its left edge to widen it; long names end in "…", the whole name on hover |
 
 ---
 

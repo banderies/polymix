@@ -227,6 +227,8 @@ impl Default for ViewOptions {
 }
 
 const DEFAULT_CREASE_DEG: f32 = 40.0;
+/// The object browser's width range (drag its left edge).
+const OBJECTS_WIDTH: (f32, f32) = (170.0, 520.0);
 
 /// Destination of a tool switch.
 #[derive(Clone, Debug)]
@@ -360,6 +362,10 @@ pub struct MeshWorkspace {
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
     hotbox: Option<egui::Pos2>,
     show_objects: bool,
+    /// The object browser folded to its title (click it to open again).
+    objects_folded: bool,
+    /// Width of the object browser (drag its left edge).
+    objects_width: f32,
     prefs: Prefs,
     show_prefs: bool,
     prefs_tab: usize,
@@ -435,6 +441,8 @@ impl MeshWorkspace {
             show_space_window: false,
             hotbox: None,
             show_objects: true,
+            objects_folded: false,
+            objects_width: 230.0,
             prefs: Prefs::default(),
             show_prefs: false,
             prefs_tab: 0,
@@ -489,6 +497,8 @@ impl MeshWorkspace {
             }
             app.view.crease_deg = st.get_string("crease_deg").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CREASE_DEG);
             app.show_objects = flag("show_objects", true);
+            app.objects_folded = flag("objects_folded", false);
+            app.objects_width = st.get_string("objects_width").and_then(|v| v.parse().ok()).filter(|w: &f32| w.is_finite()).unwrap_or(230.0).clamp(OBJECTS_WIDTH.0, OBJECTS_WIDTH.1);
             app.camera.orthographic = flag("orthographic", false);
             app.camera.free_orbit = flag("free_orbit", true);
             if st.get_string("up_axis").as_deref() == Some("z") {
@@ -1725,7 +1735,6 @@ impl MeshWorkspace {
     }
 
     fn objects_panel(&mut self, ui: &mut egui::Ui) {
-        ui_util::section(ui, "Objects");
         let mut delete = None;
         let mut make_active = None;
         let mut solo = None;
@@ -1742,7 +1751,7 @@ impl MeshWorkspace {
                 ui.checkbox(&mut o.visible, "").on_hover_text("Visible");
                 let active = Some(o.id) == self.scene.active;
                 if let Some((_, before, focused)) = renaming.as_mut().filter(|r| r.0 == o.id) {
-                    let r = ui.add(egui::TextEdit::singleline(&mut o.name).desired_width(120.0));
+                    let r = ui.add(egui::TextEdit::singleline(&mut o.name).desired_width(ui.available_width()));
                     // Focus once only: Enter, Esc, Tab or a click elsewhere then ends the rename
                     // (egui's focus, not `has_focus`, which is also false while another app is
                     // in front).
@@ -1759,46 +1768,8 @@ impl MeshWorkspace {
                     }
                     return;
                 }
-                let name = if target == Some(o.id) { format!("{}  ◎ target", o.name) } else { o.name.clone() };
-                let label = RichText::new(name).color(if active { ui_util::ACCENT } else { ui.visuals().text_color() });
-                let r = ui.selectable_label(active, label).on_hover_text("Click: make active · Double-click: rename · Right-click: more");
-                if r.clicked() {
-                    make_active = Some(o.id);
-                }
-                if r.double_clicked() {
-                    renaming = Some((o.id, o.name.clone(), false));
-                }
-                r.context_menu(|ui| {
-                    if ui.button("Rename").clicked() {
-                        renaming = Some((o.id, o.name.clone(), false));
-                        ui.close();
-                    }
-                    if ui.button("Show only this").clicked() {
-                        solo = Some(o.id);
-                        ui.close();
-                    }
-                    if ui.button("Show all").clicked() {
-                        show_all = true;
-                        ui.close();
-                    }
-                    if ui.button("Duplicate").clicked() {
-                        duplicate = Some(o.id);
-                        ui.close();
-                    }
-                    if target == Some(o.id) {
-                        if ui.button("Clear target").clicked() {
-                            new_target = Some(None);
-                            ui.close();
-                        }
-                    } else if ui.button("Set as target").on_hover_text("Target surface for Attract / Align To Target and Project to Target").clicked() {
-                        new_target = Some(Some(o.id));
-                        ui.close();
-                    }
-                    if ui.button("Delete").clicked() {
-                        delete = Some(o.id);
-                        ui.close();
-                    }
-                });
+                // The controls at the right first; the name takes the room left, cut short with
+                // "…" when it does not fit (the whole name on hover).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("x").on_hover_text("Delete object").clicked() {
                         delete = Some(o.id);
@@ -1807,6 +1778,50 @@ impl MeshWorkspace {
                     if ui.color_edit_button_rgb(&mut c).changed() {
                         o.color = Vec4::new(c[0], c[1], c[2], o.color.w);
                     }
+                    if target == Some(o.id) {
+                        ui.label(RichText::new("◎").color(ui_util::ACCENT)).on_hover_text("Target surface (Attract / Align To Target, Project to Target)");
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let label = RichText::new(&o.name).color(if active { ui_util::ACCENT } else { ui.visuals().text_color() });
+                        let r = ui.add(egui::Button::selectable(active, label).truncate()).on_hover_text(format!("{}\n\nClick: make active · Double-click: rename · Right-click: more", o.name));
+                        if r.clicked() {
+                            make_active = Some(o.id);
+                        }
+                        if r.double_clicked() {
+                            renaming = Some((o.id, o.name.clone(), false));
+                        }
+                        r.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                renaming = Some((o.id, o.name.clone(), false));
+                                ui.close();
+                            }
+                            if ui.button("Show only this").clicked() {
+                                solo = Some(o.id);
+                                ui.close();
+                            }
+                            if ui.button("Show all").clicked() {
+                                show_all = true;
+                                ui.close();
+                            }
+                            if ui.button("Duplicate").clicked() {
+                                duplicate = Some(o.id);
+                                ui.close();
+                            }
+                            if target == Some(o.id) {
+                                if ui.button("Clear target").clicked() {
+                                    new_target = Some(None);
+                                    ui.close();
+                                }
+                            } else if ui.button("Set as target").on_hover_text("Target surface for Attract / Align To Target and Project to Target").clicked() {
+                                new_target = Some(Some(o.id));
+                                ui.close();
+                            }
+                            if ui.button("Delete").clicked() {
+                                delete = Some(o.id);
+                                ui.close();
+                            }
+                        });
+                    });
                 });
             });
         }
@@ -3238,6 +3253,8 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         st.set_string("spacemouse", self.space_cfg.to_pref());
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));
+        st.set_string("objects_folded", b(self.objects_folded));
+        st.set_string("objects_width", self.objects_width.to_string());
         st.set_string("orthographic", b(self.camera.orthographic));
         st.set_string("free_orbit", b(self.camera.free_orbit));
         st.set_string("up_axis", if self.camera.up_axis == UpAxis::Z { "z".into() } else { "y".into() });
@@ -3344,20 +3361,46 @@ impl polymix_workspace::Workspace for MeshWorkspace {
             self.tool_panel_rect = Some(rect);
         }
         if self.show_objects {
-            // Under the view cube, at the right.
+            // Under the view cube, at the right; folded, just its title.
             let top = if self.view.show_view_cube { 118.0 } else { margin };
-            egui::Area::new(egui::Id::NULL.with("floating_objects"))
+            let r = egui::Area::new(egui::Id::NULL.with("floating_objects"))
                 .pivot(egui::Align2::RIGHT_TOP)
                 .fixed_pos(vr.right_top() + egui::vec2(-margin, top))
                 .order(egui::Order::Middle)
                 .show(&ctx, |ui| {
                     egui::Frame::window(ui.style()).show(ui, |ui| {
-                        ui.set_width(230.0);
+                        let title = if self.objects_folded { format!("Objects ({})", self.scene.objects.len()) } else { "Objects".to_string() };
+                        let strong = ui.visuals().strong_text_color();
+                        // As tall as its content, scrolling once it reaches the bottom of the
+                        // view. (An area offers its content last frame's size; allow it to grow.)
                         let max_h = (vr.height() - top - margin - 20.0).max(80.0);
-                        ui.set_max_height(max_h);
-                        egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| self.objects_panel(ui));
+                        if !self.objects_folded {
+                            ui.set_width(self.objects_width);
+                            ui.set_max_height(max_h);
+                        }
+                        let header = egui::CollapsingHeader::new(RichText::new(title).strong().color(strong))
+                            .id_salt("objects_header")
+                            .open(Some(!self.objects_folded))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(max_h - 28.0).show(ui, |ui| self.objects_panel(ui));
+                            });
+                        let hint = if self.objects_folded { "Show the objects" } else { "Fold the object browser away" };
+                        if header.header_response.on_hover_text(format!("{hint} (View → Object browser or Cmd+Shift+O hides it altogether)")).clicked() {
+                            self.objects_folded = !self.objects_folded;
+                        }
                     });
                 });
+            // Drag the left edge to change the width.
+            if !self.objects_folded {
+                let rect = r.response.rect;
+                let edge = egui::Rect::from_min_max(egui::pos2(rect.left() - 4.0, rect.top()), egui::pos2(rect.left() + 4.0, rect.bottom()));
+                let handle = egui::Area::new(egui::Id::NULL.with("objects_panel_edge")).fixed_pos(edge.min).order(egui::Order::Middle).show(&ctx, |ui| {
+                    ui.allocate_response(edge.size(), egui::Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                });
+                if handle.inner.dragged() {
+                    self.objects_width = (self.objects_width - handle.inner.drag_delta().x).clamp(OBJECTS_WIDTH.0, OBJECTS_WIDTH.1);
+                }
+            }
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
