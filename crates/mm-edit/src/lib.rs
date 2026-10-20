@@ -51,7 +51,7 @@ pub use bridge::{bridge, join_loops, BridgeParams, BridgeResult};
 pub use cap::{cap_planar_loops, CapResult};
 pub use complex::{convex_decomposition, generate_complex, ConvexParams};
 pub use cut::{
-    local_plane_cut, local_plane_cut_with, nearest_intersection_curve, plane_cut, plane_intersection_curves, CutFill,
+    local_intersection_curves, local_plane_cut, local_plane_cut_with, nearest_intersection_curve, plane_cut, plane_intersection_curves, CutFill,
     IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,
 };
 pub use face_groups::{generate_face_groups, FaceGroupMode};

@@ -18,7 +18,7 @@
 use crate::cap::cap_oriented_loops;
 use crate::util::*;
 use crate::{EditError, EditResult};
-use mm_core::{DVec2, DVec3, Mesh, Plane, INVALID};
+use mm_core::{Aabb, Bvh, DVec2, DVec3, Mesh, Plane, INVALID};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
@@ -145,6 +145,80 @@ impl IntersectionCurve {
     pub fn equivalent_diameter(&self) -> f64 {
         2.0 * (self.area / std::f64::consts::PI).sqrt()
     }
+
+    /// The segments in 2D coordinates of their plane (`normal`), about `origin`.
+    fn flat(&self, origin: DVec3, normal: DVec3) -> (Vec<[DVec2; 2]>, DVec3, DVec3) {
+        let (u, v) = frame(normal);
+        let to2 = |p: DVec3| DVec2::new((p - origin).dot(u), (p - origin).dot(v));
+        (self.segments.iter().map(|s| [to2(s[0]), to2(s[1])]).collect(), u, v)
+    }
+
+    /// Whether `p` (on the curve's plane, whose normal is `normal`) lies inside the curve
+    /// (its winding number is not zero; false for open curves).
+    pub fn encloses(&self, p: DVec3, normal: DVec3) -> bool {
+        self.closed && winding(&self.flat(p, normal).0, DVec2::ZERO) != 0
+    }
+
+    /// The centre of the largest circle inside the closed curve (its pole of inaccessibility)
+    /// and that circle's radius: a point well inside even a crescent, whose centroid is not.
+    /// `None` for open curves.
+    pub fn inscribed_centre(&self, normal: DVec3) -> Option<(DVec3, f64)> {
+        if !self.closed || self.segments.is_empty() {
+            return None;
+        }
+        let origin = self.segments[0][0];
+        let (segs, u, v) = self.flat(origin, normal);
+        let (lo, hi) = segs.iter().flatten().fold((DVec2::INFINITY, DVec2::NEG_INFINITY), |(a, b), &p| (a.min(p), b.max(p)));
+        let clearance = |q: DVec2| -> f64 {
+            if winding(&segs, q) == 0 {
+                return -1.0;
+            }
+            segs.iter().map(|s| point_segment_distance_2d(q, s[0], s[1])).fold(f64::INFINITY, f64::min)
+        };
+        // A grid over the curve's box, then finer grids around the best point.
+        let n = 24;
+        let mut cell = (hi - lo) / n as f64;
+        let mut best = (-1.0, lo);
+        for i in 0..=n {
+            for j in 0..=n {
+                let q = lo + DVec2::new(i as f64 * cell.x, j as f64 * cell.y);
+                let c = clearance(q);
+                if c > best.0 {
+                    best = (c, q);
+                }
+            }
+        }
+        if best.0 <= 0.0 {
+            return None;
+        }
+        for _ in 0..3 {
+            let centre = best.1;
+            for i in -3..=3 {
+                for j in -3..=3 {
+                    let q = centre + DVec2::new(i as f64 * cell.x, j as f64 * cell.y) / 3.0;
+                    let c = clearance(q);
+                    if c > best.0 {
+                        best = (c, q);
+                    }
+                }
+            }
+            cell /= 3.0;
+        }
+        Some((origin + u * best.1.x + v * best.1.y, best.0))
+    }
+}
+
+/// Winding number of the closed polygon `segs` (oriented segments, in any order) about `q`.
+fn winding(segs: &[[DVec2; 2]], q: DVec2) -> i32 {
+    let turn: f64 = segs.iter().map(|s| (s[0] - q).angle_to(s[1] - q)).sum();
+    (turn / std::f64::consts::TAU).round() as i32
+}
+
+fn point_segment_distance_2d(p: DVec2, a: DVec2, b: DVec2) -> f64 {
+    let ab = b - a;
+    let l2 = ab.length_squared();
+    let t = if l2 > 0.0 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    p.distance(a + ab * t)
 }
 
 pub(crate) fn point_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
@@ -438,6 +512,25 @@ pub fn plane_intersection_curves(mesh: &Mesh, plane: Plane) -> Vec<IntersectionC
     let Ok(plane) = normalize_plane(plane) else { return Vec::new() };
     let ctx = CutContext::new(mesh, plane, snap_eps(mesh));
     compute_curves(mesh, &ctx, None).iter().map(|c| curve_summary(c, plane.normal)).collect()
+}
+
+/// [`plane_intersection_curves`] near `point` only: the curves where `plane` cuts the
+/// triangles within `reach` of it (cheap on a big mesh; a curve the reach cuts short is open).
+/// `bvh` must be current for `mesh`, or built from a subset of it holding those triangles.
+pub fn local_intersection_curves(mesh: &Mesh, bvh: &Bvh, plane: Plane, point: DVec3, reach: f64) -> Vec<IntersectionCurve> {
+    let Ok(plane) = normalize_plane(plane) else { return Vec::new() };
+    let mut tris = Vec::new();
+    bvh.query_aabb(&Aabb::from_points([point - DVec3::splat(reach), point + DVec3::splat(reach)]), |t| {
+        let d = mesh.triangle(t).map(|v| plane.signed_distance(mesh.vertex(v)));
+        if d.iter().any(|&x| x <= 0.0) && d.iter().any(|&x| x >= 0.0) {
+            tris.push(t);
+        }
+    });
+    if tris.is_empty() {
+        return Vec::new();
+    }
+    let ctx = CutContext::for_triangles(mesh, plane, snap_eps(mesh), &tris, Vec::new());
+    compute_curves(mesh, &ctx, Some(&tris)).iter().map(|c| curve_summary(c, plane.normal)).collect()
 }
 
 /// The intersection curve nearest to `seed` (what [`local_plane_cut`] would cut).

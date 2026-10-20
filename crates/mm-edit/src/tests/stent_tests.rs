@@ -76,23 +76,21 @@ fn bare_stent_opens_the_narrowing_and_nothing_else() {
     let (m0, path) = stenosed();
     let sections = sections_at(&path, 20.0, 40.0);
     let radius = |p: DVec3| p.truncate().length();
-    // Stiffness 1: a round lumen of the stent's radius from 15 to 45; past the end blend
-    // (2) nothing moves, and nothing moves along the vessel.
+    // Stiffness 1: a round lumen of the stent's radius from 15 to 45 (the stent's tube joined
+    // to the lumen); past the end blend (2) nothing changes, not even vertex ids.
     let mut m = m0.clone();
     let params = bare(4.0, 30.0);
     let pl = place_stent(&path, sections, &params).unwrap();
     let rep = apply_stent(&mut m, &pl, &params, None).unwrap();
     assert_valid(&m);
+    assert_eq!(rep.pushed, None);
+    assert_eq!(crossings(&m), 0);
     assert!((rep.narrowest[0] - 1.0).abs() < 0.05 && (rep.narrowest[1] - 2.0).abs() < 0.05, "{:?}", rep.narrowest);
-    for v in m.vertex_ids() {
-        let (p, q) = (m0.vertex(v), m.vertex(v));
-        assert!((p.z - q.z).abs() < 1e-9, "moved along the vessel at z = {}", p.z);
-        if (15.5..44.5).contains(&p.z) {
-            assert!(radius(q) > 1.98 && radius(q) < 2.03, "radius {} at z = {}", radius(q), p.z);
-        }
-        if !(12.5..47.5).contains(&p.z) {
-            assert!(p.distance(q) < 1e-12, "moved at z = {}", p.z);
-        }
+    for q in m.vertex_ids().map(|v| m.vertex(v)).filter(|q| (15.5..44.5).contains(&q.z)) {
+        assert!(radius(q) > 1.98 && radius(q) < 2.03, "radius {} at z = {}", radius(q), q.z);
+    }
+    for v in m0.vertex_ids().filter(|&v| !(12.5..47.5).contains(&m0.vertex(v).z)) {
+        assert!(m.is_vertex(v) && m.vertex(v).distance(m0.vertex(v)) < 1e-12, "changed at z = {}", m0.vertex(v).z);
     }
     // Stiffness ½ opens the narrowing half way; stiffness 0 and following the vessel change
     // nothing.
@@ -112,6 +110,56 @@ fn bare_stent_opens_the_narrowing_and_nothing_else() {
     let narrowest = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| (16.0..44.0).contains(&p.z)).map(radius).fold(f64::INFINITY, f64::min);
     assert!(narrowest > 1.95, "remeshed lumen {narrowest}");
     assert_eq!(boundary_loops(&m).len(), 2);
+}
+
+#[test]
+fn a_wall_doubling_back_keeps_its_layers_apart() {
+    // Radius 3, narrowed to 1 from z = 19 to 40 by a lip that leans back (an undercut, as where
+    // a stenosis meets a wider sinus): from z = 20 the wall runs back to z = 19 as it narrows,
+    // so in the slices between, the lip and the narrow tube both lie inside the stent.
+    let corners = [(3.0, 0.0), (3.0, 20.0), (1.0, 19.0), (1.0, 40.0), (3.0, 40.0), (3.0, 60.0)];
+    let mut profile = vec![corners[0]];
+    for w in corners.windows(2) {
+        let ((r0, z0), (r1, z1)) = (w[0], w[1]);
+        let k = (((r1 - r0) as f64).hypot(z1 - z0) / 0.25).ceil() as usize;
+        profile.extend((1..=k).map(|j| {
+            let f = j as f64 / k as f64;
+            (r0 + (r1 - r0) * f, z0 + (z1 - z0) * f)
+        }));
+    }
+    let m0 = crate::part::revolve(&profile, 48, false);
+    let points: Vec<DVec3> = (0..=240).map(|k| straight(0.25 * k as f64)).collect();
+    let path = VesselPath { radii: points.iter().map(|p| if (19.0..40.0).contains(&p.z) { 1.0 } else { 3.0 }).collect(), points };
+    let sections = sections_at(&path, 10.0, 50.0);
+    let params = bare(5.0, 40.0);
+    let mut m = m0.clone();
+    let rep = apply_stent(&mut m, &place_stent(&path, sections, &params).unwrap(), &params, None).unwrap();
+    assert_valid(&m);
+    // Opened to the stent (no wall inside its radius), and the lip and the tube that both
+    // landed on it do not lie on one another.
+    assert!((rep.narrowest[1] - 2.5).abs() < 0.05, "{:?}", rep.narrowest);
+    assert_eq!(crossings(&m), 0);
+}
+
+#[test]
+fn the_stent_bends_no_tighter_than_its_diameter() {
+    // The vessel's course jogs 2.5 to the side within 2 (an eccentric narrowing); a stent of
+    // radius 2 following it (straightness 0) eases the jog.
+    let jog = |z: f64| DVec3::new(2.5 * smoothstep((z - 29.0) / 2.0), 0.0, z);
+    let (_, path) = vessel(jog, |_| 2.0, 60.0, 24);
+    let params = bare(4.0, 30.0);
+    let pl = place_stent(&path, sections_at(&path, 15.0, 45.0), &params).unwrap();
+    let k = pl.s.len();
+    let sharpest = (1..k - 1)
+        .filter(|&i| (0.0..=30.0).contains(&pl.s[i]))
+        .map(|i| {
+            let (a, b, c) = (pl.axis[i - 1], pl.axis[i], pl.axis[i + 1]);
+            2.0 * (b - a).cross(c - b).length() / (a.distance(b) * b.distance(c) * a.distance(c))
+        })
+        .fold(0.0, f64::max);
+    assert!(sharpest * pl.radius < 0.55, "radius × curvature {:.2}", sharpest * pl.radius);
+    // Still from one section's centre to the other's.
+    assert!(pl.point(pl.sections[0]).distance(path.points[60]) < 0.05 && pl.point(pl.sections[1]).distance(path.points[180]) < 0.05);
 }
 
 #[test]

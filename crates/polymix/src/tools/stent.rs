@@ -13,6 +13,7 @@ use crate::centerline::{self, Centerline, CenterlineParams};
 use crate::jobs::Job;
 use crate::ui_util;
 use mm_edit::EndContinuity;
+use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,8 +56,11 @@ struct StentUi {
     /// The smoothest path: G0 a straight line between the ends' centres, G1 leaving each end
     /// square to its cross-section, G2 also continuing the vessel's bend.
     continuity: EndContinuity,
-    /// 0..100 %: radial force, how far narrower wall is opened towards the stent's diameter
-    /// (100 makes a perfect tube; wider wall is never pulled in unless covered).
+    /// 0..100 %: radial force. Along the stent the lumen becomes a round tube whose diameter
+    /// lies this share of the way from the native lumen's to the stent's (2 mm native, a 6 mm
+    /// stent and 50 % give 4 mm): 100 makes a perfect tube of the stent's diameter, 0 leaves
+    /// the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to
+    /// the tube.
     stiffness: f64,
     /// How far past each end the wall eases back to its own shape, mm (0..10).
     end_blend: f64,
@@ -93,6 +97,9 @@ impl StentUi {
 /// belong to it.
 struct VesselTrace {
     path: mm_edit::VesselPath,
+    /// The stent's ends: where the path crosses each section's plane (the lumen's centre
+    /// there), else the section's centre.
+    ends: [DVec3; 2],
     owner: Vec<bool>,
     /// Centerline length between the sections.
     span: f64,
@@ -209,6 +216,8 @@ impl StentTool {
     /// The reshaped vessel for `key` (in the background, or at once for scripts).
     fn build(source: &Mesh, trace: &VesselTrace, sections: [mm_edit::StentSection; 2], key: &StentKey) -> anyhow::Result<(Mesh, mm_edit::StentPlacement, mm_edit::StentReport, usize)> {
         let params = key.ui.params();
+        // Centred in the lumen at each section (on the traced path).
+        let sections = [0, 1].map(|i| mm_edit::StentSection { center: trace.ends[i], normal: sections[i].normal });
         let placement = mm_edit::place_stent(&trace.path, sections, &params)?;
         let mut mesh = source.clone();
         let report = mm_edit::apply_stent(&mut mesh, &placement, &params, Some(&trace.owner))?;
@@ -366,6 +375,9 @@ fn warnings(out: &StentOut) -> Vec<String> {
     if out.crossings > 0 {
         w.push(format!("The reshaped wall runs into itself ({} new crossings): lower the straightness or the stent's length.", out.crossings));
     }
+    if let Some(why) = &out.report.pushed {
+        w.push(format!("The wall was pushed out to the stent rather than joined to its tube ({why}), so it may be uneven where it was narrowest."));
+    }
     w
 }
 
@@ -432,9 +444,178 @@ fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTr
     let nodes: Vec<usize> = before.iter().rev().chain(&chain).chain(&after).copied().collect();
     let on_path: std::collections::HashSet<usize> = nodes.iter().copied().collect();
     let owner = cl.vertex_node.iter().map(|n| on_path.contains(n)).collect();
-    let path = mm_edit::VesselPath { points: nodes.iter().map(|&i| pos(i)).collect(), radii: nodes.iter().map(|&i| cl.nodes[i].radius).collect() };
-    let span = path.span([a.stent(), b.stent()]).unwrap_or(0.0);
-    Ok(VesselTrace { path, owner, span })
+    let mut path = mm_edit::VesselPath { points: nodes.iter().map(|&i| pos(i)).collect(), radii: nodes.iter().map(|&i| cl.nodes[i].radius).collect() };
+    recentre(mesh, &mut path, sections);
+    let ends = [a, b].map(|s| crossing(&path.points, s.center, s.normal).filter(|c| c.distance(s.center) < 0.5 * s.diameter).unwrap_or(s.center));
+    let span = path.span(ends.map(|center| mm_edit::StentSection { center, normal: DVec3::Z })).unwrap_or(0.0);
+    Ok(VesselTrace { path, ends, owner, span })
+}
+
+/// Where `path` crosses the plane through `c` square to `n`, nearest `c`.
+fn crossing(path: &[DVec3], c: DVec3, n: DVec3) -> Option<DVec3> {
+    path.windows(2)
+        .filter_map(|w| {
+            let (da, db) = ((w[0] - c).dot(n), (w[1] - c).dot(n));
+            (da * db <= 0.0 && da != db).then(|| w[0].lerp(w[1], da / (da - db)))
+        })
+        .min_by(|p, q| p.distance(c).total_cmp(&q.distance(c)))
+}
+
+/// Move the path to the lumen's centre between the sections (the stretch the stent treats).
+/// Geodesic rings' centroids can lie millimetres off it, and outside the lumen, through a
+/// narrowed stretch that bends or narrows eccentrically (a stenosis); the stent would then
+/// push the wall open about a point outside the vessel and fold it onto itself. About the
+/// lumen's centre, cross-sections are star-shaped, as the push needs.
+///
+/// The path is resampled densely enough to follow a narrow channel. Each point's target is the
+/// centre of the lumen's cross-section square to the path there (its centroid if well inside,
+/// else the centre of the largest circle inside, as for a crescent). Where no outline is found
+/// near a point, or the nearest is too far to be this vessel's, the target is interpolated
+/// from the neighbours'. Only lumens about as narrow as the ends or narrower move the path
+/// (the stent pushes no wider wall, and a wide chamber's centre says nothing about the
+/// vessel's course). The moves are smoothed along the path over the lumen's radius and fade
+/// in from each section over about the ends' radius; a little past the sections the path
+/// keeps its course, which the stent's return onto the vessel follows.
+fn recentre(mesh: &Mesh, path: &mut mm_edit::VesselPath, sections: &[Section; 2]) {
+    if path.points.len() < 3 {
+        return;
+    }
+    let h = mesh.average_edge_length();
+    // Resample: a quarter of the local radius apart (0.2 to 1 mm, never finer than the mesh).
+    let (mut pts, mut radii) = (vec![path.points[0]], vec![path.radii[0]]);
+    for i in 1..path.points.len() {
+        let (a, b) = (path.points[i - 1], path.points[i]);
+        let step = (0.25 * path.radii[i - 1].min(path.radii[i])).clamp(0.2_f64.max(0.5 * h), 1.0_f64.max(0.5 * h));
+        let k = (a.distance(b) / step).ceil().max(1.0) as usize;
+        for j in 1..=k {
+            let f = j as f64 / k as f64;
+            pts.push(a.lerp(b, f));
+            radii.push(path.radii[i - 1] + (path.radii[i] - path.radii[i - 1]) * f);
+        }
+    }
+    let n = pts.len();
+    let mut cum = vec![0.0];
+    for w in pts.windows(2) {
+        cum.push(cum[cum.len() - 1] + w[0].distance(w[1]));
+    }
+    // The stretch to recentre: between the sections, fading in from each over about the ends'
+    // radius (or a quarter of the stretch).
+    let at = |c: DVec3| (0..n).min_by(|&i, &j| pts[i].distance(c).total_cmp(&pts[j].distance(c))).map_or(0.0, |i| cum[i]);
+    let (sa, sb) = (at(sections[0].center), at(sections[1].center));
+    let (sa, sb) = (sa.min(sb), sa.max(sb));
+    let wide = 0.5 * sections[0].diameter.max(sections[1].diameter);
+    let fade = (0.5 * wide).min(0.25 * (sb - sa)).max(1e-9);
+    let smoothstep = |x: f64| {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    };
+    let weight: Vec<f64> = cum.iter().map(|&s| smoothstep((s - sa).min(sb - s) / fade)).collect();
+    let active: Vec<usize> = (0..n).filter(|&i| weight[i] > 0.0).collect();
+    if active.is_empty() {
+        return;
+    }
+    let pad = DVec3::splat(4.0 * radii.iter().copied().fold(0.0, f64::max) + 2.0 * h);
+    let (lo, hi) = active.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &i| (a.min(pts[i]), b.max(pts[i])));
+    let (lo, hi) = (lo - pad, hi + pad);
+    let near: Vec<u32> = mesh.triangle_ids().filter(|&t| mesh.tri_positions(t).iter().any(|p| p.cmpge(lo).all() && p.cmple(hi).all())).collect();
+    let bvh = mm_core::Bvh::build_subset(mesh, &near);
+    // Points within `mm` of point i along the path, each side.
+    let window = |i: usize, mm: f64| -> usize {
+        let spacing = (cum[(i + 1).min(n - 1)] - cum[i.saturating_sub(1)]).max(1e-9) / 2.0;
+        ((mm / spacing).round() as usize).clamp(1, 40)
+    };
+    // The lumen's outline in the plane square to the path at point i (the smallest outline
+    // around the point, else the nearest close enough), with that plane's normal.
+    let lumen = |pts: &[DVec3], i: usize| -> Option<(mm_edit::IntersectionCurve, DVec3)> {
+        // The plane follows the path over about a radius, not its jitter.
+        let span = window(i, radii[i]);
+        let t = (pts[(i + span).min(n - 1)] - pts[i.saturating_sub(span)]).normalize_or_zero();
+        if t == DVec3::ZERO {
+            return None;
+        }
+        let p = pts[i];
+        let reach = 3.0 * radii[i] + 2.0 * h + 1.0;
+        let curves = mm_edit::local_intersection_curves(mesh, &bvh, mm_core::Plane::from_point_normal(p, t), p, reach);
+        let closed = curves.into_iter().filter(|c| c.closed && c.area > 0.0);
+        let (around, other): (Vec<_>, Vec<_>) = closed.partition(|c| c.encloses(p, t));
+        let c = around.into_iter().min_by(|a, b| a.area.total_cmp(&b.area)).or_else(|| other.into_iter().filter(|c| c.distance(p) < 2.0 * radii[i] + 1.0).min_by(|a, b| a.distance(p).total_cmp(&b.distance(p))))?;
+        Some((c, t))
+    };
+    for _ in 0..2 {
+        // Targets: each cross-section's centre, with the radius of the largest circle inside.
+        let found: Vec<Option<(DVec3, f64)>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if weight[i] <= 0.0 {
+                    return None;
+                }
+                let (c, t) = lumen(&pts, i)?;
+                let (centre, r) = c.inscribed_centre(t)?;
+                if r > 1.5 * wide {
+                    // A chamber: no move here.
+                    return Some((pts[i], r));
+                }
+                let fits = c.encloses(c.centroid, t) && c.distance(c.centroid) >= 0.7 * r;
+                let target = if fits { c.centroid } else { centre };
+                // Further than that, it is another vessel's lumen.
+                (target.distance(pts[i]) <= 3.0 * radii[i].max(r) + h).then_some((target, r))
+            })
+            .collect();
+        // Gaps take their neighbours' moves (interpolated).
+        let known: Vec<usize> = active.iter().copied().filter(|&i| found[i].is_some()).collect();
+        if known.is_empty() {
+            return;
+        }
+        let mut moves = vec![DVec3::ZERO; n];
+        let mut reach = radii.clone();
+        for &i in &active {
+            let j = known.partition_point(|&k| k < i);
+            // Lumens wider than the ends move less, chambers not at all.
+            let narrow = found[i].map_or(1.0, |(_, r)| 1.0 - smoothstep((r - wide) / (0.5 * wide)));
+            moves[i] = match (j.checked_sub(1).map(|j| known[j]), known.get(j).copied()) {
+                (_, Some(k)) if k == i => found[i].unwrap().0 - pts[i],
+                (Some(a), Some(b)) => {
+                    let f = (i - a) as f64 / (b - a) as f64;
+                    (found[a].unwrap().0 - pts[a]).lerp(found[b].unwrap().0 - pts[b], f)
+                }
+                (Some(a), None) => found[a].unwrap().0 - pts[a],
+                (None, Some(b)) => found[b].unwrap().0 - pts[b],
+                (None, None) => DVec3::ZERO,
+            } * weight[i]
+                * narrow;
+            if let Some((_, r)) = found[i] {
+                reach[i] = r;
+            }
+        }
+        // Smoothed along the path over the lumen's radius (wide lumens smooth more), easing out
+        // within two fades past the sections.
+        for _ in 0..2 {
+            moves = (0..n)
+                .map(|i| {
+                    let half = window(i, reach[i]);
+                    let w = i.saturating_sub(half)..=(i + half).min(n - 1);
+                    moves[w.clone()].iter().sum::<DVec3>() / w.count() as f64
+                })
+                .collect();
+        }
+        for i in 0..n {
+            moves[i] *= 1.0 - smoothstep(((sa - cum[i]).max(cum[i] - sb) - fade) / fade);
+        }
+        let moved: Vec<DVec3> = (0..n).map(|i| pts[i] + moves[i]).collect();
+        // A smoothed point that left a narrow channel takes its own target.
+        pts = (0..n)
+            .into_par_iter()
+            .map(|i| match found[i] {
+                Some((target, _)) if weight[i] >= 1.0 => match lumen(&moved, i) {
+                    Some((c, t)) if c.encloses(moved[i], t) => moved[i],
+                    _ => target,
+                },
+                _ => moved[i],
+            })
+            .collect();
+    }
+    path.points = pts;
+    path.radii = radii;
 }
 
 /// Nodes from `from` to `to` through the branch tree (breadth first over branch links).
@@ -725,7 +906,7 @@ impl Tool for StentTool {
             ui.selectable_value(&mut self.ui.continuity, EndContinuity::G2, "G2").on_hover_text("Also continues the vessel's bend at each end");
         });
         ui.add(egui::Slider::new(&mut self.ui.stiffness, 0.0..=100.0).suffix("%").text("Stiffness"))
-            .on_hover_text("Radial force: how far narrower wall is opened towards the stent's diameter. 100 % makes a perfect tube of the stent's diameter; 0 % leaves the wall as it is. Wall wider than the stent is never pulled in (unless covered)");
+            .on_hover_text("Radial force: along the stent the lumen becomes a round tube whose diameter lies this share of the way from the vessel's own to the stent's (2 mm vessel, 6 mm stent, 50 % → 4 mm). 100 % makes a perfect tube of the stent's diameter; 0 % leaves the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to the tube");
         ui.add(egui::Slider::new(&mut self.ui.end_blend, 0.0..=10.0).suffix(" mm").text("End blend"))
             .on_hover_text("How far past each end of the stent the wall eases back to its own shape");
         ui.checkbox(&mut self.ui.covered, "Covered (stent graft)")
@@ -1041,6 +1222,149 @@ mod tests {
                     ),
                     Err(e) => eprintln!("  {label}: failed: {e:#}"),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_path_is_moved_into_an_eccentric_narrowing() {
+        // The lumen narrows to radius 0.8 at z = 30 while its centre moves 2.5 to the side; a
+        // trace straight along z (as ring centroids can run) passes outside it there.
+        let bump = |z: f64| (-((z - 30.0) / 4.0).powi(2)).exp();
+        let centre = move |z: f64| DVec3::new(2.5 * bump(z), 0.0, z);
+        let radius = move |z: f64| 3.0 - 2.2 * bump(z);
+        let zs: Vec<f64> = (0..=240).map(|k| 0.25 * k as f64).collect();
+        let m = mm_core::primitives::tube_along(&zs.iter().map(|&z| centre(z)).collect::<Vec<_>>(), &zs.iter().map(|&z| radius(z)).collect::<Vec<_>>(), 64);
+        let mut path = mm_edit::VesselPath { points: zs.iter().map(|&z| DVec3::new(0.0, 0.0, z)).collect(), radii: vec![3.0; zs.len()] };
+        let end = |z: f64| Section { center: centre(z), normal: DVec3::Z, diameter: 2.0 * radius(z), ring: Vec::new() };
+        recentre(&m, &mut path, &[end(16.0), end(44.0)]);
+        // Through the narrowing, near the lumen's centre (well inside its radius).
+        for p in path.points.iter().filter(|p| (22.0..38.0).contains(&p.z)) {
+            let off = p.truncate().distance(centre(p.z).truncate());
+            assert!(off < 0.5 * radius(p.z), "{off:.2} off the centre at z = {:.1} (radius {:.2})", p.z, radius(p.z));
+        }
+        // Smooth (no longer than the lumen's own course), and unchanged past the ends.
+        let length: f64 = path.points.windows(2).filter(|w| (16.0..44.0).contains(&w[0].z)).map(|w| w[0].distance(w[1])).sum();
+        let course: f64 = zs.windows(2).filter(|w| (16.0..44.0).contains(&w[0])).map(|w| centre(w[0]).distance(centre(w[1]))).sum();
+        assert!(length < 1.02 * course, "{length:.2} vs {course:.2}");
+        // (The moves ease out within twice the fade, half the ends' radius, past each end.)
+        for p in path.points.iter().filter(|p| !(13.0..47.0).contains(&p.z)) {
+            assert!(p.truncate().length() < 1e-9, "moved at z = {:.1}", p.z);
+        }
+    }
+
+    /// A stent between given ends of a project's first object (local only):
+    /// `POLYMIX_STENT_PROJECT=<.polymix>`, `POLYMIX_STENT_ENDS="x,y,z;x,y,z"` (the ends'
+    /// centres, as `mesh_tool_state` reports them) and optionally `POLYMIX_STENT_AXES` (their
+    /// axes; without them each end is the cross-section through the wall nearest its centre),
+    /// optionally `POLYMIX_STENT_LENGTH` (mm), `POLYMIX_STENT_STIFFNESS` (%) and
+    /// `POLYMIX_STENT_COVERED=1`. Prints crossings and readouts at those settings, without
+    /// remeshing, and without straightening or push.
+    #[test]
+    #[ignore]
+    fn stent_on_a_project() {
+        let (Some(path), Ok(ends)) = (std::env::var_os("POLYMIX_STENT_PROJECT"), std::env::var("POLYMIX_STENT_ENDS")) else { return };
+        let points = |e: &str| -> Vec<DVec3> {
+            e.split(';')
+                .map(|p| {
+                    let v: Vec<f64> = p.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                    DVec3::new(v[0], v[1], v[2])
+                })
+                .collect()
+        };
+        let m = crate::project::load(std::path::Path::new(&path)).unwrap().objects[0].mesh.clone();
+        let bvh = mm_core::Bvh::build(&m);
+        let (centres, axes) = (points(&ends), std::env::var("POLYMIX_STENT_AXES").ok().map(|a| points(&a)));
+        let sections: Vec<Section> = (0..2)
+            .map(|i| match &axes {
+                Some(axes) => {
+                    let curve = mm_edit::nearest_intersection_curve(&m, mm_core::Plane::from_point_normal(centres[i], axes[i]), centres[i]).unwrap();
+                    Section { center: centres[i], normal: axes[i], diameter: curve.equivalent_diameter(), ring: curve.segments }
+                }
+                None => Section::at(&m, &bvh, bvh.nearest(&m, centres[i], f64::INFINITY).unwrap().point).unwrap(),
+            })
+            .collect();
+        let sections = [sections[0].clone(), sections[1].clone()];
+        let t0 = std::time::Instant::now();
+        let trace = trace_vessel(&m, &sections).unwrap();
+        eprintln!("ends ⌀ {:.2} / {:.2}, span {:.2} mm, traced in {:.0} ms", sections[0].diameter, sections[1].diameter, trace.span, t0.elapsed().as_secs_f64() * 1e3);
+        let d = std::env::var("POLYMIX_STENT_DIAMETER").ok().and_then(|l| l.parse().ok()).unwrap_or(((sections[0].diameter.max(sections[1].diameter) * 2.0).floor() / 2.0).max(0.5));
+        let length = std::env::var("POLYMIX_STENT_LENGTH").ok().and_then(|l| l.parse().ok()).unwrap_or(((trace.span / 5.0).ceil() * 5.0).max(5.0));
+        let stiffness = std::env::var("POLYMIX_STENT_STIFFNESS").ok().and_then(|l| l.parse().ok()).unwrap_or(100.0);
+        let covered = std::env::var("POLYMIX_STENT_COVERED").is_ok_and(|v| v == "1");
+        let ui = StentUi { diameter: d, length, stiffness, covered, ..Default::default() };
+        for (ui, label) in [(ui, "default"), (StentUi { remesh: false, ..ui }, "no remesh"), (StentUi { remesh: false, straightness: 0.0, ..ui }, "no remesh, follows"), (StentUi { remesh: false, stiffness: 0.0, ..ui }, "no remesh, no push")] {
+            let t0 = std::time::Instant::now();
+            match StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &StentKey { sections: 1, ui }) {
+                Ok((out, pl, rep, crossings)) => {
+                    // The reshaped wall along the stent: still inside it (not opened), facing the
+                    // axis (folded over), and sliver triangles, by mm along the stent.
+                    let k = pl.s.len();
+                    let near = |p: DVec3| (0..k).min_by(|&i, &j| pl.axis[i].distance_squared(p).total_cmp(&pl.axis[j].distance_squared(p))).unwrap();
+                    let mut rows = std::collections::BTreeMap::<i64, [usize; 4]>::new();
+                    for &t in &rep.triangles {
+                        if !out.is_triangle(t) {
+                            continue;
+                        }
+                        let tp = out.tri_positions(t);
+                        let c = (tp[0] + tp[1] + tp[2]) / 3.0;
+                        let i = near(c);
+                        if pl.s[i] < -3.0 || pl.s[i] > pl.length + 3.0 {
+                            continue;
+                        }
+                        let tan = (pl.axis[(i + 1).min(k - 1)] - pl.axis[i.saturating_sub(1)]).normalize();
+                        let radial = (c - pl.axis[i]) - tan * (c - pl.axis[i]).dot(tan);
+                        let row = rows.entry(pl.s[i].floor() as i64).or_default();
+                        row[0] += 1;
+                        if radial.length() < 0.9 * pl.radius && (0.0..pl.length).contains(&pl.s[i]) {
+                            row[1] += 1;
+                        }
+                        if out.tri_normal(t).dot(radial.normalize_or_zero()) < -0.3 {
+                            row[2] += 1;
+                        }
+                        let e = out.tri_edges(t).map(|e| out.edge_length(e));
+                        let longest = e.iter().copied().fold(0.0, f64::max);
+                        let area = 0.5 * (tp[1] - tp[0]).cross(tp[2] - tp[0]).length();
+                        if 2.0 * area / longest.max(1e-12) < 0.1 * longest {
+                            row[3] += 1;
+                        }
+                    }
+                    eprintln!("  {label}: region {} triangles ({} valid), source region {}; pushed: {:?}", rep.triangles.len(), rep.triangles.iter().filter(|&&t| out.is_triangle(t)).count(), rep.source_triangles.len(), rep.pushed);
+                    {
+                        // Where the sharpest creases are, by mm along the stent.
+                        let set: std::collections::HashSet<u32> = rep.triangles.iter().copied().collect();
+                        let k = pl.s.len();
+                        let mut creases: Vec<(f64, f64)> = out.edge_ids().filter_map(|e| {
+                            let [a, b] = out.edge_triangles(e);
+                            (b != mm_core::INVALID && set.contains(&a) && set.contains(&b)).then(|| {
+                                let ang = out.tri_normal(a).angle_between(out.tri_normal(b)).to_degrees();
+                                let [p, q] = out.edge_vertices(e).map(|v| out.vertex(v));
+                                let c = (p + q) * 0.5;
+                                let i = (0..k).min_by(|&x, &y| pl.axis[x].distance_squared(c).total_cmp(&pl.axis[y].distance_squared(c))).unwrap();
+                                (ang, pl.s[i])
+                            })
+                        }).filter(|x| x.0 > 90.0).collect();
+                        creases.sort_by(|a, b| b.0.total_cmp(&a.0));
+                        eprintln!("  {label}: {} creases over 90°, sharpest at s {:?}", creases.len(), creases.iter().take(6).map(|c| format!("{:.1} ({:.0}°)", c.1, c.0)).collect::<Vec<_>>());
+                    }
+                    eprintln!("  {label}: by mm along the stent: triangles, inside 0.9 r, facing the axis, slivers (height < 0.1 × longest edge)");
+                    for (s, r) in rows {
+                        if r[1] + r[2] + r[3] > 0 {
+                            eprintln!("    s {s:>4}: {:>6} {:>5} {:>5} {:>5}", r[0], r[1], r[2], r[3]);
+                        }
+                    }
+                    eprintln!(
+                    "{label}: {:.0} ms, crossings {crossings}, moved {}, max shift {:.2}, narrowest ⌀ {:.2} -> {:.2}, sharpest {:.1}°, outside {}",
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    rep.moved,
+                    rep.max_shift,
+                    2.0 * rep.narrowest[0],
+                    2.0 * rep.narrowest[1],
+                    sharpest(&out, &rep.triangles),
+                    rep.outside
+                    );
+                }
+                Err(e) => eprintln!("{label}: failed: {e:#}"),
             }
         }
     }

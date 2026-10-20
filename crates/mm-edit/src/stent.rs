@@ -7,7 +7,8 @@
 //! spline leaving each section along its normal (G1) and also continuing the vessel's bend
 //! there (G2), its tangent lengths chosen for the least bending energy for its length
 //! (length × ∫κ² ds, least for a circular arc). *Straightness* mixes the two paths at equal
-//! fractions of their length. Past each section the paths go on along the vessel and along
+//! fractions of their length, and the axis is eased to bend no tighter than the stent's
+//! diameter (where the vessel's course jogs, e.g. through an eccentric narrowing). Past each section the paths go on along the vessel and along
 //! the smooth path's end direction (its bend fading out for G2). The stent keeps its length
 //! along its own axis and is centred on the two sections, so a stent longer than the
 //! stretch reaches equally far past each.
@@ -18,16 +19,20 @@
 //!    axis, moved and turned with it, so the vessel straightens with the stent. Part of a
 //!    stent floating in a wider lumen moves nothing. The move fades out past the stent's ends
 //!    and up side branches.
-//! 2. Wall inside the stent's tube is pushed out towards it: all the way with *stiffness* 1
-//!    (a perfect tube of the stent's diameter), not at all with 0. Wall outside the tube is
-//!    left alone. The push fades out over *end blend* past each end.
+//! 2. The lumen is joined with the stent's tube (a mesh union). The tube is lofted along the
+//!    stent from round rings whose diameter lies *stiffness*'s share of the way from the native
+//!    lumen's (the widest circle about the axis inside the wall) to the stent's: a perfect tube
+//!    with stiffness 1, the vessel unchanged with 0. Past each end it eases into the wall over
+//!    *end blend*. Wall inside the tube gives
+//!    way to the tube's own surface, however folded or nearly closed it was; wall outside
+//!    it, and side branches, are left alone. Where the union cannot be made (the tube
+//!    reaches an open end of the mesh), the wall is pushed out to the tube instead.
 //! 3. The reshaped region is remeshed.
 //!
-//! **Covered stent** (stent graft). After the same steps the stented stretch is cut out and
-//! replaced by the stent's tube: the lumen there is the stent, narrowed to its diameter where
-//! the vessel was wider (an aneurysm or a dilated stretch is excluded, and side branches
-//! opening along it are sealed off and removed), and open as far as the stiffness allows where
-//! the vessel was narrower.
+//! **Covered stent** (stent graft). The stented stretch is cut out and replaced by the same
+//! round rings: the lumen there is the stent, narrowed to its diameter where the vessel was
+//! wider (an aneurysm or a dilated stretch is excluded, and side branches opening along it are
+//! sealed off and removed), and open as far as the stiffness allows where it was narrower.
 
 use crate::bridge::{aligned_loops, commit, quad_band, strip_with, AlignedLoops};
 use crate::cut::{local_plane_cut_with, CutFill, KeepSide, LocalCutResult, PlaneCutParams, Side};
@@ -466,7 +471,7 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
     let w = params.straightness;
     // Between the sections: both paths at equal fractions of their length.
     let n = ((gap.max(ideal.len()) / ds).ceil() as usize).max(8);
-    let span: Vec<(DVec3, DVec3, f64)> = (0..=n)
+    let mut span: Vec<(DVec3, DVec3, f64)> = (0..=n)
         .map(|i| {
             let u = i as f64 / n as f64;
             let s = sa + gap * u;
@@ -474,6 +479,13 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
             (c.lerp(ideal.at(ideal.len() * u), w), c, s)
         })
         .collect();
+    // A stent bends no tighter than its diameter: where the vessel's course jogs (an
+    // eccentric narrowing) its axis is eased, between the sections it is held at.
+    let mut axis: Vec<DVec3> = span.iter().map(|x| x.0).collect();
+    limit_bend(&mut axis, MAX_BEND / r);
+    for (x, p) in span.iter_mut().zip(axis) {
+        x.0 = p;
+    }
     let span_len: f64 = span.windows(2).map(|x| x[0].0.distance(x[1].0)).sum();
     // Past the sections, far enough for the stent and the longest fade beyond it.
     let longest = params.end_blend.max(12.0 * r);
@@ -579,6 +591,40 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
     Ok(pl)
 }
 
+/// The sharpest a stent bends: its radius times its axis' curvature (a bend radius of the
+/// stent's diameter). A tube bent tighter than its radius folds through itself.
+const MAX_BEND: f64 = 0.5;
+
+/// Ease `pts` where they bend with a curvature over `max` (the ends stay put): the sharpest
+/// stretches are smoothed until none is.
+fn limit_bend(pts: &mut [DVec3], max: f64) {
+    let n = pts.len();
+    if n < 3 {
+        return;
+    }
+    let curvature = |p: &[DVec3], i: usize| {
+        let (a, b, c) = (p[i - 1], p[i], p[i + 1]);
+        2.0 * (b - a).cross(c - b).length() / (a.distance(b) * b.distance(c) * a.distance(c)).max(1e-300)
+    };
+    for _ in 0..2000 {
+        let sharp: Vec<usize> = (1..n - 1).filter(|&i| curvature(pts, i) > max).collect();
+        if sharp.is_empty() {
+            return;
+        }
+        // Each sharp point and its neighbours half way to their neighbours' mean.
+        let mut mark = vec![false; n];
+        for &i in &sharp {
+            mark[i.saturating_sub(2)..=(i + 2).min(n - 1)].fill(true);
+        }
+        let old = pts.to_vec();
+        for i in 1..n - 1 {
+            if mark[i] {
+                pts[i] = old[i] * 0.5 + (old[i - 1] + old[i + 1]) * 0.25;
+            }
+        }
+    }
+}
+
 /// What [`apply_stent`] did.
 #[derive(Clone, Debug, Default)]
 pub struct StentReport {
@@ -603,6 +649,8 @@ pub struct StentReport {
     /// The input's triangles that were reshaped (ids in the input mesh), e.g. to tell
     /// crossings the stent made from ones that were already there.
     pub source_triangles: Vec<u32>,
+    /// A bare stent's wall was pushed out rather than joined to the stent's tube, and why.
+    pub pushed: Option<String>,
 }
 
 fn tangents(pts: &[DVec3]) -> Vec<DVec3> {
@@ -641,8 +689,370 @@ fn percentile(v: &mut [f64], q: f64) -> Option<f64> {
 /// `owner` marks the vertices of the stented vessel itself (indexed by vertex id), e.g. those
 /// whose centerline ring lies on the path; without it, vertices within 2.5 radii of the
 /// centerline count. Other vertices near them (side branches) move less with distance.
+///
+/// A bare stent opens the vessel by joining its tube to the lumen (see [`open_with_tube`]);
+/// where that cannot be done (the tube reaches an open end of the mesh, or the union fails),
+/// the wall is pushed out instead. The mesh is rebuilt where the tube joins it, so vertex
+/// and triangle ids change there.
 pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Option<&[bool]>) -> EditResult<StentReport> {
     check(params)?;
+    if params.stiffness <= 0.0 && !params.covered {
+        return reshape(mesh, pl, params, owner, true, None);
+    }
+    if params.covered {
+        // The tube's rings from the native lumen, measured on the straightened vessel.
+        let mut carried = mesh.clone();
+        reshape(&mut carried, pl, &StentParams { covered: false, remesh: false, ..*params }, owner, false, None)?;
+        let h = params.edge_length.unwrap_or_else(|| carried.average_edge_length());
+        let frames = pl.frames(((pl.length / h).round() as usize).max(3));
+        let rings = stent_rings(&carried, &frames, pl.radius, params.stiffness, h);
+        let along: Vec<(f64, f64)> = rings.iter().enumerate().map(|(j, ring)| (pl.length * j as f64 / (rings.len() - 1) as f64, ring.radius)).collect();
+        let mut report = reshape(mesh, pl, params, owner, true, Some(&along))?;
+        // The lumen along a covered stent is its tube.
+        report.narrowest[1] = rings.iter().map(|ring| ring.radius).fold(f64::INFINITY, f64::min);
+        return Ok(report);
+    }
+    // Straightened only, then opened by the stent's tube.
+    let mut carried = mesh.clone();
+    let mut report = reshape(&mut carried, pl, params, owner, false, None)?;
+    match open_with_tube(&mut carried, pl, params) {
+        Ok(None) => {
+            *mesh = carried;
+            Ok(report)
+        }
+        Ok(Some(opened)) => {
+            // The input's triangles near the tube (by place: ids changed where the
+            // straightened wall was remeshed).
+            let pad = DVec3::splat(opened.reach);
+            let (lo, hi) = opened.centre.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &p| (a.min(p - pad), b.max(p + pad)));
+            let near = |p: DVec3| p.cmpge(lo).all() && p.cmple(hi).all() && opened.centre.windows(2).any(|w| point_segment_distance(p, w[0], w[1]) < opened.reach);
+            report.source_triangles.extend(mesh.triangle_ids().filter(|&t| mesh.tri_positions(t).iter().any(|&p| near(p))));
+            report.source_triangles.sort_unstable();
+            report.source_triangles.dedup();
+            *mesh = carried;
+            // (Opening never narrows the lumen: the two measures differ a little.)
+            report.narrowest[1] = opened.narrowest[1].max(report.narrowest[0]);
+            report.max_shift = report.max_shift.max(opened.widened);
+            report.triangles = opened.triangles;
+            Ok(report)
+        }
+        Err(e) => {
+            let mut report = reshape(mesh, pl, params, owner, true, None)?;
+            report.pushed = Some(e.to_string());
+            Ok(report)
+        }
+    }
+}
+
+fn point_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+/// One ring of the stent's lumen: the native lumen's radius about the axis there (the
+/// nearest wall; infinite where there is none), the ring's own radius, and the wall's distance
+/// in each direction across (see [`ring_angle`]).
+#[derive(Clone, Debug)]
+struct Ring {
+    native: f64,
+    radius: f64,
+    walls: Vec<f64>,
+}
+
+/// The `j`th of `around` directions across a ring, turned by an irrational fraction of a step,
+/// so the tube's vertices do not line up exactly with a regular wall's (a union cannot
+/// resolve a vertex lying on an edge).
+fn ring_angle(j: usize, around: usize) -> f64 {
+    TAU * (j as f64 + 0.381_966) / around as f64
+}
+
+/// The stent's lumen at each frame (point, tangent and two directions across, as
+/// [`StentPlacement::frames`]): a round ring whose diameter lies *stiffness*'s share of the
+/// way from the native lumen's to the stent's (2 mm native, a 6 mm stent and 50 % make 4 mm),
+/// never wider than the stent. The native lumen is the widest circle about the axis inside
+/// the wall, so with no stiffness nothing opens. Below full stiffness the rings are smoothed
+/// a little along the stent (over a quarter of its radius), against the jitter of measuring.
+fn stent_rings(mesh: &Mesh, frames: &[[DVec3; 4]], r: f64, st: f64, h: f64) -> Vec<Ring> {
+    let around = ((TAU * r / h).ceil() as usize).clamp(12, 720);
+    let near: Vec<u32> = {
+        let pad = DVec3::splat(2.0 * r);
+        let (lo, hi) = frames.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), f| (a.min(f[0] - pad), b.max(f[0] + pad)));
+        mesh.triangle_ids().filter(|&t| mesh.tri_positions(t).iter().any(|p| p.cmpge(lo).all() && p.cmple(hi).all())).collect()
+    };
+    let bvh = Bvh::build_subset(mesh, &near);
+    let walls: Vec<Vec<f64>> = frames
+        .par_iter()
+        .map(|&[x, _, u, v]| (0..around).map(|j| ring_angle(j, around)).map(|a| bvh.raycast(mesh, &Ray::new(x, u * a.cos() + v * a.sin())).map_or(f64::INFINITY, |hit| hit.t)).collect())
+        .collect();
+    let native: Vec<f64> = walls.iter().map(|w| w.iter().copied().fold(f64::INFINITY, f64::min)).collect();
+    let mut radius: Vec<f64> = native.iter().map(|&n| r - (1.0 - st) * (r - n).max(0.0)).collect();
+    if st < 1.0 && frames.len() > 2 {
+        let step = (frames[1][0] - frames[0][0]).length().max(1e-9);
+        let half = ((0.25 * r / step).round() as usize).max(1);
+        for _ in 0..2 {
+            let old = radius.clone();
+            radius = (0..old.len()).map(|i| {
+                let w = i.saturating_sub(half)..=(i + half).min(old.len() - 1);
+                old[w.clone()].iter().sum::<f64>() / w.count() as f64
+            }).collect();
+        }
+    }
+    native.into_iter().zip(radius).zip(walls).map(|((native, radius), walls)| Ring { native, radius, walls }).collect()
+}
+
+/// The bare stent's tube joined to the lumen: how it went.
+struct TubeOpening {
+    /// The joined region's triangles (ids in the new mesh).
+    triangles: Vec<u32>,
+    /// The tube's centreline, and how far from it the wall can have changed.
+    centre: Vec<DVec3>,
+    reach: f64,
+    /// Narrowest lumen along the stent before and after (the 10th percentile of each ring's
+    /// wall distances).
+    narrowest: [f64; 2],
+    /// The most the lumen widened.
+    widened: f64,
+}
+
+/// Open the lumen to the stent: the new lumen is the old one joined with the stent's tube
+/// (a mesh union). Along the stent the tube is round at the stent's radius with *stiffness*
+/// 1; with less, part way from the wall towards it, ray by ray from the axis. Past each end it
+/// eases over *end blend* to a ring just inside the wall. Where the wall is about as wide as
+/// the tube or wider, the tube keeps just inside it, so the two never run along one another
+/// (a union cannot tell which surface is outside there) and nothing changes. The tube follows
+/// the stent's axis eased to bend no tighter than the stent's diameter.
+///
+/// The mesh's open ends are capped for the union and opened again after. `None`: the tube
+/// lies inside the lumen everywhere (nothing to open). Errors where the union fails or the
+/// tube reaches an open end.
+fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) -> EditResult<Option<TubeOpening>> {
+    let (r, length, st) = (pl.radius, pl.length, params.stiffness);
+    let blend = params.end_blend.max(0.25 * r);
+    let k = pl.s.len();
+    let (lo, hi) = (pl.s.partition_point(|&x| x < -blend), pl.s.partition_point(|&x| x <= length + blend).min(k));
+    if hi < lo + 3 {
+        return Ok(None);
+    }
+    // Edge length: the wall's near the stent.
+    let pad = DVec3::splat(2.0 * r);
+    let (bmin, bmax) = pl.axis[lo..hi].iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &p| (a.min(p), b.max(p)));
+    let (bmin, bmax) = (bmin - pad, bmax + pad);
+    let in_box = |m: &Mesh, t: u32| m.tri_positions(t).iter().any(|p| p.cmpge(bmin).all() && p.cmple(bmax).all());
+    // Zero-area and microscopic triangles near the stent fixed first (a union cannot place
+    // them, and their coincident corners could not be told apart after it).
+    let tiny = 1e-6 * r;
+    for _ in 0..4 {
+        let mut fixed = false;
+        let short: Vec<(u32, u32)> = mesh
+            .triangle_ids()
+            .filter(|&t| in_box(mesh, t))
+            .flat_map(|t| {
+                let tv = mesh.triangle(t);
+                [(tv[0], tv[1]), (tv[1], tv[2]), (tv[2], tv[0])]
+            })
+            .filter(|&(a, b)| a < b && mesh.vertex(a).distance(mesh.vertex(b)) < tiny)
+            .collect();
+        for (a, b) in short {
+            if mesh.is_vertex(a) && mesh.is_vertex(b) && mesh.find_edge(a, b).is_some() {
+                let mid = (mesh.vertex(a) + mesh.vertex(b)) * 0.5;
+                if mesh.collapse_edge(a, b).is_ok() {
+                    mesh.set_vertex(a, mid);
+                    fixed = true;
+                }
+            }
+        }
+        let degenerate: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t) && mm_repair::ops::is_degenerate_triangle(mesh, t, 1e-12)).collect();
+        for t in degenerate {
+            fixed |= mm_repair::ops::fix_degenerate_triangle(mesh, t);
+        }
+        if !fixed {
+            break;
+        }
+    }
+    let local: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t)).collect();
+    if local.is_empty() {
+        return Ok(None);
+    }
+    let h = params.edge_length.unwrap_or_else(|| local.iter().flat_map(|&t| mesh.tri_edges(t)).map(|e| mesh.edge_length(e)).sum::<f64>() / (3 * local.len()) as f64).max(1e-3 * r);
+    // The tube's centreline: the axis there, a ring about every edge length, eased.
+    let total = pl.s[hi - 1] - pl.s[lo];
+    let rings = ((total / h).ceil() as usize).max(2);
+    let at = |x: f64| {
+        let j = pl.s.partition_point(|&v| v <= x).clamp(1, k - 1) - 1;
+        let f = ((x - pl.s[j]) / (pl.s[j + 1] - pl.s[j]).max(1e-300)).clamp(0.0, 1.0);
+        pl.axis[j].lerp(pl.axis[j + 1], f)
+    };
+    let xs: Vec<f64> = (0..=rings).map(|i| pl.s[lo] + total * i as f64 / rings as f64).collect();
+    let mut centre: Vec<DVec3> = xs.iter().map(|&x| at(x)).collect();
+    limit_bend(&mut centre, MAX_BEND / r);
+    // Rotation-minimising frames along it, and the stent's rings there.
+    let mut frames: Vec<[DVec3; 4]> = Vec::with_capacity(rings + 1);
+    for (i, &c) in centre.iter().enumerate() {
+        let t = (centre[(i + 1).min(rings)] - centre[i.saturating_sub(1)]).normalize_or(DVec3::Z);
+        let u = match frames.last() {
+            None => t.any_orthonormal_vector(),
+            Some(&[x0, t0, u0, _]) => reflect_frame(x0, t0, u0, c, t),
+        };
+        frames.push([c, t, u, t.cross(u)]);
+    }
+    let lumen = stent_rings(mesh, &frames, r, st, h);
+    let around = lumen[0].walls.len();
+    // Wall this close to a ring counts as at it: half a percent of the radius, or twice the
+    // sag of the wall's own facets (a faceted tube of the stent's size is not narrower).
+    let margin = (0.005 * r).max(0.25 * h * h / r);
+    let mut pos: Vec<DVec3> = Vec::with_capacity((rings + 1) * around + 2);
+    let (mut narrowest_before, mut narrowest, mut widened, mut opens) = (f64::INFINITY, f64::INFINITY, 0.0_f64, false);
+    for ((&[c, _, u, v], &x), ring) in frames.iter().zip(&xs).zip(&lumen) {
+        // Round rings: the stent's where it opens the lumen by more than the margin, else just
+        // inside the nearest wall (so the two surfaces never run along one another), easing
+        // to that past each end.
+        let inside = ring.native.min(r) - margin;
+        let opening = if ring.radius > ring.native + margin { ring.radius } else { inside };
+        let w = if x < 0.0 { 1.0 - smoother(-x / blend) } else if x > length { 1.0 - smoother((x - length) / blend) } else { 1.0 };
+        let rad = (inside + (opening - inside) * w).max(0.05 * r);
+        if rad > ring.native {
+            opens = true;
+            widened = widened.max(rad - ring.native);
+        }
+        if (0.0..=length).contains(&x) {
+            // The 10th percentile of the wall's distance from the axis around the ring, before
+            // and after (as the straightened vessel's narrowest is measured).
+            let mut walls = ring.walls.clone();
+            let mut after: Vec<f64> = ring.walls.iter().map(|&w| w.max(rad)).collect();
+            if let (Some(b), Some(a)) = (percentile(&mut walls, 0.1), percentile(&mut after, 0.1)) {
+                narrowest_before = narrowest_before.min(b);
+                narrowest = narrowest.min(a);
+            }
+        }
+        // Round, except that where the wall is about at the ring (within the margin) the ring
+        // keeps just inside it: two surfaces lying on one another cannot be joined.
+        for (j, &wall) in ring.walls.iter().enumerate() {
+            let a = ring_angle(j, ring.walls.len());
+            let here = if (wall - rad).abs() < margin { (wall - margin).max(0.05 * r) } else { rad };
+            pos.push(c + (u * a.cos() + v * a.sin()) * here);
+        }
+    }
+    if !opens {
+        return Ok(None);
+    }
+    // The tube, closed by a fan at each end (both inside the lumen).
+    let a = around as u32;
+    let mut tris: Vec<[u32; 3]> = Vec::with_capacity(2 * rings * around + 2 * around);
+    for i in 0..rings as u32 {
+        let (p, q) = (i * a, (i + 1) * a);
+        for j in 0..a {
+            let jn = (j + 1) % a;
+            tris.push([p + j, p + jn, q + jn]);
+            tris.push([p + j, q + jn, q + j]);
+        }
+    }
+    let (c0, c1) = (pos.len() as u32, pos.len() as u32 + 1);
+    pos.push(centre[0]);
+    pos.push(centre[rings]);
+    let last = rings as u32 * a;
+    for j in 0..a {
+        let jn = (j + 1) % a;
+        tris.push([c0, jn, j]);
+        tris.push([c1, last + j, last + jn]);
+    }
+    let (tube, _) = Mesh::from_triangles(&pos, &tris, None);
+    // The vessel closed at its open ends for the union.
+    let mut closed = mesh.clone();
+    let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&closed).into_iter().map(|l| l.vertices).collect();
+    let caps = crate::cap::cap_planar_loops(&mut closed, &loops, None, CutFill::Flat)?;
+    if !caps.failed_loops.is_empty() || !closed.is_closed() {
+        return Err(EditError::Failed("could not close the vessel's open ends for the union".into()));
+    }
+    let cap_groups: HashSet<i32> = caps.groups.iter().copied().collect();
+    let joined = crate::boolean::mesh_boolean(&closed, &tube, crate::boolean::BooleanOp::Union)?;
+    let mut out = joined.mesh;
+    let tube_group = joined.group_offset;
+    // The tube must not reach a cap (an open end), which is opened again now.
+    let on_cap = joined.seam_vertices.iter().any(|&v| out.vertex_triangles(v).iter().any(|&t| cap_groups.contains(&out.tri_group(t))));
+    if on_cap {
+        return Err(EditError::Failed("the stent's tube reaches an open end of the mesh".into()));
+    }
+    let caps_out: Vec<u32> = out.triangle_ids().filter(|&t| cap_groups.contains(&out.tri_group(t))).collect();
+    out.remove_triangles(caps_out);
+    // The tube's triangles take the group of the wall they join.
+    let from_tube = |m: &Mesh, t: u32| m.tri_group(t) >= tube_group && !cap_groups.contains(&m.tri_group(t));
+    let mut votes: HashMap<i32, usize> = HashMap::new();
+    for &v in &joined.seam_vertices {
+        for t in out.vertex_triangles(v) {
+            if !from_tube(&out, t) {
+                *votes.entry(out.tri_group(t)).or_default() += 1;
+            }
+        }
+    }
+    let group = votes.into_iter().max_by_key(|x| x.1).map_or(0, |x| x.0);
+    // Back onto the straightened mesh, keeping the ids of everything the union left as it
+    // was (it copies untouched triangles exactly): its triangles the union replaced go, and
+    // the union's new ones come in. Only near the tube can anything have changed.
+    let inside_box = |p: DVec3| p.cmpge(bmin).all() && p.cmple(bmax).all();
+    let key = |p: DVec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+    let mut old_ids: HashMap<[u64; 3], u32> = HashMap::new();
+    for v in local.iter().flat_map(|&t| mesh.triangle(t)) {
+        if old_ids.insert(key(mesh.vertex(v)), v).is_some_and(|o| o != v) {
+            return Err(EditError::Failed("the wall near the stent has vertices on top of one another".into()));
+        }
+    }
+    let mut kept: HashSet<u32> = HashSet::new();
+    let mut fresh: Vec<([u32; 3], i32)> = Vec::new();
+    for t in out.triangle_ids() {
+        let tv = out.triangle(t);
+        if !tv.iter().any(|&v| inside_box(out.vertex(v))) {
+            continue;
+        }
+        let old: Vec<u32> = tv.iter().filter_map(|&v| old_ids.get(&key(out.vertex(v))).copied()).collect();
+        let same = (old.len() == 3).then(|| mesh.vertex_triangles(old[0]).into_iter().find(|&o| {
+            let ov = mesh.triangle(o);
+            old.iter().all(|v| ov.contains(v))
+        })).flatten();
+        match same {
+            Some(o) => {
+                kept.insert(o);
+            }
+            None => fresh.push((tv, if from_tube(&out, t) { group } else { out.tri_group(t) })),
+        }
+    }
+    let gone: Vec<u32> = local.iter().copied().filter(|t| !kept.contains(t)).collect();
+    mesh.remove_triangles(gone);
+    // Each corner: the old vertex there if it is still in use, else a new one; all decided
+    // before any is added, since added vertices can take the ids of removed ones.
+    let mut corner: HashMap<u32, Option<u32>> = HashMap::new();
+    for (tv, _) in &fresh {
+        for &v in tv {
+            corner.entry(v).or_insert_with(|| old_ids.get(&key(out.vertex(v))).copied().filter(|&o| mesh.is_vertex(o)));
+        }
+    }
+    let ids: HashMap<u32, u32> = corner.into_iter().map(|(v, old)| (v, old.unwrap_or_else(|| mesh.append_vertex(out.vertex(v))))).collect();
+    let mut added = Vec::with_capacity(fresh.len());
+    for (tv, g) in fresh {
+        added.push(mesh.append_triangle(tv.map(|v| ids[&v]), g).map_err(|e| EditError::Failed(format!("joining the stent's tube: {e:?}")))?);
+    }
+    mesh.remove_isolated_vertices();
+    // The joined region: the new triangles and two rings around them.
+    let mut region: HashSet<u32> = added.iter().copied().collect();
+    for _ in 0..2 {
+        let more: Vec<u32> = region.iter().flat_map(|&t| mesh.triangle(t)).flat_map(|v| mesh.vertex_triangles(v)).collect();
+        region.extend(more);
+    }
+    let mut region: Vec<u32> = region.into_iter().collect();
+    region.sort_unstable();
+    if params.remesh {
+        let rp = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(region.clone()), ..mm_remesh::RemeshParams::with_target(h) };
+        if let Ok(Some(tris)) = mm_remesh::remesh(mesh, &rp, None).map(|x| x.region_triangles) {
+            region = tris;
+        }
+    }
+    mesh.bump_shape_version();
+    Ok(Some(TubeOpening { triangles: region, centre, reach: 1.25 * r + 2.0 * h, narrowest: [narrowest_before, narrowest], widened }))
+}
+
+/// Straighten the vessel with the stent and (`push_wall`) push the wall out to it; covered,
+/// replace the stented stretch with the stent's tube, `rings` giving its radius along it.
+fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Option<&[bool]>, push_wall: bool, rings: Option<&[(f64, f64)]>) -> EditResult<StentReport> {
     let k = pl.s.len();
     if k < 3 {
         return Err(EditError::InvalidParameter("the stent placement has too few samples".into()));
@@ -766,17 +1176,25 @@ pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, o
 
     // Region and edge length before reshaping.
     // Pushed out to the stent's radius, with a soft corner (2 % of the radius) where the
-    // push starts, so the wall has no crease at the edge of contact.
+    // push starts, so the wall has no crease at the edge of contact. Wall inside the radius
+    // keeps its order away from the axis within a thin band just outside it (half a percent),
+    // rather than all landing on the radius: where the wall doubles back in a slice (a shelf
+    // where a narrowing meets a wider lumen), its layers would otherwise land on one another.
     let soft = 0.02 * r;
+    let band = 0.25 * soft;
     let open = |rho: f64| {
         let d = rho - r;
-        if d >= soft {
+        let base = if d >= soft {
             rho
         } else if d <= -soft {
             r
         } else {
             r + (d + soft) * (d + soft) / (4.0 * soft)
-        }
+        };
+        // Rising with rho to the radius, then easing out by the end of the soft corner (its
+        // slope there stays under the corner's, so the whole stays increasing).
+        let order = if d <= 0.0 { band * (rho / r).max(0.0) } else { band * (1.0 - smoother((d / soft).min(1.0))) };
+        base + order
     };
     let mapped: Vec<(u32, DVec3, f64)> = verts
         .par_iter()
@@ -793,7 +1211,7 @@ pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, o
             let rel = xt - carried.lerp(p, fade);
             let perp = rel - t * rel.dot(t);
             let rho = perp.length();
-            let push = params.stiffness * fade * wv;
+            let push = if push_wall { params.stiffness * fade * wv } else { 0.0 };
             let (xf, rho2) = if rho > 1e-12 * r && push > 0.0 {
                 let rho2 = rho + (open(rho) - rho) * push;
                 (xt + perp * ((rho2 - rho) / rho), rho2)
@@ -849,9 +1267,7 @@ pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, o
         distorted.extend(ring);
     }
     if params.covered {
-        let seeds: Vec<u32> = core.iter().take(1).flat_map(|&(v, _, _)| mesh.vertex_triangles(v)).collect();
-        let own = mm_core::topology::flood_fill_triangles(mesh, &seeds, |_| true);
-        let (tube, sealed, removed) = cover(mesh, pl, h, &own)?;
+        let (tube, sealed, removed) = cover(mesh, pl, h, rings.ok_or_else(|| EditError::Failed("a covered stent needs its rings".into()))?)?;
         region.retain(|&t| mesh.is_triangle(t));
         distorted.retain(|&t| mesh.is_triangle(t));
         distorted.extend(tube.iter().copied());
@@ -877,39 +1293,20 @@ pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, o
 }
 
 /// Covered stent: cut the stented stretch out at the stent's ends and put the stent's tube in
-/// its place (`own`: the vessel's surface, the triangles joined to its wall) — the wall's distance from the axis capped at the stent's radius, easing into
-/// each cut over a short flare. Returns the tube's triangles with the bands blended into
+/// its place: round rings of the radius `rings` gives along it (`(s, radius)`, see
+/// [`stent_rings`]), easing into each cut over a short flare. Returns the tube's triangles with the bands blended into
 /// it, the number of open ends removed and the number of triangles removed.
-fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, own: &[u32]) -> EditResult<(Vec<u32>, usize, usize)> {
+fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, rings: &[(f64, f64)]) -> EditResult<(Vec<u32>, usize, usize)> {
     let (r, l) = (pl.radius, pl.length);
     let around = ((TAU * r / h).round() as usize).clamp(12, 4000);
     let rows = ((l / h).round() as usize).max(3);
     let frames = pl.frames(rows);
-    // The lumen around the axis: each row's wall distance by angle, capped at the radius.
-    // (Measured on the vessel's own surface only: other shells overlapping it are not its wall.)
-    let bvh = Bvh::build_subset(mesh, own);
-    let mut rad: Vec<Vec<f64>> = frames
-        .iter()
-        .map(|&[x, _, u, v]| {
-            (0..around)
-                .map(|i| {
-                    let a = TAU * i as f64 / around as f64;
-                    bvh.raycast(mesh, &Ray::new(x, u * a.cos() + v * a.sin())).map_or(r, |hit| hit.t.min(r))
-                })
-                .collect()
-        })
-        .collect();
-    for _ in 0..2 {
-        let old = rad.clone();
-        let at = |jj: usize, ii: usize| old[jj.min(rows)][ii % around];
-        for (j, row) in rad.iter_mut().enumerate() {
-            for (i, x) in row.iter_mut().enumerate() {
-                let (jm, jp) = (j.saturating_sub(1), j + 1);
-                let (im, ip) = (i + around - 1, i + 1);
-                *x = (4.0 * at(j, i) + 2.0 * (at(j, im) + at(j, ip) + at(jm, i) + at(jp, i)) + at(jm, im) + at(jm, ip) + at(jp, im) + at(jp, ip)) / 16.0;
-            }
-        }
-    }
+    // The tube's radius along it (round rings, see [`stent_rings`]).
+    let ring_at = |s: f64| {
+        let j = rings.partition_point(|x| x.0 <= s).clamp(1, rings.len().max(2) - 1) - 1;
+        let ((s0, r0), (s1, r1)) = (rings[j], rings[(j + 1).min(rings.len() - 1)]);
+        r0 + (r1 - r0) * ((s - s0) / (s1 - s0).max(1e-300)).clamp(0.0, 1.0)
+    };
     let wide = 3.0 * pl.vessel_radius.iter().copied().fold(r, f64::max);
     let outside = || EditError::Failed("each end of a covered stent must lie inside the vessel (this one runs past an open end): move the ends in or shorten the stent".into());
     let cut = |mesh: &mut Mesh, x: DVec3, n: DVec3| -> EditResult<LocalCutResult> {
@@ -977,12 +1374,6 @@ fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, own: &[u32]) -> EditResul
     };
     let (prof_a, prof_b) = (profile(&p, &frames[0]), profile(&q, &frames[rows]));
     let flare = (0.5 * r).max(2.0 * h).min(l / 3.0);
-    let sample = |row: &[f64], a: f64| {
-        let x = a.rem_euclid(TAU) / TAU * around as f64;
-        let i = x.floor() as usize % around;
-        let f = x - x.floor();
-        row[i] * (1.0 - f) + row[(i + 1) % around] * f
-    };
     let mut tube_rows: Vec<Vec<u32>> = Vec::with_capacity(rows - 1);
     let mut new_vertices = Vec::new();
     for (j, &[x, _, u, v]) in frames.iter().enumerate().take(rows).skip(1) {
@@ -991,7 +1382,7 @@ fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, own: &[u32]) -> EditResul
         let row: Vec<u32> = (0..around)
             .map(|i| {
                 let a = start + sense * TAU * i as f64 / around as f64;
-                let mut rr = sample(&rad[j], a);
+                let mut rr = ring_at(s);
                 if fa < 1.0 {
                     rr = polar(&prof_a, a).unwrap_or(rr) * (1.0 - fa) + rr * fa;
                 }

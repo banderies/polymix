@@ -1,6 +1,6 @@
 use super::*;
 use crate::*;
-use mm_core::{DVec3, Plane};
+use mm_core::{Bvh, DVec2, DVec3, Plane};
 
 fn cut(m: &Mesh, plane: Plane, keep: KeepSide, fill: CutFill) -> (Mesh, PlaneCutResult) {
     let mut c = m.clone();
@@ -344,4 +344,83 @@ fn random_local_cuts_stay_valid() {
             }
         }
     }
+}
+
+/// A tube whose cross-section is a thin crescent (a disc of radius 4 with a disc of radius
+/// 3.8 centred 1.2 off its centre taken out), along z.
+fn crescent_tube() -> Mesh {
+    let outline: Vec<DVec2> = {
+        // Walk the outer circle where it is outside the bite, then the bite's circle back.
+        let mut pts = Vec::new();
+        let (r, b, off) = (4.0_f64, 3.8_f64, DVec2::new(1.2, 0.0));
+        let n = 120;
+        for i in 0..n {
+            let a = std::f64::consts::TAU * i as f64 / n as f64;
+            let p = DVec2::new(a.cos(), a.sin()) * r;
+            if (p - off).length() > b {
+                pts.push(p);
+            }
+        }
+        // The bite's arc inside the outer circle, from the last outer point back to the first.
+        let (first, last) = (pts[0], *pts.last().unwrap());
+        let (a0, a1) = ((last - off).to_angle(), (first - off).to_angle());
+        let mut a1 = a1;
+        while a1 > a0 {
+            a1 -= std::f64::consts::TAU;
+        }
+        for i in 1..40 {
+            let a = a0 + (a1 - a0) * i as f64 / 40.0;
+            pts.push(off + DVec2::new(a.cos(), a.sin()) * b);
+        }
+        pts
+    };
+    let path: Vec<DVec3> = (0..=20).map(|k| DVec3::new(0.0, 0.0, k as f64)).collect();
+    let mut m = Mesh::new();
+    let rings: Vec<Vec<u32>> = path.iter().map(|c| outline.iter().map(|p| m.append_vertex(*c + DVec3::new(p.x, p.y, 0.0))).collect()).collect();
+    let k = outline.len();
+    for w in rings.windows(2) {
+        for i in 0..k {
+            let (a, b, c, d) = (w[0][i], w[0][(i + 1) % k], w[1][i], w[1][(i + 1) % k]);
+            m.append_triangle([a, b, d], 0).unwrap();
+            m.append_triangle([a, d, c], 0).unwrap();
+        }
+    }
+    m
+}
+
+#[test]
+fn local_cross_sections_enclose_and_find_the_widest_point() {
+    // A round tube of radius 3 along z.
+    let path: Vec<DVec3> = (0..=20).map(|k| DVec3::new(0.0, 0.0, k as f64)).collect();
+    let tube = mm_core::primitives::tube_along(&path, &[3.0; 21], 48);
+    let bvh = Bvh::build(&tube);
+    let at = DVec3::new(0.5, 0.0, 10.0);
+    let curves = local_intersection_curves(&tube, &bvh, Plane::from_point_normal(at, DVec3::Z), at, 9.0);
+    assert_eq!(curves.len(), 1);
+    let c = &curves[0];
+    assert!(c.closed);
+    assert!(c.encloses(at, DVec3::Z) && c.encloses(at, -DVec3::Z));
+    assert!(!c.encloses(DVec3::new(3.5, 0.0, 10.0), DVec3::Z));
+    let (centre, r) = c.inscribed_centre(DVec3::Z).unwrap();
+    assert!(centre.distance(DVec3::new(0.0, 0.0, 10.0)) < 0.1, "{centre}");
+    assert!((r - 3.0).abs() < 0.1, "{r}");
+    // Whole-mesh slicing agrees.
+    let all = plane_intersection_curves(&tube, Plane::from_point_normal(at, DVec3::Z));
+    assert!((all[0].area - c.area).abs() < 1e-9);
+
+    // A crescent: its centroid is outside it, the widest point inside.
+    let m = crescent_tube();
+    let bvh = Bvh::build(&m);
+    let at = DVec3::new(-3.0, 0.5, 10.0);
+    let curves = local_intersection_curves(&m, &bvh, Plane::from_point_normal(at, DVec3::Z), at, 9.0);
+    assert_eq!(curves.len(), 1);
+    let c = &curves[0];
+    assert!(c.encloses(at, DVec3::Z));
+    assert!(!c.encloses(c.centroid, DVec3::Z), "the crescent's centroid {} is outside it", c.centroid);
+    let (centre, r) = c.inscribed_centre(DVec3::Z).unwrap();
+    assert!(c.encloses(centre, DVec3::Z));
+    // The widest part is opposite the bite: between x = -4 and x = -2.6.
+    // (Its thickness barely changes near there, so the centre may sit a little off y = 0.)
+    assert!((centre.x + 3.3).abs() < 0.1 && centre.y.abs() < 0.6, "{centre}");
+    assert!((r - 0.7).abs() < 0.05, "{r}");
 }
