@@ -279,7 +279,7 @@ pub fn loft_guided(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &Lof
     if smooth && params.fair > 0.0 {
         fair_tube(mesh, &rows, params);
     }
-    let band = if params.blend > 0.0 { blend_join(mesh, &result.triangles, [&p, &q], params.blend) } else { Vec::new() };
+    let band = if params.blend > 0.0 { blend_join(mesh, &result.triangles, [&p, &q], params.blend, &|_| false) } else { Vec::new() };
     if params.remesh {
         remesh_join(mesh, &mut result, band, h);
     }
@@ -290,8 +290,9 @@ pub fn loft_guided(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &Lof
 /// and a band of each vessel behind its opening, `blend` diameters wide, get Taubin λ|μ
 /// steps (which smooth without shrinking) at full strength on the tube and its seams, fading
 /// to nothing across the band (smootherstep of the distance along the surface). Other open
-/// edges stay where they are. Returns the vessels' triangles in the bands.
-pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: f64) -> Vec<u32> {
+/// edges, and vertices at points `fixed` holds, stay where they are. Returns the vessels'
+/// triangles in the bands.
+pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: f64, fixed: &dyn Fn(DVec3) -> bool) -> Vec<u32> {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, HashSet};
     let tube_verts: HashSet<u32> = tube.iter().flat_map(|&t| mesh.triangle(t)).collect();
@@ -340,7 +341,7 @@ pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], b
     };
     let movable: Vec<(u32, f64, Vec<u32>)> = weight
         .into_iter()
-        .filter(|&(v, w)| w > 0.0 && !mesh.is_boundary_vertex(v))
+        .filter(|&(v, w)| w > 0.0 && !mesh.is_boundary_vertex(v) && !fixed(mesh.vertex(v)))
         .map(|(v, w)| (v, w, mesh.vertex_neighbors(v).collect()))
         .collect();
     let iterations = (10.0 + 30.0 * blend).round() as usize;

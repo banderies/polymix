@@ -62,7 +62,8 @@ struct StentUi {
     /// stent: 100 makes a perfect tube of the stent's diameter, 0 leaves the vessel as it is.
     /// A bare stent never pulls wider wall in; a covered one narrows it to the stent.
     stiffness: f64,
-    /// How far past each end the wall eases back to its own shape, mm (0..10).
+    /// How far past each end the wall eases back to its own shape and course, mm (0..40).
+    /// Nothing beyond it changes; a straightened stent may need a longer one.
     end_blend: f64,
     /// Stent graft: the lumen along it becomes the stent's tube (wider wall narrowed, side
     /// branches opening along it sealed off and removed).
@@ -366,7 +367,7 @@ fn warnings(out: &StentOut) -> Vec<String> {
     let pl = &out.placement;
     let mut w = Vec::new();
     if let Some(e) = (0..2).filter(|&e| pl.return_bend[e] > 0.7).max_by(|&a, &b| pl.return_bend[a].total_cmp(&pl.return_bend[b])) {
-        w.push(format!("Past end {} the vessel has to bend back sharply onto its course, so its wall may crease: lower the straightness.", e + 1));
+        w.push(format!("Past end {} the vessel has to bend back sharply onto its course within the end blend, so its wall may crease: lengthen the end blend or lower the straightness.", e + 1));
     }
     let moved = out.report.moved_openings.saturating_sub(out.report.sealed_openings);
     if moved > 0 {
@@ -793,7 +794,7 @@ impl Tool for StentTool {
             }
             "straightness" => self.ui.straightness = num.unwrap_or(self.ui.straightness).clamp(0.0, 100.0),
             "stiffness" => self.ui.stiffness = num.unwrap_or(self.ui.stiffness).clamp(0.0, 100.0),
-            "blend" => self.ui.end_blend = num.unwrap_or(self.ui.end_blend).max(0.0),
+            "blend" => self.ui.end_blend = num.unwrap_or(self.ui.end_blend).clamp(0.0, 40.0),
             "ends" => {
                 self.ui.continuity = match val {
                     "g0" => EndContinuity::G0,
@@ -860,7 +861,7 @@ impl Tool for StentTool {
         // Typed sizes stop following the ends, as in the panel.
         self.sized[0] |= changes.get("diameter").is_some();
         self.sized[1] |= changes.get("length").is_some();
-        self.ui = StentUi { diameter: ui.diameter.clamp(0.5, 60.0), length: ui.length.clamp(1.0, 400.0), straightness: ui.straightness.clamp(0.0, 100.0), stiffness: ui.stiffness.clamp(0.0, 100.0), end_blend: ui.end_blend.clamp(0.0, 10.0), ..ui };
+        self.ui = StentUi { diameter: ui.diameter.clamp(0.5, 60.0), length: ui.length.clamp(1.0, 400.0), straightness: ui.straightness.clamp(0.0, 100.0), stiffness: ui.stiffness.clamp(0.0, 100.0), end_blend: ui.end_blend.clamp(0.0, 40.0), ..ui };
         self.update(cx);
         Ok(())
     }
@@ -994,8 +995,8 @@ impl Tool for StentTool {
         });
         ui.add(egui::Slider::new(&mut self.ui.stiffness, 0.0..=100.0).suffix("%").text("Stiffness"))
             .on_hover_text("Radial force: along the stent, each way across, the lumen lies this share of the way from the vessel's own wall to the stent's radius (2 mm vessel, 6 mm stent, 50 % → 4 mm), so the vessel's shape eases into the round stent. 100 % makes a perfect tube of the stent's diameter; 0 % leaves the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to the stent");
-        ui.add(egui::Slider::new(&mut self.ui.end_blend, 0.0..=10.0).suffix(" mm").text("End blend"))
-            .on_hover_text("How far past each end of the stent the wall eases back to its own shape");
+        ui.add(egui::Slider::new(&mut self.ui.end_blend, 0.0..=40.0).suffix(" mm").text("End blend"))
+            .on_hover_text("How far past each end of the stent the wall eases back to its own shape and course. Nothing beyond it changes; a straightened stent may need a longer one");
         ui.checkbox(&mut self.ui.covered, "Covered (stent graft)")
             .on_hover_text("The lumen along the stent becomes the stent's tube: wider wall (an aneurysm, a dilated stretch) is narrowed to the stent's diameter, and side branches opening along it are sealed off and removed");
         ui.checkbox(&mut self.ui.remesh, "Remesh the reshaped wall").on_hover_text("Even triangles over the reshaped region (recommended for CFD)");
@@ -1137,6 +1138,29 @@ mod tests {
             .fold(0.0, f64::max)
     }
 
+    /// Vertices of `m` past the end blend (beyond the stent's first or last slice by more than
+    /// half an edge) that `out` moved or rebuilt, of how many there are.
+    fn changed_past_the_end_blend(m: &Mesh, out: &Mesh, pl: &mm_edit::StentPlacement) -> (usize, usize) {
+        let k = pl.vessel.len();
+        let ends = [(pl.vessel[0], (pl.vessel[0] - pl.vessel[1]).normalize()), (pl.vessel[k - 1], (pl.vessel[k - 1] - pl.vessel[k - 2]).normalize())];
+        let half = 0.5 * m.average_edge_length();
+        let ring = |mesh: &Mesh, v: u32| {
+            let mut n: Vec<u32> = mesh.vertex_neighbors(v).collect();
+            n.sort_unstable();
+            n
+        };
+        let past: Vec<u32> = m
+            .vertex_ids()
+            .filter(|&v| {
+                let p = m.vertex(v);
+                let nearest = (0..k).min_by(|&a, &b| pl.vessel[a].distance(p).total_cmp(&pl.vessel[b].distance(p))).unwrap();
+                (nearest == 0 && (p - ends[0].0).dot(ends[0].1) > half) || (nearest == k - 1 && (p - ends[1].0).dot(ends[1].1) > half)
+            })
+            .collect();
+        let changed = past.iter().filter(|&&v| !(out.is_vertex(v) && out.vertex(v) == m.vertex(v) && ring(out, v) == ring(m, v))).count();
+        (changed, past.len())
+    }
+
     #[test]
     fn stent_in_a_bent_stenosed_vessel() {
         // Traced from the first end, the stent opens the narrowing; straightened (G0) and
@@ -1152,10 +1176,12 @@ mod tests {
         let sections = [Section::at(&m, &bvh, wall(a0)).unwrap(), Section::at(&m, &bvh, wall(b0)).unwrap()];
         let trace = trace_vessel(&m, &sections).unwrap();
         assert!((trace.span - (b0 - a0)).abs() < 0.6, "span {} vs {}", trace.span, b0 - a0);
+        // Straightened across the bend, the vessel turns back onto its course within the end
+        // blend: a longer one for a smooth wall.
         for (ui, label) in [
             (StentUi { length: 30.0, ..Default::default() }, "bare, half straight"),
-            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, ..Default::default() }, "bare, straight"),
-            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, covered: true, stiffness: 50.0, ..Default::default() }, "covered, straight"),
+            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, end_blend: 8.0, ..Default::default() }, "bare, straight"),
+            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, covered: true, stiffness: 50.0, end_blend: 16.0, ..Default::default() }, "covered, straight"),
         ] {
             let key = StentKey { sections: 1, ui };
             let (out, pl, rep, crossings) = StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &key).unwrap();
@@ -1169,7 +1195,16 @@ mod tests {
             let want = 4.0 + (ui.stiffness / 100.0) * 4.0;
             assert!(2.0 * rep.narrowest[1] > want - 0.3, "{label}: {:?}", rep.narrowest);
             assert_eq!(mm_core::topology::boundary_loops(&out).len(), 2, "{label}");
+            let (changed, past) = changed_past_the_end_blend(&m, &out, &pl);
+            assert!(past > 1000 && changed == 0, "{label}: {changed} of {past} vertices past the end blend changed");
         }
+        // Too short an end blend for that: still nothing past it changes, and the tool says to
+        // lengthen it.
+        let ui = StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, ..Default::default() };
+        let (mesh, placement, report, crossings) = StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &StentKey { sections: 1, ui }).unwrap();
+        assert_eq!(changed_past_the_end_blend(&m, &mesh, &placement).0, 0);
+        let out = StentOut { source: Arc::new(m.clone()), mesh, placement, report, crossings };
+        assert!(warnings(&out).iter().any(|w| w.contains("lengthen the end blend")), "{:?}", warnings(&out));
     }
 
     #[test]
@@ -1648,6 +1683,86 @@ mod tests {
         jumps.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (j, v, u) in jumps.iter().take(8) {
             eprintln!("  strain {j:.2}: v{v} at {:.2?} moved {:.2?} | v{u} moved {:.2?}", m0.vertex(*v), disp(*v), disp(*u));
+        }
+    }
+
+    /// A stent rebuilt on a mesh from a Polymix project (an `objects/N.bin` taken out of it):
+    /// what changed, and how far past the end blend (counts and distances only).
+    /// POLYMIX_STENT_BIN=<objects/N.bin>, POLYMIX_STENT_CASE="x,y,z,nx,ny,nz,d;x,y,z,nx,ny,nz,d;
+    /// diameter,length,straightness,continuity(0/1/2),stiffness,end_blend[,remesh 0/1[,covered 0/1]]"
+    #[test]
+    #[ignore]
+    fn stent_moves_on_a_real_mesh() {
+        let (Some(path), Ok(case)) = (std::env::var_os("POLYMIX_STENT_BIN"), std::env::var("POLYMIX_STENT_CASE")) else { return };
+        let m = crate::project::mesh_from_bytes(&std::fs::read(path).unwrap()).unwrap();
+        let parts: Vec<Vec<f64>> = case.split(';').map(|p| p.split(',').filter_map(|x| x.trim().parse().ok()).collect()).collect();
+        let sec = |v: &[f64]| {
+            let (c, n) = (DVec3::new(v[0], v[1], v[2]), DVec3::new(v[3], v[4], v[5]).normalize());
+            let ring = mm_edit::nearest_intersection_curve(&m, mm_core::Plane::from_point_normal(c, n), c).unwrap().segments;
+            Section { center: c, normal: n, diameter: v[6], ring }
+        };
+        let sections = [sec(&parts[0]), sec(&parts[1])];
+        let s = &parts[2];
+        let continuity = match s[3] as i32 { 0 => EndContinuity::G0, 2 => EndContinuity::G2, _ => EndContinuity::G1 };
+        let ui = StentUi { diameter: s[0], length: s[1], straightness: s[2], continuity, stiffness: s[4], end_blend: s[5], remesh: s.get(6).is_none_or(|&x| x != 0.0), covered: s.get(7).is_some_and(|&x| x != 0.0) };
+        let t0 = Instant::now();
+        let trace = trace_vessel(&m, &sections).unwrap();
+        eprintln!("traced in {:.1} s: span {:.1} mm, {} path points, {} owner vertices", t0.elapsed().as_secs_f64(), trace.span, trace.path.points.len(), trace.owner.iter().filter(|&&o| o).count());
+        let t0 = Instant::now();
+        let (out, pl, rep, crossings) = StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &StentKey { sections: 1, ui }).unwrap();
+        eprintln!("built in {:.1} s: samples s {:.1}..{:.1}, margins {:.1?}, return bend {:.2?}, centerline {:.1} / axis {:.1} between the ends, crossings {crossings}, report moved {} max {:.2}",
+            t0.elapsed().as_secs_f64(), pl.s[0], pl.s[pl.s.len() - 1], pl.margins, pl.return_bend, pl.centerline_length, pl.path_length, rep.moved, rep.max_shift);
+        // Where along the vessel's traced centerline (arc length) and how far off it; the
+        // stent's ends there.
+        let line = &trace.path.points;
+        let mut arc = vec![0.0];
+        for w in line.windows(2) {
+            arc.push(arc[arc.len() - 1] + w[0].distance(w[1]));
+        }
+        let along = |p: DVec3| {
+            let mut best = (f64::INFINITY, 0.0);
+            for i in 0..line.len() - 1 {
+                let (a, ab) = (line[i], line[i + 1] - line[i]);
+                let f = ((p - a).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
+                let d = p.distance(a + ab * f);
+                if d < best.0 {
+                    best = (d, arc[i] + (arc[i + 1] - arc[i]) * f);
+                }
+            }
+            best
+        };
+        let at = |x: f64| pl.vessel[pl.s.partition_point(|&s| s < x).min(pl.s.len() - 1)];
+        let (sa, sb) = (along(at(0.0)).1, along(at(ui.length)).1);
+        let (s0, s1) = (sa.min(sb), sa.max(sb));
+        let eb = ui.end_blend;
+        let past = |s: f64| (s0 - eb - s).max(s - s1 - eb);
+        let past_of = |p: DVec3| past(along(p).1);
+        let (changed, past) = changed_past_the_end_blend(&m, &out, &pl);
+        eprintln!("past the end blend: {past} vertices, {changed} changed");
+        // The rest by distance past the end blend along the traced centerline (moved: the same
+        // vertex, ids freed by the union and remesh being reused by new ones).
+        let ring = |mesh: &Mesh, v: u32| {
+            let mut n: Vec<u32> = mesh.vertex_neighbors(v).collect();
+            n.sort_unstable();
+            n
+        };
+        let kept = |v: u32| out.is_vertex(v) && ring(&out, v) == ring(&m, v);
+        let mut rows: Vec<(&str, f64, f64)> = Vec::new();
+        for v in m.vertex_ids() {
+            let d = if kept(v) { out.vertex(v).distance(m.vertex(v)) } else { f64::INFINITY };
+            if d > 0.0 {
+                rows.push((if d.is_finite() { "moved" } else { "rebuilt" }, past_of(m.vertex(v)), d));
+            }
+        }
+        for class in ["moved", "rebuilt"] {
+            let bins = [f64::NEG_INFINITY, 0.0, 2.0, 5.0, 10.0, 20.0, 40.0, f64::INFINITY];
+            for w in bins.windows(2) {
+                let b: Vec<_> = rows.iter().filter(|r| r.0 == class && r.1 >= w[0] && r.1 < w[1]).collect();
+                if !b.is_empty() {
+                    let max = b.iter().map(|r| r.2).filter(|d| d.is_finite()).fold(0.0, f64::max);
+                    eprintln!("  {class} {:>5.0}..{:<5.0} mm past the end blend: {} (largest move {max:.2} mm)", w[0], w[1], b.len());
+                }
+            }
         }
     }
 }

@@ -31,7 +31,7 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   | Straightness | 0 %: the stent follows the vessel's centerline. 100 %: it takes the smoothest path between the two ends (where a free stent held at both would settle). In between, a blend. Where the stent grips the wall, the vessel moves with it. |
   | Smoothest path G0 / G1 / G2 | How that path meets the ends. **G0**: a straight line between their centres. **G1**: leaves each end square to its cross-section. **G2**: also continues the vessel's bend there. |
   | Stiffness | Radial force. Along the stent, in each direction across it, the lumen lies this share of the way from the vessel's own wall to the stent's radius: a 2 mm vessel, a 6 mm stent and 50 % give 4 mm. So the vessel's shape eases into the round stent: 100 %, a perfect tube of the stent's diameter; 0 %, the vessel as it is. Wall wider than the stent is never pulled in (unless covered). |
-  | End blend | How far past each end of the stent the opened wall eases back to its own shape. |
+  | End blend | How far past each end of the stent the wall eases back to its own shape and course (0–40 mm). **Nothing beyond it changes.** A stent straightened across a bend needs one long enough for the vessel to turn back onto its course (the tool warns when it is too short). |
   | Covered (stent graft) | The lumen along the stent becomes the stent's tube; see below. |
   | Remesh the reshaped wall | Even triangles where the wall was stretched or squeezed (recommended for CFD). |
   | Edit in place | Reshape the object itself. Otherwise the result is a new object named after the stent, and the original is hidden. |
@@ -48,7 +48,8 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
 - **Warnings:**
   - the stent's axis leaves the vessel;
   - the reshaped wall runs into itself (new crossings only);
-  - the vessel must bend back sharply past an end;
+  - the vessel must bend back sharply within the end blend past an end (lengthen the end
+    blend or lower the straightness);
   - the reshaping moves an open end (inlet or outlet) of the mesh.
 
 ## How it works
@@ -102,10 +103,10 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
 - **Centring.** The stent keeps its length along its own axis. A straighter axis is shorter
   between the ends, so a straightened stent reaches further past each.
 - **Return past each end.** The vessel returns from the stent's end onto its own centerline
-  along the least-bending path that leaves the stent along its direction. Its length is the
-  shortest for which the bend stays gentle for the vessel's radius (radius × curvature ≤ 0.4),
-  up to 12 stent radii. Turning back more sharply would fold the wall on the inside of the
-  turn. `return_bend` reports what was reached.
+  along the least-bending path that leaves the stent along its direction and meets the
+  centerline at the end of the end blend. `return_bend` reports how sharply it turns (radius ×
+  curvature): from 0.4 the wall starts to crease on the inside of the turn, and above 0.7 the
+  tool warns.
 
 ### Bare stent (`apply_stent`)
 
@@ -114,7 +115,13 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
    the vessel. Part of a stent floating in a wider lumen (an "elephant trunk") moves nothing.
 2. **Carry.** Each slice of gripped vessel is carried from the centerline onto the stent's
    axis (and past the ends onto the return path). It turns to face along the new path, so
-   the vessel straightens with the stent without shearing.
+   the vessel straightens with the stent without shearing. Past each end the carry and the
+   turn fade out over the end blend, to nothing at its end.
+   - A slice carries only the stented vessel's own wall: wall within three radii of its
+     centerline (the vessel's or the stent's, whichever is wider) and joined, through such
+     wall, to the wall around the stent. Wall that only passes near, such as the vessel
+     turning back alongside further on or another vessel, stays where it is. Side branches
+     follow with distance along the surface, fading out before three radii.
    - Where the centerline turns tighter than the wall's distance from it (it jogs through an
      eccentric narrowing, or bends sharply), wall a few millimetres off it can be nearer one
      slice or another from one vertex to the next, and the two would be carried apart: a
@@ -179,9 +186,10 @@ After the grip, carry and push:
 - **Geometric, not mechanical.** Straightness and Stiffness are proxies for bending and
   radial stiffness. There are no contact forces, wall mechanics or deployment simulation.
 - **Not modelled yet:** braided-stent foreshortening and stent struts.
-- **Straightening reaches far.** A long stent straightened across a tight bend moves the
-  vessel well past its ends. If an inlet or outlet is that close, it moves too (the tool
-  warns).
+- **Nothing past the end blend changes:** no vertex moves and no triangle is rebuilt there,
+  by the carry, the push, the tube's union, the covered stent's cut and join, or the remesh.
+  A stent straightened across a bend therefore needs an end blend long enough for the vessel
+  to turn back onto its course; with a short one the wall creases there (the tool warns).
 - **Overlapping shells.** Pieces of the mesh that overlap the vessel without being joined to
   it (vessels merged without a union) are not treated as its wall.
 - **Speed.** About 1 s per preview on an 800 000-triangle vessel (the union takes half).
@@ -205,10 +213,16 @@ After the grip, carry and push:
     at 100 % it is round;
   - a carry torn into a step is evened out (no edge more than doubles), the rest unchanged;
   - outside the end blend, vertices keep their ids and positions;
+  - a stent straightened across a bend changes nothing past the end blend (no vertex moved,
+    no neighbourhood rebuilt), with the stretch itself straightened and opened;
+  - a hairpin whose returning leg runs beside the stented stretch, every vertex marked as the
+    vessel's own: the returning leg stays exactly as it was;
   - local cross-sections: a point inside a lumen, and the widest point inside a crescent.
 - **App (`tools/stent.rs`):**
   - a bent, eccentrically narrowed vessel, traced from its first end: bare, straightened and
-    covered stents, centred, opened, no crossings, sharpest crease under 30°;
+    covered stents, centred, opened, no crossings, sharpest crease under 30° (straightened
+    with a longer end blend), nothing changed past the end blend; with too short an end blend
+    for the straightening, still nothing past it changes, and the tool says to lengthen it;
   - Measure's vessel diameters carry the stent's ends.
   - a trace that passes outside an eccentric narrowing is moved to the lumen's centre, stays
     smooth, and is unchanged past the ends;

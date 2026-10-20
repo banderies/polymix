@@ -378,3 +378,71 @@ fn covered_stent_seals_off_a_side_branch() {
 }
 
 
+
+/// Vertices still there with the same neighbours and position.
+fn unchanged(before: &Mesh, after: &Mesh, v: u32) -> bool {
+    let ring = |m: &Mesh| {
+        let mut n: Vec<u32> = m.vertex_neighbors(v).collect();
+        n.sort_unstable();
+        n
+    };
+    after.is_vertex(v) && after.vertex(v) == before.vertex(v) && ring(after) == ring(before)
+}
+
+#[test]
+fn nothing_changes_past_the_end_blend() {
+    // A stent straightened across a bend, opening the vessel and remeshed: past each end the
+    // vessel is back on its course by the end of the end blend, and nothing beyond it moves
+    // or is rebuilt.
+    let (m0, path) = vessel(arc, |_| 1.5, 40.0, 24);
+    let sections = sections_at(&path, 14.0, 26.0);
+    for (w, continuity) in [(1.0, EndContinuity::G0), (0.5, EndContinuity::G1)] {
+        let params = StentParams { straightness: w, continuity, end_blend: 3.0, remesh: true, ..bare(3.4, 16.0) };
+        let pl = place_stent(&path, sections, &params).unwrap();
+        let mut m = m0.clone();
+        apply_stent(&mut m, &pl, &params, None).unwrap();
+        assert_valid(&m);
+        assert_eq!(crossings(&m), 0);
+        let along = |p: DVec3| ARC * p.y.atan2(p.x);
+        let (a, b) = (along(pl.point(0.0)), along(pl.point(pl.length)));
+        let beyond: Vec<u32> = m0.vertex_ids().filter(|&v| (along(m0.vertex(v)) - 0.5 * (a + b)).abs() > 0.5 * (b - a) + params.end_blend + 0.5).collect();
+        assert!(beyond.len() > 1000);
+        let changed = beyond.iter().filter(|&&v| !unchanged(&m0, &m, v)).count();
+        assert_eq!(changed, 0, "straightness {w}: {changed} of {} vertices past the end blend changed", beyond.len());
+        // While the stretch itself was straightened and opened.
+        let mid = m0.vertex_ids().filter(|&v| (along(m0.vertex(v)) - 0.5 * (a + b)).abs() < 1.0).map(|v| m.vertex(v).distance(m0.vertex(v))).fold(0.0, f64::max);
+        assert!(mid > 0.15, "straightness {w}: the middle moved {mid:.3}");
+    }
+}
+
+#[test]
+fn wall_passing_near_the_stent_is_not_carried() {
+    // A hairpin: the vessel turns back 4 mm from the stented stretch. Every vertex counts as
+    // the vessel's own (as a trace running on round the turn marks it), yet the returning
+    // leg, near the stent but not part of its stretch, stays exactly where it was.
+    let bump = |s: f64| -1.5 * (std::f64::consts::PI * s / 40.0).sin().powi(2);
+    let turn = 2.0 * std::f64::consts::PI;
+    let axis = move |s: f64| {
+        if s <= 40.0 {
+            DVec3::new(s, bump(s), 0.0)
+        } else if s <= 40.0 + turn {
+            let a = -std::f64::consts::FRAC_PI_2 + (s - 40.0) / 2.0;
+            DVec3::new(40.0 + 2.0 * a.cos(), 2.0 + 2.0 * a.sin(), 0.0)
+        } else {
+            DVec3::new(40.0 - (s - 40.0 - turn), 4.0, 0.0)
+        }
+    };
+    let (m0, path) = vessel(axis, |_| 1.2, 80.0 + turn, 24);
+    let sections = sections_at(&path, 12.0, 28.0);
+    let owner = vec![true; m0.max_vid()];
+    let params = StentParams { straightness: 1.0, continuity: EndContinuity::G0, end_blend: 3.0, remesh: true, ..bare(3.0, 16.0) };
+    let pl = place_stent(&path, sections, &params).unwrap();
+    let mut m = m0.clone();
+    let rep = apply_stent(&mut m, &pl, &params, Some(&owner)).unwrap();
+    assert_valid(&m);
+    assert!(rep.moved > 0);
+    let back: Vec<u32> = m0.vertex_ids().filter(|&v| m0.vertex(v).y > 2.4 && m0.vertex(v).x < 38.0).collect();
+    assert!(back.len() > 1000);
+    let changed = back.iter().filter(|&&v| !unchanged(&m0, &m, v)).count();
+    assert_eq!(changed, 0, "{changed} of {} vertices of the returning leg changed", back.len());
+}

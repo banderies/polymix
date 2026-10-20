@@ -17,8 +17,9 @@
 //! 1. Where the stent grips the wall (the vessel no wider than the stent, letting go by 1.6×
 //!    its radius), each slice of the vessel is carried from the centerline onto the stent's
 //!    axis, moved and turned with it, so the vessel straightens with the stent. Part of a
-//!    stent floating in a wider lumen moves nothing. The move fades out past the stent's ends
-//!    and up side branches.
+//!    stent floating in a wider lumen moves nothing. The move fades out over the end blend past
+//!    the stent's ends, and up side branches. Only the stented vessel's own wall moves: wall
+//!    passing near it (the vessel turning back, another vessel) does not.
 //! 2. The lumen is joined with the stent's tube (a mesh union). The tube is lofted along the
 //!    stent from rings that, in each direction across, lie *stiffness*'s share of the way from
 //!    the native wall (lightly smoothed) to the stent's radius: a perfect tube with stiffness
@@ -143,12 +144,13 @@ pub struct StentPlacement {
     pub centerline_length: f64,
     /// Length of the stent's axis between the sections.
     pub path_length: f64,
-    /// How far the samples run on past each end. There the axis is the path along which the
-    /// vessel returns from the stent's end onto its own centerline, which it meets this far
-    /// on (further where the stent leaves the vessel at an angle).
+    /// How far the samples run on past each end: the end blend. There the axis is the path
+    /// along which the vessel returns from the stent's end onto its own centerline, which it
+    /// meets at the end of the end blend. Nothing beyond moves.
     pub margins: [f64; 2],
     /// How sharply the vessel bends back past each end: its radius times the return path's
-    /// curvature (from 0.4 the wall starts to crease on the inside of the turn, at 1 it folds).
+    /// curvature (from 0.4 the wall starts to crease on the inside of the turn, at 1 it folds;
+    /// a longer end blend or less straightness eases it).
     pub return_bend: [f64; 2],
 }
 
@@ -487,9 +489,10 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
         x.0 = p;
     }
     let span_len: f64 = span.windows(2).map(|x| x[0].0.distance(x[1].0)).sum();
-    // Past the sections, far enough for the stent and the longest fade beyond it.
-    let longest = params.end_blend.max(12.0 * r);
-    let past = 1.25 * ((0.5 * (length - span_len)).max(0.0) + longest) + 4.0 * ds;
+    // Past each end the vessel is back on its own course by the end of the end blend: nothing
+    // beyond it moves. (A few samples at least, where there is no end blend.)
+    let ret = params.end_blend.max(2.0 * ds);
+    let past = 1.25 * ((0.5 * (length - span_len)).max(0.0) + ret) + 4.0 * ds;
     let m = (past / ds).ceil() as usize;
     let ext_a = continue_path(a.center, -dirs[0], bends[0], 2.0 * r, ds, m);
     let ext_b = continue_path(b.center, dirs[1], bends[1], 2.0 * r, ds, m);
@@ -520,9 +523,7 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
     };
     // Past each end the vessel returns from the stent's end onto its own course along the
     // path of least bending that leaves the stent along its direction and meets the
-    // centerline tangentially some way on: the shortest way whose bend stays gentle for the
-    // vessel's radius (turning back too sharply would fold the wall on the inside of the
-    // turn), or the gentlest there is.
+    // centerline tangentially at the end of the end blend.
     let ends = [(start, -1.0), (start + length, 1.0)];
     let return_path = |e: usize, l: f64| {
         let (x, out) = ends[e];
@@ -537,19 +538,8 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
     };
     let returns: Vec<(Curve, f64, f64)> = (0..2)
         .map(|e| {
-            let mut l = params.end_blend.max(2.0 * r);
-            let mut best: Option<(Curve, f64, f64)> = None;
-            while l <= longest {
-                let (path, sharp) = return_path(e, l);
-                if best.as_ref().is_none_or(|b| sharp < b.2) {
-                    best = Some((path, l, sharp));
-                }
-                if sharp <= 0.4 {
-                    break;
-                }
-                l *= 1.15;
-            }
-            best.expect("at least one return path")
+            let (path, sharp) = return_path(e, ret);
+            (path, ret, sharp)
         })
         .collect();
     let beyond = |e: usize, u: f64| {
@@ -650,6 +640,24 @@ pub(crate) fn relax(mesh: &Mesh, moves: &mut [(u32, DVec3)]) {
     for (m, d) in moves.iter_mut().zip(shift) {
         m.1 = mesh.vertex(m.0) + d;
     }
+}
+
+/// Past the end blend (`end_blend`) at either end, by the vessel's slice nearest `p` (as the
+/// carry decides what it moves). Nothing there changes.
+fn past_end(pl: &StentPlacement, end_blend: f64, p: DVec3) -> bool {
+    let k = pl.vessel.len();
+    let mut best = (f64::INFINITY, 0.0);
+    for i in 0..k - 1 {
+        let (a, ab) = (pl.vessel[i], pl.vessel[i + 1] - pl.vessel[i]);
+        let f = ((p - a).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
+        let d = p.distance_squared(a + ab * f);
+        if d < best.0 {
+            best = (d, i as f64 + f);
+        }
+    }
+    let i = (best.1.floor() as usize).min(k - 2);
+    let s = pl.s[i] + (pl.s[i + 1] - pl.s[i]) * (best.1 - i as f64);
+    best.1 <= 0.0 || best.1 >= (k - 1) as f64 || s < -end_blend || s > pl.length + end_blend
 }
 
 /// The sharpest a stent bends: its radius times its axis' curvature (a bend radius of the
@@ -942,7 +950,8 @@ struct TubeOpening {
 /// tube reaches an open end.
 fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) -> EditResult<Option<TubeOpening>> {
     let (r, length, st) = (pl.radius, pl.length, params.stiffness);
-    let blend = params.end_blend.max(0.25 * r);
+    // The tube eases into the wall over the end blend and ends there: nothing beyond changes.
+    let blend = params.end_blend;
     let k = pl.s.len();
     let (lo, hi) = (pl.s.partition_point(|&x| x < -blend), pl.s.partition_point(|&x| x <= length + blend).min(k));
     if hi < lo + 3 {
@@ -953,6 +962,43 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     let (bmin, bmax) = pl.axis[lo..hi].iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &p| (a.min(p), b.max(p)));
     let (bmin, bmax) = (bmin - pad, bmax + pad);
     let in_box = |m: &Mesh, t: u32| m.tri_positions(t).iter().any(|p| p.cmpge(bmin).all() && p.cmple(bmax).all());
+    let boxed: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t)).collect();
+    if boxed.is_empty() {
+        return Ok(None);
+    }
+    let h = params.edge_length.unwrap_or_else(|| boxed.iter().flat_map(|&t| mesh.tri_edges(t)).map(|e| mesh.edge_length(e)).sum::<f64>() / (3 * boxed.len()) as f64).max(1e-3 * r);
+    // The tube's centreline: the axis there, a ring about every edge length, eased.
+    let total = pl.s[hi - 1] - pl.s[lo];
+    let rings = ((total / h).ceil() as usize).max(2);
+    let at = |x: f64| {
+        let j = pl.s.partition_point(|&v| v <= x).clamp(1, k - 1) - 1;
+        let f = ((x - pl.s[j]) / (pl.s[j + 1] - pl.s[j]).max(1e-300)).clamp(0.0, 1.0);
+        pl.axis[j].lerp(pl.axis[j + 1], f)
+    };
+    let xs: Vec<f64> = (0..=rings).map(|i| pl.s[lo] + total * i as f64 / rings as f64).collect();
+    let mut centre: Vec<DVec3> = xs.iter().map(|&x| at(x)).collect();
+    limit_bend(&mut centre, MAX_BEND / r);
+    // Only wall near the tube, within the stent and its end blend, can change: the union is
+    // taken there only (elsewhere it could also change where the mesh already ran into
+    // itself), and only that is remeshed. Past the end blend is where the carry stops too:
+    // nearest the first or last of the vessel's slices.
+    let reach = 1.25 * r + 2.0 * h;
+    let off_tube = |p: DVec3| centre.windows(2).map(|w| point_segment_distance(p, w[0], w[1])).fold(f64::INFINITY, f64::min);
+    let changes = |p: DVec3| off_tube(p) < reach && !past_end(pl, blend, p);
+    // Each vertex's distance from the tube, once (by id; infinite outside the box).
+    let off_all = |m: &Mesh, tris: &[u32]| {
+        let mut ids: Vec<u32> = tris.iter().flat_map(|&t| m.triangle(t)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let d: Vec<f64> = ids.par_iter().map(|&v| off_tube(m.vertex(v))).collect();
+        let mut off = vec![f64::INFINITY; m.max_vid()];
+        for (&v, d) in ids.iter().zip(d) {
+            off[v as usize] = d;
+        }
+        off
+    };
+    let near_tube = |m: &Mesh, off: &[f64], t: u32| m.triangle(t).iter().any(|&v| off.get(v as usize).is_some_and(|&d| d < reach));
+    let off = off_all(mesh, &boxed);
     // Zero-area and microscopic triangles near the stent fixed first (a union cannot place
     // them, and their coincident corners could not be told apart after it).
     let tiny = 1e-6 * r;
@@ -960,7 +1006,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
         let mut fixed = false;
         let short: Vec<(u32, u32)> = mesh
             .triangle_ids()
-            .filter(|&t| in_box(mesh, t))
+            .filter(|&t| in_box(mesh, t) && near_tube(mesh, &off, t))
             .flat_map(|t| {
                 let tv = mesh.triangle(t);
                 [(tv[0], tv[1]), (tv[1], tv[2]), (tv[2], tv[0])]
@@ -976,7 +1022,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
                 }
             }
         }
-        let degenerate: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t) && mm_repair::ops::is_degenerate_triangle(mesh, t, 1e-12)).collect();
+        let degenerate: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t) && near_tube(mesh, &off, t) && mm_repair::ops::is_degenerate_triangle(mesh, t, 1e-12)).collect();
         for t in degenerate {
             fixed |= mm_repair::ops::fix_degenerate_triangle(mesh, t);
         }
@@ -984,22 +1030,13 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
             break;
         }
     }
-    let local: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t)).collect();
+    // (Again after the fixes, which may have added vertices.)
+    let boxed: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t)).collect();
+    let off = off_all(mesh, &boxed);
+    let local: Vec<u32> = boxed.iter().copied().filter(|&t| near_tube(mesh, &off, t)).collect();
     if local.is_empty() {
         return Ok(None);
     }
-    let h = params.edge_length.unwrap_or_else(|| local.iter().flat_map(|&t| mesh.tri_edges(t)).map(|e| mesh.edge_length(e)).sum::<f64>() / (3 * local.len()) as f64).max(1e-3 * r);
-    // The tube's centreline: the axis there, a ring about every edge length, eased.
-    let total = pl.s[hi - 1] - pl.s[lo];
-    let rings = ((total / h).ceil() as usize).max(2);
-    let at = |x: f64| {
-        let j = pl.s.partition_point(|&v| v <= x).clamp(1, k - 1) - 1;
-        let f = ((x - pl.s[j]) / (pl.s[j + 1] - pl.s[j]).max(1e-300)).clamp(0.0, 1.0);
-        pl.axis[j].lerp(pl.axis[j + 1], f)
-    };
-    let xs: Vec<f64> = (0..=rings).map(|i| pl.s[lo] + total * i as f64 / rings as f64).collect();
-    let mut centre: Vec<DVec3> = xs.iter().map(|&x| at(x)).collect();
-    limit_bend(&mut centre, MAX_BEND / r);
     // Rotation-minimising frames along it, and the stent's rings there.
     let mut frames: Vec<[DVec3; 4]> = Vec::with_capacity(rings + 1);
     for (i, &c) in centre.iter().enumerate() {
@@ -1121,9 +1158,11 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     }
     let mut kept: HashSet<u32> = HashSet::new();
     let mut fresh: Vec<([u32; 3], i32)> = Vec::new();
-    for t in out.triangle_ids() {
+    let out_boxed: Vec<u32> = out.triangle_ids().filter(|&t| out.tri_positions(t).iter().any(|&p| inside_box(p))).collect();
+    let out_off = off_all(&out, &out_boxed);
+    for &t in &out_boxed {
         let tv = out.triangle(t);
-        if !tv.iter().any(|&v| inside_box(out.vertex(v))) {
+        if !tv.iter().any(|&v| inside_box(out.vertex(v)) && out_off[v as usize] < reach) {
             continue;
         }
         let old: Vec<u32> = tv.iter().filter_map(|&v| old_ids.get(&key(out.vertex(v))).copied()).collect();
@@ -1156,9 +1195,17 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     mesh.remove_isolated_vertices();
     // The joined region: the new triangles and two rings around them.
     let mut region: HashSet<u32> = added.iter().copied().collect();
+    let mut may: HashMap<u32, bool> = HashMap::new();
     for _ in 0..2 {
-        let more: Vec<u32> = region.iter().flat_map(|&t| mesh.triangle(t)).flat_map(|v| mesh.vertex_triangles(v)).collect();
-        region.extend(more);
+        let mut more: Vec<u32> = region.iter().flat_map(|&t| mesh.triangle(t)).flat_map(|v| mesh.vertex_triangles(v)).filter(|t| !region.contains(t)).collect();
+        more.sort_unstable();
+        more.dedup();
+        let mut verts: Vec<u32> = more.iter().flat_map(|&t| mesh.triangle(t)).filter(|v| !may.contains_key(v)).collect();
+        verts.sort_unstable();
+        verts.dedup();
+        let ok: Vec<bool> = verts.par_iter().map(|&v| changes(mesh.vertex(v))).collect();
+        may.extend(verts.into_iter().zip(ok));
+        region.extend(more.into_iter().filter(|&t| mesh.triangle(t).iter().all(|v| may[v])));
     }
     let mut region: Vec<u32> = region.into_iter().collect();
     region.sort_unstable();
@@ -1169,7 +1216,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
         }
     }
     mesh.bump_shape_version();
-    Ok(Some(TubeOpening { triangles: region, centre, reach: 1.25 * r + 2.0 * h, narrowest: [narrowest_before, narrowest], widened }))
+    Ok(Some(TubeOpening { triangles: region, centre, reach, narrowest: [narrowest_before, narrowest], widened }))
 }
 
 /// Straighten the vessel with the stent and (`push_wall`) push the wall out to it; covered,
@@ -1210,13 +1257,16 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         (best.1, best.2)
     };
     let project = |p: DVec3| project_in(p, 0.0, (k - 1) as f64);
+    // A slice carries wall at most this far from the centerline: wall further off lies near
+    // the samples without belonging to them (the vessel passing by again, another vessel).
+    let bound = |x: f64| 3.0 * lerp_f(&pl.vessel_radius, x).max(r);
     let near: Vec<u32> = mesh.vertex_ids().filter(|&v| !(mesh.vertex(v).cmplt(lo).any() || mesh.vertex(v).cmpgt(hi).any())).collect();
-    let core: Vec<(u32, f64, DVec3)> = near
+    let candidates: Vec<(u32, f64, DVec3)> = near
         .par_iter()
         .filter_map(|&v| {
             let p = mesh.vertex(v);
             let (x, c) = project(p);
-            if x <= 0.0 || x >= (k - 1) as f64 {
+            if x <= 0.0 || x >= (k - 1) as f64 || p.distance(c) >= bound(x) {
                 return None;
             }
             let mine = match owner {
@@ -1226,6 +1276,30 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
             mine.then_some((v, x, p - c))
         })
         .collect();
+    // The stented vessel's own wall: the candidates joined, through candidates, to wall close
+    // around the stent's stretch of centerline.
+    let index: HashMap<u32, usize> = candidates.iter().enumerate().map(|(i, c)| (c.0, i)).collect();
+    let mut reached = vec![false; candidates.len()];
+    let mut stack: Vec<usize> = (0..candidates.len())
+        .filter(|&i| {
+            let (_, x, o) = candidates[i];
+            (first as f64..=last as f64).contains(&x) && o.length() < 1.5 * lerp_f(&pl.vessel_radius, x).max(r)
+        })
+        .collect();
+    for &i in &stack {
+        reached[i] = true;
+    }
+    while let Some(i) = stack.pop() {
+        for w in mesh.vertex_neighbors(candidates[i].0) {
+            if let Some(&j) = index.get(&w) {
+                if !reached[j] {
+                    reached[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    let core: Vec<(u32, f64, DVec3)> = candidates.into_iter().zip(&reached).filter(|(_, &joined)| joined).map(|(c, _)| c).collect();
     let mut is_core = vec![false; mesh.max_vid()];
     for &(v, _, _) in &core {
         {
@@ -1259,9 +1333,16 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         if !is_core[v as usize] {
             let p = mesh.vertex(v);
             let (x, c) = project(p);
-            verts.push((v, x, p - c, 1.0 - smoother(d / reach)));
+            // (Fading out before the bound, beyond which no slice carries anything.)
+            let off = 1.0 - smoother(3.0 * (p.distance(c) / bound(x)) - 2.0);
+            if x > 0.0 && x < (k - 1) as f64 && off > 0.0 {
+                verts.push((v, x, p - c, (1.0 - smoother(d / reach)) * off));
+            }
         }
     }
+    // Nothing past the end blend moves: such wall is neither carried nor pushed, nor evened
+    // out with its neighbours below.
+    verts.retain(|&(_, x, _, _)| lerp_f(&radial, x) > 0.0);
 
 
     // Grip: the stent holds the vessel where the wall is no wider than the stent.
@@ -1331,11 +1412,12 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
             let tw = lerp_f(&carry, x) * wv;
             let i = (x.floor().max(0.0) as usize).min(k - 2);
             let q = DQuat::IDENTITY.slerp(rot[i].slerp(rot[i + 1], x - i as f64), wv);
-            let carried = c + (p - c) * tw;
-            let xt = carried + q * o;
-            // Past the stent's end the push fades out about the vessel's own centre, not an
-            // imaginary continuation of the stent.
+            // Past the stent's end the carry, its turn and the push fade out over the end blend
+            // (the push about the vessel's own centre, not an imaginary continuation of the
+            // stent), so nothing beyond it moves.
             let fade = lerp_f(&radial, x);
+            let carried = c + (p - c) * (tw * fade);
+            let xt = carried + DQuat::IDENTITY.slerp(q, fade) * o;
             let rel = xt - carried.lerp(p, fade);
             let perp = rel - t * rel.dot(t);
             let rho = perp.length();
@@ -1399,11 +1481,20 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         let ring: Vec<u32> = distorted.iter().flat_map(|&t| mesh.triangle(t)).flat_map(|v| mesh.vertex_triangles(v)).collect();
         distorted.extend(ring);
     }
+    // Only wall within the stent and its end blend is remeshed (a region's border stays put).
+    let within: HashSet<u32> = moves.iter().map(|m| m.0).collect();
+    distorted.retain(|&t| mesh.triangle(t).iter().all(|v| within.contains(v)));
     if params.covered {
-        let (tube, sealed, removed, landing) = cover(mesh, pl, h, rings.ok_or_else(|| EditError::Failed("a covered stent needs its rings".into()))?)?;
+        let (tube, sealed, removed, landing) = cover(mesh, pl, h, params.end_blend, rings.ok_or_else(|| EditError::Failed("a covered stent needs its rings".into()))?)?;
         region.retain(|&t| mesh.is_triangle(t));
         distorted.retain(|&t| mesh.is_triangle(t));
         distorted.extend(tube.iter().copied());
+        // (Not past the end blend: the cut and its smoothing stop short of it.)
+        let mut verts: Vec<u32> = distorted.iter().flat_map(|&t| mesh.triangle(t)).collect();
+        verts.sort_unstable();
+        verts.dedup();
+        let past: HashSet<u32> = verts.par_iter().copied().filter(|&v| past_end(pl, params.end_blend, mesh.vertex(v))).collect();
+        distorted.retain(|&t| !mesh.triangle(t).iter().any(|v| past.contains(v)));
         region.extend(tube);
         report.sealed_openings = sealed;
         report.landing = landing;
@@ -1430,7 +1521,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
 /// its place, shaped as `rings` gives (see [`stent_rings`]), easing into each cut over a short
 /// flare. Also returns each cut's width over the stent's ([`StentReport::landing`]). Returns the tube's triangles with the bands blended into
 /// it, the number of open ends removed and the number of triangles removed.
-fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, rings: &Profile) -> EditResult<(Vec<u32>, usize, usize, [f64; 2])> {
+fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, end_blend: f64, rings: &Profile) -> EditResult<(Vec<u32>, usize, usize, [f64; 2])> {
     let (r, l) = (pl.radius, pl.length);
     let around = ((TAU * r / h).round() as usize).clamp(12, 4000);
     let rows = ((l / h).round() as usize).max(3);
@@ -1558,7 +1649,14 @@ fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, rings: &Profile) -> EditR
     }
     tris.extend(end);
     let tube = commit(mesh, tris, new_vertices, group)?;
-    let mut out = blend_join(mesh, &tube.triangles, [&p, &q], 0.25);
+    // The vessel behind each cut is smoothed over a quarter of its diameter, no further than
+    // the end blend.
+    let across = |lp: &[u32]| {
+        let c = lp.iter().map(|&v| mesh.vertex(v)).sum::<DVec3>() / lp.len().max(1) as f64;
+        2.0 * lp.iter().map(|&v| mesh.vertex(v).distance(c)).sum::<f64>() / lp.len().max(1) as f64
+    };
+    let band = (end_blend / across(&p).max(across(&q)).max(1e-9)).min(0.25);
+    let mut out = blend_join(mesh, &tube.triangles, [&p, &q], band, &|x| past_end(pl, end_blend, x));
     out.extend(tube.triangles);
     Ok((out, sealed, removed, wide))
 }

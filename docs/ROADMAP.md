@@ -269,8 +269,10 @@ venous sinus stenosis with bare self-expanding stents.
       length × ∫κ²).
 - [x] **M16.2 Bare stent**: gripped slices carried onto the stent's axis (none where the stent
       floats in a wider lumen), the vessel returning past each end along a least-bending path
-      gentle for its radius; wall inside the stent pushed out by *Stiffness*, faded over *End
-      blend*; side branches follow with distance; stretched wall remeshed.
+      within *End blend*; wall inside the stent pushed out by *Stiffness*, faded over *End
+      blend*; side branches follow with distance; stretched wall remeshed. Nothing past the
+      end blend changes, and only the stretch's own wall is carried (not wall passing near
+      it).
 - [x] **M16.3 Covered stent**: the stretch cut out and replaced by the stent's tube (wider wall
       narrowed to the stent, side branches and aneurysms sealed off and removed).
 - [x] **M16.4 Tool**: live preview with the stent as a wireframe, readouts (lengths,
