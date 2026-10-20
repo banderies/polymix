@@ -724,6 +724,8 @@ pub struct StentReport {
     /// (the cut's equivalent radius over the stent's). Well over 1, the graft lands in a far
     /// wider lumen, where a real one would leave a gap; the flare to the wall there can fold.
     pub landing: [f64; 2],
+    /// The remesh of the stretched wall was undone: it made the wall run into itself.
+    pub remesh_undone: bool,
 }
 
 fn tangents(pts: &[DVec3]) -> Vec<DVec3> {
@@ -1209,10 +1211,21 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     }
     let mut region: Vec<u32> = region.into_iter().collect();
     region.sort_unstable();
+    // A join that runs into the wall (where it lies close, e.g. at a branch's mouth) is not
+    // used: the wall is pushed out instead.
+    if runs_into_wall(mesh, &region) {
+        return Err(EditError::Failed("the stent's tube, joined to the wall, ran into it".into()));
+    }
     if params.remesh {
         let rp = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(region.clone()), ..mm_remesh::RemeshParams::with_target(h) };
+        // A remesh that makes the wall run into itself is undone.
+        let unremeshed = mesh.clone();
         if let Ok(Some(tris)) = mm_remesh::remesh(mesh, &rp, None).map(|x| x.region_triangles) {
-            region = tris;
+            if runs_into_wall(mesh, &tris) {
+                *mesh = unremeshed;
+            } else {
+                region = tris;
+            }
         }
     }
     mesh.bump_shape_version();
@@ -1506,15 +1519,39 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
     if params.remesh && !distorted.is_empty() {
         let mut part: Vec<u32> = distorted.iter().copied().collect();
         part.sort_unstable();
-        let rp = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(part), ..mm_remesh::RemeshParams::with_target(h) };
+        let rp = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(part.clone()), ..mm_remesh::RemeshParams::with_target(h) };
+        // Kept to go back to: a remesh that makes the wall run into itself (where walls lie
+        // close, e.g. a branch's mouth near the stent's end) is undone.
+        let unremeshed = mesh.clone();
+        let crossed_before = runs_into_wall(mesh, &part);
         if let Ok(Some(tris)) = mm_remesh::remesh(mesh, &rp, None).map(|x| x.region_triangles) {
-            region.retain(|t| !distorted.contains(t) && mesh.is_triangle(*t));
-            region.extend(tris);
+            if !crossed_before && runs_into_wall(mesh, &tris) {
+                *mesh = unremeshed;
+                report.remesh_undone = true;
+            } else {
+                region.retain(|t| !distorted.contains(t) && mesh.is_triangle(*t));
+                region.extend(tris);
+            }
         }
     }
     mesh.bump_shape_version();
     report.triangles = region;
     Ok(report)
+}
+
+/// Whether any of `tris` crosses another triangle of `m` (one it shares no corner with).
+fn runs_into_wall(m: &Mesh, tris: &[u32]) -> bool {
+    let bvh = mm_core::bvh::Bvh::build(m);
+    tris.par_iter().filter(|&&t| m.is_triangle(t)).any(|&t| {
+        let (tv, tp) = (m.triangle(t), m.tri_positions(t));
+        let mut hit = false;
+        bvh.query_aabb(&mm_core::Aabb::from_points(tp), |o| {
+            if !hit && o != t && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
+                hit = true;
+            }
+        });
+        hit
+    })
 }
 
 /// Covered stent: cut the stented stretch out at the stent's ends and put the stent's tube in

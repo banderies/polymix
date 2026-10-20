@@ -27,6 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use glam::DVec3;
 use mm_core::mesh::BuildReport;
 use mm_core::Mesh;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
@@ -158,6 +159,13 @@ pub struct ImportedMesh {
     pub colors: Option<Vec<[f32; 3]>>,
     /// Non-fatal problems noticed while parsing (e.g. ignored trailing bytes).
     pub warnings: Vec<String>,
+    /// Texture coordinates of each triangle's corners, indexed by triangle id of
+    /// [`Self::mesh`] (OBJ `vt`; zero where a triangle had none).
+    pub uvs: Option<Vec<[[f32; 2]; 3]>>,
+    /// The image the file's (most used) material maps onto it (OBJ: `map_Kd` in its `.mtl`).
+    pub texture: Option<std::path::PathBuf>,
+    /// OBJ: material library and material, resolved into `texture` when read from a path.
+    material: Option<(String, String)>,
 }
 
 /// Options for writing.
@@ -190,6 +198,10 @@ pub(crate) struct Raw {
     pub warnings: Vec<String>,
     /// Vertices merged by the parser itself (STL exact weld).
     pub welded: usize,
+    /// Texture coordinates of each triangle's corners (OBJ).
+    pub uvs: Option<Vec<[[f32; 2]; 3]>>,
+    /// OBJ: the material library and the material most faces use.
+    pub material: Option<(String, String)>,
 }
 
 /// Read a mesh file, choosing the format from the extension (case-insensitive).
@@ -206,6 +218,9 @@ pub fn read_mesh_with(path: &Path, opts: &ReadOptions) -> Result<ImportedMesh> {
         .with_context(|| format!("failed to load {} as {format}", path.display()))?;
     if let Some(stem) = path.file_stem() {
         m.name = stem.to_string_lossy().into_owned();
+    }
+    if let Some((lib, material)) = m.material.take() {
+        m.texture = path.parent().and_then(|dir| obj::diffuse_map(&dir.join(&lib), &material));
     }
     Ok(m)
 }
@@ -258,6 +273,10 @@ fn finish(mut raw: Raw, format: Format, opts: &ReadOptions) -> Result<ImportedMe
             .collect();
         let mut k = keep.iter();
         raw.triangles.retain(|_| *k.next().unwrap());
+        if let Some(u) = &mut raw.uvs {
+            let mut k = keep.iter();
+            u.retain(|_| *k.next().unwrap());
+        }
         if let Some(g) = &mut raw.groups {
             let mut k = keep.iter();
             g.retain(|_| *k.next().unwrap());
@@ -293,6 +312,18 @@ fn finish(mut raw: Raw, format: Format, opts: &ReadOptions) -> Result<ImportedMe
         bail!("file contains no valid triangles ({} degenerate)", report.degenerate);
     }
     let colors = raw.colors.map(|c| colors_for_mesh(&mesh, &raw.positions, c));
+    // UVs by triangle id: each kept triangle is found by its corners (as given); those split
+    // off at non-manifold vertices get none.
+    let uvs = raw.uvs.map(|u| {
+        let by_corners: HashMap<[u32; 3], usize> = raw.triangles.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+        let mut out = vec![[[0.0f32; 2]; 3]; mesh.max_tid()];
+        for t in mesh.triangle_ids() {
+            if let Some(&i) = by_corners.get(&mesh.triangle(t)) {
+                out[t as usize] = u[i];
+            }
+        }
+        out
+    });
     // The mesh carries the colours too, so they follow later edits and are exported.
     if let Some(c) = &colors {
         for v in mesh.vertex_ids().collect::<Vec<_>>() {
@@ -309,6 +340,9 @@ fn finish(mut raw: Raw, format: Format, opts: &ReadOptions) -> Result<ImportedMe
         welded_vertices: welded,
         colors,
         warnings: raw.warnings,
+        uvs,
+        texture: None,
+        material: raw.material,
     })
 }
 

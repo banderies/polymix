@@ -1508,7 +1508,7 @@ mod tests {
                             .vertex_ids()
                             .filter(|&v| out.is_vertex(v))
                             .map(|v| {
-                                let s = out.vertex_neighbors(v).into_iter().filter(|&u| m.is_vertex(u)).map(|u| (out.vertex(v).distance(out.vertex(u)) / m.vertex(v).distance(m.vertex(u)).max(1e-9) - 1.0).abs()).fold(0.0, f64::max);
+                                let s = out.vertex_neighbors(v).filter(|&u| m.is_vertex(u)).map(|u| (out.vertex(v).distance(out.vertex(u)) / m.vertex(v).distance(m.vertex(u)).max(1e-9) - 1.0).abs()).fold(0.0, f64::max);
                                 (s, v)
                             })
                             .collect();
@@ -1677,7 +1677,7 @@ mod tests {
         eprintln!("box: {} vertices; move min {:.3} median {:.3} max {:.3}", boxed.len(), pct(0.0), pct(0.5), pct(1.0));
         let mut jumps: Vec<(f64, u32, u32)> = boxed
             .iter()
-            .flat_map(|&v| m1.vertex_neighbors(v).into_iter().filter(move |&u| (u as usize) < n).map(move |u| (v, u)))
+            .flat_map(|&v| m1.vertex_neighbors(v).filter(move |&u| (u as usize) < n).map(move |u| (v, u)))
             .map(|(v, u)| ((disp(v) - disp(u)).length() / m0.vertex(v).distance(m0.vertex(u)).max(1e-9), v, u))
             .collect();
         jumps.sort_by(|a, b| b.0.total_cmp(&a.0));

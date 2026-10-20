@@ -35,6 +35,10 @@ struct SoftState {
     continuity: mm_edit::Continuity,
     falloff: f64,
     ignore_groups: bool,
+    /// Refine Mesh: split the edges the move stretches (see [`mm_edit::soft::soft_deform_refined`]).
+    refine: bool,
+    /// Stretched edges longer than this are split while refining.
+    max_edge: f64,
     region: mm_edit::SoftRegion,
     /// Pivot per piece label of `region`.
     pivots: Vec<DVec3>,
@@ -61,6 +65,8 @@ pub struct TransformTool {
     frame: DQuat,
     space: Space,
     preview: Option<Mesh>,
+    /// The selection on `preview` when Refine Mesh split its triangles.
+    preview_selection: Option<Vec<u32>>,
     translate: DVec3,
     rotation: DQuat,
     /// Scale along the scale axes (the frame's axes in Local, world axes in World).
@@ -167,6 +173,7 @@ impl TransformTool {
             frame,
             space: Space::Local,
             preview: None,
+            preview_selection: None,
             translate: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             scale: DVec3::ONE,
@@ -211,6 +218,8 @@ impl TransformTool {
             continuity: mm_edit::Continuity::SoftPosition,
             falloff: (0.5 * b.diagonal()).max(t.source.average_edge_length() * 2.0),
             ignore_groups: false,
+            refine: false,
+            max_edge: 0.0,
             region: Default::default(),
             pivots: Vec::new(),
         });
@@ -266,6 +275,7 @@ impl TransformTool {
         self.pivot = extents_of(r.groups.iter().flat_map(|g| g.0.iter()).map(|&v| m.vertex(v)), axes).1;
         if let Some(soft) = r.soft.as_mut() {
             soft.region = mm_edit::soft_region(m, &r.tris, soft.falloff, r.fixed_boundary, soft.ignore_groups, r.shared_frame);
+            soft.max_edge = mm_edit::soft::refine_length(m, &soft.region);
             // Pivot per piece: the centre of its selected vertices.
             let pieces = soft.region.handle_piece.iter().chain(&soft.region.band_piece).max().map_or(0, |&p| p as usize + 1);
             let mut members: Vec<Vec<DVec3>> = vec![Vec::new(); pieces];
@@ -279,6 +289,10 @@ impl TransformTool {
             soft.pivots = members.into_iter().map(|pts| extents_of(pts.into_iter(), axes).1).collect();
         }
         self.dirty = true;
+    }
+
+    fn soft(&self) -> Option<&SoftState> {
+        self.region.as_ref().and_then(|r| r.soft.as_ref())
     }
 
     /// Axes the scale applies along, in the source's coordinates.
@@ -326,18 +340,27 @@ impl TransformTool {
 
     fn rebuild(&mut self) {
         let mut mesh = (*self.source).clone();
-        if let Some(soft) = self.region.as_ref().and_then(|r| r.soft.as_ref().map(|s| (s, r.shared_frame))) {
-            let (soft, shared) = soft;
+        self.preview_selection = None;
+        if let Some((soft, r)) = self.region.as_ref().and_then(|r| r.soft.as_ref().map(|s| (s, r))) {
+            let shared = r.shared_frame;
             let lin = self.linear();
             let (pivot, t) = (self.pivot, self.translate);
             let tf = |piece: u32, x: DVec3| {
                 let c = if shared { pivot } else { soft.pivots.get(piece as usize).copied().unwrap_or(pivot) };
                 c + t + lin * (x - c)
             };
-            for (v, p) in mm_edit::soft_deform(&self.source, &soft.region, &tf, soft.kind, soft.continuity) {
-                mesh.set_vertex(v, p);
+            if soft.refine {
+                let opts = mm_edit::soft::RefineOptions { kind: soft.kind, continuity: soft.continuity, fixed_boundary: r.fixed_boundary, max_edge: soft.max_edge };
+                let out = mm_edit::soft::soft_deform_refined(&self.source, &soft.region, &r.tris, &tf, &opts);
+                self.sizes = extents_of(out.region.handle.iter().map(|&v| out.mesh.vertex(v)), self.axes()).0;
+                mesh = out.mesh;
+                self.preview_selection = Some(out.selection);
+            } else {
+                for (v, p) in mm_edit::soft_deform(&self.source, &soft.region, &tf, soft.kind, soft.continuity) {
+                    mesh.set_vertex(v, p);
+                }
+                self.sizes = extents_of(soft.region.handle.iter().map(|&v| mesh.vertex(v)), self.axes()).0;
             }
-            self.sizes = extents_of(soft.region.handle.iter().map(|&v| mesh.vertex(v)), self.axes()).0;
         } else if let Some(r) = &self.region {
             let lin = self.linear();
             for (verts, pivot) in &r.groups {
@@ -398,6 +421,10 @@ impl TransformTool {
             self.baked = self.matrix() * self.baked;
             self.frame = (self.rotation * self.frame).normalize();
             self.source = std::sync::Arc::new(self.preview.clone().unwrap_or_default());
+            // Refine Mesh split the selected triangles: the halves stay selected.
+            if let (Some(r), Some(tris)) = (self.region.as_mut(), self.preview_selection.clone()) {
+                r.tris = tris;
+            }
             self.translate = DVec3::ZERO;
             self.rotation = DQuat::IDENTITY;
             self.scale = DVec3::ONE;
@@ -423,8 +450,12 @@ impl TransformTool {
         let frame = (self.rotation * self.frame).normalize();
         let whole = self.region.is_none();
         let total = self.matrix() * self.baked;
+        let refined = self.preview_selection.take();
         if let (Some(o), Some(m)) = (cx.scene.get_mut(id), self.preview.take()) {
-            let sel = o.selection.clone();
+            let sel = match refined {
+                Some(tris) => mm_core::TriSelection::from_tris(&m, tris),
+                None => o.selection.clone(),
+            };
             o.mesh = std::sync::Arc::new(m);
             if whole {
                 o.frame = frame;
@@ -438,7 +469,17 @@ impl TransformTool {
             o.selection = sel;
             o.touch_selection();
         }
+        // Create Pivot's "From Last Tool": the gizmo's centre and axes where they ended up.
+        cx.scene.record_tool_frame(self.name(), self.pivot + self.translate, self.gizmo_frame());
         true
+    }
+
+    /// Orientation of the gizmo's axes (see [`TransformTool::axes`]).
+    fn gizmo_frame(&self) -> DQuat {
+        match self.space {
+            Space::Local => (self.rotation * self.frame).normalize(),
+            Space::World => DQuat::IDENTITY,
+        }
     }
 
     /// Set the size along gizmo axis `i` (all axes proportionally with uniform scaling).
@@ -655,6 +696,10 @@ impl Tool for TransformTool {
                     .on_hover_text("Width of the transition band (along the surface)")
                     .changed();
                 region_changed |= ui.checkbox(&mut soft.ignore_groups, "Ignore groups").on_hover_text("Let the band spread across face-group borders").changed();
+                redraw |= ui
+                    .checkbox(&mut soft.refine, "Refine mesh")
+                    .on_hover_text("Split the edges the move stretches, so the triangles keep about their size (the original vertices end where they would without it)")
+                    .changed();
             }
             ui.horizontal(|ui| {
                 region_changed |= ui.checkbox(&mut r.shared_frame, "Shared frame").on_hover_text("Off: each selected piece turns and scales about its own centre").changed();
@@ -868,24 +913,32 @@ impl Tool for TransformTool {
         let f = self.scale_frame();
         let (rx, ry, rz) = (f.inverse() * self.rotation * f).to_euler(EulerRot::XYZ);
         let deg = [rx, ry, rz].map(|r| if r.abs() < 1e-9 { 0.0 } else { round(r.to_degrees(), 4) });
-        Some(serde_json::json!({
+        let mut v = serde_json::json!({
             "space": if self.space == Space::Local { "local" } else { "world" },
             "translate_mm": vec3(self.translate.to_array(), 5),
             "rotate_deg": deg,
             "scale": vec3(self.scale.to_array(), 6),
             "uniform_scaling": self.uniform,
-        }))
+        });
+        if let Some(soft) = self.soft() {
+            v["refine_mesh"] = serde_json::json!(soft.refine);
+        }
+        Some(v)
     }
 
     fn settings_schema(&self) -> Option<serde_json::Value> {
         let v3 = |d: &str| serde_json::json!({"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": d});
-        Some(serde_json::json!({"type": "object", "properties": {
+        let mut schema = serde_json::json!({"type": "object", "properties": {
             "space": {"type": "string", "enum": ["local", "world"], "description": "Axes of the rotation and scale: the object's own frame (turning with it) or the world's. Switching keeps what was done so far"},
             "translate_mm": v3("Move by, mm"),
             "rotate_deg": v3("Rotation about X, Y, Z (applied in that order), degrees, about the centre"),
             "scale": v3("Scale along the axes, about the centre"),
             "uniform_scaling": {"type": "boolean", "description": "set_size scales all axes alike"},
-        }}))
+        }});
+        if self.soft().is_some() {
+            schema["properties"]["refine_mesh"] = serde_json::json!({"type": "boolean", "description": "Split the edges the move stretches, so the triangles keep about their size (the original vertices end where they would without it)"});
+        }
+        Some(schema)
     }
 
     fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
@@ -915,6 +968,9 @@ impl Tool for TransformTool {
             self.scale = s;
         }
         self.uniform = a.opt_bool("uniform_scaling").unwrap_or(self.uniform);
+        if let (Some(refine), Some(soft)) = (a.opt_bool("refine_mesh"), self.region.as_mut().and_then(|r| r.soft.as_mut())) {
+            soft.refine = refine;
+        }
         self.dirty = true;
         self.rebuild();
         Ok(())
@@ -933,6 +989,7 @@ impl Tool for TransformTool {
             "axes": self.axes().map(|a| vec3(a.to_array(), 5)),
             "sizes_mm": vec3(self.sizes.to_array(), 4),
             "changed": !self.is_identity(),
+            "vertices_added_by_refining": self.preview_selection.as_ref().and(self.preview.as_ref()).map(|m| m.vertex_count().saturating_sub(self.source.vertex_count())),
             "next": "change the settings (or use the actions), then accept (mesh_tool accept)",
         })
     }
@@ -1009,6 +1066,7 @@ mod tests {
             frame,
             space,
             preview: None,
+            preview_selection: None,
             translate: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             scale: DVec3::ONE,
@@ -1099,6 +1157,7 @@ mod face_tests {
             source,
             space: Space::Local,
             preview: None,
+            preview_selection: None,
             translate: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             scale: DVec3::ONE,
@@ -1164,5 +1223,60 @@ mod face_tests {
         // Shared: the left piece moves toward the common centre; separate: it stays.
         assert!(centre(shared.preview.as_ref().unwrap(), true).x > before.x + 0.5);
         assert!((centre(apart.preview.as_ref().unwrap(), true) - before).length() < 1e-9);
+    }
+
+    #[test]
+    fn soft_transform_refines_the_stretched_band() {
+        let m = primitives::plane_grid(6.0, 6.0, 30, 30);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).truncate().length() < 0.8).collect();
+        let mut t = face_tool(m.clone(), sel.clone());
+        t.region.as_mut().unwrap().soft = Some(SoftState {
+            kind: mm_edit::SoftKind::Linear,
+            continuity: mm_edit::Continuity::SoftPosition,
+            falloff: 1.2,
+            ignore_groups: false,
+            refine: false,
+            max_edge: 0.0,
+            region: Default::default(),
+            pivots: Vec::new(),
+        });
+        t.update_region();
+        let max_edge = t.soft().unwrap().max_edge;
+        assert!(max_edge > 0.2 && max_edge < 0.4, "{max_edge}");
+        t.translate = DVec3::Z * 2.0;
+        t.rebuild();
+        let plain = t.preview.clone().unwrap();
+        assert!(t.preview_selection.is_none());
+        assert_eq!(t.settings().unwrap()["refine_mesh"], false);
+        let (mut unused, ctx) = (DummyCx::default(), egui::Context::default());
+        t.set_settings(&serde_json::json!({"refine_mesh": true}), &mut unused.cx(&ctx)).unwrap();
+        let refined = t.preview.clone().unwrap();
+        refined.check_validity().unwrap();
+        assert!(refined.vertex_count() > plain.vertex_count());
+        let longest = |mm: &Mesh| mm.edge_ids().map(|e| mm.edge_length(e)).fold(0.0, f64::max);
+        assert!(longest(&plain) > 2.0 * max_edge && longest(&refined) <= max_edge * (1.0 + 1e-9));
+        assert!(m.vertex_ids().all(|v| refined.vertex(v) == plain.vertex(v)), "the original vertices move as without refining");
+        let tris = t.preview_selection.clone().unwrap();
+        assert!(tris.len() >= sel.len() && tris.iter().all(|&x| refined.is_triangle(x)));
+        // Switching the coordinate space bakes the refined result, selection included.
+        t.bake();
+        assert_eq!(t.source.vertex_count(), refined.vertex_count());
+        assert_eq!(t.region.as_ref().unwrap().tris, tris);
+    }
+
+    /// A tool context for calls that need one but do not use it.
+    #[derive(Default)]
+    struct DummyCx {
+        scene: Scene,
+        history: crate::scene::History,
+        camera: crate::camera::Camera,
+        status: String,
+    }
+
+    impl DummyCx {
+        fn cx<'a>(&'a mut self, ctx: &'a egui::Context) -> ToolCx<'a> {
+            let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+            ToolCx { scene: &mut self.scene, history: &mut self.history, camera: &mut self.camera, status: &mut self.status, egui: ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift }
+        }
     }
 }

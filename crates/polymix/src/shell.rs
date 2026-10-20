@@ -102,6 +102,8 @@ pub struct PolymixApp {
     brought_forward: bool,
     /// Until when work in the Mesh workspace is an agent's (after its last change).
     agent_work_until: Option<Instant>,
+    /// The catalog and volume Segmentation's overlay choices were listed for.
+    overlay_key: Option<(usize, usize)>,
 }
 
 struct Wait {
@@ -162,7 +164,7 @@ impl PolymixApp {
         let mut agents = AgentAccess::new(storage, agents::all_tools());
         agents.start_if_enabled(ctx);
         let ui_access = crate::ui_access::UiAccess::new(ctx);
-        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None }
+        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None, overlay_key: None }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -614,6 +616,36 @@ impl eframe::App for PolymixApp {
             if let Some((catalog, k, label)) = self.volume.call(|w| w.current_volume()).flatten() {
                 self.segmentation.call(|w| w.show_volume(&catalog.volumes[k], &label, ctx));
             }
+        }
+        // Images that can be shown over the one in Segmentation (its Overlay menu): listed
+        // again when another is shown or the catalog changes.
+        let asked = self.segmentation.call(|w| w.wants_overlay_choices()) == Some(true);
+        if active == Tab::Segmentation || asked {
+            let current = self.volume.call(|w| w.current_volume()).flatten();
+            let key = current.as_ref().map(|(c, k, _)| (Arc::as_ptr(c) as usize, *k));
+            if asked || key != self.overlay_key {
+                self.overlay_key = key;
+                let choices = current.and_then(|(c, k, _)| self.volume.call(|w| w.overlay_choices(&c.volumes[k]))).unwrap_or_default();
+                self.segmentation.call(|w| w.set_overlay_choices(choices));
+            }
+        }
+        // The Segmentation tab's image, for the image slices in Mesh.
+        if active == Tab::Mesh {
+            let source = self.segmentation.call(|w| w.view_for_mesh()).flatten().map(|i| crate::app::slices::SliceSource { volume: i.volume, name: i.name, cursor: i.cursor, window: i.window });
+            self.mesh.call(|w| w.set_image_source(source));
+        }
+        // Meshes sent from Mesh become segments in Segmentation, which is shown.
+        if let Some(meshes) = self.mesh.call(|w| w.take_for_segmentation()).filter(|m| !m.is_empty()) {
+            self.segmentation.call(|w| {
+                for (name, mesh) in meshes {
+                    w.import_mesh(name, mesh, ctx);
+                }
+            });
+            self.active = Tab::Segmentation;
+        }
+        // Images saved in Segmentation (Mask volume) are listed in Volume.
+        if let Some(paths) = self.segmentation.call(|w| w.take_volumes()).filter(|p| !p.is_empty()) {
+            self.volume.call(|w| w.add_derived(paths, false, ctx));
         }
         // Meshes made in Segmentation go to Mesh, which is shown.
         if let Some((meshes, by_agent)) = self.segmentation.call(|w| w.take_meshes()).filter(|(m, _)| !m.is_empty()) {

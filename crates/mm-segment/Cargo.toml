@@ -9,6 +9,7 @@ license.workspace = true
 mm-volume = { path = "../mm-volume" }
 mm-core = { path = "../mm-core" }
 mm-solid = { path = "../mm-solid" }
+mm-edit = { path = "../mm-edit" }
 glam.workspace = true
 rayon.workspace = true
 anyhow.workspace = true

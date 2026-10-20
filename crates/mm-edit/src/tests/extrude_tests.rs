@@ -194,3 +194,23 @@ fn flat_end_and_constant_direction() {
         }
     }
 }
+
+#[test]
+fn exact_offset_keeps_its_distance_in_concave_corners() {
+    // Inside out, a cube's edges and corners are concave: moved along their normals they come
+    // too close to the faces they join (0.58 of the distance at a corner).
+    let mut m = mm_core::primitives::cube(10.0, 4);
+    m.reverse_orientation();
+    let original = m.clone();
+    let all: Vec<u32> = m.triangle_ids().collect();
+    let bvh = mm_core::bvh::Bvh::build(&original);
+    let gap = |m: &Mesh| m.vertex_ids().map(|v| bvh.nearest(&original, m.vertex(v), f64::INFINITY).unwrap().dist_sq.sqrt()).fold(f64::INFINITY, f64::min);
+    let mut along_normals = m.clone();
+    offset_selection(&mut along_normals, &all, 1.0, 0.0).unwrap();
+    assert!(gap(&along_normals) < 0.6, "{}", gap(&along_normals));
+    offset_selection_exact(&mut m, &all, 1.0, 0.0, false, 10).unwrap();
+    assert!((gap(&m) - 1.0).abs() < 1e-3, "{}", gap(&m));
+    // The inner box: 8 mm across.
+    let b = m.bounds();
+    assert!((b.max.x - b.min.x - 8.0).abs() < 1e-3);
+}

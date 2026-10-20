@@ -28,6 +28,10 @@ pub struct ProjectObject {
     /// Corner UVs in triangle order (see [`crate::scene::UvSet`]).
     pub uvs: Option<Vec<[[f32; 2]; 3]>>,
     pub pivots: Vec<crate::scene::Pivot>,
+    /// The texture image's file (the image itself stays where it is).
+    pub texture: Option<std::path::PathBuf>,
+    /// A reference object (see [`crate::scene::SceneObject::reference`]).
+    pub reference: bool,
 }
 
 const UV_MAGIC: &[u8; 8] = b"PMXUV001";
@@ -186,6 +190,12 @@ fn manifest(p: &Project) -> String {
             let (x, q) = (p.position, p.frame);
             s += &format!("pivot {} {} {} {} {} {} {}\n", x.x, x.y, x.z, q.x, q.y, q.z, q.w);
         }
+        if let Some(t) = &o.texture {
+            s += &format!("texture {}\n", one_line(&t.to_string_lossy()));
+        }
+        if o.reference {
+            s += "reference 1\n";
+        }
         s += "end\n";
     }
     s
@@ -250,6 +260,8 @@ pub fn load(path: &Path) -> Result<Project> {
                     group_names: Vec::new(),
                     uvs: None,
                     pivots: Vec::new(),
+                    texture: None,
+                    reference: false,
                 };
                 cur = Some((o, String::new()));
                 uv_file = None;
@@ -275,6 +287,8 @@ pub fn load(path: &Path) -> Result<Project> {
                 }
             }
             ("uvs", Some(_)) => uv_file = Some(rest.trim().to_string()),
+            ("texture", Some((o, _))) => o.texture = Some(std::path::PathBuf::from(rest)),
+            ("reference", Some((o, _))) => o.reference = rest.trim() != "0",
             ("pivot", Some((o, _))) => {
                 if let [x, y, z, qx, qy, qz, qw] = nums(rest)[..] {
                     o.pivots.push(crate::scene::Pivot { position: DVec3::new(x, y, z), frame: DQuat::from_xyzw(qx, qy, qz, qw).normalize() });
@@ -326,6 +340,8 @@ mod tests {
                     group_names: vec![(3, "wall".into()), (4, "inlet 1".into())],
                     uvs: Some((0..a.triangle_count()).map(|t| [[t as f32, 0.5], [0.25, 0.125], [1.0, t as f32 * 0.001]]).collect()),
                     pivots: vec![crate::scene::Pivot { position: DVec3::new(1.0, -2.0, 0.5), frame: DQuat::from_rotation_x(0.7) }],
+                    texture: Some(std::path::PathBuf::from("/some dir/skin.png")),
+                    reference: false,
                 },
                 ProjectObject {
                     name: "box".into(),
@@ -337,6 +353,8 @@ mod tests {
                     group_names: Vec::new(),
                     uvs: None,
                     pivots: Vec::new(),
+                    texture: None,
+                    reference: true,
                 },
             ],
             active: Some(0),
@@ -362,6 +380,8 @@ mod tests {
         assert!((o.pivots[0].position - DVec3::new(1.0, -2.0, 0.5)).length() < 1e-12);
         assert!(o.pivots[0].frame.angle_between(DQuat::from_rotation_x(0.7)) < 1e-9);
         assert!(q.objects[1].uvs.is_none());
+        assert_eq!(q.objects[0].texture.as_deref(), Some(std::path::Path::new("/some dir/skin.png")));
+        assert!(!q.objects[0].reference && q.objects[1].reference);
         // Positions are bit-exact, groups and colours kept.
         for (v, w) in a.vertex_ids().zip(o.mesh.vertex_ids()) {
             assert_eq!(a.vertex(v), o.mesh.vertex(w));

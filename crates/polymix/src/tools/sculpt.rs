@@ -1,10 +1,21 @@
 //! Sculpt brushes (Meshmixer "Sculpt > Brushes"). Volume brushes refine the mesh under the
 //! brush as they go and reach everything inside the brush sphere; surface brushes keep the
 //! triangles and stay on the stroked surface. Shift switches to the secondary (smoothing) brush.
+//!
+//! Dabs are placed a set distance apart along the stroke (Spacing). The primary brush's
+//! footprint can be shaped by a brush alpha that moves and turns with the dab (AlignToStroke)
+//! — on the draw brushes it embosses the image — and by a stencil fixed to the view
+//! ([`stencil`]). Symmetry mirrors every dab across a freely placed plane ([`symmetry`]).
+
+pub mod stencil;
+pub mod symmetry;
 
 use super::*;
 use crate::ui_util;
+use mm_edit::brush_alpha::{AlphaMap, DabFrame, ScreenMap, ScreenStencil, Spacer};
 use rayon::prelude::*;
+use stencil::Alpha;
+pub use symmetry::{SymPlane, Symmetry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Brush {
@@ -331,33 +342,6 @@ struct Footprint {
     hold_groups: bool,
 }
 
-/// Symmetry plane: normal along `axis`, through `offset` on that axis.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct SymPlane {
-    axis: usize,
-    offset: f64,
-}
-
-impl SymPlane {
-    /// Plane through the centre of the object's bounding box.
-    fn centered(mesh: &Mesh, axis: usize) -> Self {
-        Self { axis, offset: mesh.bounds().center()[axis] }
-    }
-    fn reflect(self, p: DVec3) -> DVec3 {
-        let mut q = p;
-        q[self.axis] = 2.0 * self.offset - p[self.axis];
-        q
-    }
-    fn reflect_dir(self, v: DVec3) -> DVec3 {
-        let mut q = v;
-        q[self.axis] = -v[self.axis];
-        q
-    }
-    fn distance(self, p: DVec3) -> f64 {
-        (p[self.axis] - self.offset).abs()
-    }
-}
-
 /// SymSnap tolerance, as a fraction of the brush radius.
 const SYM_SNAP_TOL: f64 = 0.03;
 
@@ -366,12 +350,20 @@ const SYM_SNAP_TOL: f64 = 0.03;
 fn sym_snap(mesh: &mut Mesh, verts: impl Iterator<Item = u32>, start: &std::collections::HashMap<u32, DVec3>, sym: SymPlane, tol: f64) {
     for v in verts {
         if mesh.is_vertex(v) && start.get(&v).is_some_and(|&p| sym.distance(p) < tol) {
-            let mut p = mesh.vertex(v);
-            p[sym.axis] = sym.offset;
+            let p = sym.project(mesh.vertex(v));
             mesh.set_vertex(v, p);
         }
     }
 }
+
+/// Dab spacing range, in brush radii.
+const SPACING_RANGE: (f64, f64) = (0.05, 3.0);
+/// Most dabs one pointer move places (a longer jump spaces them wider).
+const MAX_DABS_PER_MOVE: usize = 32;
+/// Brush alpha size range (image side over the brush diameter) and stencil size range
+/// (image side over the viewport height).
+const ALPHA_SCALE_RANGE: (f64, f64) = (0.05, 8.0);
+const STENCIL_SIZE_RANGE: (f64, f64) = (0.02, 10.0);
 
 pub struct SculptTool {
     brush: Brush,
@@ -390,11 +382,25 @@ pub struct SculptTool {
     hold_groups: bool,
     /// Pull the stroked surface toward the target surface as well.
     attract: bool,
-    /// Mirror every dab across `sym` (Shift+S).
-    symmetry: bool,
-    sym: SymPlane,
+    /// Mirror every dab across a plane (Shift+S).
+    symmetry: Symmetry,
     /// Vertices that sat on the symmetry plane stay on it, so the halves stay joined.
     sym_snap: bool,
+    /// Distance between dabs along a stroke, in brush radii.
+    spacing: f64,
+    /// The brush alpha turns with the stroke (otherwise it stays upright in the view).
+    align_to_stroke: bool,
+    /// Footprint / texture of the primary brush, moving with the dab, and how it sits.
+    alpha: Option<Alpha>,
+    alpha_map: AlphaMap,
+    /// Image fixed to the view masking the primary brush, and where it is.
+    stencil: Option<Alpha>,
+    screen_stencil: ScreenStencil,
+    /// How strongly the stencil shows over the view (0..1).
+    stencil_opacity: f32,
+    /// Left-drags move the stencil (Shift scales, Cmd/Ctrl turns) instead of sculpting.
+    placing_stencil: bool,
+    stencil_drag: Option<(egui::Pos2, ScreenStencil)>,
     /// PaintVertex colour.
     paint: [f32; 3],
     refinement: Refinement,
@@ -403,7 +409,9 @@ pub struct SculptTool {
     strength: f64,
     stroke: Option<SculptStroke>,
     armed: bool,
+    /// Surface point under the pointer, the brush radius there and the surface normal.
     hover: Option<(DVec3, f64)>,
+    hover_normal: DVec3,
     /// Keep open-boundary vertices fixed.
     hold_boundary: bool,
     /// Strength when a right-drag (strength adjust) started.
@@ -421,11 +429,46 @@ struct SculptStroke {
     drag_r: f64,
     /// Previous dab centre (for stroke-direction brushes).
     last_center: Option<DVec3>,
+    /// Stroke direction, smoothed over the dabs (AlignToStroke).
+    dir: Option<DVec3>,
     /// Positions when the stroke first touched each vertex (Draw3's layer reference).
     start: std::collections::HashMap<u32, DVec3>,
-    /// Lazy brush centre, and the pointer position of the last dab (Flow off).
+    /// Lazy brush point on the surface, and the pointer position last frame (resting test).
     lazy: Option<DVec3>,
     last_pos: Option<egui::Pos2>,
+    /// Places the dabs along the stroke.
+    spacer: Spacer,
+}
+
+impl SculptStroke {
+    fn new(object: ObjectId, invert: bool, step: f64) -> Self {
+        Self {
+            object,
+            invert,
+            drag_verts: Vec::new(),
+            drag_mirror: Vec::new(),
+            drag_origin: None,
+            drag_start_pos: Default::default(),
+            drag_r: 0.0,
+            last_center: None,
+            dir: None,
+            start: Default::default(),
+            lazy: None,
+            last_pos: None,
+            spacer: Spacer::new(step),
+        }
+    }
+
+    /// Note a dab at `center`: the motion since the previous one, and the smoothed stroke
+    /// direction.
+    fn advance(&mut self, center: DVec3) -> DVec3 {
+        let motion = self.last_center.map_or(DVec3::ZERO, |c| center - c);
+        self.last_center = Some(center);
+        if let Some(m) = motion.try_normalize() {
+            self.dir = Some(self.dir.map_or(m, |d| (d + m).normalize_or(m)));
+        }
+        motion
+    }
 }
 
 impl SculptTool {
@@ -435,11 +478,10 @@ impl SculptTool {
 
     /// Volume or surface brushes (Meshmixer hotkeys 3 and 2), optionally with a brush.
     pub fn with_mode(cx: &mut ToolCx, mode: SculptMode, brush: Option<Brush>) -> Self {
-        let sym = cx.scene.active().map_or(SymPlane { axis: 0, offset: 0.0 }, |o| SymPlane::centered(&o.mesh, 0));
-        Self::build(mode, brush, sym)
+        Self::build(mode, brush, Symmetry::for_scene(cx.scene))
     }
 
-    fn build(mode: SculptMode, brush: Option<Brush>, sym: SymPlane) -> Self {
+    fn build(mode: SculptMode, brush: Option<Brush>, symmetry: Symmetry) -> Self {
         let volume = mode == SculptMode::Volume;
         Self {
             brush: brush.unwrap_or(if volume { Brush::Draw } else { Brush::RobustSmooth }),
@@ -452,9 +494,17 @@ impl SculptTool {
             volumetric: volume,
             hold_groups: false,
             attract: false,
-            symmetry: false,
-            sym,
+            symmetry,
             sym_snap: false,
+            spacing: 0.25,
+            align_to_stroke: false,
+            alpha: None,
+            alpha_map: AlphaMap::default(),
+            stencil: None,
+            screen_stencil: ScreenStencil::default(),
+            stencil_opacity: 0.35,
+            placing_stencil: false,
+            stencil_drag: None,
             paint: [0.85, 0.25, 0.2],
             refinement: Refinement { enabled: volume, ..Refinement::default() },
             size_pct: 4.0,
@@ -462,6 +512,7 @@ impl SculptTool {
             stroke: None,
             armed: false,
             hover: None,
+            hover_normal: DVec3::Z,
             hold_boundary: true,
             strength_drag: None,
         }
@@ -478,6 +529,11 @@ struct Stamp {
     view: DVec3,
     r: f64,
     invert: bool,
+    /// Where the brush alpha's x axis points (laid into the surface): the stroke direction
+    /// with AlignToStroke, else the view's right.
+    across: DVec3,
+    /// How the view maps the surface to the screen (for the stencil).
+    screen: Option<ScreenMap>,
 }
 
 impl SculptTool {
@@ -485,23 +541,59 @@ impl SculptTool {
         Footprint { falloff: self.falloff, volumetric: self.volumetric, hold_boundary: self.hold_boundary, hold_groups: self.hold_groups }
     }
 
+    /// The brush alpha and stencil shape `brush` (the primary brush, not the secondary
+    /// smoothing one, the density brushes or Move).
+    fn shapes(&self, brush: Brush) -> bool {
+        (self.alpha.is_some() || self.stencil.is_some()) && brush == self.brush && !brush.density() && !brush.grabs()
+    }
+
+    /// Multiply the falloff weights by the brush alpha (in the dab's `frame`) and the stencil
+    /// (where each vertex shows on screen), dropping vertices left at zero. `back` takes a
+    /// mirrored dab's vertices to where the original dab sees them, so the mirror image of
+    /// the footprint is applied.
+    fn shape(&self, mesh: &Mesh, verts: &mut Vec<(u32, f64)>, frame: &DabFrame, screen: Option<&ScreenMap>, back: impl Fn(DVec3) -> DVec3) {
+        let alpha = self.alpha.as_ref().map(|a| (&*a.image, self.alpha_map));
+        let stencil = self.stencil.as_ref().zip(screen).map(|(a, s)| (&*a.image, self.screen_stencil, *s));
+        for (v, w) in verts.iter_mut() {
+            let p = back(mesh.vertex(*v));
+            if let Some((img, map)) = alpha {
+                *w *= map.factor(img, frame.local(p));
+            }
+            if let Some((img, st, screen)) = &stencil {
+                *w *= st.factor(img, p, screen);
+            }
+        }
+        verts.retain(|x| x.1 > 0.0);
+    }
+
     /// Apply a dab and, with symmetry on, its mirror image (the same operation reflected;
     /// Meshmixer does not enforce strict mesh symmetry either). `start` collects where the
     /// stroke first found each vertex. Returns whether the triangles changed.
     fn stamp(&self, o: &mut crate::scene::SceneObject, s: &Stamp, start: &mut std::collections::HashMap<u32, DVec3>, target: Option<&crate::scene::TargetSurface>) -> bool {
         let (brush, r, fp) = (s.brush, s.r, self.footprint());
-        let sym = self.symmetry.then_some(self.sym);
-        let mut dabs = vec![(s.center, s.motion, s.view, Some(s.seed))];
+        let sym = self.symmetry.active();
+        let mut dabs = vec![(s.center, s.motion, s.view, Some(s.seed), None)];
         if let Some(sym) = sym {
-            dabs.push((sym.reflect(s.center), sym.reflect_dir(s.motion), sym.reflect_dir(s.view), None));
+            dabs.push((sym.reflect(s.center), sym.reflect_dir(s.motion), sym.reflect_dir(s.view), None, Some(sym)));
         }
+        let shaped = self.shapes(brush);
+        // The footprint's frame comes from the original dab; its mirror image uses it too.
+        let mut frame: Option<DabFrame> = None;
         let mut retriangulated = false;
-        for (c, motion, view, seed) in dabs {
+        for (c, motion, view, seed, mirror) in dabs {
             let bvh = o.bvh();
             let Some(seed) = seed.or_else(|| bvh.nearest(&o.mesh, c, r).map(|n| n.tid)) else { continue };
-            let verts = brush_vertices(&o.mesh, &bvh, c, r, Some(seed), &fp);
+            let mut verts = brush_vertices(&o.mesh, &bvh, c, r, Some(seed), &fp);
             for &(v, _) in &verts {
                 start.entry(v).or_insert_with(|| o.mesh.vertex(v));
+            }
+            if shaped {
+                let m: &Mesh = &o.mesh;
+                let f = *frame.get_or_insert_with(|| {
+                    let n = verts.iter().map(|&(v, w)| m.vertex_normal(v) * w).sum::<DVec3>().normalize_or(m.tri_normal(seed));
+                    DabFrame::new(c, n, s.across, r)
+                });
+                self.shape(m, &mut verts, &f, s.screen.as_ref(), |p| mirror.map_or(p, |sym| sym.reflect(p)));
             }
             if brush.density() {
                 retriangulated |= density_dab(o.mesh_mut(), &verts, brush, r, self.strength);
@@ -751,41 +843,55 @@ fn brush_key(b: Brush) -> String {
 }
 
 impl SculptTool {
-    /// Dabs along `path` (points in mm, spaced a quarter of the brush radius apart) with the
-    /// current brush, as one stroke: what dragging the brush along it does.
+    /// How the current view maps the surface to the screen.
+    fn screen_map(cx: &ToolCx) -> ScreenMap {
+        let size = cx.vp.rect.size();
+        ScreenMap { view_proj: cx.camera.view_proj(cx.vp.aspect()), size: DVec2::new(size.x as f64, size.y as f64) }
+    }
+
+    /// One dab of `stroke` at surface point `p` (Depth applied): the motion since the last
+    /// dab, the alpha's direction and symmetry as dragging does. Returns whether the
+    /// triangles changed.
+    fn dab_at(&self, cx: &mut ToolCx, stroke: &mut SculptStroke, brush: Brush, p: DVec3, r: f64, target: Option<&TargetSurface>) -> bool {
+        let (view, right, screen) = (cx.camera.forward(), cx.camera.right(), Self::screen_map(cx));
+        let Some(o) = cx.scene.get_mut(stroke.object) else { return false };
+        let bvh = o.bvh();
+        let Some(h) = bvh.nearest(&o.mesh, p, f64::INFINITY) else { return false };
+        let center = h.point - o.mesh.tri_normal(h.tid) * (self.depth / 100.0 * r);
+        let motion = stroke.advance(center);
+        let across = if self.align_to_stroke { stroke.dir.unwrap_or(right) } else { right };
+        if o.moved_vertices.is_empty() {
+            o.moved_from = o.mesh.shape_version();
+        }
+        let stamp = Stamp { brush, center, seed: h.tid, motion, view, r, invert: stroke.invert, across, screen: Some(screen) };
+        let retriangulated = self.stamp(o, &stamp, &mut stroke.start, target);
+        if retriangulated {
+            // New triangles: the GPU copy and the selection are rebuilt.
+            o.moved_vertices.clear();
+            let m = o.mesh.clone();
+            o.selection.sync(&m);
+            o.touch_selection();
+        }
+        retriangulated
+    }
+
+    /// Dabs along `path` (points in mm; the brush's spacing apart, from the first point)
+    /// with the current brush, as one stroke: what dragging the brush along it does.
     fn stroke_along(&mut self, cx: &mut ToolCx, path: &[DVec3], invert: bool) -> Result<usize, String> {
         let id = cx.scene.active.ok_or("no active object")?;
         let r = brush_radius(cx.scene, id, self.size_pct);
         if r <= 0.0 {
             return Err("the brush has no size".into());
         }
-        let mut pts = Vec::new();
-        for w in path.windows(2) {
-            let n = ((w[0].distance(w[1]) / (0.25 * r)).ceil() as usize).max(1);
-            pts.extend((0..n).map(|k| w[0].lerp(w[1], k as f64 / n as f64)));
+        if let Some(b) = cx.scene.get(id).map(|o| o.bounds()) {
+            self.symmetry.place(id, &b);
         }
-        pts.extend(path.last());
+        let mut stroke = SculptStroke::new(id, invert, self.spacing * r);
+        let pts: Vec<DVec3> = path.iter().flat_map(|&p| stroke.spacer.advance(p, usize::MAX)).collect();
         cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
-        let view = cx.camera.forward();
         let target = cx.scene.target_surface(Some(id));
-        let (mut start, mut last) = (std::collections::HashMap::new(), None);
         for p in &pts {
-            let o = cx.scene.get_mut(id).ok_or("no object")?;
-            let bvh = o.bvh();
-            let Some(h) = bvh.nearest(&o.mesh, *p, f64::INFINITY) else { continue };
-            let center = h.point - o.mesh.tri_normal(h.tid) * (self.depth / 100.0 * r);
-            let motion = last.map_or(DVec3::ZERO, |c| center - c);
-            last = Some(center);
-            if o.moved_vertices.is_empty() {
-                o.moved_from = o.mesh.shape_version();
-            }
-            let stamp = Stamp { brush: self.brush, center, seed: h.tid, motion, view, r, invert };
-            if self.stamp(o, &stamp, &mut start, target.as_ref()) {
-                o.moved_vertices.clear();
-                let m = o.mesh.clone();
-                o.selection.sync(&m);
-                o.touch_selection();
-            }
+            self.dab_at(cx, &mut stroke, self.brush, *p, r, target.as_ref());
         }
         Ok(pts.len())
     }
@@ -796,14 +902,17 @@ impl SculptTool {
         let id = cx.scene.active.ok_or("no active object")?;
         let r = brush_radius(cx.scene, id, self.size_pct);
         let fp = self.footprint();
-        let sym = self.symmetry.then_some(self.sym);
+        if let Some(b) = cx.scene.get(id).map(|o| o.bounds()) {
+            self.symmetry.place(id, &b);
+        }
+        let sym = self.symmetry.active();
         cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
         let o = cx.scene.get_mut(id).ok_or("no object")?;
         let bvh = o.bvh();
         let h = bvh.nearest(&o.mesh, from, f64::INFINITY).ok_or("no surface")?;
         let delta = to - h.point;
         let verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
-        let mirror = sym.and_then(|s| bvh.nearest(&o.mesh, s.reflect(h.point), r).map(|n| (s, brush_vertices(&o.mesh, &bvh, s.reflect(h.point), r, Some(n.tid), &fp)))).unwrap_or((SymPlane { axis: 0, offset: 0.0 }, Vec::new()));
+        let mirror = sym.and_then(|s| bvh.nearest(&o.mesh, s.reflect(h.point), r).map(|n| (s, brush_vertices(&o.mesh, &bvh, s.reflect(h.point), r, Some(n.tid), &fp)))).unwrap_or((SymPlane::new(DVec3::ZERO, DVec3::X), Vec::new()));
         let mut moved: std::collections::HashMap<u32, DVec3> = verts.iter().chain(&mirror.1).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
         let start = moved.clone();
         for (vs, step) in [(&verts, delta), (&mirror.1, mirror.0.reflect_dir(delta))] {
@@ -827,6 +936,113 @@ impl SculptTool {
         o.moved_vertices.extend(moved.keys().copied());
         Ok(moved.len())
     }
+
+    /// The stroke following the pointer at `pos`: Move grabs the surface once and carries
+    /// it; the other brushes dab the spacing apart along the (lazy) path, and with Flow keep
+    /// dabbing where the pointer rests.
+    fn drag_stroke(&self, stroke: &mut SculptStroke, input: &PointerInput, pos: egui::Pos2, hover: Option<(ObjectId, mm_core::bvh::RayHit)>, cx: &mut ToolCx) {
+        let fp = self.footprint();
+        let brush = if input.shift && !self.brush.grabs() { self.secondary } else { self.brush };
+        let resting = stroke.last_pos == Some(pos);
+        stroke.last_pos = Some(pos);
+        let sym = self.symmetry.active();
+        if brush.grabs() {
+            if stroke.drag_origin.is_none() {
+                let Some((_, h)) = hover else { return };
+                let r = brush_radius(cx.scene, stroke.object, self.size_pct);
+                let Some(o) = cx.scene.get_mut(stroke.object) else { return };
+                let bvh = o.bvh();
+                stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
+                if let Some(sym) = sym {
+                    let mc = sym.reflect(h.point);
+                    if let Some(n) = bvh.nearest(&o.mesh, mc, r) {
+                        stroke.drag_mirror = brush_vertices(&o.mesh, &bvh, mc, r, Some(n.tid), &fp);
+                    }
+                }
+                stroke.drag_start_pos = stroke.drag_verts.iter().chain(&stroke.drag_mirror).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
+                stroke.drag_origin = Some((h.point, pos));
+                stroke.drag_r = r;
+                return;
+            }
+            if resting {
+                return;
+            }
+            let (p0, s0) = stroke.drag_origin.unwrap();
+            let wpp = cx.world_per_point(p0);
+            let d = pos - s0;
+            let delta = (cx.camera.right() * d.x as f64 - cx.camera.up() * d.y as f64) * wpp;
+            let Some(o) = cx.scene.get_mut(stroke.object) else { return };
+            if o.moved_vertices.is_empty() {
+                o.moved_from = o.mesh.shape_version();
+            }
+            // Mirrored grabs move by the mirrored offset; where the two overlap both apply.
+            let mut moved: std::collections::HashMap<u32, DVec3> = stroke.drag_start_pos.clone();
+            let mirrored = sym.map_or(DVec3::ZERO, |s| s.reflect_dir(delta));
+            for (verts, step) in [(&stroke.drag_verts, delta), (&stroke.drag_mirror, mirrored)] {
+                for &(v, w) in verts {
+                    if let Some(p) = moved.get_mut(&v) {
+                        *p += step * w;
+                    }
+                }
+            }
+            let m = o.mesh_mut();
+            let pos_arr = m.positions_mut();
+            for (&v, &p) in &moved {
+                pos_arr[v as usize] = p;
+            }
+            m.bump_shape_version();
+            if let (Some(sym), true) = (sym, self.sym_snap) {
+                sym_snap(m, moved.keys().copied(), &stroke.drag_start_pos, sym, stroke.drag_r * SYM_SNAP_TOL);
+            }
+            o.moved_vertices.extend(moved.keys().copied());
+            return;
+        }
+        let Some((_, h)) = hover else { return };
+        let r = brush_radius(cx.scene, stroke.object, self.size_pct);
+        // Lazyness lets the brush trail the pointer.
+        let mut p = h.point;
+        if let Some(prev) = stroke.lazy {
+            p = prev + (p - prev) * (1.0 - 0.95 * self.lazyness / 100.0);
+        }
+        stroke.lazy = Some(p);
+        let mut dabs = stroke.spacer.advance(p, MAX_DABS_PER_MOVE);
+        if self.flow {
+            if dabs.is_empty() && resting {
+                dabs.push(p);
+            }
+            // Frames keep coming while the button is held, so a resting brush keeps working.
+            cx.egui.request_repaint();
+        }
+        let target = cx.scene.target_surface(Some(stroke.object));
+        for q in dabs {
+            self.dab_at(cx, stroke, brush, q, r, target.as_ref());
+        }
+    }
+
+    /// Stencil placing: left-drag moves the stencil, Shift+drag sizes it (up: larger),
+    /// Cmd/Ctrl+drag turns it.
+    fn place_stencil(&mut self, input: &PointerInput, cx: &ToolCx) {
+        let Some(pos) = input.pos else { return };
+        if input.pressed {
+            self.stencil_drag = Some((pos, self.screen_stencil));
+        }
+        if let (true, Some((p0, s0))) = (input.down, self.stencil_drag) {
+            let d = pos - p0;
+            let size = cx.vp.rect.size();
+            let mut st = s0;
+            if input.shift {
+                st.map.scale = (s0.map.scale * (-d.y as f64 * 0.01).exp()).clamp(STENCIL_SIZE_RANGE.0, STENCIL_SIZE_RANGE.1);
+            } else if input.command {
+                st.map.rotation_deg = (s0.map.rotation_deg - d.x as f64 * 0.5 + 180.0).rem_euclid(360.0) - 180.0;
+            } else {
+                st.center = s0.center + DVec2::new((d.x / size.x.max(1.0)) as f64, (d.y / size.y.max(1.0)) as f64);
+            }
+            self.screen_stencil = st;
+        }
+        if input.released {
+            self.stencil_drag = None;
+        }
+    }
 }
 
 impl Tool for SculptTool {
@@ -835,49 +1051,104 @@ impl Tool for SculptTool {
     }
 
     fn settings(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
+        use polymix_workspace::agent::round;
+        let name = |a: &Option<Alpha>| a.as_ref().map_or_else(|| "none".to_string(), Alpha::key);
+        let (m, st) = (self.alpha_map, self.screen_stencil);
+        let mut v = serde_json::json!({
             "brush": brush_key(self.brush),
             "size_percent": self.size_pct,
             "strength": self.strength,
             "depth": self.depth,
             "hold_boundary": self.hold_boundary,
             "hold_groups": self.hold_groups,
-            "symmetry": self.symmetry,
-            "symmetry_axis": (["x", "y", "z"][self.sym.axis.min(2)]),
-        }))
+            "sym_snap": self.sym_snap,
+            "spacing_percent": round(self.spacing * 100.0, 3),
+            "align_to_stroke": self.align_to_stroke,
+            "alpha": {"image": name(&self.alpha), "scale": m.scale, "rotation_deg": m.rotation_deg, "strength": m.strength, "tile": m.tile, "invert": m.invert},
+            "stencil": {
+                "image": name(&self.stencil), "center": [round(st.center.x, 5), round(st.center.y, 5)], "size": st.map.scale, "rotation_deg": st.map.rotation_deg,
+                "strength": st.map.strength, "tile": st.map.tile, "invert": st.map.invert,
+            },
+        });
+        if let Some(o) = v.as_object_mut() {
+            o.extend(self.symmetry.settings());
+        }
+        Some(v)
     }
 
     fn settings_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "object", "properties": {
+        let image = "none, a built-in pattern (".to_string() + &mm_edit::Pattern::ALL.map(|p| p.key()).join(", ") + "), an image in the stencils folder, or a path to a grey PNG / JPEG";
+        let mut props = serde_json::json!({
             "brush": {"type": "string", "enum": Brush::ALL.map(brush_key), "description": "The brush (robust_smooth for smoothing bumps; draw / inflate / flatten / pinch to shape; move drags)"},
             "size_percent": {"type": "number", "description": "Brush radius as a percentage of the object's size (0.1..25); the state gives it in mm"},
             "strength": {"type": "number", "description": "0..1"},
             "depth": {"type": "number", "description": "-100..100: moves the brush centre into (+) or out of (−) the surface"},
             "hold_boundary": {"type": "boolean", "description": "Open-boundary vertices stay put"},
             "hold_groups": {"type": "boolean", "description": "Face-group border vertices stay put"},
-            "symmetry": {"type": "boolean", "description": "Mirror every dab across the symmetry plane (through the object's centre)"},
-            "symmetry_axis": {"type": "string", "enum": ["x", "y", "z"]},
-        }}))
+            "sym_snap": {"type": "boolean", "description": "With symmetry: vertices on the symmetry plane stay on it"},
+            "spacing_percent": {"type": "number", "description": "Distance between dabs along a stroke, as a percentage of the brush radius (5..300)"},
+            "align_to_stroke": {"type": "boolean", "description": "The brush alpha turns with the stroke direction (otherwise it stays upright in the view)"},
+            "alpha": {"type": "object", "description": "Brush alpha: an image shaping the brush's footprint, moving with each dab (the draw brushes emboss it)", "properties": {
+                "image": {"type": "string", "description": image},
+                "scale": {"type": "number", "description": "Image side over the brush diameter (0.05..8)"},
+                "rotation_deg": {"type": "number", "description": "Turns the image counter-clockwise"},
+                "strength": {"type": "number", "description": "0..1: how much the image shapes the brush"},
+                "tile": {"type": "boolean", "description": "Repeat the image (otherwise the brush does nothing outside it)"},
+                "invert": {"type": "boolean"},
+            }},
+            "stencil": {"type": "object", "description": "Stencil: an image fixed to the view; the brush acts where it is light", "properties": {
+                "image": {"type": "string", "description": image},
+                "center": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "Centre as fractions of the viewport's width and height from its top left"},
+                "size": {"type": "number", "description": "Image side over the viewport height (0.02..10)"},
+                "rotation_deg": {"type": "number"},
+                "strength": {"type": "number", "description": "0..1"},
+                "tile": {"type": "boolean", "description": "Repeat the image over the whole view"},
+                "invert": {"type": "boolean"},
+            }},
+        });
+        if let Some(o) = props.as_object_mut() {
+            o.extend(Symmetry::schema());
+        }
+        Some(serde_json::json!({"type": "object", "properties": props}))
     }
 
     fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
         let mut v = self.settings().unwrap_or_default();
         merge_settings(&mut v, changes)?;
         let a = Args(&v);
+        // Images first: a name that matches nothing changes nothing.
+        let image = |k: &str| changes.get(k).and_then(|x| x.get("image")).map(|x| x.as_str().ok_or(format!("{k}.image is a name or path")).and_then(Alpha::find)).transpose();
+        let (alpha, stencil) = (image("alpha")?, image("stencil")?);
         self.brush = Brush::ALL.into_iter().find(|b| a.opt_str("brush") == Some(brush_key(*b).as_str())).ok_or("unknown brush")?;
         self.size_pct = (a.f64("size_percent")? as f32).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
         self.strength = a.f64("strength")?.clamp(0.0, 1.0);
         self.depth = a.f64("depth")?.clamp(-100.0, 100.0);
         self.hold_boundary = a.opt_bool("hold_boundary").unwrap_or(self.hold_boundary);
         self.hold_groups = a.opt_bool("hold_groups").unwrap_or(self.hold_groups);
-        self.symmetry = a.opt_bool("symmetry").unwrap_or(false);
-        let axis = ["x", "y", "z"].iter().position(|x| a.opt_str("symmetry_axis") == Some(*x)).unwrap_or(self.sym.axis);
-        if axis != self.sym.axis || changes.get("symmetry").is_some() {
-            if let Some(o) = cx.scene.active() {
-                self.sym = SymPlane::centered(&o.mesh, axis);
-            }
+        self.sym_snap = a.opt_bool("sym_snap").unwrap_or(self.sym_snap);
+        self.spacing = (a.f64("spacing_percent")? / 100.0).clamp(SPACING_RANGE.0, SPACING_RANGE.1);
+        self.align_to_stroke = a.opt_bool("align_to_stroke").unwrap_or(self.align_to_stroke);
+        if let Some(x) = alpha {
+            self.alpha = x;
         }
-        Ok(())
+        if let Some(x) = stencil {
+            self.stencil = x;
+        }
+        let map = |m: &serde_json::Value, old: AlphaMap, size_key: &str, range: (f64, f64)| -> Result<AlphaMap, String> {
+            let m = Args(m);
+            Ok(AlphaMap {
+                scale: m.f64(size_key)?.clamp(range.0, range.1),
+                rotation_deg: m.f64("rotation_deg")?,
+                strength: m.f64("strength")?.clamp(0.0, 1.0),
+                tile: m.opt_bool("tile").unwrap_or(old.tile),
+                invert: m.opt_bool("invert").unwrap_or(old.invert),
+            })
+        };
+        self.alpha_map = map(&v["alpha"], self.alpha_map, "scale", ALPHA_SCALE_RANGE)?;
+        let st = map(&v["stencil"], self.screen_stencil.map, "size", STENCIL_SIZE_RANGE)?;
+        let c = v["stencil"]["center"].as_array().and_then(|c| Some(DVec2::new(c.first()?.as_f64()?, c.get(1)?.as_f64()?))).ok_or("stencil.center is [x, y]")?;
+        self.screen_stencil = ScreenStencil { center: c, map: st };
+        self.symmetry.set_settings(&v, changes, cx)
     }
 
     fn state(&self, scene: &Scene) -> serde_json::Value {
@@ -892,13 +1163,18 @@ impl Tool for SculptTool {
 
     fn actions(&self) -> Vec<Action> {
         use serde_json::json;
-        vec![
-            Action::new("stroke", "Brush along a path over the active object, as dragging the brush does: one undo step (not for the move brush)", json!({"path": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "description": "Points in mm on or near the surface, in order; one point is a single dab"}, "invert": arg::boolean("The brush's opposite (Ctrl held): draw in, deflate…")})).required(&["path"]),
+        let mut out = vec![
+            Action::new("stroke", "Brush along a path over the active object, as dragging the brush does: one undo step (not for the move brush)", json!({"path": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "description": "Points in mm on or near the surface, in order; dabs go the spacing apart from the first point (one point is a single dab)"}, "invert": arg::boolean("The brush's opposite (Ctrl held): draw in, deflate…")})).required(&["path"]),
             Action::new("drag", "The move brush: carry the surface under the brush at `from` to `to`", json!({"from": arg::point("A point on or near the surface, mm"), "to": arg::point("Where it goes, mm")})).required(&["from", "to"]),
-        ]
+        ];
+        out.extend(Symmetry::actions());
+        out
     }
 
     fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        if let Some(r) = self.symmetry.act(action, args, cx) {
+            return r;
+        }
         let a = Args(args);
         match action {
             "stroke" => {
@@ -980,37 +1256,63 @@ impl Tool for SculptTool {
         });
         ui.add(egui::Slider::new(&mut self.depth, -100.0..=100.0).text("depth")).on_hover_text("Moves the brush centre into (+) or out of (−) the surface");
         ui.add(egui::Slider::new(&mut self.lazyness, 0.0..=100.0).text("lazyness")).on_hover_text("The brush trails the pointer for steadier strokes");
+        let mut spacing = self.spacing * 100.0;
+        if ui
+            .add(egui::Slider::new(&mut spacing, SPACING_RANGE.0 * 100.0..=SPACING_RANGE.1 * 100.0).logarithmic(true).suffix("%").text("spacing"))
+            .on_hover_text("Distance between dabs along the stroke, as a percentage of the brush radius: strokes come out the same however fast they go. Large spacing stamps the brush alpha one dab at a time.")
+            .changed()
+        {
+            self.spacing = spacing / 100.0;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.flow, "Flow").on_hover_text("Keep sculpting while the pointer rests");
             ui.checkbox(&mut self.volumetric, "Volumetric").on_hover_text("Affect everything inside the brush, not only the stroked surface");
         });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.symmetry, "Symmetry (Shift+S)").on_hover_text("Mirror every dab across the symmetry plane");
-            if self.symmetry {
-                for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-                    if ui.selectable_label(self.sym.axis == i, *n).on_hover_text(format!("Plane across {n}")).clicked() && self.sym.axis != i {
-                        self.sym = cx.scene.active().map_or(SymPlane { axis: i, offset: 0.0 }, |o| SymPlane::centered(&o.mesh, i));
-                    }
-                }
-            }
-        });
-        if self.symmetry {
-            ui.horizontal(|ui| {
-                ui.label("Plane at");
-                let span = cx.scene.active().map_or(1.0, |o| o.bounds().diagonal());
-                ui.add(egui::DragValue::new(&mut self.sym.offset).speed(span * 0.002).max_decimals(3));
-                if ui.button("Reset").on_hover_text("Back to the centre of the object").clicked() {
-                    if let Some(o) = cx.scene.active() {
-                        self.sym = SymPlane::centered(&o.mesh, self.sym.axis);
-                    }
-                }
-            });
-        }
-        ui.add_enabled(self.symmetry, egui::Checkbox::new(&mut self.sym_snap, "SymSnap")).on_hover_text("Vertices on the symmetry plane stay on it, so the two halves stay joined");
+        self.symmetry.ui(ui, cx, "Symmetry (Shift+S)");
+        ui.add_enabled(self.symmetry.enabled, egui::Checkbox::new(&mut self.sym_snap, "SymSnap")).on_hover_text("Vertices on the symmetry plane stay on it, so the two halves stay joined");
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.hold_boundary, "Hold boundary (B)");
             ui.checkbox(&mut self.hold_groups, "Preserve groups (G)");
             ui.checkbox(&mut self.attract, "Attract (A)").on_hover_text("Also pull the stroked surface toward the target surface");
+        });
+        egui::CollapsingHeader::new("Brush texture").default_open(self.alpha.is_some()).show(ui, |ui| {
+            ui.small("An image shaping the primary brush's footprint; it moves with each dab, so the draw brushes emboss it.");
+            stencil::picker(ui, "sculpt alpha", &mut self.alpha, self.alpha_map.invert, cx.status);
+            ui.add_enabled_ui(self.alpha.is_some(), |ui| {
+                let m = &mut self.alpha_map;
+                ui.add(egui::Slider::new(&mut m.scale, ALPHA_SCALE_RANGE.0..=ALPHA_SCALE_RANGE.1).logarithmic(true).text("scale")).on_hover_text("Image size over the brush diameter");
+                ui.add(egui::Slider::new(&mut m.rotation_deg, -180.0..=180.0).suffix("°").text("rotation"));
+                ui.add(egui::Slider::new(&mut m.strength, 0.0..=1.0).text("strength")).on_hover_text("How much the image shapes the brush (0: a plain brush)");
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut m.tile, "Tile").on_hover_text("Repeat the image across the brush (otherwise nothing outside it)");
+                    ui.checkbox(&mut m.invert, "Invert");
+                    ui.checkbox(&mut self.align_to_stroke, "Align to stroke").on_hover_text("The image turns with the stroke direction (otherwise it stays upright in the view)");
+                });
+            });
+        });
+        egui::CollapsingHeader::new("Stencil").default_open(self.stencil.is_some()).show(ui, |ui| {
+            ui.small("An image fixed to the view: the primary brush acts where it is light.");
+            if stencil::picker(ui, "sculpt stencil", &mut self.stencil, self.screen_stencil.map.invert, cx.status) && self.stencil.is_none() {
+                self.placing_stencil = false;
+            }
+            ui.add_enabled_ui(self.stencil.is_some(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.toggle_value(&mut self.placing_stencil, "Place").on_hover_text("Left-drag moves the stencil, Shift+drag sizes it, Cmd/Ctrl+drag turns it (no sculpting until you turn this off or press Esc)");
+                    if ui.button("Centre").on_hover_text("Back to the middle of the view, unturned").clicked() {
+                        self.screen_stencil.center = DVec2::splat(0.5);
+                        self.screen_stencil.map.rotation_deg = 0.0;
+                    }
+                });
+                let st = &mut self.screen_stencil;
+                ui.add(egui::Slider::new(&mut st.map.scale, STENCIL_SIZE_RANGE.0..=STENCIL_SIZE_RANGE.1).logarithmic(true).text("size")).on_hover_text("Image size over the view's height");
+                ui.add(egui::Slider::new(&mut st.map.rotation_deg, -180.0..=180.0).suffix("°").text("rotation"));
+                ui.add(egui::Slider::new(&mut st.map.strength, 0.0..=1.0).text("strength"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut st.map.tile, "Tile").on_hover_text("Repeat the image over the whole view");
+                    ui.checkbox(&mut st.map.invert, "Invert");
+                });
+                ui.add(egui::Slider::new(&mut self.stencil_opacity, 0.0..=1.0).text("show")).on_hover_text("How strongly the stencil shows over the view");
+            });
         });
         ui_util::section(ui, "Refinement");
         let rf = &mut self.refinement;
@@ -1033,9 +1335,22 @@ impl Tool for SculptTool {
     }
 
     fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
+        // Setting the symmetry plane and placing the stencil take the pointer: no sculpting.
+        if self.symmetry.pointer(input, cx) {
+            self.hover = None;
+            return;
+        }
+        if self.placing_stencil && self.stencil.is_some() {
+            self.hover = None;
+            self.place_stencil(input, cx);
+            return;
+        }
         let Some(pos) = input.pos else { return };
         let hover = cx.pick(pos, cx.scene.active);
         self.hover = hover.map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.size_pct)));
+        if let Some(n) = hover.and_then(|(id, h)| cx.scene.get(id).map(|o| o.mesh.tri_normal(h.tid))) {
+            self.hover_normal = n;
+        }
         if input.pressed {
             self.armed = true;
         }
@@ -1043,19 +1358,11 @@ impl Tool for SculptTool {
             if let Some((id, _)) = hover {
                 cx.scene.active = Some(id);
                 cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
-                self.stroke = Some(SculptStroke {
-                    object: id,
-                    invert: input.command,
-                    drag_verts: Vec::new(),
-                    drag_mirror: Vec::new(),
-                    drag_origin: None,
-                    drag_start_pos: Default::default(),
-                    drag_r: 0.0,
-                    last_center: None,
-                    start: Default::default(),
-                    lazy: None,
-                    last_pos: None,
-                });
+                if let Some(b) = cx.scene.get(id).map(|o| o.bounds()) {
+                    self.symmetry.place(id, &b);
+                }
+                let r = brush_radius(cx.scene, id, self.size_pct);
+                self.stroke = Some(SculptStroke::new(id, input.command, self.spacing * r));
             }
         }
         if input.released {
@@ -1066,123 +1373,35 @@ impl Tool for SculptTool {
         if !input.down {
             return;
         }
-        let fp = self.footprint();
-        let Some(stroke) = &mut self.stroke else { return };
-        let brush = if input.shift && !self.brush.grabs() { self.secondary } else { self.brush };
-        if !self.flow && stroke.last_pos == Some(pos) {
-            return;
-        }
-        stroke.last_pos = Some(pos);
-        let sym = self.symmetry.then_some(self.sym);
-        if brush.grabs() {
-            if stroke.drag_origin.is_none() {
-                let Some((_, h)) = hover else { return };
-                let r = brush_radius(cx.scene, stroke.object, self.size_pct);
-                let Some(o) = cx.scene.get_mut(stroke.object) else { return };
-                let bvh = o.bvh();
-                stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
-                if let Some(sym) = sym {
-                    let mc = sym.reflect(h.point);
-                    if let Some(n) = bvh.nearest(&o.mesh, mc, r) {
-                        stroke.drag_mirror = brush_vertices(&o.mesh, &bvh, mc, r, Some(n.tid), &fp);
-                    }
-                }
-                stroke.drag_start_pos = stroke.drag_verts.iter().chain(&stroke.drag_mirror).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
-                stroke.drag_origin = Some((h.point, pos));
-                stroke.drag_r = r;
-                return;
-            }
-            let (p0, s0) = stroke.drag_origin.unwrap();
-            let wpp = cx.world_per_point(p0);
-            let d = pos - s0;
-            let delta = (cx.camera.right() * d.x as f64 - cx.camera.up() * d.y as f64) * wpp;
-            let Some(o) = cx.scene.get_mut(stroke.object) else { return };
-            if o.moved_vertices.is_empty() {
-                o.moved_from = o.mesh.shape_version();
-            }
-            // Mirrored grabs move by the mirrored offset; where the two overlap both apply.
-            let mut moved: std::collections::HashMap<u32, DVec3> = stroke.drag_start_pos.clone();
-            let mirrored = sym.map_or(DVec3::ZERO, |s| s.reflect_dir(delta));
-            for (verts, step) in [(&stroke.drag_verts, delta), (&stroke.drag_mirror, mirrored)] {
-                for &(v, w) in verts {
-                    if let Some(p) = moved.get_mut(&v) {
-                        *p += step * w;
-                    }
-                }
-            }
-            let m = o.mesh_mut();
-            let pos_arr = m.positions_mut();
-            for (&v, &p) in &moved {
-                pos_arr[v as usize] = p;
-            }
-            m.bump_shape_version();
-            if let (Some(sym), true) = (sym, self.sym_snap) {
-                sym_snap(m, moved.keys().copied(), &stroke.drag_start_pos, sym, stroke.drag_r * SYM_SNAP_TOL);
-            }
-            o.moved_vertices.extend(moved.keys().copied());
-            return;
-        }
-        let Some((_, h)) = hover else { return };
-        let r = brush_radius(cx.scene, stroke.object, self.size_pct);
-        let view = cx.camera.forward();
-        let target = cx.scene.target_surface(Some(stroke.object));
-        let Some(o) = cx.scene.get_mut(stroke.object) else { return };
-        // Depth moves the centre along the surface normal; lazyness lets it trail the pointer.
-        let mut center = h.point - o.mesh.tri_normal(h.tid) * (self.depth / 100.0 * r);
-        if let Some(prev) = stroke.lazy {
-            center = prev + (center - prev) * (1.0 - 0.95 * self.lazyness / 100.0);
-        }
-        stroke.lazy = Some(center);
-        let motion = stroke.last_center.map_or(DVec3::ZERO, |c| center - c);
-        stroke.last_center = Some(center);
-        if o.moved_vertices.is_empty() {
-            o.moved_from = o.mesh.shape_version();
-        }
-        let stamp = Stamp { brush, center, seed: h.tid, motion, view, r, invert: stroke.invert };
-        let mut start = std::mem::take(&mut stroke.start);
-        let retriangulated = self.stamp(o, &stamp, &mut start, target.as_ref());
-        if let Some(stroke) = &mut self.stroke {
-            stroke.start = start;
-        }
-        if retriangulated {
-            // New triangles: the GPU copy and the selection are rebuilt.
-            o.moved_vertices.clear();
-            let m = o.mesh.clone();
-            o.selection.sync(&m);
-            o.touch_selection();
-        }
+        let Some(mut stroke) = self.stroke.take() else { return };
+        self.drag_stroke(&mut stroke, input, pos, hover, cx);
+        self.stroke = Some(stroke);
     }
 
     fn overlay(&mut self, ov: &mut Overlay, cx: &mut ToolCx) {
         if let Some((c, r)) = self.hover {
             ov.brush = Some((c.as_vec3(), r as f32));
+            if self.alpha.is_some() {
+                // The brush alpha's square on the surface, turned as the next dab would be,
+                // with a tick to its top edge.
+                let right = cx.camera.right();
+                let across = if self.align_to_stroke { self.stroke.as_ref().and_then(|s| s.dir).unwrap_or(right) } else { right };
+                let f = DabFrame::new(c + self.hover_normal * (r * 0.02), self.hover_normal, across, r);
+                let m = self.alpha_map;
+                let q = [DVec2::ZERO, DVec2::X, DVec2::ONE, DVec2::Y].map(|uv| f.point(m.local(uv)));
+                let col = Vec4::new(1.0, 0.55, 0.15, 0.9);
+                for i in 0..4 {
+                    ov.line(q[i], q[(i + 1) % 4], col);
+                }
+                ov.line(f.center, f.point(m.local(DVec2::new(0.5, 0.0))), col);
+            }
         }
-        if !self.symmetry {
-            return;
-        }
-        // The plane, spanning the object's bounds (plus a margin).
-        let Some(b) = cx.scene.active().map(|o| o.bounds()) else { return };
-        let (k, (i, j)) = (self.sym.axis, [(1, 2), (0, 2), (0, 1)][self.sym.axis]);
-        let pad = b.extents() * 0.08;
-        let corner = |a: bool, c: bool| {
-            let mut p = DVec3::ZERO;
-            p[k] = self.sym.offset;
-            p[i] = if a { b.max[i] + pad[i] } else { b.min[i] - pad[i] };
-            p[j] = if c { b.max[j] + pad[j] } else { b.min[j] - pad[j] };
-            p
-        };
-        let q = [corner(false, false), corner(true, false), corner(true, true), corner(false, true)];
-        let (fill, edge) = (Vec4::new(0.3, 0.6, 1.0, 0.08), Vec4::new(0.3, 0.6, 1.0, 0.7));
-        ov.tri(q[0], q[1], q[2], fill);
-        ov.tri(q[0], q[2], q[3], fill);
-        for n in 0..4 {
-            ov.line(q[n], q[(n + 1) % 4], edge);
-        }
+        self.symmetry.overlay(ov, cx);
         // Ring on the surface around the mirrored brush centre.
-        let Some((c, r)) = self.hover else { return };
+        let (Some(sym), Some((c, r))) = (self.symmetry.active(), self.hover) else { return };
         let Some(o) = cx.scene.active.and_then(|id| cx.scene.get_mut(id)) else { return };
         let bvh = o.bvh();
-        let Some(h) = bvh.nearest(&o.mesh, self.sym.reflect(c), r) else { return };
+        let Some(h) = bvh.nearest(&o.mesh, sym.reflect(c), r) else { return };
         let n = o.mesh.tri_normal(h.tid);
         let (u, v) = mm_core::geom::orthonormal_basis(n);
         let ring: Vec<DVec3> = (0..=48)
@@ -1197,13 +1416,39 @@ impl Tool for SculptTool {
         }
     }
 
+    fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
+        if let Some(a) = &mut self.stencil {
+            stencil::paint_stencil(painter, cx.vp.rect, a, &self.screen_stencil, self.stencil_opacity, cx.egui);
+        }
+        self.symmetry.paint(painter, cx);
+    }
+
+    fn cancel(&mut self, _cx: &mut ToolCx) -> bool {
+        // Esc leaves Set (restoring the plane) or stencil placing before it closes the tool.
+        if self.symmetry.cancel_edit() {
+            return false;
+        }
+        if self.placing_stencil {
+            self.placing_stencil = false;
+            return false;
+        }
+        true
+    }
+
+    fn accept(&mut self, _cx: &mut ToolCx) -> bool {
+        self.symmetry.accept_edit();
+        self.placing_stencil = false;
+        false
+    }
+
     fn wheel(&mut self, delta: f32, _cx: &mut ToolCx) -> bool {
         self.size_pct = (self.size_pct * (delta * 0.004).exp()).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
         true
     }
 
-    fn script(&mut self, cmd: &str, _cx: &mut ToolCx) {
-        // `brush:Refine`, `size:8`.
+    fn script(&mut self, cmd: &str, cx: &mut ToolCx) {
+        // `brush:Refine`, `size:8`, `sym:x` / `sym:view` / `sym:set` / `sym:off`, `spacing:50`,
+        // `alpha:noise`, `stencil:rings`, `align:on`.
         match cmd.split_once(':') {
             Some(("brush", name)) => self.brush = Brush::ALL.into_iter().find(|b| b.label().eq_ignore_ascii_case(name)).unwrap_or(self.brush),
             Some(("size", pct)) => self.size_pct = pct.parse().unwrap_or(self.size_pct),
@@ -1213,9 +1458,25 @@ impl Tool for SculptTool {
                 }
             }
             Some(("sym", axis)) => {
-                self.symmetry = axis != "off";
-                self.sym.axis = ["x", "y", "z"].iter().position(|a| *a == axis).unwrap_or(self.sym.axis);
+                self.symmetry.enabled = axis != "off";
+                if axis == "set" {
+                    self.symmetry.begin_edit(cx);
+                } else if axis == "view" {
+                    self.symmetry.set_plane(SymPlane::from_view(cx.camera));
+                } else if let Some(i) = ["x", "y", "z"].iter().position(|a| *a == axis) {
+                    self.symmetry.preset(cx, i);
+                }
             }
+            Some(("spacing", pct)) => self.spacing = pct.parse::<f64>().map_or(self.spacing, |p| (p / 100.0).clamp(SPACING_RANGE.0, SPACING_RANGE.1)),
+            Some(("alpha", name)) => match Alpha::find(name) {
+                Ok(a) => self.alpha = a,
+                Err(e) => *cx.status = e,
+            },
+            Some(("stencil", name)) => match Alpha::find(name) {
+                Ok(a) => self.stencil = a,
+                Err(e) => *cx.status = e,
+            },
+            Some(("align", on)) => self.align_to_stroke = on == "on",
             _ => {}
         }
     }
@@ -1261,7 +1522,10 @@ impl Tool for SculptTool {
             return toggle(&mut self.attract, "Attract", cx.status);
         }
         if i.key_pressed(egui::Key::S) && i.modifiers.shift && !i.modifiers.command && !i.modifiers.alt {
-            return toggle(&mut self.symmetry, "Symmetry", cx.status);
+            if self.symmetry.enabled {
+                self.symmetry.cancel_edit();
+            }
+            return toggle(&mut self.symmetry.enabled, "Symmetry", cx.status);
         }
         if i.key_pressed(egui::Key::OpenBracket) {
             step_brush_size(&mut self.size_pct, false);
@@ -1334,15 +1598,15 @@ mod tests {
         // An icosphere is symmetric across x = 0; a mirrored stroke must keep it so.
         let m0 = primitives::icosphere(1.0, 4);
         let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
-        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), SymPlane::centered(&m0, 0));
-        tool.symmetry = true;
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), Symmetry::new(Some(SymPlane::axis(&m0.bounds(), 0)), None));
+        tool.symmetry.enabled = true;
         tool.strength = 0.8;
         let mut start = Default::default();
         let mut c = DVec3::new(0.6, 0.0, 0.8).normalize();
         for _ in 0..6 {
             let bvh = o.bvh();
             let h = bvh.nearest(&o.mesh, c, 1.0).unwrap();
-            let s = Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::Y * 0.05, view: -c, r: 0.35, invert: false };
+            let s = Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::Y * 0.05, view: -c, r: 0.35, invert: false, across: DVec3::X, screen: None };
             tool.stamp(&mut o, &s, &mut start, None);
             c = (c + DVec3::Y * 0.05).normalize();
         }
@@ -1355,17 +1619,17 @@ mod tests {
                 moved += 1;
             }
             // The mirror twin of every vertex moved the same way.
-            let twin = bvh0.nearest(&m0, SymPlane { axis: 0, offset: 0.0 }.reflect(m0.vertex(v)), 1e-6).map(|h| m0.triangle(h.tid).into_iter().min_by(|&a, &b| m0.vertex(a).distance(h.point).total_cmp(&m0.vertex(b).distance(h.point))).unwrap()).unwrap();
+            let twin = bvh0.nearest(&m0, SymPlane::new(DVec3::ZERO, DVec3::X).reflect(m0.vertex(v)), 1e-6).map(|h| m0.triangle(h.tid).into_iter().min_by(|&a, &b| m0.vertex(a).distance(h.point).total_cmp(&m0.vertex(b).distance(h.point))).unwrap()).unwrap();
             let q = m.vertex(twin);
             assert!((p - DVec3::new(-q.x, q.y, q.z)).length() < 1e-9, "vertex {v}");
         }
         assert!(moved > 20);
         // Without symmetry the other side stays put.
         let mut o = crate::scene::SceneObject::new(2, "s", m0.clone());
-        tool.symmetry = false;
+        tool.symmetry.enabled = false;
         let bvh = o.bvh();
         let h = bvh.nearest(&o.mesh, DVec3::new(0.6, 0.0, 0.8), 1.0).unwrap();
-        tool.stamp(&mut o, &Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.35, invert: false }, &mut Default::default(), None);
+        tool.stamp(&mut o, &Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.35, invert: false, across: DVec3::X, screen: None }, &mut Default::default(), None);
         assert!(o.mesh.vertex_ids().filter(|&v| m0.vertex(v).x < -0.1).all(|v| o.mesh.vertex(v) == m0.vertex(v)));
     }
 
@@ -1379,14 +1643,14 @@ mod tests {
         assert!(!seam.is_empty());
         let run = |snap: bool| {
             let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
-            let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Inflate), SymPlane { axis: 0, offset: 0.0 });
-            tool.symmetry = true;
+            let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Inflate), Symmetry::new(Some(SymPlane::new(DVec3::ZERO, DVec3::X)), None));
+            tool.symmetry.enabled = true;
             tool.sym_snap = snap;
             let mut start = Default::default();
             for _ in 0..5 {
                 let bvh = o.bvh();
                 let h = bvh.nearest(&o.mesh, DVec3::new(0.05, 0.3, 0.95), 1.0).unwrap();
-                tool.stamp(&mut o, &Stamp { brush: Brush::Inflate, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert: false }, &mut start, None);
+                tool.stamp(&mut o, &Stamp { brush: Brush::Inflate, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert: false, across: DVec3::X, screen: None }, &mut start, None);
             }
             o.mesh.check_validity().unwrap();
             let drift = seam.iter().map(|&v| o.mesh.vertex(v).x.abs()).fold(0.0, f64::max);
@@ -1404,12 +1668,12 @@ mod tests {
     fn paint_and_smooth_vertex_colors() {
         let m0 = primitives::icosphere(1.0, 4);
         let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
-        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::PaintVertex), SymPlane { axis: 0, offset: 0.0 });
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::PaintVertex), Symmetry::new(Some(SymPlane::new(DVec3::ZERO, DVec3::X)), None));
         tool.strength = 1.0;
         tool.paint = [1.0, 0.0, 0.0];
         let bvh = o.bvh();
         let h = bvh.nearest(&o.mesh, DVec3::Z, 1.0).unwrap();
-        let dab = |brush, invert| Stamp { brush, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert };
+        let dab = |brush, invert| Stamp { brush, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert, across: DVec3::X, screen: None };
         assert!(!tool.stamp(&mut o, &dab(Brush::PaintVertex, false), &mut Default::default(), None));
         let m = &o.mesh;
         let top = m.vertex_ids().max_by(|&a, &b| m.vertex(a).z.total_cmp(&m.vertex(b).z)).unwrap();
@@ -1533,5 +1797,299 @@ mod tests {
         let a = Refinement { adaptive: true, ..p };
         assert!(a.target(&flat, &ft, 0.5) > a.target(&sphere, &st, 0.5));
         assert!(a.target(&flat, &ft, 0.5) > p.target(&flat, &ft, 0.5));
+    }
+
+    /// A scene holding `mesh`, seen from above (looking down −z) in an 800 × 600 view.
+    struct Rig {
+        scene: Scene,
+        history: crate::scene::History,
+        camera: crate::camera::Camera,
+        status: String,
+        ctx: egui::Context,
+    }
+
+    impl Rig {
+        fn new(mesh: Mesh) -> Self {
+            let mut scene = Scene::default();
+            scene.add("m", mesh);
+            let mut camera = crate::camera::Camera::default();
+            camera.look_along(-DVec3::Z);
+            camera.focus(&scene.bounds());
+            Self { scene, history: Default::default(), camera, status: String::new(), ctx: egui::Context::default() }
+        }
+        fn cx(&mut self) -> ToolCx<'_> {
+            let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+            ToolCx { scene: &mut self.scene, history: &mut self.history, camera: &mut self.camera, status: &mut self.status, egui: &self.ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift }
+        }
+    }
+
+    #[test]
+    fn spacing_sets_the_dabs_along_a_stroke() {
+        // A path two radii long: at 25 % of the radius 9 dabs, at 100 % 3.
+        for (spacing, want) in [(25, "Draw: 9 dabs"), (100, "Draw: 3 dabs")] {
+            let mut rig = Rig::new(primitives::plane_grid(4.0, 4.0, 40, 40));
+            let mut cx = rig.cx();
+            let mut tool = SculptTool::new(&mut cx);
+            tool.brush = Brush::Draw;
+            tool.set_settings(&serde_json::json!({"spacing_percent": spacing}), &mut cx).unwrap();
+            let r = brush_radius(cx.scene, cx.scene.active.unwrap(), tool.size_pct);
+            let path = serde_json::json!({"path": [[-1.0, 0.0, 0.0], [-1.0 + r, 0.0, 0.0], [-1.0 + 2.0 * r, 0.0, 0.0]]});
+            assert_eq!(tool.act("stroke", &path, &mut cx).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn a_fast_drag_dabs_like_a_slow_one() {
+        // Flow off: the dabs follow the path, however many pointer moves cover it (before,
+        // a fast drag dabbed once per frame and left gaps).
+        let run = |moves: usize| {
+            let mut rig = Rig::new(primitives::plane_grid(4.0, 4.0, 80, 80));
+            let mut cx = rig.cx();
+            let mut tool = SculptTool::new(&mut cx);
+            tool.brush = Brush::Draw;
+            tool.flow = false;
+            let (a, b) = (cx.project(DVec3::new(-0.6, 0.1, 0.0)).unwrap(), cx.project(DVec3::new(0.6, -0.1, 0.0)).unwrap());
+            tool.pointer(&PointerInput { pos: Some(a), pressed: true, down: true, ..Default::default() }, &mut cx);
+            for k in 1..=moves {
+                let p = a + (b - a) * (k as f32 / moves as f32);
+                tool.pointer(&PointerInput { pos: Some(p), down: true, ..Default::default() }, &mut cx);
+            }
+            tool.pointer(&PointerInput { pos: Some(b), released: true, ..Default::default() }, &mut cx);
+            cx.scene.active().unwrap().mesh.as_ref().clone()
+        };
+        let (fast, slow) = (run(1), run(40));
+        let lift = fast.vertex_ids().map(|v| fast.vertex(v).z.abs()).fold(0.0, f64::max);
+        let diff = fast.vertex_ids().map(|v| (fast.vertex(v) - slow.vertex(v)).length()).fold(0.0, f64::max);
+        assert!(lift > 1e-3, "{lift}");
+        assert!(diff < 0.05 * lift, "{diff} vs {lift}");
+        // The ridge is continuous: every grid vertex on the stroke's middle line was raised.
+        let along = fast.vertex_ids().filter(|&v| fast.vertex(v).x.abs() < 0.55 && (fast.vertex(v).y + fast.vertex(v).x / 6.0).abs() < 0.01).collect::<Vec<_>>();
+        assert!(!along.is_empty() && along.iter().all(|&v| fast.vertex(v).z.abs() > 0.3 * lift));
+    }
+
+    #[test]
+    fn brush_alpha_embosses_and_turns_with_the_stroke() {
+        let m0 = primitives::plane_grid(2.0, 2.0, 80, 80);
+        let raised = |across: DVec3, tile: bool| {
+            let mut o = crate::scene::SceneObject::new(1, "g", m0.clone());
+            let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), Symmetry::new(None, None));
+            tool.alpha = Some(Alpha::pattern(mm_edit::Pattern::Stripes));
+            tool.alpha_map.tile = tile;
+            tool.falloff = Falloff::Flat;
+            let bvh = o.bvh();
+            let h = bvh.nearest(&o.mesh, DVec3::ZERO, 1.0).unwrap();
+            let s = Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.5, invert: false, across, screen: None };
+            tool.stamp(&mut o, &s, &mut Default::default(), None);
+            let m = o.mesh.as_ref().clone();
+            move |p: DVec3| {
+                let v = m.vertex_ids().min_by(|&a, &b| m.vertex(a).distance(p).total_cmp(&m.vertex(b).distance(p))).unwrap();
+                m.vertex(v).z.abs()
+            }
+        };
+        // The stripes run across the image's x: ridges 0.2 r either side of the middle, a
+        // groove along it.
+        let along_x = raised(DVec3::X, false);
+        assert!(along_x(DVec3::new(0.1, 0.0, 0.0)) > 0.01 && along_x(DVec3::new(-0.1, 0.0, 0.0)) > 0.01);
+        assert!(along_x(DVec3::ZERO) < 1e-4 && along_x(DVec3::new(0.0, 0.1, 0.0)) < 1e-4, "the groove runs along y");
+        // AlignToStroke: the stroke now runs along y, and the stripes turn with it.
+        let along_y = raised(DVec3::Y, false);
+        assert!(along_y(DVec3::new(0.0, 0.1, 0.0)) > 0.01 && along_y(DVec3::new(0.1, 0.0, 0.0)) < 1e-4);
+        // Not tiled the image ends at the brush's square; the secondary brush is never shaped.
+        assert!(along_x(DVec3::new(0.45, 0.45, 0.0)) < 1e-12);
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), Symmetry::new(None, None));
+        assert!(!tool.shapes(Brush::Draw), "no alpha, no shaping");
+        tool.alpha = Some(Alpha::pattern(mm_edit::Pattern::Noise));
+        assert!(tool.shapes(Brush::Draw) && !tool.shapes(tool.secondary));
+    }
+
+    #[test]
+    fn stencil_masks_the_brush_where_it_shows_on_screen() {
+        let m0 = primitives::plane_grid(2.0, 2.0, 80, 80);
+        let mut camera = crate::camera::Camera::default();
+        camera.look_along(-DVec3::Z);
+        camera.focus(&m0.bounds());
+        let size = DVec2::new(800.0, 600.0);
+        let screen = ScreenMap { view_proj: camera.view_proj(size.x / size.y), size };
+        let mut o = crate::scene::SceneObject::new(1, "g", m0.clone());
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), Symmetry::new(None, None));
+        tool.falloff = Falloff::Flat;
+        tool.stencil = Some(Alpha::pattern(mm_edit::Pattern::Disc));
+        // A small disc right of the view's middle, inside the brush.
+        tool.screen_stencil = ScreenStencil { center: DVec2::new(0.6, 0.45), map: AlphaMap { scale: 0.15, ..Default::default() } };
+        let bvh = o.bvh();
+        let h = bvh.nearest(&o.mesh, DVec3::ZERO, 1.0).unwrap();
+        let s = Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.95, invert: false, across: DVec3::X, screen: Some(screen) };
+        tool.stamp(&mut o, &s, &mut Default::default(), None);
+        let (mut inside, mut moved) = (0, 0);
+        for v in o.mesh.vertex_ids() {
+            let p0 = m0.vertex(v);
+            let uv = tool.screen_stencil.uv(screen.to_screen(p0).unwrap(), size);
+            let d = (uv - DVec2::splat(0.5)).length();
+            let lifted = (o.mesh.vertex(v) - p0).length() > 1e-9;
+            moved += lifted as usize;
+            if d < 0.35 && p0.length() < 0.9 {
+                inside += 1;
+                assert!(lifted, "vertex {v} under the stencil's disc");
+            }
+            if d > 0.55 {
+                assert!(!lifted, "vertex {v} outside the stencil's disc");
+            }
+        }
+        assert!(inside > 10 && moved >= inside);
+    }
+
+    #[test]
+    fn a_tilted_symmetry_plane_mirrors_dabs_and_snaps_the_seam() {
+        // The icosphere's x = 0 mirror plane, tilted by turning the sphere.
+        let rot = glam::DQuat::from_euler(glam::EulerRot::XYZ, 0.3, 0.5, 0.2);
+        let plane = SymPlane::new(DVec3::ZERO, rot * DVec3::X);
+        assert_eq!(plane.axis_index(), None);
+        let mut m0 = primitives::icosphere(1.0, 4);
+        m0.transform(|p| rot * p);
+        let mut o = crate::scene::SceneObject::new(1, "s", m0.clone());
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), Symmetry::new(Some(plane), None));
+        tool.symmetry.enabled = true;
+        tool.strength = 0.8;
+        let mut start = Default::default();
+        let mut c = rot * DVec3::new(0.6, 0.0, 0.8).normalize();
+        for _ in 0..6 {
+            let bvh = o.bvh();
+            let h = bvh.nearest(&o.mesh, c, 1.0).unwrap();
+            let s = Stamp { brush: Brush::Draw, center: h.point, seed: h.tid, motion: rot * DVec3::Y * 0.05, view: -c, r: 0.35, invert: false, across: rot * DVec3::Y, screen: None };
+            tool.stamp(&mut o, &s, &mut start, None);
+            c = (c + rot * DVec3::Y * 0.05).normalize();
+        }
+        // Every vertex's mirror twin moved to the mirror image of where it went.
+        let (m, bvh0) = (&o.mesh, mm_core::Bvh::build(&m0));
+        let twin = |v: u32| {
+            let h = bvh0.nearest(&m0, plane.reflect(m0.vertex(v)), 1e-6).unwrap();
+            m0.triangle(h.tid).into_iter().min_by(|&a, &b| m0.vertex(a).distance(h.point).total_cmp(&m0.vertex(b).distance(h.point))).unwrap()
+        };
+        let mut moved = 0;
+        for v in m.vertex_ids() {
+            moved += (m.vertex(v).distance(m0.vertex(v)) > 1e-6) as usize;
+            assert!((plane.reflect(m.vertex(twin(v))) - m.vertex(v)).length() < 1e-9, "vertex {v}");
+        }
+        assert!(moved > 20);
+        // SymSnap on a slightly lopsided sphere: inflating across the seam lets seam vertices
+        // drift off the tilted plane, unless snapped back onto it.
+        let mut m1 = primitives::icosphere(1.0, 4);
+        m1.transform(|p| p + DVec3::X * 0.02 * p.y * p.z);
+        m1.transform(|p| rot * p);
+        let seam: Vec<u32> = m1.vertex_ids().filter(|&v| plane.distance(m1.vertex(v)) < 1e-9).collect();
+        assert!(!seam.is_empty());
+        let run = |snap: bool| {
+            let mut o = crate::scene::SceneObject::new(1, "s", m1.clone());
+            let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Inflate), Symmetry::new(Some(plane), None));
+            tool.symmetry.enabled = true;
+            tool.sym_snap = snap;
+            let mut start = Default::default();
+            for _ in 0..5 {
+                let bvh = o.bvh();
+                let h = bvh.nearest(&o.mesh, rot * DVec3::new(0.05, 0.3, 0.95), 1.0).unwrap();
+                tool.stamp(&mut o, &Stamp { brush: Brush::Inflate, center: h.point, seed: h.tid, motion: DVec3::ZERO, view: -DVec3::Z, r: 0.4, invert: false, across: DVec3::X, screen: None }, &mut start, None);
+            }
+            seam.iter().map(|&v| plane.distance(o.mesh.vertex(v))).fold(0.0, f64::max)
+        };
+        assert!(run(false) > 1e-6);
+        assert!(run(true) < 1e-12);
+    }
+
+    #[test]
+    fn agents_set_spacing_alpha_stencil_and_a_free_plane() {
+        use serde_json::json;
+        let mut rig = Rig::new(primitives::icosphere(1.0, 3));
+        let mut cx = rig.cx();
+        let mut tool = SculptTool::new(&mut cx);
+        let change = json!({
+            "spacing_percent": 60, "align_to_stroke": true,
+            "alpha": {"image": "dots", "scale": 0.5, "tile": true},
+            "stencil": {"image": "rings", "center": [0.3, 0.4], "rotation_deg": 30},
+            "symmetry": true, "sym_snap": true, "symmetry_plane": {"point_mm": [0.1, 0.0, 0.0], "normal": [1.0, 1.0, 0.0]},
+        });
+        tool.set_settings(&change, &mut cx).unwrap();
+        let s = tool.settings().unwrap();
+        assert_eq!(s["spacing_percent"], 60.0);
+        assert_eq!((s["align_to_stroke"].as_bool(), s["sym_snap"].as_bool()), (Some(true), Some(true)));
+        assert_eq!((s["alpha"]["image"].as_str(), s["alpha"]["scale"].as_f64(), s["alpha"]["tile"].as_bool()), (Some("dots"), Some(0.5), Some(true)));
+        assert_eq!((s["stencil"]["image"].as_str(), s["stencil"]["center"][0].as_f64(), s["stencil"]["rotation_deg"].as_f64()), (Some("rings"), Some(0.3), Some(30.0)));
+        assert_eq!(s["symmetry_axis"], "free");
+        let p = tool.symmetry.active().unwrap();
+        assert!((p.normal - DVec3::new(1.0, 1.0, 0.0).normalize()).length() < 1e-12 && p.distance(DVec3::new(0.1, 0.0, 0.0)) < 1e-12);
+        // A name that matches nothing is an error and changes nothing.
+        assert!(tool.set_settings(&json!({"alpha": {"image": "no such alpha"}, "spacing_percent": 10}), &mut cx).is_err());
+        assert_eq!(tool.settings().unwrap()["spacing_percent"], 60.0);
+        // Back to an axis, and the plane through three points.
+        tool.set_settings(&json!({"symmetry_axis": "y"}), &mut cx).unwrap();
+        assert_eq!(tool.symmetry.active().unwrap().axis_index(), Some(1));
+        tool.act("symmetry_through_points", &json!({"points": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]]}), &mut cx).unwrap();
+        assert_eq!(tool.symmetry.active().unwrap().axis_index(), Some(0));
+        assert!(tool.act("symmetry_through_points", &json!({"points": [[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 0.0, 3.0]]}), &mut cx).is_err());
+        // Every setting is described.
+        let schema = tool.settings_schema().unwrap();
+        for k in tool.settings().unwrap().as_object().unwrap().keys() {
+            assert!(schema["properties"].get(k).is_some(), "{k}");
+        }
+        assert!(tool.actions().iter().any(|a| a.name == "symmetry_from_selection"));
+    }
+
+    #[test]
+    fn panel_and_overlays_draw_with_alpha_stencil_and_set_mode() {
+        let mut rig = Rig::new(primitives::icosphere(1.0, 3));
+        let mut tool = SculptTool::new(&mut rig.cx());
+        tool.alpha = Some(Alpha::pattern(mm_edit::Pattern::Rings));
+        tool.stencil = Some(Alpha::pattern(mm_edit::Pattern::Dots));
+        tool.screen_stencil.map.tile = true;
+        tool.symmetry.begin_edit(&rig.cx());
+        assert!(tool.symmetry.editing() && tool.symmetry.enabled);
+        let ctx = rig.ctx.clone();
+        let mut lines = 0;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = ui.ctx().clone();
+            let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+            let mut cx = ToolCx { scene: &mut rig.scene, history: &mut rig.history, camera: &mut rig.camera, status: &mut rig.status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+            tool.panel(ui, &mut cx);
+            tool.hover = Some((DVec3::Z, 0.2));
+            let mut ov = Overlay::default();
+            tool.overlay(&mut ov, &mut cx);
+            lines = ov.lines.len();
+            tool.paint(ui.painter(), &mut cx);
+        });
+        assert!(lines >= 2 * (4 + 1 + 4), "alpha square and tick, symmetry plane: {lines}");
+        // Esc leaves Set (keeping symmetry on) and stencil placing before it closes the tool.
+        let mut cx = rig.cx();
+        assert!(!tool.cancel(&mut cx) && !tool.symmetry.editing() && tool.symmetry.enabled);
+        tool.placing_stencil = true;
+        assert!(!tool.cancel(&mut cx));
+        assert!(tool.cancel(&mut cx));
+    }
+
+    #[test]
+    fn set_mode_gizmo_slides_and_tilts_the_plane() {
+        let mut rig = Rig::new(primitives::icosphere(1.0, 3));
+        let mut cx = rig.cx();
+        let mut tool = SculptTool::new(&mut cx);
+        tool.symmetry.begin_edit(&cx);
+        let p0 = tool.symmetry.active().unwrap();
+        assert_eq!(p0.axis_index(), Some(0));
+        // The arrow along the normal (+x, to the right on screen): drag it right.
+        let c = cx.project(p0.point).unwrap();
+        let tip = cx.project(p0.point + p0.normal * cx.world_per_point(p0.point) * 80.0).unwrap();
+        let grab = c + (tip - c) * 0.9;
+        tool.pointer(&PointerInput { pos: Some(grab), pressed: true, down: true, ..Default::default() }, &mut cx);
+        tool.pointer(&PointerInput { pos: Some(grab + egui::vec2(40.0, 0.0)), down: true, ..Default::default() }, &mut cx);
+        tool.pointer(&PointerInput { pos: Some(grab + egui::vec2(40.0, 0.0)), released: true, ..Default::default() }, &mut cx);
+        let p1 = tool.symmetry.active().unwrap();
+        assert!(p1.offset() > p0.offset() + 0.05 && p1.normal == p0.normal, "slid along +x: {p1:?}");
+        assert!(tool.hover.is_none(), "no brush while setting");
+        // Picking three points sets the plane through them.
+        tool.symmetry.cancel_edit();
+        assert_eq!(tool.symmetry.active(), Some(p0), "Cancel restores the plane");
+        tool.symmetry.begin_edit(&cx);
+        let pts = [DVec3::new(0.3, 0.3, 0.9), DVec3::new(-0.3, 0.3, 0.9), DVec3::new(0.0, -0.4, 0.9)].map(|p| p.normalize());
+        tool.symmetry.through_points(&pts).unwrap();
+        assert!(tool.symmetry.accept_edit());
+        let p2 = tool.symmetry.active().unwrap();
+        assert!(pts.iter().all(|&p| p2.distance(p) < 1e-12));
     }
 }

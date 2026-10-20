@@ -6,6 +6,7 @@ mod camera;
 mod centerline;
 mod commands;
 mod icons;
+mod image_planes;
 mod jobs;
 #[cfg(target_os = "macos")]
 mod macos_open;

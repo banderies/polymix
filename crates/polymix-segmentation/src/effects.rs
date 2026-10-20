@@ -4,7 +4,7 @@
 use crate::segmentation::Mode;
 use glam::DVec3;
 use mm_core::Mesh;
-use mm_segment::{mask_to_mesh, ops, Connectivity, Mask, MeshParams};
+use mm_segment::{mask_to_mesh, ops, AutoThreshold, Connectivity, HollowSide, Mask, MeshParams};
 use mm_volume::geometry::Geometry;
 use mm_volume::load::LoadedVolume;
 use std::sync::Arc;
@@ -13,28 +13,92 @@ use std::sync::Arc;
 pub enum Effect {
     Threshold,
     Paint,
+    Draw,
     Erase,
+    LevelTracing,
     FloodFill,
+    Scissors,
     Islands,
     Margin,
     Smoothing,
+    Hollow,
     Logical,
+    GrowFromSeeds,
+    Watershed,
+    FastMarching,
+    DrawTube,
+    SurfaceCut,
+    FillBetweenSlices,
+    MaskVolume,
+    SplitVolume,
+    LevelSet,
+    GuidedVessel,
+    Engrave,
 }
 
 impl Effect {
-    pub const ALL: [Effect; 8] = [Effect::Threshold, Effect::Paint, Effect::Erase, Effect::FloodFill, Effect::Islands, Effect::Margin, Effect::Smoothing, Effect::Logical];
+    pub const ALL: [Effect; 23] = [
+        Effect::Threshold,
+        Effect::Paint,
+        Effect::Draw,
+        Effect::Erase,
+        Effect::LevelTracing,
+        Effect::FloodFill,
+        Effect::Scissors,
+        Effect::Islands,
+        Effect::Margin,
+        Effect::Smoothing,
+        Effect::Hollow,
+        Effect::Logical,
+        Effect::GrowFromSeeds,
+        Effect::Watershed,
+        Effect::FastMarching,
+        Effect::DrawTube,
+        Effect::SurfaceCut,
+        Effect::FillBetweenSlices,
+        Effect::MaskVolume,
+        Effect::SplitVolume,
+        Effect::LevelSet,
+        Effect::GuidedVessel,
+        Effect::Engrave,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Effect::Threshold => "Threshold",
             Effect::Paint => "Paint",
+            Effect::Draw => "Draw",
             Effect::Erase => "Erase",
+            Effect::LevelTracing => "Level tracing",
             Effect::FloodFill => "Flood fill",
+            Effect::Scissors => "Scissors",
             Effect::Islands => "Islands",
             Effect::Margin => "Margin",
             Effect::Smoothing => "Smoothing",
+            Effect::Hollow => "Hollow",
             Effect::Logical => "Logical",
+            Effect::GrowFromSeeds => "Grow from seeds",
+            Effect::Watershed => "Watershed",
+            Effect::FastMarching => "Fast marching",
+            Effect::DrawTube => "Draw tube",
+            Effect::SurfaceCut => "Surface cut",
+            Effect::FillBetweenSlices => "Fill between slices",
+            Effect::MaskVolume => "Mask volume",
+            Effect::SplitVolume => "Split volume",
+            Effect::LevelSet => "Level set",
+            Effect::GuidedVessel => "Guided vessel",
+            Effect::Engrave => "Engrave",
         }
+    }
+
+    /// Previewed in the views before Apply (from the visible segments as seeds).
+    pub fn seeded(self) -> bool {
+        matches!(self, Effect::GrowFromSeeds | Effect::Watershed | Effect::FillBetweenSlices)
+    }
+
+    /// Works on points clicked in the views.
+    pub fn takes_points(self) -> bool {
+        matches!(self, Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel)
     }
 
     /// Name in test scripts.
@@ -42,12 +106,27 @@ impl Effect {
         match self {
             Effect::Threshold => "threshold",
             Effect::Paint => "paint",
+            Effect::Draw => "draw",
             Effect::Erase => "erase",
+            Effect::LevelTracing => "trace",
             Effect::FloodFill => "flood",
+            Effect::Scissors => "scissors",
             Effect::Islands => "islands",
             Effect::Margin => "margin",
             Effect::Smoothing => "smoothing",
+            Effect::Hollow => "hollow",
             Effect::Logical => "logical",
+            Effect::GrowFromSeeds => "grow",
+            Effect::Watershed => "watershed",
+            Effect::FastMarching => "march",
+            Effect::DrawTube => "tube",
+            Effect::SurfaceCut => "surface",
+            Effect::FillBetweenSlices => "fill",
+            Effect::MaskVolume => "mask",
+            Effect::SplitVolume => "split",
+            Effect::LevelSet => "levelset",
+            Effect::GuidedVessel => "guided",
+            Effect::Engrave => "engrave",
         }
     }
 
@@ -55,12 +134,191 @@ impl Effect {
         match self {
             Effect::Threshold => "The segment becomes the voxels in an intensity range",
             Effect::Paint => "Paint the segment with a brush (left drag)",
+            Effect::Draw => "Click points or drag a line around a region in a slice; double-click or Enter fills it",
             Effect::Erase => "Erase the segment with a brush (left drag)",
+            Effect::LevelTracing => "The region under the pointer brighter than it is outlined in its slice; a click adds it",
             Effect::FloodFill => "Click a structure: the connected voxels of similar intensity are added",
+            Effect::Scissors => "Drag a shape in a slice: fill or erase inside or outside it, through a range of slices",
             Effect::Islands => "Keep or remove separate pieces of the segment",
             Effect::Margin => "Grow or shrink the segment by a distance",
             Effect::Smoothing => "Remove bumps and fill gaps",
+            Effect::Hollow => "Make the segment a shell of a thickness: a wall around a lumen, or a lining inside a structure",
             Effect::Logical => "Combine with another segment, invert, clear or fill",
+            Effect::GrowFromSeeds => "Paint seeds in two or more segments (the structure and its surroundings): each grows over the voxels most like its own",
+            Effect::Watershed => "Paint seeds in two or more segments: they flood the image until they meet at its edges",
+            Effect::FastMarching => "Grow the segment over similar voxels, nearest first, to a size",
+            Effect::DrawTube => "Click points along a vessel, catheter or nerve: a tube of a radius through them",
+            Effect::SurfaceCut => "Click points on a structure's surface: the closed shape through them",
+            Effect::FillBetweenSlices => "Segment every few slices; the slices in between are filled by interpolating the shapes",
+            Effect::MaskVolume => "A new image: the volume with a value filled in inside or outside the segment (e.g. to blank out what is not the vessel)",
+            Effect::SplitVolume => "A new image per visible segment: the volume cropped to the segment (with a margin), optionally blank outside it",
+            Effect::LevelSet => "Grow (or shrink) the segment to the vessel's wall: a geodesic active contour that stays smooth, within the threshold range or following the overlay (e.g. vesselness)",
+            Effect::GuidedVessel => "Click points along a vessel: it is segmented from the first to the last, following the vessel between them (within the threshold range)",
+            Effect::Engrave => "Text cut into the segment or raised from it, where you click in a slice view (labels for printed models)",
+        }
+    }
+}
+
+/// How Flood fill's region gets its edges (as 3D Slicer's Local threshold algorithms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refine {
+    /// As thresholded ("Masking").
+    None,
+    /// Decided by Grow from seeds within the feature size of the thresholded edge.
+    GrowCut,
+    /// Decided by Watershed there.
+    Watershed,
+}
+
+impl Refine {
+    pub const ALL: [Refine; 3] = [Refine::None, Refine::GrowCut, Refine::Watershed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Refine::None => "As thresholded",
+            Refine::GrowCut => "Refined by Grow from seeds",
+            Refine::Watershed => "Refined by Watershed",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Refine::None => "none",
+            Refine::GrowCut => "grow",
+            Refine::Watershed => "watershed",
+        }
+    }
+}
+
+/// Where Mask volume fills in its values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaskFill {
+    Inside,
+    Outside,
+    /// Both: a binary image.
+    Both,
+}
+
+impl MaskFill {
+    pub const ALL: [MaskFill; 3] = [MaskFill::Inside, MaskFill::Outside, MaskFill::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskFill::Inside => "Fill inside",
+            MaskFill::Outside => "Fill outside",
+            MaskFill::Both => "Fill inside and outside",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            MaskFill::Inside => "inside",
+            MaskFill::Outside => "outside",
+            MaskFill::Both => "both",
+        }
+    }
+}
+
+/// How an automatic threshold sets the range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoMode {
+    /// From the threshold to the largest value (brighter structures).
+    Lower,
+    /// From the smallest value to the threshold (darker structures).
+    Upper,
+}
+
+/// What Scissors does with its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScissorsOp {
+    EraseInside,
+    EraseOutside,
+    FillInside,
+    FillOutside,
+}
+
+impl ScissorsOp {
+    pub const ALL: [ScissorsOp; 4] = [ScissorsOp::EraseInside, ScissorsOp::EraseOutside, ScissorsOp::FillInside, ScissorsOp::FillOutside];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScissorsOp::EraseInside => "Erase inside",
+            ScissorsOp::EraseOutside => "Erase outside",
+            ScissorsOp::FillInside => "Fill inside",
+            ScissorsOp::FillOutside => "Fill outside",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ScissorsOp::EraseInside => "erase_inside",
+            ScissorsOp::EraseOutside => "erase_outside",
+            ScissorsOp::FillInside => "fill_inside",
+            ScissorsOp::FillOutside => "fill_outside",
+        }
+    }
+}
+
+/// The shape Scissors draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScissorsShape {
+    FreeForm,
+    Circle,
+    Rectangle,
+}
+
+impl ScissorsShape {
+    pub const ALL: [ScissorsShape; 3] = [ScissorsShape::FreeForm, ScissorsShape::Circle, ScissorsShape::Rectangle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScissorsShape::FreeForm => "Free-form",
+            ScissorsShape::Circle => "Circle",
+            ScissorsShape::Rectangle => "Rectangle",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ScissorsShape::FreeForm => "free",
+            ScissorsShape::Circle => "circle",
+            ScissorsShape::Rectangle => "rectangle",
+        }
+    }
+}
+
+/// The slices Scissors cuts through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScissorsRange {
+    /// All of them.
+    Unlimited,
+    /// This one and those towards the patient's superior / anterior / right (the slice's
+    /// normal), …
+    Positive,
+    /// … or the other way.
+    Negative,
+    /// A slab of a given thickness centred on this slice.
+    Symmetric,
+}
+
+impl ScissorsRange {
+    pub const ALL: [ScissorsRange; 4] = [ScissorsRange::Unlimited, ScissorsRange::Positive, ScissorsRange::Negative, ScissorsRange::Symmetric];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScissorsRange::Unlimited => "Unlimited",
+            ScissorsRange::Positive => "Positive",
+            ScissorsRange::Negative => "Negative",
+            ScissorsRange::Symmetric => "Symmetric",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ScissorsRange::Unlimited => "unlimited",
+            ScissorsRange::Positive => "positive",
+            ScissorsRange::Negative => "negative",
+            ScissorsRange::Symmetric => "symmetric",
         }
     }
 }
@@ -112,10 +370,13 @@ pub enum SmoothMethod {
     Opening,
     Closing,
     FillHoles,
+    Gaussian,
+    /// Every visible segment together, so that no gaps or overlaps open between them.
+    Joint,
 }
 
 impl SmoothMethod {
-    pub const ALL: [SmoothMethod; 4] = [SmoothMethod::Median, SmoothMethod::Opening, SmoothMethod::Closing, SmoothMethod::FillHoles];
+    pub const ALL: [SmoothMethod; 6] = [SmoothMethod::Median, SmoothMethod::Opening, SmoothMethod::Closing, SmoothMethod::FillHoles, SmoothMethod::Gaussian, SmoothMethod::Joint];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -123,6 +384,8 @@ impl SmoothMethod {
             SmoothMethod::Opening => "Opening (remove extrusions)",
             SmoothMethod::Closing => "Closing (fill gaps)",
             SmoothMethod::FillHoles => "Fill holes",
+            SmoothMethod::Gaussian => "Gaussian",
+            SmoothMethod::Joint => "Joint (visible segments together)",
         }
     }
 
@@ -132,8 +395,103 @@ impl SmoothMethod {
             SmoothMethod::Opening => "open",
             SmoothMethod::Closing => "close",
             SmoothMethod::FillHoles => "fill",
+            SmoothMethod::Gaussian => "gaussian",
+            SmoothMethod::Joint => "joint",
         }
     }
+
+    /// The size is a Gaussian's standard deviation rather than a kernel's width.
+    pub fn sigma(self) -> bool {
+        matches!(self, SmoothMethod::Gaussian | SmoothMethod::Joint)
+    }
+}
+
+/// The shape drawn on a slice for Threshold's local histogram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalShape {
+    Box,
+    Circle,
+    Line,
+}
+
+impl LocalShape {
+    pub const ALL: [LocalShape; 3] = [LocalShape::Box, LocalShape::Circle, LocalShape::Line];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalShape::Box => "Box",
+            LocalShape::Circle => "Circle",
+            LocalShape::Line => "Line",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            LocalShape::Box => "box",
+            LocalShape::Circle => "circle",
+            LocalShape::Line => "line",
+        }
+    }
+}
+
+/// Where an end of the range set from a local histogram comes from: the region's extreme
+/// (minimum or maximum), a percentile (5th or 95th), or its average.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalPick {
+    Extreme,
+    Percentile,
+    Average,
+}
+
+impl LocalPick {
+    pub const ALL: [LocalPick; 3] = [LocalPick::Extreme, LocalPick::Percentile, LocalPick::Average];
+
+    pub fn label(self, upper: bool) -> &'static str {
+        match (self, upper) {
+            (LocalPick::Extreme, false) => "Minimum",
+            (LocalPick::Extreme, true) => "Maximum",
+            (LocalPick::Percentile, false) => "Lower (5%)",
+            (LocalPick::Percentile, true) => "Upper (95%)",
+            (LocalPick::Average, _) => "Average",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            LocalPick::Extreme => "extreme",
+            LocalPick::Percentile => "percentile",
+            LocalPick::Average => "average",
+        }
+    }
+}
+
+/// The threshold range from a region's values (sorted): its lower end and upper end as picked.
+pub fn local_range(sorted: &[f32], lower: LocalPick, upper: LocalPick) -> Option<(f32, f32)> {
+    let (first, last) = (*sorted.first()?, *sorted.last()?);
+    let mean = (sorted.iter().map(|&v| v as f64).sum::<f64>() / sorted.len() as f64) as f32;
+    let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+    let lo = match lower {
+        LocalPick::Extreme => first,
+        LocalPick::Percentile => at(0.05),
+        LocalPick::Average => mean,
+    };
+    let hi = match upper {
+        LocalPick::Extreme => last,
+        LocalPick::Percentile => at(0.95),
+        LocalPick::Average => mean,
+    };
+    Some((lo.min(hi), lo.max(hi)))
+}
+
+/// Where Hollow's shell lies: (side, label, name in scripts).
+pub const HOLLOW_SIDES: [(HollowSide, &str, &str); 3] = [
+    (HollowSide::Outside, "Outside the surface (the segment is the lumen)", "outside"),
+    (HollowSide::Medial, "Centred on the surface", "medial"),
+    (HollowSide::Inside, "Inside the surface (the segment is the outside)", "inside"),
+];
+
+pub fn hollow_side_key(side: HollowSide) -> &'static str {
+    HOLLOW_SIDES.iter().find(|h| h.0 == side).map_or("outside", |h| h.2)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +543,10 @@ impl LogicalOp {
 pub struct Settings {
     pub threshold: (f32, f32),
     pub brush_mm: f32,
+    /// The brush's size follows the view's: its diameter is `brush_percent` % of the view's
+    /// smaller side (zooming changes `brush_mm`).
+    pub brush_relative: bool,
+    pub brush_percent: f32,
     /// A ball rather than a disc in the slice.
     pub sphere: bool,
     pub islands: IslandOp,
@@ -200,20 +562,91 @@ pub struct Settings {
     pub margin_mm: f32,
     pub smoothing: SmoothMethod,
     pub smoothing_mm: f32,
+    /// Hollow's shell thickness, mm, and where it lies.
+    pub hollow_mm: f32,
+    pub hollow_side: HollowSide,
     pub logical: LogicalOp,
     /// The other segment of a logical operation (its label).
     pub logical_other: Option<u8>,
     pub mesh_smoothing_mm: f32,
     /// Make meshes of every visible segment rather than the selected one.
     pub mesh_all_visible: bool,
+    pub scissors_op: ScissorsOp,
+    pub scissors_shape: ScissorsShape,
+    pub scissors_range: ScissorsRange,
+    /// Thickness of a symmetric Scissors cut, mm.
+    pub scissors_mm: f32,
+    /// Level tracing outlines the darker region (values at most the pointer's) instead.
+    pub trace_darker: bool,
+    /// Margin and Smoothing change every visible segment, not only the selected one.
+    pub apply_visible: bool,
+    /// Logical operators ignore the masking settings.
+    pub bypass_masking: bool,
+    /// Draw tube's radius, mm.
+    pub tube_mm: f32,
+    /// Grow from seeds: how much distance counts besides likeness (0 = none).
+    pub seed_locality: f32,
+    /// Grow from seeds and Watershed work within this far of the seeds, mm.
+    pub seed_margin_mm: f32,
+    /// Grow from seeds and Watershed update their preview after every edit of the seeds.
+    pub auto_update: bool,
+    /// Watershed's object scale (smoothing before the edges are found), mm.
+    pub watershed_mm: f32,
+    /// Fast marching grows the segment to this share of the volume, %.
+    pub march_percent: f32,
+    /// Threshold's range from a region drawn on a slice (as 3D Slicer's local histogram):
+    /// the shape, and where its lower and upper ends come from.
+    pub local_histogram: bool,
+    pub local_shape: LocalShape,
+    pub local_lower: LocalPick,
+    pub local_upper: LocalPick,
+    /// Threshold's automatic method, and how it sets the range.
+    pub auto_method: AutoThreshold,
+    pub auto_mode: AutoMode,
+    /// Fill between slices fills between slices of this plane.
+    pub fill_plane: mm_volume::slice::Plane,
+    /// Mask volume: where it fills, with what inside and outside, and the soft edge (mm, 0 =
+    /// sharp).
+    pub mask_fill: MaskFill,
+    pub mask_inside: f32,
+    pub mask_outside: f32,
+    pub mask_soft_mm: f32,
+    /// Level set: iterations, how far the front may move (mm), the curvature weight (smoothness),
+    /// and whether the overlay shown (e.g. vesselness) drives it instead of the threshold range.
+    pub ls_iterations: usize,
+    pub ls_max_mm: f32,
+    pub ls_curvature: f32,
+    pub ls_overlay: bool,
+    /// Engrave: the text, its letters' height and depth (mm, through the slices), and whether
+    /// it is raised (added) rather than cut.
+    pub engrave_text: String,
+    pub engrave_mm: f32,
+    pub engrave_depth_mm: f32,
+    pub engrave_raise: bool,
+    /// Split volume: the margin kept around each segment (mm), and whether the voxels outside
+    /// the segment are filled with `mask_outside`.
+    pub split_pad_mm: f32,
+    pub split_blank: bool,
+    /// Paint and Erase work on single voxels (the brush's size is ignored).
+    pub pixel_mode: bool,
+    /// Flood fill's edges, and the feature size they are refined within, mm.
+    pub flood_refine: Refine,
+    pub flood_feature_mm: f32,
 }
 
 impl Settings {
+    /// The level set's parameters (its range is the threshold's).
+    pub fn level_set_params(&self) -> mm_segment::LevelSetParams {
+        mm_segment::LevelSetParams { range: self.threshold, iterations: self.ls_iterations, max_distance_mm: self.ls_max_mm as f64, curvature: self.ls_curvature as f64, ..Default::default() }
+    }
+
     pub fn for_volume(vol: &LoadedVolume, hist: &Histogram) -> Self {
         let lo = hist.otsu().unwrap_or(vol.auto_window.0 as f32);
         Self {
             threshold: (lo, vol.range.1),
             brush_mm: 5.0,
+            brush_relative: false,
+            brush_percent: 5.0,
             sphere: false,
             islands: IslandOp::KeepLargest,
             min_island: 1000,
@@ -223,17 +656,56 @@ impl Settings {
             margin_mm: 1.0,
             smoothing: SmoothMethod::Median,
             smoothing_mm: 3.0,
+            hollow_mm: 2.0,
+            hollow_side: HollowSide::Outside,
             logical: LogicalOp::Add,
             logical_other: None,
             mesh_smoothing_mm: 0.5,
             mesh_all_visible: false,
+            scissors_op: ScissorsOp::EraseInside,
+            scissors_shape: ScissorsShape::FreeForm,
+            scissors_range: ScissorsRange::Unlimited,
+            scissors_mm: 10.0,
+            trace_darker: false,
+            apply_visible: false,
+            bypass_masking: false,
+            tube_mm: 1.5,
+            seed_locality: 0.0,
+            seed_margin_mm: 10.0,
+            auto_update: true,
+            watershed_mm: 0.5,
+            march_percent: 1.0,
+            local_histogram: false,
+            local_shape: LocalShape::Box,
+            local_lower: LocalPick::Extreme,
+            local_upper: LocalPick::Extreme,
+            auto_method: AutoThreshold::Otsu,
+            auto_mode: AutoMode::Lower,
+            fill_plane: mm_volume::slice::Plane::Axial,
+            mask_fill: MaskFill::Outside,
+            ls_iterations: 300,
+            ls_max_mm: 10.0,
+            ls_curvature: 0.3,
+            ls_overlay: false,
+            engrave_text: "L".into(),
+            engrave_mm: 8.0,
+            engrave_depth_mm: 2.0,
+            engrave_raise: false,
+            split_pad_mm: 5.0,
+            split_blank: false,
+            mask_inside: 1.0,
+            mask_outside: vol.range.0,
+            mask_soft_mm: 0.0,
+            pixel_mode: false,
+            flood_refine: Refine::None,
+            flood_feature_mm: 1.0,
         }
     }
 
     /// Effects that take the left button in the slice views (a click or a stroke).
     pub fn takes_left_button(&self, e: Effect) -> bool {
         match e {
-            Effect::Paint | Effect::Erase | Effect::FloodFill => true,
+            Effect::Paint | Effect::Erase | Effect::FloodFill | Effect::Draw | Effect::LevelTracing | Effect::Scissors | Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel | Effect::Engrave => true,
             Effect::Islands => self.islands.by_click(),
             _ => false,
         }
@@ -250,6 +722,22 @@ pub struct Histogram {
 }
 
 impl Histogram {
+    /// Of some values (finite ones), over their own range.
+    pub fn of_values(values: &[f32], n: usize) -> Self {
+        let finite = values.iter().copied().filter(|v| v.is_finite());
+        let (lo, hi) = finite.clone().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+        if lo > hi {
+            return Self { range: (0.0, 1.0), bins: vec![0; n] };
+        }
+        let hi = if hi > lo { hi } else { lo + 1.0 };
+        let mut bins = vec![0u32; n];
+        let scale = n as f32 / (hi - lo);
+        for v in finite {
+            bins[(((v - lo) * scale) as usize).min(n - 1)] += 1;
+        }
+        Self { range: (lo, hi), bins }
+    }
+
     pub fn of(vol: &LoadedVolume, n: usize) -> Self {
         let (lo, hi) = vol.range;
         let mut bins = vec![0u32; n];
@@ -264,6 +752,21 @@ impl Histogram {
     /// Value at the lower edge of bin `b`.
     pub fn value(&self, b: f32) -> f32 {
         self.range.0 + (self.range.1 - self.range.0) * b / self.bins.len() as f32
+    }
+
+    /// The automatic threshold of `method`: the value splitting the histogram's two classes.
+    pub fn auto(&self, method: AutoThreshold) -> Option<f32> {
+        let counts: Vec<u64> = self.bins.iter().map(|&c| c as u64).collect();
+        mm_segment::auto_threshold(method, &counts).map(|b| self.value(b as f32 + 1.0))
+    }
+
+    /// The range an automatic threshold gives: from it up, or up to it.
+    pub fn auto_range(&self, method: AutoThreshold, mode: AutoMode) -> Option<(f32, f32)> {
+        let t = self.auto(method)?;
+        Some(match mode {
+            AutoMode::Lower => (t, self.range.1),
+            AutoMode::Upper => (self.range.0, t),
+        })
     }
 
     /// Otsu's threshold: the value that best splits the histogram in two classes.
@@ -348,10 +851,25 @@ pub fn stroke(dims: [usize; 3], spacing: [f64; 3], a: DVec3, b: DVec3, r: f64, d
 pub enum Outcome {
     /// Change segment `label` by `mask`.
     Edit { label: u8, mask: Mask, mode: Mode, what: String },
+    /// Several segments changed together (one undo step).
+    Edits { edits: Vec<(u8, Mask, Mode)>, what: String },
+    /// A seeded effect's result for the label map at `version`: the labels it gives (0
+    /// outside its region), for the seed labels `seeds`.
+    Seeded { effect: Effect, version: u64, labels: Vec<u8>, seeds: Vec<u8> },
     /// Segment `label` becomes `keep`; each of `islands` becomes a new segment.
     Split { label: u8, keep: Mask, islands: Vec<Mask> },
     Meshes(Vec<(String, Mesh)>),
     Saved { path: String, version: u64 },
+    /// A new image saved among the derived images.
+    Volume { path: std::path::PathBuf },
+    /// A segment's centerline and cross-sections.
+    Centerline(Box<crate::vessels::VesselResult>),
+    /// Measures of segments (label, statistics), for the segmentation's `version`.
+    Stats { version: u64, rows: Vec<(u8, mm_segment::SegmentStats)> },
+    /// New images saved among the derived images.
+    Volumes { paths: Vec<std::path::PathBuf> },
+    /// Segments from a file or a mesh, to add.
+    Imported { imported: crate::import::Imported, what: String },
 }
 
 /// One whole-volume operation on segment `label` (its voxels in `segment`).
@@ -387,6 +905,9 @@ pub fn run(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, op: Op) -> any
                     anyhow::bail!("the clicked structure is narrower than the minimum diameter");
                 }
                 ops::island_at(&mut grown, seed, true, conn);
+            }
+            if s.flood_refine != Refine::None {
+                grown = refine_edges(vol, &grown, s.flood_refine, s.flood_feature_mm as f64);
             }
             edit(grown, Mode::Add, "Flood fill")
         }
@@ -446,8 +967,18 @@ pub fn run(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, op: Op) -> any
                 SmoothMethod::Opening => ops::open(&mut m, radius, spacing),
                 SmoothMethod::Closing => ops::close(&mut m, radius, spacing),
                 SmoothMethod::FillHoles => ops::fill_holes(&mut m),
+                SmoothMethod::Gaussian => mm_segment::gaussian(&mut m, s.smoothing_mm as f64, spacing),
+                SmoothMethod::Joint => anyhow::bail!("joint smoothing works on the visible segments together"),
             }
             edit(m, Mode::Set, s.smoothing.label())
+        }
+        Effect::Hollow => {
+            if segment.count() == 0 {
+                anyhow::bail!("the segment is empty");
+            }
+            let mut m = segment;
+            mm_segment::hollow(&mut m, s.hollow_mm as f64, s.hollow_side, spacing);
+            edit(m, Mode::Set, "Hollow")
         }
         Effect::Logical => {
             let mut m = segment;
@@ -464,7 +995,164 @@ pub fn run(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, op: Op) -> any
             edit(m, Mode::Set, s.logical.label())
         }
         Effect::Paint | Effect::Erase => anyhow::bail!("{} works with the brush", effect.label()),
+        Effect::Draw | Effect::LevelTracing | Effect::Scissors | Effect::DrawTube | Effect::SurfaceCut => anyhow::bail!("{} works in a slice view", effect.label()),
+        Effect::GrowFromSeeds | Effect::Watershed | Effect::FillBetweenSlices => anyhow::bail!("{} works from the visible segments: use Initialize", effect.label()),
+        Effect::SplitVolume => anyhow::bail!("Split volume works on the visible segments"),
+        Effect::LevelSet => {
+            if segment.count() == 0 {
+                anyhow::bail!("the segment is empty: paint or threshold a rough start inside the vessel");
+            }
+            let grown = mm_segment::level_set(vol, &segment, None, &s.level_set_params(), &|_| true)?;
+            edit(grown, Mode::Set, "Level set")
+        }
+        Effect::GuidedVessel => anyhow::bail!("Guided vessel works on points clicked along the vessel"),
+        Effect::Engrave => anyhow::bail!("Engrave works where you click in a slice view"),
+        Effect::MaskVolume => {
+            if segment.count() == 0 {
+                anyhow::bail!("the segment is empty");
+            }
+            let values = mask_volume(vol, &segment, s.mask_fill, s.mask_inside, s.mask_outside, s.mask_soft_mm as f64)?;
+            let dir = polymix_workspace::derived_dir().ok_or_else(|| anyhow::anyhow!("no data folder to save into"))?;
+            std::fs::create_dir_all(&dir)?;
+            let path = polymix_workspace::derived_path(&dir, &vol.name, " masked", ".nii.gz");
+            let what = format!("{} masked ({}, inside {}, outside {})", vol.name, s.mask_fill.label().to_lowercase(), s.mask_inside, s.mask_outside);
+            mm_volume::write::nifti(&path, mm_volume::write::Data::F32(&values), vol.dims, &vol.geometry, &what, mm_volume::write::Intent::None)?;
+            Ok(Outcome::Volume { path })
+        }
+        Effect::FastMarching => {
+            let target = ((s.march_percent as f64 / 100.0) * vol.voxel_count() as f64).round() as usize;
+            if segment.count() == 0 {
+                anyhow::bail!("paint a few voxels of the structure into the segment first");
+            }
+            let grown = mm_segment::fast_march(vol, &segment, target.max(segment.count()));
+            edit(grown, Mode::Add, "Fast marching")
+        }
     }
+}
+
+/// Split volume: for each (name, segment), the volume cropped to the segment's box grown by
+/// `pad_mm`, with `blank` (when given) outside the segment, saved among the derived images.
+pub fn split_volume(vol: &LoadedVolume, segments: &[(String, Mask)], pad_mm: f64, blank: Option<f32>, progress: &dyn Fn(f32) -> bool) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let dir = polymix_workspace::derived_dir().ok_or_else(|| anyhow::anyhow!("no data folder to save into"))?;
+    std::fs::create_dir_all(&dir)?;
+    let mut paths = Vec::new();
+    for (k, (name, mask)) in segments.iter().enumerate() {
+        if !progress(k as f32 / segments.len().max(1) as f32) {
+            anyhow::bail!("cancelled");
+        }
+        let Some((lo, hi)) = mask.bounds() else { continue };
+        let pad = vol.geometry.spacing.map(|s| (pad_mm / s).ceil().max(0.0) as usize);
+        let lo = [0, 1, 2].map(|a| lo[a].saturating_sub(pad[a]));
+        let hi = [0, 1, 2].map(|a| (hi[a] + pad[a]).min(vol.dims[a] - 1));
+        let mut part = mm_image::grid::crop(vol, lo, hi)?;
+        if let Some(b) = blank {
+            for z in 0..part.dims[2] {
+                for y in 0..part.dims[1] {
+                    for x in 0..part.dims[0] {
+                        if !mask.get(lo[0] + x, lo[1] + y, lo[2] + z) {
+                            let i = part.index(x, y, z);
+                            part.values[i] = b;
+                        }
+                    }
+                }
+            }
+        }
+        let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+        let path = polymix_workspace::derived_path(&dir, &vol.name, &format!(" {}", safe.trim()), ".nii.gz");
+        let what = format!("{} cropped to segment {name}", vol.name);
+        mm_volume::write::nifti(&path, mm_volume::write::Data::F32(&part.values), part.dims, &part.geometry, &what, mm_volume::write::Intent::None)?;
+        paths.push(path);
+    }
+    if paths.is_empty() {
+        anyhow::bail!("the visible segments are empty");
+    }
+    Ok(paths)
+}
+
+/// `region`'s edges decided again by Grow from seeds or Watershed: the region shrunk by
+/// `feature_mm` seeds the structure, everything beyond it grown by `feature_mm` seeds the
+/// background, and the band between goes to whichever reaches it.
+pub fn refine_edges(vol: &LoadedVolume, region: &Mask, how: Refine, feature_mm: f64) -> Mask {
+    let spacing = vol.geometry.spacing;
+    let f = feature_mm.max(spacing.iter().cloned().fold(f64::INFINITY, f64::min));
+    let mut inner = region.clone();
+    ops::shrink(&mut inner, f, spacing);
+    if inner.count() == 0 {
+        return region.clone();
+    }
+    let mut outer = region.clone();
+    ops::grow(&mut outer, f, spacing);
+    let mut roi = region.clone();
+    ops::grow(&mut roi, 2.0 * f, spacing);
+    let seeds: Vec<u8> = (0..region.len()).map(|n| if inner.data[n] != 0 { 1 } else if roi.data[n] != 0 && outer.data[n] == 0 { 2 } else { 0 }).collect();
+    let out = match how {
+        Refine::Watershed => mm_segment::watershed(vol, &seeds, 0.5 * f, Some(&roi), 0.0),
+        _ => mm_segment::grow_from_seeds(vol, &seeds, Some(&roi), 0.0, 0.0),
+    };
+    Mask { dims: region.dims, data: out.iter().map(|&l| (l == 1) as u8).collect() }
+}
+
+/// The volume's values with `inside` filled in where `segment` is (or `outside` where it is
+/// not, or both), the boundary softened over a Gaussian of `soft_mm` (0: sharp).
+pub fn mask_volume(vol: &LoadedVolume, segment: &Mask, fill: MaskFill, inside: f32, outside: f32, soft_mm: f64) -> anyhow::Result<Vec<f32>> {
+    let w: Vec<f32> = if soft_mm > 0.0 {
+        let m: Vec<f32> = segment.data.iter().map(|&x| x as f32).collect();
+        let s = vol.geometry.spacing.map(|sp| soft_mm / sp.max(1e-9));
+        mm_image::filter::gaussian(&m, vol.dims, s, &|_| true)?
+    } else {
+        segment.data.iter().map(|&x| x as f32).collect()
+    };
+    Ok(vol
+        .values
+        .iter()
+        .zip(&w)
+        .map(|(&v, &w)| match fill {
+            MaskFill::Inside => v + (inside - v) * w,
+            MaskFill::Outside => outside + (v - outside) * w,
+            MaskFill::Both => outside + (inside - outside) * w,
+        })
+        .collect())
+}
+
+/// Grow from seeds or Watershed from `labels` (the label map with only the seed segments in
+/// it), as of `version`.
+pub fn run_seeded(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, labels: Vec<u8>, version: u64) -> anyhow::Result<Outcome> {
+    if effect == Effect::FillBetweenSlices {
+        let mut segments: Vec<u8> = labels.iter().copied().filter(|&l| l != 0).collect();
+        segments.sort_unstable();
+        segments.dedup();
+        if segments.is_empty() {
+            anyhow::bail!("segment a few slices of a visible segment first");
+        }
+        let axis = mm_volume::slice::plane_axes(&vol.geometry, s.fill_plane).slice;
+        let mut out = vec![0u8; labels.len()];
+        for (l, voxels) in mm_segment::fill_between_slices(&labels, vol.dims, vol.geometry.spacing, axis, &segments) {
+            for i in voxels {
+                out[i] = l;
+            }
+        }
+        return Ok(Outcome::Seeded { effect, version, labels: out, seeds: segments });
+    }
+    let mut seeds: Vec<u8> = Vec::new();
+    for &l in &labels {
+        if l != 0 && !seeds.contains(&l) {
+            seeds.push(l);
+            if seeds.len() > 1 {
+                break;
+            }
+        }
+    }
+    if seeds.len() < 2 {
+        anyhow::bail!("paint seeds in at least two visible segments: the structure, and what surrounds it");
+    }
+    let mut all: Vec<u8> = labels.iter().copied().filter(|&l| l != 0).collect();
+    all.sort_unstable();
+    all.dedup();
+    let out = match effect {
+        Effect::Watershed => mm_segment::watershed(vol, &labels, s.watershed_mm as f64, None, s.seed_margin_mm as f64),
+        _ => mm_segment::grow_from_seeds(vol, &labels, None, s.seed_margin_mm as f64, s.seed_locality as f64),
+    };
+    Ok(Outcome::Seeded { effect, version, labels: out, seeds: all })
 }
 
 /// Closed surface meshes of segments (name, voxels), in LPS millimetres as 3D Slicer
@@ -517,6 +1205,43 @@ mod tests {
         let s = stroke([40, 5, 5], [1.0; 3], DVec3::new(2.0, 2.0, 2.0), DVec3::new(37.0, 2.0, 2.0), 1.0, Some(2));
         let row: Vec<usize> = s.iter().filter(|&&i| i / 40 % 5 == 2).map(|&i| i % 40).collect();
         assert_eq!(row, (1..=38).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn masking_a_volume() {
+        let g = Geometry::from_axes([4, 1, 1, 1], [1.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        let vol = LoadedVolume::from_values("t", [4, 1, 1], vec![10.0, 20.0, 30.0, 40.0], g);
+        let seg = Mask { dims: [4, 1, 1], data: vec![0, 1, 1, 0] };
+        assert_eq!(mask_volume(&vol, &seg, MaskFill::Inside, -1.0, 0.0, 0.0).unwrap(), vec![10.0, -1.0, -1.0, 40.0]);
+        assert_eq!(mask_volume(&vol, &seg, MaskFill::Outside, 0.0, -5.0, 0.0).unwrap(), vec![-5.0, 20.0, 30.0, -5.0]);
+        assert_eq!(mask_volume(&vol, &seg, MaskFill::Both, 1.0, 0.0, 0.0).unwrap(), vec![0.0, 1.0, 1.0, 0.0]);
+        // A soft edge blends: between the two values at the boundary.
+        let soft = mask_volume(&vol, &seg, MaskFill::Both, 1.0, 0.0, 1.0).unwrap();
+        assert!(soft[0] > 0.0 && soft[0] < 0.5 && soft[1] > 0.5 && soft[1] < 1.0, "{soft:?}");
+    }
+
+    #[test]
+    fn refined_edges_follow_the_object() {
+        // A ball of radius 6 (value 100) in noise (± 30): thresholding at 50 gives ragged
+        // edges; refining keeps the ball (Dice against the true ball stays high).
+        let n = 24;
+        let g = Geometry::from_axes([n, n, n, 1], [1.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        let c = (n as f64 - 1.0) * 0.5;
+        let truth: Vec<u8> = (0..n * n * n).map(|i| (DVec3::new((i % n) as f64 - c, ((i / n) % n) as f64 - c, (i / n / n) as f64 - c).length() <= 6.0) as u8).collect();
+        let values: Vec<f32> = (0..n * n * n).map(|i| truth[i] as f32 * 100.0 + ((i.wrapping_mul(2654435761) >> 7) % 61) as f32 - 30.0).collect();
+        let vol = LoadedVolume::from_values("t", [n, n, n], values, g);
+        let region = ops::threshold(&vol, 50.0, 1e9);
+        let dice = |m: &Mask| {
+            let both = m.data.iter().zip(&truth).filter(|(a, b)| **a != 0 && **b != 0).count() as f64;
+            2.0 * both / (m.count() as f64 + truth.iter().filter(|&&t| t != 0).count() as f64)
+        };
+        for how in [Refine::GrowCut, Refine::Watershed] {
+            let r = refine_edges(&vol, &region, how, 1.5);
+            assert!(dice(&r) > 0.9, "{how:?}: Dice {:.3}", dice(&r));
+        }
+        // Too small to shrink: unchanged.
+        let tiny = Mask { dims: [n; 3], data: (0..n * n * n).map(|i| (i == 300) as u8).collect() };
+        assert_eq!(refine_edges(&vol, &tiny, Refine::GrowCut, 2.0), tiny);
     }
 
     #[test]

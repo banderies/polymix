@@ -15,6 +15,9 @@ pub struct SegmentInfo {
     pub colour: [u8; 3],
     /// Its value in the label map (1–255).
     pub label: u8,
+    /// Its state as 3D Slicer tags it (`notstarted`, `inprogress`, `completed`, `flagged`), or
+    /// empty.
+    pub status: String,
 }
 
 /// Save a uint8 label map as NIfTI-1 (gzip-compressed when the name ends in `.gz`).
@@ -48,7 +51,8 @@ pub fn write_seg_nrrd(path: &Path, labels: &[u8], dims: [usize; 3], geometry: &G
         head += &format!("Segment{n}_LabelValue:={}\n", s.label);
         head += &format!("Segment{n}_Layer:=0\n");
         head += &format!("Segment{n}_Extent:={extent}\n");
-        head += &format!("Segment{n}_Tags:=|\n");
+        let tags = if s.status.is_empty() { String::new() } else { format!("Segmentation.Status:{}", s.status) };
+        head += &format!("Segment{n}_Tags:={tags}|\n");
     }
     head += "\n";
     let mut data = Vec::new();
@@ -112,7 +116,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let labels: Vec<u8> = (0..24).map(|v| (v % 3) as u8).collect();
         let p = dir.join("vessels.seg.nrrd");
-        let segs = [SegmentInfo { name: "Aorta".into(), colour: [220, 60, 50], label: 1 }, SegmentInfo { name: "Branch".into(), colour: [80, 160, 230], label: 2 }];
+        let segs = [SegmentInfo { name: "Aorta".into(), colour: [220, 60, 50], label: 1, status: "completed".into() }, SegmentInfo { name: "Branch".into(), colour: [80, 160, 230], label: 2, status: String::new() }];
         write_seg_nrrd(&p, &labels, [4, 3, 2], &oblique(), &segs).unwrap();
         let h = mm_volume::nrrd::read(&p, 1 << 20).unwrap();
         assert_eq!(h.segment_names(), vec!["Aorta".to_string(), "Branch".to_string()]);

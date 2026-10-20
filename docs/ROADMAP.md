@@ -10,7 +10,8 @@ modeling extras.
 
 **Out of scope — 3D printing** (modern slicers do this better): Print / printers / printer bed,
 Overhangs & supports, Orientation, Layout/Packing, Slicing, Make Slices, Stability, Strength,
-Thickness, Hollow escape holes, Export SVG. The Inspector (Analysis) stays — it is done.
+Thickness, Export SVG. The Inspector (Analysis) stays — it is done; so do Hollow's escape
+holes and Thicken (M18), which printed flow models need.
 
 ---
 
@@ -233,7 +234,23 @@ Lives in the Segmentation tab, which shows the volume selected in Volume. Views 
 - [x] **M14.2 Three planes**: axial, sagittal and coronal (radiological convention) with a
       shared crosshair, orientation letters, label overlays, value under the pointer.
 - [x] **M14.3 3D view**: GPU ray casting (MIP, shaded volume rendering, threshold surface)
-      with label surfaces in front.
+      with label surfaces in front; left drag turns, right drag pans, middle drag / wheel
+      zooms, left + right drag sets the window and level as in the slice views (the turn
+      made before the second button went down is undone; histogram shown while dragging).
+- [x] **M14.4 Viewing**: window presets (CT brain, subdural, soft tissue, angio, bone, lung;
+      automatic, from the file, full range), colour maps (grey, hot, rainbow, viridis, single
+      hues), thick slabs in the slice views (MIP, MinIP, mean), layouts (four-up, 3D over the
+      three planes, three planes in a row), a second image over the first or compared with it
+      (blend, wipe, toggle with T; resampled by position when the grids differ), rulers,
+      angles and regions (area and statistics), oblique planes (⌥ + drag turns the other two
+      planes about a view; *Straighten*), the planes turned with a vessel at a centerline
+      section (`polymix_imaging::{layers, measure, oblique}`).
+- [x] **M14.5 Viewer in the Volume tab**: *Viewer* shows the selected image in three planes
+      under the browser, with the same controls and *Compare with* (derived images first:
+      before and after N4, denoising, registration).
+- [x] **M14.6 Image slices in the Mesh 3D view**: the Segmentation tab's image as three
+      planes among the meshes (through its crosshair, LPS like meshes made from segments, or
+      RAS), depth-tested, see-through, outlined in Slicer's colours (View → Image slices).
 
 ## M15 — Segmentation
 
@@ -245,9 +262,23 @@ the Volume tab and the viewer features they share), with engine and UI status:
       grow / shrink / open / close in mm (exact distance transforms), majority smoothing,
       hole filling; a mask to a closed, manifold mesh (smoothed distance field →
       `mm_solid::mesh_implicit`, LPS or RAS); NIfTI and Slicer `.seg.nrrd` label maps.
-- [ ] **M15.2 Tools in the Segmentation tab** (see the tracking doc).
-- [ ] **M15.3 Hand-off**: *Make mesh* sends the segment to the Mesh tab; save / load label
-      maps.
+- [x] **M15.2 Tools in the Segmentation tab** (see the tracking doc): every Segment Editor
+      effect — Threshold with the eleven automatic methods and a local histogram, Paint /
+      Erase (mm or % of the view, sphere, pixel mode), Draw, Level tracing, Scissors,
+      Islands, Margin, Hollow, Smoothing (median, opening, closing, fill holes, Gaussian,
+      joint), Logical operators, Grow from seeds, Watershed, Fill between slices, Flood fill
+      / Local threshold, Fast marching, Draw tube, Surface cut, Mask volume, Split volume,
+      Engrave; segment status and filter, Slicer's keys, Apply to visible segments, Bypass
+      masking; Paint, island, flood-fill and point clicks in the 3D view; segment
+      statistics. Vessel tools (`mm_segment::{levelset, centerline}`): Level set (geodesic
+      active contour from the segment, on the threshold range or an overlay such as
+      vesselness), Guided vessel (minimal path through clicked points, then a level set),
+      Centerline (TEASAR tree with radii) with cross-sections along each branch, the
+      narrowest one and a diameter plot. Scissors also cut in the 3D view. Left: brushing a
+      smoothing region (⚪).
+- [x] **M15.3 Hand-off**: *Make mesh* sends the segment to the Mesh tab; save and load label
+      maps (`.seg.nrrd`, NIfTI; another grid resampled by position); a mesh from the Mesh tab
+      (right-click → *Send to Segmentation*) becomes a segment.
 - [x] **M15.4 Image preparation in the Volume tab** (`mm-image`; Volume → *Prepare image*): N4
       bias correction, denoising (Gaussian, median, gradient / curvature diffusion, non-local
       means), resampling, crop / pad, reorientation and header fixes, rigid / affine
@@ -280,6 +311,46 @@ venous sinus stenosis with bare self-expanding stents.
       crossings, sharp return, moved open ends); edit in place or as a copy.
 - [ ] **M16.5** Covered-stent refinements, braided foreshortening, struts, mechanics, device
       catalogue, several stents: see [virtual_stenting.md § Future work](virtual_stenting.md#future-work).
+
+## M18 — Printed models
+
+Hollow vessel models for printing and benchtop flow.
+
+- [x] **M18.1 Thicken** (`mm_edit::thicken`; Edit → Thicken, Vessel → Thicken into a shell):
+      a wall of a given thickness outward, inward or centred on the surface, the cut ends
+      kept open with flat rims. The new side is a level set of the lumen's distance field
+      (the lumen closed by straight prolongations of each end); exact booleans subtract a
+      short cylinder standing on each end and the lumen, so the rims are exactly flat and
+      walls meeting near an end are cut cleanly; the kept surface is untouched (rebuilt from
+      the field when it runs into itself). Stair steps in concave creases are smoothed
+      (Taubin); the new wall is remeshed away from the rims; anything that would make the
+      wall run into itself is undone. Tests: a tube each way (radii, volume, flat rims,
+      measured thickness), a bend tighter than the wall, a too-narrow end reported, a closed
+      surface.
+- [x] **M18.2 Escape holes** (Edit → Offset / Hollow): clicked on the object, straight through
+      the wall along the surface normal (radius, taper), or one at the lowest point; cut by
+      exact booleans.
+
+## M19 — The rest of Meshmixer parity
+
+Everything [feature_parity.md](feature_parity.md) still listed as missing, except what is out of
+scope (printing) or Autodesk content (the art library).
+
+- [x] **M19.1 Sculpt**: dab spacing; brush textures (scale, rotation, strength, tile, invert)
+      turned with the stroke (AlignToStroke); a screen stencil fixed to the view; own patterns
+      or grey PNG / JPEG images (`mm_edit::brush_alpha`); a free symmetry plane (Set gizmo,
+      from the view, 3 points, the selection's best-fit plane, typed), shared with Select.
+- [x] **M19.2 Edit**: Offset's Connected / Accuracy / Preserve Groups; Fit Primitive's adjust
+      gizmo (handles on the fitted frame); Soft Transform's Refine Mesh; Create Pivot's
+      Existing Pivot / From Last Tool, Create Symmetric, Link To Target and pivot-to-pivot
+      Align; UV layout editing and Set UVs (planar, cylindrical, spherical, box); Filter
+      Complex; Make Solid's Material-to-Vertex colours.
+- [x] **M19.3 Stamps, hair and parts**: a stamp library (shapes, icons, text in Polymix's own
+      letters, the user's stamps; holes kept), Convert To Stamp end to end; Grow Hair's Fill
+      Density and Hair Patch; parts folders in Meshmix.
+- [x] **M19.4 Display and files**: textures (OBJ `vt` and `map_Kd`, Texture…, lit or unlit),
+      X-ray, grid size, centre of mass; Import reference; export one file per region or per
+      object.
 
 ## M17 — Agent access (MCP)
 

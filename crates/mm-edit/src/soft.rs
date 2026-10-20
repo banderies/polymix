@@ -15,6 +15,9 @@
 //! * [`SoftKind::Nonlinear`] solves for an as-rigid-as-possible band (local rotations fitted
 //!   to each one-ring, alternated with a global Laplacian solve), which keeps detail
 //!   undistorted when the handle turns.
+//!
+//! [`soft_deform_refined`] is the "Refine Mesh" option: it splits the edges the deformation
+//! stretches, so the moved region keeps its triangle size.
 
 use mm_core::linalg::closest_rotation;
 use mm_core::{DMat3, DVec3, Mesh, INVALID};
@@ -262,6 +265,305 @@ pub fn soft_deform(mesh: &Mesh, region: &SoftRegion, transform: &dyn Fn(u32, DVe
     out
 }
 
+/// How [`soft_deform_refined`] solves and refines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RefineOptions {
+    pub kind: SoftKind,
+    pub continuity: Continuity,
+    /// The region was made with a fixed boundary (see [`soft_region`]).
+    pub fixed_boundary: bool,
+    /// Stretched edges longer than this are split (see [`refine_length`]).
+    pub max_edge: f64,
+}
+
+/// Result of [`soft_deform_refined`].
+#[derive(Clone, Debug)]
+pub struct RefinedSoft {
+    /// The refined mesh, deformed.
+    pub mesh: Mesh,
+    /// The selection on the refined mesh (both halves of a split triangle keep its membership).
+    pub selection: Vec<u32>,
+    /// Handle and band on the refined mesh (rest pose), with the original pieces' labels.
+    pub region: SoftRegion,
+    /// The vertex budget stopped the refinement before every stretched edge was split.
+    pub capped: bool,
+}
+
+/// Splitting rounds: each halves the edges still too long, so stretches up to about 2⁸ are
+/// refined.
+const REFINE_ROUNDS: usize = 8;
+
+/// Further splitting rounds when solving the new band vertices stretches edges the plan left
+/// alone.
+const REFINE_CHECKS: usize = 3;
+
+/// Edges longer than this many times the region's mean edge length are split while
+/// refining (so they come out between about 2/3 and 4/3 of it).
+pub const REFINE_FACTOR: f64 = 4.0 / 3.0;
+
+/// The edge length above which Refine Mesh splits a stretched edge: [`REFINE_FACTOR`] times the
+/// mean length of the edges of `region` on `mesh` (at rest), or of the whole mesh if the region
+/// is empty.
+pub fn refine_length(mesh: &Mesh, region: &SoftRegion) -> f64 {
+    let verts: HashSet<u32> = region.handle.iter().chain(&region.band).copied().collect();
+    let edges: HashSet<u32> = verts.iter().flat_map(|&v| mesh.vertex_edges(v).iter().copied()).collect();
+    let mean = if edges.is_empty() {
+        mesh.average_edge_length()
+    } else {
+        edges.iter().map(|&e| mesh.edge_length(e)).sum::<f64>() / edges.len() as f64
+    };
+    REFINE_FACTOR * mean
+}
+
+/// A vertex's part in a soft transform: handle (weight 1) or band vertex, and its piece.
+#[derive(Clone, Copy, Debug)]
+struct Role {
+    handle: bool,
+    weight: f64,
+    piece: u32,
+}
+
+fn region_from_roles(roles: &HashMap<u32, Role>) -> SoftRegion {
+    let mut verts: Vec<(&u32, &Role)> = roles.iter().collect();
+    verts.sort_unstable_by_key(|x| *x.0);
+    let mut r = SoftRegion::default();
+    for (&v, role) in verts {
+        if role.handle {
+            r.handle.push(v);
+            r.handle_piece.push(role.piece);
+        } else {
+            r.band.push(v);
+            r.band_weight.push(role.weight);
+            r.band_piece.push(role.piece);
+        }
+    }
+    r
+}
+
+/// Soft Transform with Meshmixer's "Refine Mesh": the deformation [`soft_deform`] gives
+/// `region` (from [`soft_region`] on `mesh` and `selection`), on a copy of `mesh` whose edges
+/// are split (at their rest-pose midpoints) wherever the deformation stretches them past
+/// `opts.max_edge`, so the triangles of the moved region stay roughly the size they were.
+/// Edges the deformation does not lengthen are left alone.
+///
+/// The original vertices end exactly where [`soft_deform`] puts them, so turning refinement
+/// on changes the shape only between them; fixed boundaries, group borders and separate
+/// pieces behave as without it. A new vertex takes its part from the split edge: it joins the
+/// handle where the selection covers it (and moves with its piece), otherwise the band with
+/// the mean of its ends' weights (a fixed boundary's border stays fixed). New band vertices
+/// are blended like the rest for [`SoftKind::Linear`]; for the solved kinds the splits are
+/// planned on the interpolated displacement and the new band vertices are then solved between
+/// the original ones (as rigidly as possible for [`SoftKind::Nonlinear`], as a smooth
+/// displacement for the others), with a few re-checks. Splits keep face groups,
+/// and both halves of a selected triangle stay selected.
+pub fn soft_deform_refined(mesh: &Mesh, region: &SoftRegion, selection: &[u32], transform: &dyn Fn(u32, DVec3) -> DVec3, opts: &RefineOptions) -> RefinedSoft {
+    let mut roles: HashMap<u32, Role> = HashMap::new();
+    for (&v, &piece) in region.handle.iter().zip(&region.handle_piece) {
+        roles.insert(v, Role { handle: true, weight: 1.0, piece });
+    }
+    for (&v, (&weight, &piece)) in region.band.iter().zip(region.band_weight.iter().zip(&region.band_piece)) {
+        roles.insert(v, Role { handle: false, weight, piece });
+    }
+    // Deformed positions of the moving vertices, starting with the unrefined result.
+    let mut pos: HashMap<u32, DVec3> = soft_deform(mesh, region, transform, opts.kind, opts.continuity).into_iter().collect();
+    let budget = (16 * roles.len() + 1000).min(2_000_000);
+    let mut rest = mesh.clone();
+    let mut selected: Vec<u32> = selection.iter().copied().filter(|&t| mesh.is_triangle(t)).collect();
+    selected.sort_unstable();
+    selected.dedup();
+    let mut in_sel: HashSet<u32> = selected.iter().copied().collect();
+    // New band vertices whose positions the solved kinds work out (all at once, after planning).
+    let mut new_band: Vec<u32> = Vec::new();
+    let linear = opts.kind == SoftKind::Linear;
+    let (mut rounds, mut checks, mut added, mut capped, mut solved, mut fills) = (0, 0, 0usize, false, true, 0);
+    let refine = opts.max_edge.is_finite() && opts.max_edge > 0.0;
+    loop {
+        // Checking a solve of the new band vertices (not the plan)?
+        let check = solved && !linear && fills > 0;
+        let more = refine && !capped && if check { checks < REFINE_CHECKS } else { rounds < REFINE_ROUNDS };
+        let long = if more { stretched_edges(&rest, &pos, opts.max_edge) } else { Vec::new() };
+        if long.is_empty() {
+            if !solved {
+                solve_new_band(&rest, &new_band, &mut pos, opts);
+                solved = true;
+                fills += 1;
+                continue;
+            }
+            break;
+        }
+        if check {
+            checks += 1;
+        } else {
+            rounds += 1;
+        }
+        let mut fresh: Vec<u32> = Vec::new();
+        for e in long {
+            if added >= budget {
+                capped = true;
+                break;
+            }
+            let [a, b] = rest.edge_vertices(e);
+            let shift = |v: u32| pos.get(&v).map_or(DVec3::ZERO, |p| *p - rest.vertex(v));
+            let moved = 0.5 * (shift(a) + shift(b));
+            let Ok(info) = rest.split_edge(e) else { continue };
+            added += 1;
+            fresh.push(info.v_new);
+            let tris: Vec<u32> = info.t_orig.into_iter().filter(|&t| t != INVALID).collect();
+            let covered = tris.iter().filter(|t| in_sel.contains(t)).count();
+            for k in 0..2 {
+                if info.t_new[k] != INVALID && in_sel.contains(&info.t_orig[k]) {
+                    in_sel.insert(info.t_new[k]);
+                    selected.push(info.t_new[k]);
+                }
+            }
+            let (ra, rb) = (roles.get(&info.v_a).copied(), roles.get(&info.v_b).copied());
+            let w = |r: Option<Role>| r.map_or(0.0, |r| r.weight);
+            let both_handle = matches!((ra, rb), (Some(x), Some(y)) if x.handle && y.handle && x.piece == y.piece);
+            // Without a fixed boundary the handle is every vertex of a selected triangle; with
+            // one, the selection's interior away from its border.
+            let (handle, may_move) = if opts.fixed_boundary { (both_handle && covered == tris.len(), covered == tris.len()) } else { (covered > 0 && both_handle, true) };
+            let weight = 0.5 * (w(ra) + w(rb));
+            let piece = match (ra, rb) {
+                (Some(x), Some(y)) if y.weight > x.weight => y.piece,
+                (Some(x), _) | (None, Some(x)) => x.piece,
+                (None, None) => 0,
+            };
+            let (f, x) = (info.v_new, rest.vertex(info.v_new));
+            if handle {
+                roles.insert(f, Role { handle: true, weight: 1.0, piece });
+                pos.insert(f, transform(piece, x));
+            } else if may_move && weight > 0.0 {
+                let weight = weight.min(1.0);
+                roles.insert(f, Role { handle: false, weight, piece });
+                if linear {
+                    pos.insert(f, x + (transform(piece, x) - x) * ease(weight, opts.continuity));
+                } else {
+                    // Planned on the interpolated displacement; solved once the splits are done.
+                    pos.insert(f, x + moved);
+                    new_band.push(f);
+                    solved = false;
+                }
+            }
+        }
+        delaunay_flips(&mut rest, &fresh, &in_sel, &|v| roles.contains_key(&v));
+    }
+    for (&v, &p) in &pos {
+        rest.set_vertex(v, p);
+    }
+    selected.sort_unstable();
+    RefinedSoft { mesh: rest, selection: selected, region: region_from_roles(&roles), capped }
+}
+
+/// Work out the positions of the new band vertices `free` of a refined mesh (rest pose
+/// `rest`), every other vertex staying where `pos` (or `rest`) has it: as-rigid-as-possible for
+/// [`SoftKind::Nonlinear`], otherwise a smooth (biharmonic) displacement between the original
+/// vertices' solved positions. (Re-solving a membrane on the stretched, refined band itself
+/// would weigh its slivers by their cotangents and could overshoot.)
+fn solve_new_band(rest: &Mesh, free: &[u32], pos: &mut HashMap<u32, DVec3>, opts: &RefineOptions) {
+    if free.is_empty() {
+        return;
+    }
+    match opts.kind {
+        SoftKind::Linear => {}
+        SoftKind::Nonlinear => arap(rest, free, pos, 8),
+        SoftKind::Flat | SoftKind::Stretchy => {
+            let mut m = rest.clone();
+            for v in rest.vertex_ids() {
+                m.set_vertex(v, DVec3::ZERO);
+            }
+            for (&v, &p) in pos.iter() {
+                m.set_vertex(v, p - rest.vertex(v));
+            }
+            if mm_repair::fair_region(&mut m, free, 2, LaplacianWeights::Uniform).is_ok() {
+                for &v in free {
+                    pos.insert(v, rest.vertex(v) + m.vertex(v));
+                }
+            }
+        }
+    }
+}
+
+/// Cotangent of the angle between `u` and `v`.
+fn cot(u: DVec3, v: DVec3) -> f64 {
+    u.dot(v) / u.cross(v).length().max(1e-300)
+}
+
+/// Flip the edges around the new vertices `fresh` that break the Delaunay condition (so the
+/// split fans do not leave slivers whose clamped weights would soak up a solved band's
+/// stretch). Only edges with a `moving` end, in nearly flat quads whose two triangles share
+/// face group and selection state, are flipped: the surface that stays put, the group
+/// borders and the selection stay as they were.
+fn delaunay_flips(m: &mut Mesh, fresh: &[u32], in_sel: &HashSet<u32>, moving: &dyn Fn(u32) -> bool) {
+    let mut queue: Vec<u32> = fresh.iter().filter(|&&v| m.is_vertex(v)).flat_map(|&v| m.vertex_triangles(v)).flat_map(|t| m.tri_edges(t)).collect();
+    queue.sort_unstable();
+    queue.dedup();
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for &e in &queue {
+            if !m.is_edge(e) {
+                continue;
+            }
+            let [t0, t1] = m.edge_triangles(e);
+            if t1 == INVALID || m.tri_group(t0) != m.tri_group(t1) || in_sel.contains(&t0) != in_sel.contains(&t1) {
+                continue;
+            }
+            let [a, b] = m.edge_vertices(e);
+            let [c, d] = m.edge_opposite_vertices(e);
+            if c == INVALID || d == INVALID || c == d || !(moving(a) || moving(b)) {
+                continue;
+            }
+            let (pa, pb, pc, pd) = (m.vertex(a), m.vertex(b), m.vertex(c), m.vertex(d));
+            if cot(pa - pc, pb - pc) + cot(pa - pd, pb - pd) >= -1e-9 {
+                continue;
+            }
+            // Nearly flat, and the flipped pair keeps facing the same way.
+            let (n0, n1) = (m.tri_normal(t0), m.tri_normal(t1));
+            let (f0, f1) = ((pa - pc).cross(pd - pc).normalize_or_zero(), (pb - pd).cross(pc - pd).normalize_or_zero());
+            let n = (n0 + n1).normalize_or_zero();
+            if n0.dot(n1) < 0.94 || f0.dot(n).abs() < 0.9 || f1.dot(n).abs() < 0.9 || f0.dot(f1) < 0.9 {
+                continue;
+            }
+            if let Ok(info) = m.flip_edge(e) {
+                next.extend(info.t.iter().flat_map(|&t| m.tri_edges(t)).filter(|&x| x != e));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        next.sort_unstable();
+        next.dedup();
+        queue = next;
+    }
+}
+
+/// Edges with a moved end (in `pos`) that the deformation makes longer than `max_edge` and
+/// longer than at rest, longest first.
+fn stretched_edges(m: &Mesh, pos: &HashMap<u32, DVec3>, max_edge: f64) -> Vec<u32> {
+    // Dense lookups: this runs every round over the whole moved region.
+    let mut moved: Vec<Option<DVec3>> = vec![None; m.max_vid()];
+    for (&v, &p) in pos {
+        moved[v as usize] = Some(p);
+    }
+    let at = |v: u32| moved[v as usize].unwrap_or_else(|| m.vertex(v));
+    let mut seen = vec![false; m.max_eid()];
+    let mut long: Vec<(f64, u32)> = Vec::new();
+    for &v in pos.keys() {
+        for &e in m.vertex_edges(v) {
+            if std::mem::replace(&mut seen[e as usize], true) {
+                continue;
+            }
+            let [a, b] = m.edge_vertices(e);
+            let len = at(a).distance(at(b));
+            // 1% slack, so rigidly moved edges (unchanged up to round-off) are never split.
+            if len > max_edge && len > 1.01 * m.edge_length(e) {
+                long.push((len, e));
+            }
+        }
+    }
+    long.sort_unstable_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
+    long.into_iter().map(|x| x.1).collect()
+}
+
 /// Clamped cotangent weight of edge `e` on the source mesh.
 fn edge_weight(m: &Mesh, e: u32) -> f64 {
     let [a, b] = m.edge_vertices(e);
@@ -381,4 +683,119 @@ pub fn warp(mesh: &Mesh, selection: &[u32], handles: &[(u32, DVec3)], rigid: boo
     }
     out.extend(free.iter().map(|&v| (v, pos[&v])));
     out
+}
+
+#[cfg(test)]
+mod refine_tests {
+    use super::*;
+    use mm_core::primitives;
+
+    /// A 6 × 6 grid of 0.2 squares and a disc of radius 0.8 selected in its middle.
+    fn grid() -> (Mesh, Vec<u32>) {
+        let m = primitives::plane_grid(6.0, 6.0, 30, 30);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).truncate().length() < 0.8).collect();
+        (m, sel)
+    }
+
+    fn apply(m: &Mesh, moves: &[(u32, DVec3)]) -> Mesh {
+        let mut out = m.clone();
+        for &(v, p) in moves {
+            out.set_vertex(v, p);
+        }
+        out
+    }
+
+    fn longest_edge(m: &Mesh) -> f64 {
+        m.edge_ids().map(|e| m.edge_length(e)).fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn refine_bounds_stretched_edges_and_keeps_the_shape() {
+        let (m, sel) = grid();
+        let lift = |_: u32, p: DVec3| p + DVec3::Z * 2.0;
+        for kind in [SoftKind::Linear, SoftKind::Nonlinear, SoftKind::Flat, SoftKind::Stretchy] {
+            for fixed_boundary in [false, true] {
+                // (A fixed boundary's band lies inside the selection: a narrow one leaves a
+                // handle wide enough not to be a point pull, which no refinement makes smooth.)
+                let falloff = if fixed_boundary { 0.4 } else { 1.2 };
+                let r = soft_region(&m, &sel, falloff, fixed_boundary, false, true);
+                let max_edge = refine_length(&m, &r);
+                assert!(max_edge > 0.2 * 2f64.sqrt(), "the grid's diagonals are not split at rest: {max_edge}");
+                let plain = apply(&m, &soft_deform(&m, &r, &lift, kind, Continuity::SoftPosition));
+                assert!(longest_edge(&plain) > 1.5 * max_edge, "{kind:?}: the lift stretches the band");
+                let opts = RefineOptions { kind, continuity: Continuity::SoftPosition, fixed_boundary, max_edge };
+                let out = soft_deform_refined(&m, &r, &sel, &lift, &opts);
+                out.mesh.check_validity().unwrap();
+                assert!(out.mesh.is_consistently_oriented());
+                assert!(!out.capped && out.mesh.vertex_count() > m.vertex_count());
+                // The linear blend is refined to the bound; a solved band is planned on the
+                // interpolated displacement and then re-solved, which can stretch a few edges a
+                // little past it after the capped re-checks.
+                let longest = longest_edge(&out.mesh);
+                let bound = if kind == SoftKind::Linear { 1.0 + 1e-9 } else { 1.25 };
+                assert!(longest <= max_edge * bound, "{kind:?} fixed {fixed_boundary}: edge {longest} > {max_edge}");
+                // The original vertices land exactly where they do without refinement.
+                let tol = 1e-12;
+                let worst = m.vertex_ids().map(|v| out.mesh.vertex(v).distance(plain.vertex(v))).fold(0.0, f64::max);
+                assert!(worst <= tol, "{kind:?} fixed {fixed_boundary}: original vertices moved {worst} from the unrefined result");
+                // Vertices outside the region (new ones included) stay in the grid's plane.
+                let moving: HashSet<u32> = out.region.handle.iter().chain(&out.region.band).copied().collect();
+                assert!(out.mesh.vertex_ids().filter(|v| !moving.contains(v)).all(|v| out.mesh.vertex(v).z == 0.0));
+                // The selection keeps its split triangles (with a fixed boundary the band, which
+                // stretches, lies inside it).
+                assert!(out.selection.len() >= sel.len() && (out.selection.len() > sel.len()) == fixed_boundary);
+                assert!(out.selection.iter().all(|&t| out.mesh.is_triangle(t)));
+                if fixed_boundary {
+                    // The selection's border (and everything outside it) stays put.
+                    let inside: HashSet<u32> = out.selection.iter().copied().collect();
+                    for v in out.mesh.vertex_ids() {
+                        if out.mesh.vertex_triangles(v).iter().any(|t| !inside.contains(t)) {
+                            assert_eq!(out.mesh.vertex(v).z, 0.0, "border vertex {v} moved");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refine_follows_pieces_groups_and_scaling() {
+        // Two separate pieces, each scaled up about its own centre (so the handles stretch
+        // too), next to a face-group border the band must not cross.
+        let mut m = primitives::plane_grid(8.0, 4.0, 40, 20);
+        for t in m.triangle_ids().collect::<Vec<_>>() {
+            if m.tri_centroid(t).y > 1.0 {
+                m.set_tri_group(t, 7);
+            }
+        }
+        let centres = [DVec3::new(-2.0, 0.0, 0.0), DVec3::new(2.0, 0.0, 0.0)];
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| centres.iter().any(|c| m.tri_centroid(t).distance(*c) < 0.6)).collect();
+        let r = soft_region(&m, &sel, 0.8, false, false, false);
+        let mut pivots = [DVec3::ZERO; 2];
+        for (&v, &p) in r.handle.iter().zip(&r.handle_piece) {
+            pivots[p as usize] = if m.vertex(v).x < 0.0 { centres[0] } else { centres[1] };
+        }
+        let grow = move |piece: u32, p: DVec3| {
+            let c = pivots[piece as usize];
+            c + (p - c) * 2.5 + DVec3::Z * if piece == 0 { 0.5 } else { -0.5 }
+        };
+        let plain = apply(&m, &soft_deform(&m, &r, &grow, SoftKind::Linear, Continuity::SoftPosition));
+        let max_edge = refine_length(&m, &r);
+        let opts = RefineOptions { kind: SoftKind::Linear, continuity: Continuity::SoftPosition, fixed_boundary: false, max_edge };
+        let out = soft_deform_refined(&m, &r, &sel, &grow, &opts);
+        out.mesh.check_validity().unwrap();
+        assert!(longest_edge(&plain) > 2.0 * max_edge);
+        assert!(longest_edge(&out.mesh) <= max_edge * (1.0 + 1e-9));
+        assert!(m.vertex_ids().all(|v| out.mesh.vertex(v).distance(plain.vertex(v)) < 1e-12), "each piece keeps its transform");
+        // Split triangles keep their face group, and the band stops at the group border
+        // exactly as it does unrefined.
+        let groups = |mm: &Mesh| mm.triangle_ids().map(|t| mm.tri_group(t)).collect::<HashSet<i32>>();
+        assert_eq!(groups(&out.mesh), groups(&m));
+        let beyond = |mm: &Mesh| m.vertex_ids().filter(|&v| m.vertex_triangles(v).iter().all(|&t| m.tri_group(t) == 7) && mm.vertex(v) != m.vertex(v)).count();
+        assert_eq!(beyond(&out.mesh), beyond(&plain));
+        // Moving without stretching splits nothing.
+        let shift = |_: u32, p: DVec3| p + DVec3::new(0.05, 0.0, 0.0);
+        let same = soft_deform_refined(&m, &r, &sel, &shift, &opts);
+        assert_eq!(same.mesh.vertex_count(), m.vertex_count());
+    }
 }

@@ -1,14 +1,18 @@
 //! Grow Hair (Select > Edit > Grow Hair): strands on the selected faces (see
 //! [`mm_edit::hair`]), previewed live; Accept adds them to the object as tapered tubes in a
-//! new face group.
+//! new face group. Modes: NumHairs (a fixed count at random), Fill Density (an even spread
+//! at so many per mm²) and Hair Patch (guide strands with the rest gathered into clumps).
 
 use super::*;
 use crate::ui_util;
+use mm_edit::hair::{fill_count, fill_spacing, HairMode, MAX_HAIRS};
 use mm_edit::HairParams;
 
 pub struct HairTool {
     object: Option<ObjectId>,
     tris: Vec<u32>,
+    /// Area of the selected faces.
+    area: f64,
     params: HairParams,
     show_tubes: bool,
     /// Strands for the current parameters.
@@ -21,13 +25,16 @@ impl HairTool {
             Some(o) => (Some(o.id), o.selection.to_vec(), o.bounds().diagonal()),
             None => (None, Vec::new(), 1.0),
         };
+        let area = cx.scene.active().map_or(0.0, |o| mm_edit::hair::selection_area(&o.mesh, &tris));
         let length = diag * 0.08;
         let down = match cx.camera.up_axis {
             crate::camera::UpAxis::Y => -DVec3::Y,
             crate::camera::UpAxis::Z => -DVec3::Z,
         };
-        let params = HairParams { length, curl_pitch: length / 3.0, base_radius: length * 0.02, tip_radius: length * 0.006, down, ..Default::default() };
-        Self { object, tris, params, show_tubes: false, curves: None }
+        // Fill Density starts at the default count's density.
+        let density = if area > 0.0 { 200.0 / area } else { 1.0 };
+        let params = HairParams { length, curl_pitch: length / 3.0, base_radius: length * 0.02, tip_radius: length * 0.006, down, density, ..Default::default() };
+        Self { object, tris, area, params, show_tubes: false, curves: None }
     }
 
     fn refresh(&mut self, cx: &mut ToolCx) {
@@ -93,7 +100,28 @@ impl Tool for HairTool {
         }
         let p = &mut self.params;
         let len = p.length.max(1e-9);
-        ui.add(egui::Slider::new(&mut p.count, 1..=5000).logarithmic(true).text("NumHairs"));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut p.mode, HairMode::Count, "NumHairs").on_hover_text("A fixed number of strands at random points");
+            ui.selectable_value(&mut p.mode, HairMode::FillDensity, "Fill Density").on_hover_text("Strands spread evenly over the selection, so many per unit area");
+            ui.selectable_value(&mut p.mode, HairMode::HairPatch, "Hair Patch").on_hover_text("A few guide strands; the others follow them and gather into clumps");
+        });
+        match p.mode {
+            HairMode::Count => {
+                ui.add(egui::Slider::new(&mut p.count, 1..=5000).logarithmic(true).text("NumHairs"));
+            }
+            HairMode::FillDensity => {
+                let a = self.area.max(1e-12);
+                ui.add(egui::Slider::new(&mut p.density, 1.0 / a..=MAX_HAIRS as f64 / a).logarithmic(true).text("Density").suffix(" /mm²")).on_hover_text("Strands per unit area (per mm² for a model in millimetres)");
+                let n = fill_count(self.area, p.density);
+                let capped = if n == MAX_HAIRS { format!(" (at most {})", ui_util::format_count(MAX_HAIRS)) } else { String::new() };
+                ui.small(format!("≈ {} strands{capped}, no two closer than {:.3}", ui_util::format_count(n), fill_spacing(p.density)));
+            }
+            HairMode::HairPatch => {
+                ui.add(egui::Slider::new(&mut p.count, 1..=5000).logarithmic(true).text("NumHairs")).on_hover_text("All strands, guides included");
+                ui.add(egui::Slider::new(&mut p.clumps, 1..=200).logarithmic(true).text("Clumps")).on_hover_text("Guide strands, spread evenly; each gathers the strands around it");
+                ui.add(egui::Slider::new(&mut p.clumping, 0.0..=1.0).text("Clumping")).on_hover_text("How far strands are drawn toward their guide, more toward the tips (1: the tips meet)");
+            }
+        }
         ui.add(egui::Slider::new(&mut p.points, 2..=64).text("Points"));
         ui.add(egui::Slider::new(&mut p.length, len * 0.1..=len * 5.0).logarithmic(true).text("Length"));
         ui.add(egui::Slider::new(&mut p.curl_radius, 0.0..=len * 0.3).text("Curl Radius"));
@@ -159,5 +187,26 @@ impl Tool for HairTool {
         }
         *cx.status = format!("Grew {} strands", curves.len());
         true
+    }
+
+    fn script(&mut self, cmd: &str, _cx: &mut ToolCx) {
+        // `mode:count|fill|patch`, `count:300`, `density:0.5`, `clumps:8`, `clumping:0.9`,
+        // `tubes:on`.
+        let p = &mut self.params;
+        match cmd.split_once(':') {
+            Some(("mode", m)) => {
+                p.mode = match m {
+                    "fill" => HairMode::FillDensity,
+                    "patch" => HairMode::HairPatch,
+                    _ => HairMode::Count,
+                }
+            }
+            Some(("count", n)) => p.count = n.parse().unwrap_or(p.count),
+            Some(("density", d)) => p.density = d.parse().unwrap_or(p.density),
+            Some(("clumps", n)) => p.clumps = n.parse().unwrap_or(p.clumps),
+            Some(("clumping", c)) => p.clumping = c.parse().unwrap_or(p.clumping),
+            Some(("tubes", t)) => self.show_tubes = t == "on",
+            _ => {}
+        }
     }
 }

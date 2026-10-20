@@ -17,8 +17,8 @@ cleaning up medical segmentations (e.g. cerebral vessels from 3D Slicer) for CFD
 Polymix has three workspaces, shown as tabs at the top of the window (⌘1 / ⌘2 / ⌘3):
 
 - **Volume**: find, organise and preview medical images (DICOM, NIfTI, NRRD, …) in a folder.
-- **Segmentation**: the image selected in Volume in three planes and in 3D (segmentation
-  tools coming next).
+- **Segmentation**: segment the image selected in Volume, in three planes and in 3D, with
+  3D Slicer's Segment Editor tools; segments go to Mesh as surfaces.
 - **Mesh**: the mesh editor described below.
 
 **Volume** (*Add folder…*): Polymix looks through the folder and everything under it,
@@ -49,11 +49,37 @@ correction, denoising, resampling, crop / pad, reorientation and header fixes, r
 another scan (rigid / affine, saved with a `.tfm` for 3D Slicer), subtraction, intensity
 normalisation, vessel enhancement (Frangi / Sato / Jerman), MIP / MinIP slabs, 4D time points,
 phase-contrast velocities, and de-identified copies for sharing. Results are saved as NIfTI
-images under *Derived images* and can be segmented like any other image.
+images under *Derived images* and can be segmented like any other image. *Viewer* shows the
+selected image in three planes under the browser; *Compare with* puts another image over it
+or beside it (blend, a wipe with a divider, or toggle with T), e.g. before and after N4.
 
 **Segmentation** shows the image selected in Volume: axial, sagittal and coronal planes with
 a shared crosshair, and a 3D view (maximum intensity projection, volume rendering, or the
-surface above a threshold).
+surface above a threshold). Segments are drawn over the image and as surfaces in 3D. The
+effects follow 3D Slicer's Segment Editor (keys too: 1–0 / ⇧1–⇧0 effects, Space the one
+before, i intensity masking, q / w segments): Threshold (eleven automatic methods, or the
+range from a box, circle or line dragged over the structure), Paint and Erase, Draw, Level
+tracing, Scissors, Islands, Margin, Hollow, Smoothing (median, opening, closing, Gaussian,
+joint), Logical operators, Grow from seeds, Watershed, Fill between slices, Flood fill, Fast
+marching, Draw tube, Surface cut, Mask volume and Split volume, with Slicer's masking rules
+(editable area, intensity range, which segments may be overwritten) and undo. For vessels:
+*Level set* grows a rough segment to the vessel wall (on the threshold range, or following a
+vesselness overlay), *Guided vessel* segments a vessel through points clicked along it, and
+*Centerline* gives the segment's centerline tree with the diameter along each branch, its
+narrowest section (a click there turns the planes across and along the vessel) and a CSV of
+the cross-sections. In the 3D view a click paints, picks an island or a flood-fill seed, or
+places a point; ⌘ / Ctrl + drag paints.
+*Statistics* measures every segment (volume, surface, intensities, largest diameter,
+roundness, elongation; copy as CSV). *Make mesh* sends segments to Mesh as closed surfaces;
+*Save* / *Load segmentation* read and write 3D Slicer `.seg.nrrd` and NIfTI label maps; and a
+mesh comes back as a segment from Mesh (right-click an object → *Send to Segmentation*).
+
+The image tabs share their display: window presets (CT and automatic), colour maps, thick
+slabs (MIP, MinIP, mean), layouts (four-up, 3D over the planes, planes in a row), *Overlay*
+(another image over this one), rulers, angles and regions (area and statistics), and oblique
+planes (**⌥ + drag** in a view turns the other two; *Straighten* puts them back). In the Mesh
+tab, View → *Image slices* shows the Segmentation tab's image as three planes among the
+meshes, to check a surface against the image.
 
 Every image view uses the same mouse: **left drag** scrolls through slices, **right drag**
 pans, **middle drag** zooms, **left + right drag** sets window / level, the **wheel** scrolls
@@ -61,7 +87,8 @@ slices (⌘ + wheel zooms) and a **click** moves the crosshair. While the window
 dragged, a histogram in the bottom left of the view shows the image's values with the window
 over them. In the Segmentation tab a **double-click** makes a view fill the view area, and
 another brings the four views back (**Fit** resets zoom and pan, **Auto** the window); in the
-Volume tab's thumbnail a double-click resets. In the 3D view, left drag rotates.
+Volume tab's thumbnail a double-click resets. In the 3D view, left drag rotates (left + right
+drag sets the window there too).
 
 Each workspace is independent: if one runs into an internal error it stops on its own (its
 tab shows what happened, with a Restart button and a log in the data folder) and the
@@ -143,6 +170,13 @@ far narrower wall opens to the stent; wider wall is left alone), *End blend*, an
 Previewed live; kept in place or as a copy. Details and limits:
 [docs/virtual_stenting.md](docs/virtual_stenting.md).
 
+Printed flow models: cut the inlets and outlets square (**Vessel → Trim branch**, or Plane
+Cut), then **Vessel → Thicken into a shell** (also **Edit → Thicken**): a wall of the given
+thickness (e.g. 2 mm) grown outward (the lumen keeps its shape), inward or centred, the cut
+ends kept open with flat rims. The new side comes from a distance field, so it never folds
+into itself at a bifurcation or a tight bend as moving the surface along its normals would,
+and the result is a closed, manifold wall ready to print.
+
 Analysis extras: **Centerline** (vessel tree, per-branch length and diameters, CSV / VTK export
 for ParaView/VMTK), **Measure** (cross-section equivalent diameter, distances), **Deviation**
 (signed distance to a reference with colour map, mean/RMS/95th percentile/Hausdorff — handy for
@@ -177,10 +211,11 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 | Category | Tools |
 |---|---|
 | Select | Sphere brush (fixed size on the model), lasso and laser lasso (through or visible only), hole-border ring, grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
-| Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag |
-| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid, Remesh, Reduce, Smooth, Offset / Hollow, Boolean (union/difference/intersection; exact or volumetric), Add Tube, Fit Primitive (`P` in Select), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
-| Vessel | Trim branch, Flow extensions, Cap open ends, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
-| Analysis | Inspector, Measure (distance, thickness, gaps, cylinder fit, vessel diameter, snapping), Mesh Query (normals, quality, curvature), Units / Dimensions (incl. scale from measurements), Clearance, Check for CFD, Deviation |
+| Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag, the draw and pinch brushes and the rest of Meshmixer's set; spacing, brush textures turned with the stroke, a screen stencil; symmetry across any plane; Stamp (a library of shapes, icons and text for labelling prints, plus your own) |
+| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid (colours from vertices or the texture), Remesh, Reduce, Smooth, Offset / Hollow (with escape holes), Thicken (a shell with open ends), Boolean (union/difference/intersection; exact or volumetric), Add Tube, Fit Primitive (`P` in Select; an adjust gizmo), Create Pivot (incl. from the last tool, symmetric, linked to the target, pivot-to-pivot Align), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
+| Vessel | Trim branch, Flow extensions, Cap open ends, Thicken into a shell, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
+| Analysis | Inspector, Measure (distance, thickness, gaps, cylinder fit, vessel diameter, snapping), Mesh Query (normals, quality, curvature), Units / Dimensions (incl. scale from measurements), Clearance, Check for CFD, Deviation; centre of mass in the statistics |
+| View & files | Textures (OBJ `vt` and `map_Kd`, or right-click → Texture…), UV checker, X-ray, grid size, image slices from the Segmentation tab; Import reference (a see-through guide), Import parts folder, export one file per region or per object |
 
 ## Project layout
 

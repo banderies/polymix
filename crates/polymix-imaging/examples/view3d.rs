@@ -56,7 +56,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.columns(3, |cols| {
                 for (k, col) in cols.iter_mut().enumerate() {
-                    self.views[k].ui(col, self.render_state.as_ref(), &self.vol, &self.state, if k == 2 { Some(&overlay) } else { None });
+                    self.views[k].ui(col, self.render_state.as_ref(), &self.vol, &mut self.state, if k == 2 { Some(&overlay) } else { None });
                 }
             });
         });

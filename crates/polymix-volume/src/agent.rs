@@ -51,6 +51,23 @@ pub fn actions() -> Vec<Action> {
         Action::new("add_folder", "Find the images in a folder and everything under it (or in one file)", json!({"path": arg::text("Absolute path")})).required(&["path"]),
         Action::new("remove_folder", "Stop looking in a folder", json!({"folder": arg::integer("Its number in volume_catalog's sources, from 0")})).required(&["folder"]),
         Action::plain("rescan", "Scan the folders again (volume numbers may change)"),
+        Action::new(
+            "viewer",
+            "The viewer under the browser: the selected image in three planes. open: show or hide it. compare: an image to show over it or beside it, by volume number (images overlapping it; resampled onto its grid in the background: app_wait), with `mode` blend (see-through by opacity), wipe (divider at `wipe` 0–1) or toggle (showing_second). remove_compare: stop comparing. colour_map, slab (off / max / min / mean) and slab_mm, window_preset: how it is shown",
+            json!({
+                "open": arg::boolean("Show the viewer"),
+                "compare": volume("Volume number to compare with"),
+                "mode": arg::choice(&polymix_imaging::Compare::ALL.map(|c| c.key()), "How the two are shown"),
+                "opacity": arg::number("Blend: the second image's opacity, 0–1"),
+                "wipe": arg::number("Wipe: the divider, 0–1"),
+                "showing_second": arg::boolean("Toggle: show the second image"),
+                "remove_compare": arg::boolean("Stop comparing"),
+                "colour_map": arg::choice(&polymix_imaging::ColourMap::ALL.map(|m| m.key()), "Colours of the image"),
+                "slab": arg::choice(&polymix_imaging::SlabMode::ALL.map(|m| m.key()), "Thick slabs"),
+                "slab_mm": arg::number("Slab thickness, mm"),
+                "window_preset": arg::choice(&polymix_imaging::layers::CT_PRESETS.map(|p| p.0), "A CT window"),
+            }),
+        ),
         Action::plain("cancel_scan", "Stop the scan running"),
         Action::new(
             "prepare",
@@ -78,6 +95,54 @@ fn act_now(ws: &mut VolumeWorkspace, action: &str, a: &Args, ctx: &egui::Context
     let catalog = |ws: &VolumeWorkspace| ws.catalog.clone().ok_or_else(|| "No catalog yet: add a folder (add_folder) or wait for the scan (app_wait).".to_string());
     let volume = |c: &Catalog, k: usize| if k < c.volumes.len() { Ok(k) } else { Err(format!("No volume {k}: the catalog has {}", c.volumes.len())) };
     match action {
+        "viewer" => {
+            if let Some(o) = a.opt_bool("open") {
+                ws.viewer.open = o;
+            }
+            if let Some(k) = a.opt_usize("compare") {
+                let c = catalog(ws)?;
+                let k = volume(&c, k)?;
+                if ws.viewer.volume.is_none() {
+                    return Err("The viewer shows no image yet: open it (open: true) with an image selected, then app_wait".into());
+                }
+                let label = ws.agent_privacy.path(&c.volumes[k].name);
+                ws.viewer.compare_with(c.volumes[k].clone(), label, ctx);
+            }
+            let st = ws.viewer.state.as_mut();
+            if let Some(st) = st {
+                if a.opt_bool("remove_compare") == Some(true) {
+                    st.fusion = None;
+                }
+                if let Some(m) = a.opt_str("colour_map") {
+                    st.colour_map = polymix_imaging::ColourMap::ALL.into_iter().find(|x| x.key() == m).ok_or("unknown colour map")?;
+                }
+                if let Some(m) = a.opt_str("slab") {
+                    st.slab.mode = polymix_imaging::SlabMode::ALL.into_iter().find(|x| x.key() == m).ok_or("slab is off, max, min or mean")?;
+                }
+                if let Some(mm) = a.opt_f64("slab_mm") {
+                    st.slab.mm = mm.clamp(0.1, 500.0);
+                }
+                if let Some(p) = a.opt_str("window_preset") {
+                    let (_, c, w) = polymix_imaging::layers::CT_PRESETS.into_iter().find(|x| x.0 == p).ok_or("unknown window preset")?;
+                    st.window = (c, w);
+                }
+                if let Some(f) = &mut st.fusion {
+                    if let Some(m) = a.opt_str("mode") {
+                        f.compare = polymix_imaging::Compare::ALL.into_iter().find(|x| x.key() == m).ok_or("mode is blend, wipe or toggle")?;
+                    }
+                    if let Some(o) = a.opt_f64("opacity") {
+                        f.opacity = o.clamp(0.0, 1.0) as f32;
+                    }
+                    if let Some(w) = a.opt_f64("wipe") {
+                        f.wipe = w.clamp(0.0, 1.0) as f32;
+                    }
+                    if let Some(s) = a.opt_bool("showing_second") {
+                        f.showing = s;
+                    }
+                }
+            }
+            Ok(format!("Viewer {}", if ws.viewer.open { "shown" } else { "hidden" }))
+        }
         "select" => {
             let c = catalog(ws)?;
             let k = volume(&c, a.usize("volume")?)?;
@@ -221,6 +286,7 @@ struct Snapshot {
     selection: Value,
     previewed: Value,
     prepare: Value,
+    viewer: Value,
     hide_ids: bool,
 }
 
@@ -249,6 +315,16 @@ pub fn call(ws: &mut VolumeWorkspace, tool: &str, args: &Value) -> AgentReply {
             json!({"volume": p.volume, "slice": p.slice, "slices": p.slices, "window": {"centre": round(c, 3), "width": round(w, 3)}})
         }),
         prepare: ws.prepare.agent_state(),
+        viewer: json!({
+            "open": ws.viewer.open,
+            "volume": ws.viewer.volume.as_ref().map(|(k, _)| k),
+            "busy": ws.viewer.busy(),
+            "colour_map": ws.viewer.state.as_ref().map(|s| s.colour_map.key()),
+            "slab": ws.viewer.state.as_ref().map(|s| json!({"mode": s.slab.mode.key(), "mm": s.slab.mm})),
+            "compared_with": ws.viewer.state.as_ref().and_then(|s| s.fusion.as_ref()).map(|f| json!({"name": f.name, "mode": f.compare.key(), "opacity": round(f.opacity as f64, 2), "wipe": round(f.wipe as f64, 2), "showing_second": f.showing})),
+            "measurements": ws.viewer.measure.items.iter().map(|m| m.text()).collect::<Vec<_>>(),
+            "error": ws.viewer.error.as_ref().map(|e| polymix_workspace::guard::scrub_paths(e)),
+        }),
         hide_ids: ws.hide_ids,
         privacy,
     };
@@ -268,6 +344,7 @@ fn catalog(s: &Snapshot, args: &Value) -> Value {
         "selected": s.selection,
         "previewed": s.previewed,
         "prepare": s.prepare,
+        "viewer": s.viewer,
         "identifiers_hidden_in_window": s.hide_ids,
     });
     let Some(c) = &s.catalog else {
@@ -385,8 +462,7 @@ mod tests {
     use mm_volume::model::{Format, Kind, Patient, PatientKey, Series, Study, Voxels};
 
     fn sample() -> Catalog {
-        let mut c = Catalog::default();
-        c.roots = vec!["/data/DOE_JANE scans".into()];
+        let mut c = Catalog { roots: vec!["/data/DOE_JANE scans".into()], ..Default::default() };
         let fields = vec![
             Field::new("Patient", "Name", "DOE JANE"),
             Field::new("Patient", "Birth date", "1980-01-01"),
@@ -417,7 +493,7 @@ mod tests {
 
     fn snapshot(c: Catalog) -> Snapshot {
         let privacy = Arc::new(Privacy::new(true, Some(&c)));
-        Snapshot { roots: c.roots.iter().map(|r| privacy.path(&r.display().to_string())).collect(), catalog: Some(Arc::new(c)), privacy, scanning: None, scan_error: None, selection: Value::Null, previewed: Value::Null, prepare: Value::Null, hide_ids: false }
+        Snapshot { roots: c.roots.iter().map(|r| privacy.path(&r.display().to_string())).collect(), catalog: Some(Arc::new(c)), privacy, scanning: None, scan_error: None, selection: Value::Null, previewed: Value::Null, prepare: Value::Null, viewer: Value::Null, hide_ids: false }
     }
 
     #[test]

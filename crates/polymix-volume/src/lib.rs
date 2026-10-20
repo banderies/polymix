@@ -9,10 +9,11 @@
 mod agent;
 mod prepare;
 mod preview;
+mod viewer;
 mod privacy;
 mod scan_task;
 
-use mm_volume::model::{Catalog, Kind};
+use mm_volume::model::{Catalog, Kind, Volume};
 use mm_volume::scan::Progress;
 use polymix_workspace::style::{format_count, section};
 use polymix_workspace::Workspace;
@@ -45,6 +46,9 @@ struct Show {
     other: bool,
 }
 
+/// An image of the catalog and its label (names masked as the browser shows them).
+pub type Choice = (Volume, String);
+
 pub struct VolumeWorkspace {
     /// Folders (or files) to look in.
     roots: Vec<PathBuf>,
@@ -66,6 +70,10 @@ pub struct VolumeWorkspace {
     /// A file opened from outside (Finder, command line): select its volume after the scan.
     open_select: Option<PathBuf>,
     prepare: prepare::Prepare,
+    /// Three planes of the image previewed, under the browser.
+    viewer: viewer::Viewer,
+    /// The images the viewer's can be compared with, for (catalog, volume).
+    viewer_choices: (Option<(usize, usize)>, Vec<Choice>),
 }
 
 impl VolumeWorkspace {
@@ -91,6 +99,8 @@ impl VolumeWorkspace {
             script: VecDeque::new(),
             open_select: None,
             prepare: prepare::Prepare::default(),
+            viewer: viewer::Viewer::default(),
+            viewer_choices: (None, Vec::new()),
         }
     }
 
@@ -155,6 +165,21 @@ impl VolumeWorkspace {
     /// The volume other workspaces show (Segmentation): the selected volume; for a series or
     /// a study, the one previewed if it is in it, else its first image. With its name as
     /// listed here (identifiers masked when hidden).
+    /// List derived images saved elsewhere (e.g. a volume masked in the Segmentation
+    /// workspace): the derived folder joins the folders scanned, and is scanned again;
+    /// `select` selects the first file when found.
+    pub fn add_derived(&mut self, paths: Vec<PathBuf>, select: bool, ctx: &egui::Context) {
+        if let Some(dir) = prepare::derived_dir() {
+            if !self.roots.contains(&dir) {
+                self.roots.push(dir);
+            }
+        }
+        if select {
+            self.open_select = paths.into_iter().next();
+        }
+        self.start_scan(ctx);
+    }
+
     pub fn current_volume(&self) -> Option<(Arc<Catalog>, usize, String)> {
         let c = self.catalog.clone()?;
         let previewed = self.preview.as_ref().map(|p| p.volume);
@@ -167,6 +192,34 @@ impl VolumeWorkspace {
         }?;
         let label = self.privacy.path(&c.volumes.get(k)?.name);
         Some((c, k, label))
+    }
+
+    /// Images that can be shown over `current` (fusion, before / after): those of the catalog
+    /// that overlap it in space by at least half of the smaller, with their labels (names
+    /// masked as the browser shows them), derived images first.
+    pub fn overlay_choices(&self, current: &Volume) -> Vec<(Volume, String)> {
+        let (Some(c), Some(g)) = (&self.catalog, &current.geometry) else { return Vec::new() };
+        let bounds = |g: &mm_volume::geometry::Geometry| {
+            let d = g.dims.map(|n| n as f64 - 0.5);
+            let pts: Vec<glam::DVec3> = (0..8).map(|c| g.world(glam::DVec3::new(if c & 1 > 0 { d[0] } else { -0.5 }, if c & 2 > 0 { d[1] } else { -0.5 }, if c & 4 > 0 { d[2] } else { -0.5 }))).collect();
+            (pts.iter().fold(glam::DVec3::INFINITY, |a, p| a.min(*p)), pts.iter().fold(glam::DVec3::NEG_INFINITY, |a, p| a.max(*p)))
+        };
+        let vol = |b: &(glam::DVec3, glam::DVec3)| (b.1 - b.0).max(glam::DVec3::ZERO).element_product();
+        let here = bounds(g);
+        let mut out: Vec<(Volume, String)> = c
+            .volumes
+            .iter()
+            .filter(|v| !(v.name == current.name && v.files == current.files) && matches!(v.kind, Kind::Image | Kind::Derived | Kind::LabelMap))
+            .filter_map(|v| {
+                let b = bounds(v.geometry.as_ref()?);
+                let common = (here.0.max(b.0), here.1.min(b.1));
+                (vol(&common) >= 0.5 * vol(&here).min(vol(&b))).then(|| (v.clone(), self.privacy.path(&v.name)))
+            })
+            .take(200)
+            .collect();
+        let derived = |v: &Volume| v.files.first().is_some_and(|f| polymix_workspace::derived_dir().is_some_and(|d| f.starts_with(d)));
+        out.sort_by_key(|(v, _)| !derived(v));
+        out
     }
 
     /// Whether *Hide identifiers* is on (the shell lets agents take screenshots of the image
@@ -330,6 +383,8 @@ impl VolumeWorkspace {
             ui.toggle_value(&mut self.show.other, "Derived & other").on_hover_text("Reformats, projections and maps computed from other images, localizers, vector fields, and DICOM series without images");
             ui.separator();
             ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search").desired_width(160.0));
+            ui.separator();
+            ui.toggle_value(&mut self.viewer.open, "Viewer").on_hover_text("The image selected in three planes under the browser: window presets, colour maps, slabs, compare with another image, measure");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut hide = self.hide_ids;
                 if ui.checkbox(&mut hide, "Hide identifiers").on_hover_text("Mask patient names, IDs, birth dates and accession numbers, also inside file names; hide thumbnails of screenshots").changed() {
@@ -592,6 +647,24 @@ impl VolumeWorkspace {
         });
     }
 
+    fn viewer_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Some((c, k, label)) = self.current_volume() else {
+            ui.weak("Select an image in the browser to view it here.");
+            ui.allocate_space(ui.available_size());
+            return;
+        };
+        self.viewer.show(k, &c.volumes[k], &ctx);
+        let key = Some((Arc::as_ptr(&c) as usize, k));
+        if self.viewer_choices.0 != key {
+            self.viewer_choices = (key, self.overlay_choices(&c.volumes[k]));
+        }
+        if let Some(pick) = self.viewer.ui(ui, &label, &self.viewer_choices.1) {
+            let (v, l) = self.viewer_choices.1[pick].clone();
+            self.viewer.compare_with(v, l, &ctx);
+        }
+    }
+
     fn details(&mut self, ui: &mut egui::Ui) {
         let Some(c) = self.catalog.clone() else { return };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.selection {
@@ -743,6 +816,7 @@ impl Workspace for VolumeWorkspace {
     }
 
     fn tick(&mut self, ctx: &egui::Context, active: bool) {
+        self.viewer.tick();
         if self.scan_soon && self.scan.is_none() {
             self.start_scan(ctx);
         }
@@ -764,13 +838,7 @@ impl Workspace for VolumeWorkspace {
         }
         // Derived images were saved: list them (their folder becomes a source), select the first.
         if let Some(paths) = self.prepare.poll().filter(|p| !p.is_empty()) {
-            if let Some(dir) = prepare::derived_dir() {
-                if !self.roots.contains(&dir) {
-                    self.roots.push(dir);
-                }
-            }
-            self.open_select = paths.into_iter().next();
-            self.start_scan(ctx);
+            self.add_derived(paths, true, ctx);
         }
         if active && self.scan.is_none() && !self.prepare.busy() && !self.preview.as_ref().is_some_and(|p| p.busy()) {
             if let Some(step) = self.script.pop_front() {
@@ -787,6 +855,9 @@ impl Workspace for VolumeWorkspace {
         });
         if self.catalog.is_some() {
             egui::Panel::right("volume.details").resizable(true).default_size(400.0).show(ui, |ui| self.details(ui));
+        }
+        if self.viewer.open {
+            egui::Panel::bottom("volume.viewer").resizable(true).default_size(420.0).min_size(220.0).show(ui, |ui| self.viewer_ui(ui));
         }
         egui::CentralPanel::default().show(ui, |ui| self.browser(ui));
     }
@@ -819,7 +890,7 @@ impl Workspace for VolumeWorkspace {
     }
 
     fn script_idle(&self) -> bool {
-        self.script.is_empty() && self.scan.is_none() && !self.scan_soon && !self.preview.as_ref().is_some_and(|p| p.busy()) && !self.prepare.busy()
+        self.script.is_empty() && self.scan.is_none() && !self.scan_soon && !self.preview.as_ref().is_some_and(|p| p.busy()) && !self.prepare.busy() && !self.viewer.busy()
     }
 
     fn agent_tools() -> Vec<polymix_workspace::agent::AgentTool> {

@@ -38,8 +38,8 @@ pub struct SelectTool {
     /// The brush only selects faces whose outer side is outside the solid (skips faces
     /// buried inside other parts, e.g. overlapping tubes).
     pub restrict_exterior: bool,
-    /// Mirror brush strokes across this axis through the object's centre.
-    pub symmetry: Option<usize>,
+    /// Mirror brush strokes across a plane (X / Y / Z through the object's centre, or free).
+    pub symmetry: super::sculpt::Symmetry,
     /// Right-drag grow/shrink metric (Meshmixer's Expand Mode).
     pub expand_mode: ExpandMode,
     /// Brush spread and geodesic growth stop at edges sharper than this (degrees; 0 = off).
@@ -208,7 +208,7 @@ impl Default for SelectTool {
             brush_shape: mm_core::BrushShape::Unwrap,
             visible_side_only: false,
             restrict_exterior: false,
-            symmetry: None,
+            symmetry: super::sculpt::Symmetry::new(None, None),
             expand_mode: ExpandMode::Geodesic,
             crease_deg: 0.0,
             wand_deg: 20.0,
@@ -323,16 +323,9 @@ impl SelectTool {
             }
         }
         // Symmetry: also paint the mirror image of every stamp.
-        if let Some(axis) = self.symmetry {
-            let c = bvh.bounds().center();
-            let mirrored: Vec<(u32, DVec3)> = stamps
-                .iter()
-                .filter_map(|&(_, p)| {
-                    let mut q = p;
-                    q[axis] = 2.0 * c[axis] - p[axis];
-                    bvh.nearest(&mesh, q, r).map(|n| (n.tid, n.point))
-                })
-                .collect();
+        if self.symmetry.enabled {
+            let sym = self.symmetry.place(object, &bvh.bounds());
+            let mirrored: Vec<(u32, DVec3)> = stamps.iter().filter_map(|&(_, p)| bvh.nearest(&mesh, sym.reflect(p), r).map(|n| (n.tid, n.point))).collect();
             stamps.extend(mirrored);
         }
         if self.restrict_exterior && self.exterior.as_ref().is_none_or(|e| e.object != object || e.version != mesh.shape_version()) {
@@ -565,14 +558,18 @@ impl Tool for SelectTool {
             SelectMode::Lasso => "lasso",
             SelectMode::Wand => "wand",
         };
-        Some(serde_json::json!({
+        let mut v = serde_json::json!({
             "mode": mode, "size_percent": self.size_pct, "visible_side_only": self.visible_side_only, "restrict_exterior": self.restrict_exterior,
             "crease_deg": self.crease_deg, "wand_deg": self.wand_deg, "lasso_through": self.through,
-        }))
+        });
+        if let Some(o) = v.as_object_mut() {
+            o.extend(self.symmetry.settings());
+        }
+        Some(v)
     }
 
     fn settings_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "object", "properties": {
+        let mut v = serde_json::json!({"type": "object", "properties": {
             "mode": {"type": "string", "enum": ["brush", "lasso", "wand"], "description": "What clicking and dragging do (agents select with mesh_select, or wand_at here)"},
             "size_percent": {"type": "number", "description": "Brush radius as a percentage of the object's size"},
             "visible_side_only": {"type": "boolean", "description": "The brush keeps to faces turned the same way as the one under it"},
@@ -580,10 +577,14 @@ impl Tool for SelectTool {
             "crease_deg": {"type": "number", "description": "Brush spread and growth stop at edges sharper than this (degrees; 0 = off)"},
             "wand_deg": {"type": "number", "description": "Magic wand: largest angle between a face's normal and the picked face's (1..90)"},
             "lasso_through": {"type": "boolean", "description": "Lasso selects through the model"},
-        }}))
+        }});
+        if let Some(p) = v["properties"].as_object_mut() {
+            p.extend(super::sculpt::Symmetry::schema());
+        }
+        Some(v)
     }
 
-    fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
+    fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
         let mut v = self.settings().unwrap_or_default();
         merge_settings(&mut v, changes)?;
         let a = Args(&v);
@@ -598,7 +599,7 @@ impl Tool for SelectTool {
         self.crease_deg = (a.f64("crease_deg")? as f32).clamp(0.0, 180.0);
         self.wand_deg = (a.f64("wand_deg")? as f32).clamp(1.0, 90.0);
         self.through = a.opt_bool("lasso_through").unwrap_or(self.through);
-        Ok(())
+        self.symmetry.set_settings(&v, changes, cx)
     }
 
     fn state(&self, scene: &Scene) -> serde_json::Value {
@@ -611,15 +612,20 @@ impl Tool for SelectTool {
 
     fn actions(&self) -> Vec<Action> {
         use serde_json::json;
-        vec![Action::new(
+        let mut out = vec![Action::new(
             "wand_at",
             "Magic wand: add (or remove) the connected faces turned nearly the same way as the face nearest `at` (within wand_deg, stopping at creases)",
             json!({"at": arg::point("A point on or near the surface, mm"), "deselect": arg::boolean("Remove them from the selection instead")}),
         )
-        .required(&["at"])]
+        .required(&["at"])];
+        out.extend(super::sculpt::Symmetry::actions());
+        out
     }
 
     fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
+        if let Some(r) = self.symmetry.act(action, args, cx) {
+            return r;
+        }
         let a = Args(args);
         match action {
             "wand_at" => {
@@ -683,18 +689,7 @@ impl Tool for SelectTool {
                 });
                 let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size_pct));
                 brush_size_ui(ui, &mut self.size_pct, r);
-                ui.horizontal(|ui| {
-                    let mut on = self.symmetry.is_some();
-                    ui.checkbox(&mut on, "Symmetry").on_hover_text("Mirror strokes across the object's centre");
-                    if on {
-                        let axis = self.symmetry.get_or_insert(0);
-                        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-                            ui.selectable_value(axis, i, *n);
-                        }
-                    } else {
-                        self.symmetry = None;
-                    }
-                });
+                self.symmetry.ui(ui, cx, "Symmetry");
                 ui_util::section(ui, "Filters");
                 egui::ComboBox::from_label("Expand mode (Cmd+right-drag)")
                     .selected_text(match self.expand_mode {
@@ -883,6 +878,11 @@ impl Tool for SelectTool {
     }
 
     fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
+        // Setting the symmetry plane (a brush option) takes the pointer.
+        if self.mode == SelectMode::Brush && self.symmetry.pointer(input, cx) {
+            self.hover_brush = None;
+            return;
+        }
         let Some(pos) = input.pos else { return };
         let deselect = input.shift || input.command;
         if input.double_clicked {
@@ -1007,7 +1007,10 @@ impl Tool for SelectTool {
         }
     }
 
-    fn overlay(&mut self, ov: &mut Overlay, _cx: &mut ToolCx) {
+    fn overlay(&mut self, ov: &mut Overlay, cx: &mut ToolCx) {
+        if self.mode == SelectMode::Brush {
+            self.symmetry.overlay(ov, cx);
+        }
         let col = Vec4::new(1.0, 0.85, 0.2, 1.0);
         let drawing = self.surface_curve.as_ref().map(|(p, _)| p);
         for c in self.surface.iter().flat_map(|(_, cs)| cs.iter()).chain(drawing) {
@@ -1020,7 +1023,10 @@ impl Tool for SelectTool {
         }
     }
 
-    fn paint(&mut self, painter: &egui::Painter, _cx: &mut ToolCx) {
+    fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
+        if self.mode == SelectMode::Brush {
+            self.symmetry.paint(painter, cx);
+        }
         let Some(curve) = &self.curve else { return };
         if curve.len() < 2 {
             return;
@@ -1108,6 +1114,9 @@ impl Tool for SelectTool {
     }
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
+        if self.symmetry.accept_edit() {
+            return false;
+        }
         // Enter closes a Lasso Mode loop in progress.
         if self.surface.is_some() {
             self.close_surface_loop(cx, false);
@@ -1116,7 +1125,11 @@ impl Tool for SelectTool {
     }
 
     fn cancel(&mut self, cx: &mut ToolCx) -> bool {
-        // Esc drops lasso curves in progress, then clears the selection, then exits.
+        // Esc leaves symmetry Set, drops lasso curves in progress, then clears the
+        // selection, then exits.
+        if self.symmetry.cancel_edit() {
+            return false;
+        }
         if self.surface.take().is_some() {
             return false;
         }
@@ -1363,5 +1376,47 @@ mod tests {
         let out = EraseFillSpec::run(&m, Some(&ring), &EraseFillSpec::defaults(&info), &|_| true).unwrap();
         assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 1, "only the top rim stays open");
         out.mesh.check_validity().unwrap();
+    }
+
+    #[test]
+    fn brush_selects_the_mirror_image_across_a_free_plane() {
+        // A sphere turned so its mirror plane is tilted; brushing one spot selects its mirror
+        // image too, with the plane set by agents or by three points.
+        let rot = glam::DQuat::from_euler(glam::EulerRot::XYZ, 0.2, -0.4, 0.3);
+        let mut m = primitives::icosphere(1.0, 4);
+        m.transform(|p| rot * p);
+        let plane = super::super::sculpt::SymPlane::new(DVec3::ZERO, rot * DVec3::X);
+        let mut scene = Scene::default();
+        let id = scene.add("ball", m);
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        camera.look_along(-DVec3::Z);
+        camera.focus(&scene.bounds());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = SelectTool { size_pct: 4.0, ..Default::default() };
+        let n = plane.normal;
+        tool.set_settings(&serde_json::json!({"symmetry": true, "symmetry_plane": {"point_mm": [0.0, 0.0, 0.0], "normal": [n.x, n.y, n.z]}}), &mut cx).unwrap();
+        assert_eq!(tool.settings().unwrap()["symmetry_axis"], "free");
+        // A spot facing the camera, off the plane.
+        let spot = (DVec3::new(0.35, 0.25, 0.0) + DVec3::Z * (1.0 - 0.35f64.powi(2) - 0.25f64.powi(2)).sqrt()).normalize();
+        assert!(plane.distance(spot) > 0.2);
+        let at = cx.project(spot).unwrap();
+        tool.pointer(&PointerInput { pos: Some(at), pressed: true, down: true, ..Default::default() }, &mut cx);
+        tool.pointer(&PointerInput { pos: Some(at), released: true, ..Default::default() }, &mut cx);
+        let o = cx.scene.get(id).unwrap();
+        let near = |p: DVec3| o.mesh.triangle_ids().min_by(|&a, &b| o.mesh.tri_centroid(a).distance(p).total_cmp(&o.mesh.tri_centroid(b).distance(p))).unwrap();
+        assert!(o.selection.contains(near(spot)) && o.selection.contains(near(plane.reflect(spot))));
+        assert!(o.selection.iter().all(|t| {
+            let c = o.mesh.tri_centroid(t);
+            c.distance(spot).min(c.distance(plane.reflect(spot))) < 0.5
+        }));
+        // Three points on the plane place it too, X / Y / Z put it back across an axis.
+        let (u, v) = mm_core::geom::orthonormal_basis(n);
+        let pts = serde_json::json!({"points": [u.to_array(), v.to_array(), (-u).to_array()]});
+        tool.act("symmetry_through_points", &pts, &mut cx).unwrap();
+        assert_eq!(tool.settings().unwrap()["symmetry_axis"], "free");
+        tool.set_settings(&serde_json::json!({"symmetry_axis": "z"}), &mut cx).unwrap();
+        assert_eq!(tool.settings().unwrap()["symmetry_axis"], "z");
     }
 }

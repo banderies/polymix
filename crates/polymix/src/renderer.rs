@@ -2,6 +2,7 @@
 //! image. Meshes are uploaded as triangle soups so per-triangle state (selection, face
 //! group) can live in a compact storage buffer indexed by `vertex_index / 3`.
 
+use crate::image_planes::{ImagePlanesGpu, PlanesFrame};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu;
 use eframe::wgpu;
@@ -98,6 +99,11 @@ pub struct ObjectStyle {
     pub vertex_colors: bool,
     /// Show a checker texture through the UVs (when there are any).
     pub uv_checker: bool,
+    /// Show the object's texture through its UVs: 0 no, 1 lit, 2 unlit (its colours as they
+    /// are).
+    pub texture_mode: u8,
+    /// See-through, the parts seen edge-on most opaque (X-ray).
+    pub xray: bool,
     pub material: crate::materials::Material,
 }
 
@@ -136,7 +142,12 @@ pub struct GpuMesh {
     uv_key: Option<u64>,
     /// Mesh triangle id -> soup triangle index (u32::MAX if absent).
     soup_index: Vec<u32>,
+    /// The object's texture on the GPU, with the image's stamp.
+    texture: Option<(u64, wgpu::Texture, wgpu::TextureView)>,
 }
+
+/// An object's texture for [`SceneRenderer::sync_mesh`]: stamp, width, height, RGBA rows.
+pub type TextureData<'a> = (u64, u32, u32, &'a [u8]);
 
 pub struct SceneRenderer {
     globals_buf: wgpu::Buffer,
@@ -149,6 +160,11 @@ pub struct SceneRenderer {
     background_pipeline: wgpu::RenderPipeline,
     lines_buf: Option<(wgpu::Buffer, usize)>,
     overlay_tris_buf: Option<(wgpu::Buffer, usize)>,
+    /// Image slices drawn among the meshes ([`Self::set_image_planes`]).
+    image_planes: ImagePlanesGpu,
+    /// What objects without a texture sample, and how textures are sampled.
+    white: wgpu::TextureView,
+    sampler: wgpu::Sampler,
     target: Option<Target>,
     /// egui's renderer, where the target is registered as a texture (freed on drop, e.g.
     /// when the Mesh workspace restarts after a crash).
@@ -227,7 +243,40 @@ impl SceneRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
+        });
+        // Objects without a texture sample a white pixel.
+        let white = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("white"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        rs.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &white, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &[255; 4],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let white = white.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("object texture"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -374,6 +423,8 @@ impl SceneRenderer {
             cache: None,
         });
 
+        let image_planes = ImagePlanesGpu::new(device, &globals_bgl, COLOR_FORMAT, DEPTH_FORMAT, SAMPLE_COUNT);
+
         Self {
             globals_buf,
             globals_bg,
@@ -385,9 +436,18 @@ impl SceneRenderer {
             background_pipeline,
             lines_buf: None,
             overlay_tris_buf: None,
+            image_planes,
+            white,
+            sampler,
             target: None,
             egui_renderer: rs.renderer.clone(),
         }
+    }
+
+    /// Image slices to draw among the meshes in the next [`Self::render`] only (set them
+    /// before every frame that shows them, like [`FrameInput`]).
+    pub fn set_image_planes(&mut self, planes: Option<PlanesFrame>) {
+        self.image_planes.set(planes);
     }
 
     /// Create an empty GPU mesh; call [`Self::sync_mesh`] to fill it.
@@ -399,7 +459,7 @@ impl SceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = self.make_object_bg(device, &uniform_buf, &flags_buf);
+        let bind_group = self.make_object_bg(device, &uniform_buf, &flags_buf, &self.white);
         GpuMesh {
             vertex_buf,
             flags_buf,
@@ -417,6 +477,7 @@ impl SceneRenderer {
             colors_key: None,
             uv_key: None,
             soup_index: Vec::new(),
+            texture: None,
         }
     }
 
@@ -436,15 +497,47 @@ impl SceneRenderer {
         (vb, fb)
     }
 
-    fn make_object_bg(&self, device: &wgpu::Device, ub: &wgpu::Buffer, fb: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn make_object_bg(&self, device: &wgpu::Device, ub: &wgpu::Buffer, fb: &wgpu::Buffer, texture: &wgpu::TextureView) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("object"),
             layout: &self.object_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: fb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(texture) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         })
+    }
+
+    /// Upload `texture` for `gpu` when it changed (or drop it), rebuilding its bind group.
+    fn sync_texture(&self, device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuMesh, texture: Option<TextureData>) {
+        if gpu.texture.as_ref().map(|t| t.0) == texture.map(|t| t.0) {
+            return;
+        }
+        gpu.texture = texture.filter(|t| t.1 > 0 && t.2 > 0 && t.3.len() >= (t.1 * t.2 * 4) as usize).map(|(stamp, w, h, rgba)| {
+            let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("object texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &rgba[..(w * h * 4) as usize],
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                size,
+            );
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (stamp, tex, view)
+        });
+        let view = gpu.texture.as_ref().map_or(&self.white, |t| &t.2);
+        gpu.bind_group = self.make_object_bg(device, &gpu.uniform_buf, &gpu.flags_buf, view);
     }
 
     /// Upload mesh geometry and per-triangle flags if they changed.
@@ -462,12 +555,15 @@ impl SceneRenderer {
         moved: (&mut Vec<u32>, u64),
         scalars: ScalarField,
         uvs: Option<(u64, &[[[f32; 2]; 3]])>,
+        texture: Option<TextureData>,
     ) {
+        let texture = texture.filter(|_| style.texture_mode != 0 && uvs.is_some());
+        self.sync_texture(device, queue, gpu, texture);
         let (moved_vertices, moved_from) = moved;
         let groups_key = style.group_normals.then_some(mesh.group_version());
         let show_colors = style.vertex_colors && mesh.has_vertex_colors();
         let colors_key = show_colors.then_some(mesh.color_version());
-        let uvs = uvs.filter(|_| style.uv_checker);
+        let uvs = uvs.filter(|_| style.uv_checker || style.texture_mode != 0);
         let uv_key = uvs.map(|u| u.0);
         let uv_slice = uvs.map(|u| u.1);
         let geometry_changed = gpu.shape_version != mesh.shape_version()
@@ -523,7 +619,8 @@ impl SceneRenderer {
                 gpu.vertex_buf = vb;
                 gpu.flags_buf = fb;
                 gpu.capacity_tris = cap;
-                gpu.bind_group = self.make_object_bg(device, &gpu.uniform_buf, &gpu.flags_buf);
+                let view = gpu.texture.as_ref().map_or(&self.white, |t| &t.2);
+                gpu.bind_group = self.make_object_bg(device, &gpu.uniform_buf, &gpu.flags_buf, view);
             }
             if !verts.is_empty() {
                 queue.write_buffer(&gpu.vertex_buf, 0, bytemuck::cast_slice(&verts));
@@ -572,11 +669,12 @@ impl SceneRenderer {
                     Some((_, TriField::Scalar(_))) => 2,
                     Some((_, TriField::Rgb(_))) => 3,
                     None if style.group_colors => 1,
-                    None if uv_key.is_some() => 5,
+                    None if uv_key.is_some() && gpu.texture.is_some() => 5 + style.texture_mode.min(2) as u32,
+                    None if uv_key.is_some() && style.uv_checker => 5,
                     None if show_colors => 4,
                     None => 0,
                 },
-                style.dim as u32 | ((style.cut_tint as u32) << 1),
+                style.dim as u32 | ((style.cut_tint as u32) << 1) | ((style.xray as u32) << 2),
             ],
             material: style.material.uniform().0,
             material2: style.material.uniform().1,
@@ -705,6 +803,7 @@ impl SceneRenderer {
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&frame.globals));
         Self::upload_dynamic(device, queue, &mut self.lines_buf, frame.lines);
         Self::upload_dynamic(device, queue, &mut self.overlay_tris_buf, frame.overlay_tris);
+        self.image_planes.prepare(device, queue, &frame.globals);
 
         let target = self.target.as_ref().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene") });
@@ -739,6 +838,7 @@ impl SceneRenderer {
                 pass.set_vertex_buffer(0, m.vertex_buf.slice(..));
                 pass.draw(0..m.tri_count * 3, 0..1);
             }
+            self.image_planes.draw(&mut pass, false);
             if let Some((buf, _)) = &self.lines_buf {
                 if !frame.lines.is_empty() {
                     pass.set_pipeline(&self.line_pipeline);
@@ -746,6 +846,7 @@ impl SceneRenderer {
                     pass.draw(0..frame.lines.len() as u32, 0..1);
                 }
             }
+            self.image_planes.draw(&mut pass, true);
             pass.set_pipeline(&self.mesh_pipeline_transparent);
             for (m, transparent) in &frame.objects {
                 if !*transparent || m.tri_count == 0 {

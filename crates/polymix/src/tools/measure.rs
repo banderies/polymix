@@ -312,6 +312,9 @@ impl MeasureTool {
         let Some(o) = cx.scene.get_mut(id) else { return };
         let c = o.bounds().center();
         o.mesh_mut().transform(|p| c + (p - c) * s);
+        for p in &mut o.pivots {
+            p.position = c + (p.position - c) * s;
+        }
         for m in self.items.iter_mut().filter(|m| m.object == id) {
             m.a = c + (m.a - c) * s;
             m.b = c + (m.b - c) * s;

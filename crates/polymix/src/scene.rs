@@ -49,7 +49,55 @@ pub struct SceneObject {
     pub uvs: Option<Arc<UvSet>>,
     /// Pivots attached to the object (Create Pivot).
     pub pivots: Vec<Pivot>,
+    /// An image mapped onto the object through its UVs (View → Color → Texture).
+    pub texture: Option<Arc<TextureImage>>,
+    /// A reference (File → Import reference…): drawn see-through as a guide, not picked in the
+    /// view nor exported with the visible objects, until made editable.
+    pub reference: bool,
     bvh: Option<Arc<Bvh>>,
+}
+
+/// An RGBA image for an object's texture.
+pub struct TextureImage {
+    pub width: u32,
+    pub height: u32,
+    /// Rows from the top, 4 bytes per pixel.
+    pub rgba: Vec<u8>,
+    /// Unique per image (GPU cache key).
+    pub stamp: u64,
+    /// The file it came from.
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl TextureImage {
+    /// Read an image file (PNG, JPEG, BMP, TGA).
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let mut img = image::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?.to_rgba8();
+        // GPUs take textures of 8192 pixels a side at least; keep well within that.
+        let (w, h) = img.dimensions();
+        if w.max(h) > 4096 {
+            let f = 4096.0 / w.max(h) as f64;
+            img = image::imageops::resize(&img, ((w as f64 * f) as u32).max(1), ((h as f64 * f) as u32).max(1), image::imageops::FilterType::Triangle);
+        }
+        let (width, height) = img.dimensions();
+        Ok(Self { width, height, rgba: img.into_raw(), stamp: next_stamp(), path: Some(path.to_path_buf()) })
+    }
+
+    /// The colour (0–1, as stored) at texture coordinates `uv` (repeating; v up), bilinear.
+    pub fn sample(&self, uv: [f32; 2]) -> [f32; 3] {
+        let (w, h) = (self.width.max(1) as usize, self.height.max(1) as usize);
+        let x = uv[0].rem_euclid(1.0) * w as f32 - 0.5;
+        let y = (1.0 - uv[1]).rem_euclid(1.0) * h as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |i: f32, j: f32| {
+            let (i, j) = ((i as i64).rem_euclid(w as i64) as usize, (j as i64).rem_euclid(h as i64) as usize);
+            let k = (j * w + i) * 4;
+            [0, 1, 2].map(|c| self.rgba.get(k + c).copied().unwrap_or(0) as f32 / 255.0)
+        };
+        let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+        [0, 1, 2].map(|k| (a[k] * (1.0 - fx) + b[k] * fx) * (1.0 - fy) + (c[k] * (1.0 - fx) + d[k] * fx) * fy)
+    }
 }
 
 /// A point with a coordinate frame attached to an object.
@@ -57,6 +105,15 @@ pub struct SceneObject {
 pub struct Pivot {
     pub position: glam::DVec3,
     pub frame: glam::DQuat,
+}
+
+/// The frame a tool last worked in (Create Pivot's "From Last Tool"): see
+/// [`Scene::record_tool_frame`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolFrame {
+    /// The tool's name, e.g. "Transform".
+    pub tool: String,
+    pub pivot: Pivot,
 }
 
 /// UVs of each triangle's corners (indexed by triangle id). They belong to one mesh
@@ -94,6 +151,8 @@ impl SceneObject {
             material: 0,
             uvs: None,
             pivots: Vec::new(),
+            reference: false,
+            texture: None,
             bvh: None,
         }
     }
@@ -155,6 +214,8 @@ pub struct Scene {
     /// The target surface (Meshmixer's Set as Target) for Attract / Align To Target and
     /// "Project to Target" options.
     pub target: Option<ObjectId>,
+    /// The frame the last tool that records one worked in (not saved in projects).
+    pub last_tool_frame: Option<ToolFrame>,
 }
 
 /// A target surface ready for nearest-point queries.
@@ -218,6 +279,15 @@ impl Scene {
     }
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
+    }
+
+    /// Remember the frame a tool just worked in, for Create Pivot's "From Last Tool": its
+    /// centre and axes (Transform), where the source frame landed (Align), or a point on its
+    /// plane with z along the normal (Plane Cut, Mirror). Tools call this when they commit.
+    pub fn record_tool_frame(&mut self, tool: &str, position: glam::DVec3, frame: glam::DQuat) {
+        if position.is_finite() && frame.is_finite() {
+            self.last_tool_frame = Some(ToolFrame { tool: tool.to_string(), pivot: Pivot { position, frame: frame.normalize() } });
+        }
     }
 }
 
@@ -338,6 +408,7 @@ impl Scene {
     /// visibility, patch names) when switching to an undo/redo snapshot.
     fn carry_metadata(&mut self, from: &Scene) {
         self.target = from.target.filter(|&t| self.get(t).is_some());
+        self.last_tool_frame = from.last_tool_frame.clone();
         for o in &mut self.objects {
             if let Some(src) = from.get(o.id) {
                 o.name = src.name.clone();

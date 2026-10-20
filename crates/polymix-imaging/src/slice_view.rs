@@ -1,33 +1,48 @@
 //! One plane of a volume, for the three-plane views: the slice through the cursor in the
 //! radiological convention, with the shared mouse controls ([`Nav`]), the other two planes
 //! as crosshair lines in their colours, the patient directions at the edges, and labels drawn
-//! over the image.
+//! over the image; in a colour map, as a thick slab, and with a second image over it
+//! ([`crate::layers`]).
 //!
 //! Voxel coordinates are continuous, in the convention of the volume's affine: voxel
 //! (i, j, k) is centred on (i, j, k) and covers ±0.5 around it, so rounding gives the voxel
 //! and `geometry.world(cursor)` gives its position in the patient.
 
 use crate::histogram;
+use crate::layers::{ColourMap, Compare, Fusion, Slab, SlabMode};
 use crate::nav::{drag_window, Nav};
+use crate::oblique::{direction_letter, rotated, standard_frame, Frame, ObliqueGrid};
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use glam::DVec3;
 use mm_volume::load::LoadedVolume;
 use mm_volume::slice::{plane_axes, Plane, PlaneAxes};
 
-/// What the three views (and the 3D view) share: the voxel they go through and the window.
+/// The three planes in the order the image tabs show them.
+pub const PLANES: [Plane; 3] = [Plane::Axial, Plane::Sagittal, Plane::Coronal];
+
+/// What the three views (and the 3D view) share: the voxel they go through, the window and
+/// how values are shown.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewState {
     /// Voxel coordinates (i, j, k).
     pub cursor: DVec3,
     /// Window (centre, width).
     pub window: (f64, f64),
+    pub colour_map: ColourMap,
+    /// Thick slabs in the slice views.
+    pub slab: Slab,
+    /// A second image on the same grid, over this one or compared with it.
+    pub fusion: Option<Fusion>,
+    /// Oblique planes (axial, sagittal, coronal views' frames in RAS); `None`: the views
+    /// follow the voxel grid.
+    pub frames: Option<[Frame; 3]>,
 }
 
 impl ViewState {
     /// The middle voxel of the volume, with the automatic window.
     pub fn new(vol: &LoadedVolume) -> Self {
         let mid = |a: usize| (vol.dims[a].saturating_sub(1) / 2) as f64;
-        Self { cursor: DVec3::new(mid(0), mid(1), mid(2)), window: vol.auto_window }
+        Self { cursor: DVec3::new(mid(0), mid(1), mid(2)), window: vol.auto_window, colour_map: ColourMap::Grey, slab: Slab::default(), fusion: None, frames: None }
     }
 }
 
@@ -76,6 +91,90 @@ pub struct SliceResponse {
     pub brush_wheel: f32,
     /// Double-clicked (the layout around the view decides what that does).
     pub double_clicked: bool,
+    /// Where voxels of the slice shown were drawn this frame (to draw over the view).
+    pub map: ViewMap,
+}
+
+/// Where a slice view drew its slice: screen positions of voxel coordinates on it, and back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewMap {
+    pub plane: Plane,
+    /// The voxel axes across, down and through the slice, and whether across / down run
+    /// against the screen's.
+    pub axes: PlaneAxes,
+    /// The slice shown (along `axes.slice`), and the voxel step along that axis towards the
+    /// patient's superior, anterior or right (±1: the slice's normal).
+    pub slice: usize,
+    pub step: i64,
+    /// The view, and the image within it.
+    pub rect: Rect,
+    pub image: Rect,
+    size: [usize; 2],
+    /// An oblique plane (the view does not follow the voxel grid: `axes`, `slice` and
+    /// `screen` / `voxel` do not apply; use `project` / `voxel_at`).
+    pub oblique: Option<ObliqueGrid>,
+}
+
+impl ViewMap {
+    /// Screen position of voxel coordinates (across, down) on the slice.
+    pub fn screen(&self, across: f64, down: f64) -> Pos2 {
+        let u = if self.axes.flip_across { self.size[0] as f64 - (across + 0.5) } else { across + 0.5 };
+        let v = if self.axes.flip_down { self.size[1] as f64 - (down + 0.5) } else { down + 0.5 };
+        Pos2::new(self.image.min.x + (u / self.size[0] as f64) as f32 * self.image.width(), self.image.min.y + (v / self.size[1] as f64) as f32 * self.image.height())
+    }
+
+    /// Voxel coordinates (across, down) on the slice at a screen position (anywhere, not
+    /// only over the image).
+    pub fn voxel(&self, p: Pos2) -> (f64, f64) {
+        let u = (p.x - self.image.min.x) as f64 / self.image.width() as f64 * self.size[0] as f64;
+        let v = (p.y - self.image.min.y) as f64 / self.image.height() as f64 * self.size[1] as f64;
+        let a = if self.axes.flip_across { self.size[0] as f64 - u } else { u };
+        let d = if self.axes.flip_down { self.size[1] as f64 - v } else { v };
+        (a - 0.5, d - 0.5)
+    }
+
+    /// Screen points per millimetre (across).
+    pub fn points_per_mm(&self, spacing: [f64; 3]) -> f32 {
+        match &self.oblique {
+            Some(g) => self.image.width() / (self.size[0] as f64 * g.px) as f32,
+            None => self.image.width() / (self.size[0] as f64 * spacing[self.axes.across]) as f32,
+        }
+    }
+
+    /// Screen position of voxel coordinates `v`, and how far `v` lies from the plane shown
+    /// (in slices: voxels along the grid, or pixels of an oblique plane).
+    pub fn project(&self, v: DVec3) -> (Pos2, f64) {
+        match &self.oblique {
+            Some(g) => {
+                let (u, w, d) = g.pixel(g.to_world.transform_point3(v));
+                (Pos2::new(self.image.min.x + (u / self.size[0] as f64) as f32 * self.image.width(), self.image.min.y + (w / self.size[1] as f64) as f32 * self.image.height()), d)
+            }
+            None => (self.screen(v[self.axes.across], v[self.axes.down]), v[self.axes.slice] - self.slice as f64),
+        }
+    }
+
+    /// Voxel coordinates of the point of the plane shown at a screen position.
+    pub fn voxel_at(&self, p: Pos2) -> DVec3 {
+        let u = (p.x - self.image.min.x) as f64 / self.image.width() as f64 * self.size[0] as f64;
+        let v = (p.y - self.image.min.y) as f64 / self.image.height() as f64 * self.size[1] as f64;
+        match &self.oblique {
+            Some(g) => g.to_voxel.transform_point3(g.world(u, v)),
+            None => {
+                let (a, d) = self.voxel(p);
+                let mut c = [0.0; 3];
+                c[self.axes.across] = a;
+                c[self.axes.down] = d;
+                c[self.axes.slice] = self.slice as f64;
+                DVec3::from(c)
+            }
+        }
+    }
+
+    /// Over the image (not the view's margins).
+    fn on_image(&self, p: Pos2) -> bool {
+        let (u, v) = ((p.x - self.image.min.x) / self.image.width(), (p.y - self.image.min.y) / self.image.height());
+        (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v)
+    }
 }
 
 /// View colours as in 3D Slicer: red axial, yellow sagittal, green coronal.
@@ -137,6 +236,7 @@ impl Grid {
 
     /// Voxel coordinates across and down at image position (`u`, `v`) in pixels from the
     /// top left.
+    #[cfg(test)]
     fn voxel_at(&self, u: f64, v: f64) -> (f64, f64) {
         let a = if self.axes.flip_across { self.size[0] as f64 - u } else { u };
         let d = if self.axes.flip_down { self.size[1] as f64 - v } else { v };
@@ -151,6 +251,32 @@ impl Grid {
     /// Image position (pixels from the top) of voxel coordinate `d` down.
     fn v_of(&self, d: f64) -> f64 {
         if self.axes.flip_down { self.size[1] as f64 - (d + 0.5) } else { d + 0.5 }
+    }
+
+    /// Slice `s` of volume-ordered values, or the slab of `half` slices on each side of it
+    /// combined as `mode`, row by row from the top left.
+    fn extract_slab(&self, values: &[f32], dims: [usize; 3], s: usize, half: usize, mode: SlabMode) -> Vec<f32> {
+        let mut out = self.extract(values, dims, s);
+        if half == 0 || mode == SlabMode::Off {
+            return out;
+        }
+        let n = dims[self.axes.slice];
+        let (from, to) = (s.saturating_sub(half), (s + half).min(n - 1));
+        for k in (from..=to).filter(|&k| k != s) {
+            let other = self.extract(values, dims, k);
+            for (o, &x) in out.iter_mut().zip(&other) {
+                *o = match mode {
+                    SlabMode::Max => o.max(x),
+                    SlabMode::Min => o.min(x),
+                    _ => *o + x,
+                };
+            }
+        }
+        if mode == SlabMode::Mean {
+            let count = (to - from + 1) as f32;
+            out.iter_mut().for_each(|o| *o /= count);
+        }
+        out
     }
 
     /// Values of slice `s` of a volume-ordered array, row by row from the top left.
@@ -172,6 +298,7 @@ impl Grid {
     }
 
     /// A full voxel position from coordinates across and down on slice `s`.
+    #[cfg(test)]
     fn voxel(&self, a: f64, d: f64, s: f64) -> DVec3 {
         let mut c = [0.0; 3];
         c[self.axes.across] = a;
@@ -211,34 +338,56 @@ fn volume_id(vol: &LoadedVolume) -> VolumeId {
     (vol.values.as_ptr() as usize, vol.values.len(), vol.dims)
 }
 
-/// What the texture shows.
+/// Which image of a volume a view shows: a slice of the voxel grid, or an oblique plane (its
+/// frame, origin and pixel size, as bits).
 #[derive(Clone, Copy, Debug, PartialEq)]
+enum At {
+    Slice(usize),
+    Oblique([u64; 13]),
+}
+
+fn at_oblique(g: &ObliqueGrid) -> At {
+    let f = g.frame;
+    At::Oblique([f[0].x, f[0].y, f[0].z, f[1].x, f[1].y, f[1].z, f[2].x, f[2].y, f[2].z, g.origin.x, g.origin.y, g.origin.z, g.px].map(f64::to_bits))
+}
+
+/// What the texture shows.
+#[derive(Clone, Debug, PartialEq)]
 struct Shown {
     volume: VolumeId,
-    slice: usize,
+    at: At,
     window: (f64, f64),
     invert: bool,
     smooth: bool,
     /// Labels version and opacity.
     labels: Option<(u64, u32)>,
+    colour_map: ColourMap,
+    slab: Slab,
+    fusion: Option<Fusion>,
 }
+
+/// Which slab of which volume a cached slice holds (and whether it was interpolated).
+type SliceKey = (VolumeId, At, usize, SlabMode, bool);
 
 pub struct SliceView {
     pub plane: Plane,
     pub nav: Nav,
     texture: Option<egui::TextureHandle>,
-    /// Slice values for (volume, slice).
-    values_of: Option<(VolumeId, usize)>,
+    /// Slice values for (volume, slice, slab).
+    values_of: Option<SliceKey>,
     values: Vec<f32>,
+    /// The second image's slice values, for (its values, slice, slab).
+    fusion_of: Option<(usize, At, usize, SlabMode, bool)>,
+    fusion_values: Vec<f32>,
     /// Slice labels for (volume, slice, version).
-    labels_of: Option<(VolumeId, usize, u64)>,
+    labels_of: Option<(VolumeId, At, u64)>,
     labels: Vec<u8>,
     shown: Option<Shown>,
 }
 
 impl SliceView {
     pub fn new(plane: Plane) -> Self {
-        Self { plane, nav: Nav::default(), texture: None, values_of: None, values: Vec::new(), labels_of: None, labels: Vec::new(), shown: None }
+        Self { plane, nav: Nav::default(), texture: None, values_of: None, values: Vec::new(), fusion_of: None, fusion_values: Vec::new(), labels_of: None, labels: Vec::new(), shown: None }
     }
 
     /// Show the plane through `state.cursor` in the space left in `ui`, and apply the mouse
@@ -253,86 +402,170 @@ impl SliceView {
         let tool_drag = !opts.left_drag_scrolls && primary && !secondary && response.is_pointer_button_down_on();
         let brush_wheel = if opts.brush_mm.is_some() && response.hovered() && ui.input(|i| i.modifiers.shift) { take_wheel(ui.ctx()) } else { 0.0 };
         let ev = self.nav.handle(ui, &response);
-        let img = self.nav.image_rect(rect, grid.content());
-        // Pointer → voxel coordinates across and down (over the image only).
-        let on_image = |p: Pos2| -> Option<(f64, f64)> {
-            let u = (p.x - img.min.x) as f64 / img.width() as f64 * grid.size[0] as f64;
-            let v = (p.y - img.min.y) as f64 / img.height() as f64 * grid.size[1] as f64;
-            ((0.0..grid.size[0] as f64).contains(&u) && (0.0..grid.size[1] as f64).contains(&v)).then(|| grid.voxel_at(u, v))
-        };
+        let index = crate::PLANES.iter().position(|p| *p == self.plane).unwrap_or(0);
 
-        // Slices (a tool's left drag does not scroll).
+        // Slices (a tool's left drag does not scroll): along the grid, or along an oblique
+        // plane's normal a pixel at a time.
         if ev.slices != 0 && !tool_drag {
-            let k = nearest(state.cursor[axes.slice], n) as i64 + ev.slices as i64 * grid.step;
-            state.cursor[axes.slice] = k.clamp(0, n as i64 - 1) as f64;
+            match state.frames {
+                Some(f) => {
+                    let g = ObliqueGrid::new(vol, f[index], state.cursor);
+                    let w = g.to_world.transform_point3(state.cursor) + f[index][2] * (g.px * ev.slices as f64);
+                    let v = g.to_voxel.transform_point3(w);
+                    state.cursor = DVec3::from([0, 1, 2].map(|a| v[a].clamp(0.0, vol.dims[a] as f64 - 1.0)));
+                }
+                None => {
+                    let k = nearest(state.cursor[axes.slice], n) as i64 + ev.slices as i64 * grid.step;
+                    state.cursor[axes.slice] = k.clamp(0, n as i64 - 1) as f64;
+                }
+            }
         }
         if let Some(d) = ev.window {
             state.window = drag_window(state.window, d);
         }
         let slice = nearest(state.cursor[axes.slice], n);
-        let at = |(a, d): (f64, f64)| grid.voxel(a, d, slice as f64);
-        let clicked_voxel = ev.clicked.and_then(on_image).map(at);
+        let oblique = state.frames.map(|f| ObliqueGrid::new(vol, f[index], state.cursor));
+        let (size, content) = match &oblique {
+            Some(g) => (g.size, Vec2::new((g.size[0] as f64 * g.px) as f32, (g.size[1] as f64 * g.px) as f32)),
+            None => (grid.size, grid.content()),
+        };
+        let img = self.nav.image_rect(rect, content);
+        let map = ViewMap { plane: self.plane, axes, slice, step: grid.step, rect, image: img, size, oblique };
+        // ⌥ + left drag turns the other two planes about this one's normal, around the cursor
+        // (the crosshair lines follow the pointer).
+        if let Some((a, b)) = ev.rotate {
+            let c = map.project(state.cursor).0;
+            let turn = (b - c).angle() - (a - c).angle();
+            let mut f = state.frames.unwrap_or(crate::PLANES.map(standard_frame));
+            let axis = f[index][2];
+            for (j, frame) in f.iter_mut().enumerate().filter(|(j, _)| *j != index) {
+                let _ = j;
+                *frame = rotated(*frame, axis, turn as f64);
+            }
+            state.frames = Some(f);
+        }
+        // Pointer → voxel coordinates (over the image only).
+        let at = |p: Pos2| map.on_image(p).then(|| map.voxel_at(p));
+        let clicked_voxel = ev.clicked.and_then(at);
         if let (Some(c), true) = (clicked_voxel, opts.left_drag_scrolls) {
             state.cursor = c;
         }
-        let hover_voxel = ev.hover.and_then(on_image).map(at);
-        let left_drag_voxel = if tool_drag { response.interact_pointer_pos().and_then(on_image).map(at) } else { None };
+        let hover_voxel = ev.hover.and_then(at);
+        let left_drag_voxel = if tool_drag { response.interact_pointer_pos().and_then(at) } else { None };
 
-        self.update_texture(ui.ctx(), vol, &grid, slice, state.window, overlay, opts.smooth);
-        self.paint(ui, rect, img, vol, &grid, state, opts, ev.hover);
+        self.update_texture(ui.ctx(), vol, &grid, &map, state, overlay, opts.smooth);
+        self.paint(ui, &map, vol, &grid, state, opts, ev.hover);
         // Above the slice position in the bottom left corner.
         let key = (volume_id(vol), vol.range.0.to_bits(), vol.range.1.to_bits());
         histogram::show(ui, response.id, rect, rect.bottom() - 24.0, key, &vol.values, state.window, vol.invert, self.nav.windowing());
-        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel, double_clicked: ev.double_clicked }
+        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel, double_clicked: ev.double_clicked, map }
     }
 
     /// Re-make the texture when what it shows has changed.
     #[allow(clippy::too_many_arguments)]
-    fn update_texture(&mut self, ctx: &egui::Context, vol: &LoadedVolume, grid: &Grid, slice: usize, window: (f64, f64), overlay: Option<&LabelOverlay>, smooth: bool) {
+    fn update_texture(&mut self, ctx: &egui::Context, vol: &LoadedVolume, grid: &Grid, map: &ViewMap, state: &ViewState, overlay: Option<&LabelOverlay>, smooth: bool) {
         let volume = volume_id(vol);
-        if self.values_of != Some((volume, slice)) {
-            self.values = grid.extract(&vol.values, vol.dims, slice);
-            self.values_of = Some((volume, slice));
+        let window = state.window;
+        let slice = map.slice;
+        let mode = state.slab.mode;
+        // The image's values, the second image's and the labels: a slice (slab) of the grid,
+        // or sampled on the oblique plane.
+        let (at, half, half_mm, interpolated) = match &map.oblique {
+            Some(g) => (at_oblique(g), 0, state.slab.mm * 0.5, smooth),
+            None => (At::Slice(slice), state.slab.half(vol.geometry.spacing[grid.axes.slice]), 0.0, false),
+        };
+        let take = |values: &[f32]| match &map.oblique {
+            Some(g) => g.sample(vol, values, smooth, half_mm, mode),
+            None => grid.extract_slab(values, vol.dims, slice, half, mode),
+        };
+        if self.values_of != Some((volume, at, half, mode, interpolated)) {
+            self.values = take(&vol.values);
+            self.values_of = Some((volume, at, half, mode, interpolated));
+        }
+        let fusion = state.fusion.as_ref().filter(|f| f.values.len() == vol.values.len());
+        if let Some(f) = fusion {
+            let key = (f.values.as_ptr() as usize, at, half, mode, interpolated);
+            if self.fusion_of != Some(key) {
+                self.fusion_values = take(&f.values);
+                self.fusion_of = Some(key);
+            }
         }
         let overlay = overlay.filter(|o| o.labels.len() == vol.values.len());
         if let Some(o) = overlay {
-            if self.labels_of != Some((volume, slice, o.version)) {
-                self.labels = grid.extract(o.labels, vol.dims, slice);
-                self.labels_of = Some((volume, slice, o.version));
+            if self.labels_of != Some((volume, at, o.version)) {
+                self.labels = match &map.oblique {
+                    Some(g) => g.sample_labels(vol, o.labels),
+                    None => grid.extract(o.labels, vol.dims, slice),
+                };
+                self.labels_of = Some((volume, at, o.version));
             }
         }
-        let shown = Shown { volume, slice, window, invert: vol.invert, smooth, labels: overlay.map(|o| (o.version, o.opacity.to_bits())) };
-        if self.shown == Some(shown) && self.texture.is_some() {
+        let shown = Shown { volume, at, window, invert: vol.invert, smooth, labels: overlay.map(|o| (o.version, o.opacity.to_bits())), colour_map: state.colour_map, slab: state.slab, fusion: fusion.cloned() };
+        if self.shown.as_ref() == Some(&shown) && self.texture.is_some() {
             return;
         }
-        let (c, w) = window;
-        let lo = c - w * 0.5;
-        let scale = 255.0 / w.max(f64::MIN_POSITIVE);
-        let grey = |x: f32| {
-            let g = ((x as f64 - lo) * scale).round().clamp(0.0, 255.0) as u8;
-            if vol.invert { 255 - g } else { g }
+        let level = |(c, w): (f64, f64), invert: bool| {
+            let (lo, scale) = (c - w * 0.5, 255.0 / w.max(f64::MIN_POSITIVE));
+            move |x: f32| {
+                let g = ((x as f64 - lo) * scale).round().clamp(0.0, 255.0) as u8;
+                if invert { 255 - g } else { g }
+            }
+        };
+        let (grey, lut) = (level(window, vol.invert), state.colour_map.lut());
+        // The image's colour, with the second image over it as compared.
+        let [w, h] = map.size;
+        let base: Vec<Color32> = match fusion {
+            Some(f) => {
+                let (fgrey, flut) = (level(f.window, false), f.colour_map.lut());
+                let divider = (f.wipe.clamp(0.0, 1.0) * w as f32).round() as usize;
+                self.values
+                    .iter()
+                    .zip(&self.fusion_values)
+                    .enumerate()
+                    .map(|(p, (&x, &y))| {
+                        let (a, b) = (lut[grey(x) as usize], flut[fgrey(y) as usize]);
+                        match f.compare {
+                            Compare::Blend => a.lerp_to_gamma(b, f.opacity.clamp(0.0, 1.0)),
+                            Compare::Wipe => {
+                                if p % w < divider {
+                                    a
+                                } else {
+                                    b
+                                }
+                            }
+                            Compare::Toggle => {
+                                if f.showing {
+                                    b
+                                } else {
+                                    a
+                                }
+                            }
+                        }
+                    })
+                    .collect()
+            }
+            None => self.values.iter().map(|&x| lut[grey(x) as usize]).collect(),
         };
         let pixels: Vec<Color32> = match overlay {
             Some(o) => {
                 // Segments as Slicer draws them: a see-through fill and a solid outline.
                 let fill = o.opacity.clamp(0.0, 1.0);
-                let [w, h] = grid.size;
                 let labels = &self.labels;
                 (0..w * h)
                     .map(|p| {
-                        let (g, l) = (grey(self.values[p]), labels[p]);
-                        let Some(col) = o.colours.get(l as usize).filter(|c| l != 0 && c.a() > 0) else { return Color32::from_gray(g) };
+                        let (g, l) = (base[p], labels[p]);
+                        let Some(col) = o.colours.get(l as usize).filter(|c| l != 0 && c.a() > 0) else { return g };
                         let (x, y) = (p % w, p / w);
                         let edge = x == 0 || y == 0 || x + 1 == w || y + 1 == h || labels[p - 1] != l || labels[p + 1] != l || labels[p - w] != l || labels[p + w] != l;
                         let alpha = if edge { 1.0 } else { fill };
-                        let mix = |c: u8| (g as f32 + (c as f32 - g as f32) * alpha).round() as u8;
-                        Color32::from_rgb(mix(col.r()), mix(col.g()), mix(col.b()))
+                        let mix = |g: u8, c: u8| (g as f32 + (c as f32 - g as f32) * alpha).round() as u8;
+                        Color32::from_rgb(mix(g.r(), col.r()), mix(g.g(), col.g()), mix(g.b(), col.b()))
                     })
                     .collect()
             }
-            None => self.values.iter().map(|&x| Color32::from_gray(grey(x))).collect(),
+            None => base,
         };
-        let image = egui::ColorImage::new(grid.size, pixels);
+        let image = egui::ColorImage::new(map.size, pixels);
         let options = if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST };
         match &mut self.texture {
             Some(t) => t.set(image, options),
@@ -342,51 +575,92 @@ impl SliceView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint(&self, ui: &egui::Ui, rect: Rect, img: Rect, vol: &LoadedVolume, grid: &Grid, state: &ViewState, opts: &SliceOptions, pointer: Option<Pos2>) {
+    fn paint(&self, ui: &egui::Ui, map: &ViewMap, vol: &LoadedVolume, grid: &Grid, state: &ViewState, opts: &SliceOptions, pointer: Option<Pos2>) {
+        let (rect, img) = (map.rect, map.image);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
         if let Some(t) = &self.texture {
             painter.image(t.id(), img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         }
+        // The wipe's divider.
+        if let Some(f) = state.fusion.as_ref().filter(|f| f.compare == Compare::Wipe) {
+            let x = img.min.x + img.width() * ((f.wipe * map.size[0] as f32).round() / map.size[0] as f32);
+            painter.vline(x, img.y_range(), Stroke::new(1.5, Color32::from_rgb(255, 230, 120)));
+        }
         if let (Some(r), Some(p)) = (opts.brush_mm, pointer) {
-            let points_per_mm = img.width() / (grid.size[0] as f64 * grid.mm[0]) as f32;
-            painter.circle_stroke(p, (r * points_per_mm).max(1.5), Stroke::new(1.5, Color32::from_rgb(255, 230, 120)));
+            painter.circle_stroke(p, (r * map.points_per_mm(vol.geometry.spacing)).max(1.5), Stroke::new(1.5, Color32::from_rgb(255, 230, 120)));
         }
         let axes = grid.axes;
         if opts.crosshair {
-            // The other planes, through the voxels they show.
-            for other in Plane::ALL.into_iter().filter(|&p| p != self.plane) {
-                let s = plane_axes(&vol.geometry, other).slice;
-                let colour = plane_colour(other).gamma_multiply(0.7);
-                let k = nearest(state.cursor[s], vol.dims[s]) as f64;
-                if s == axes.across {
-                    let x = img.min.x + (grid.u_of(k) / grid.size[0] as f64) as f32 * img.width();
-                    painter.vline(x, rect.y_range(), Stroke::new(1.0, colour));
-                } else if s == axes.down {
-                    let y = img.min.y + (grid.v_of(k) / grid.size[1] as f64) as f32 * img.height();
-                    painter.hline(rect.x_range(), y, Stroke::new(1.0, colour));
+            match (&map.oblique, &state.frames) {
+                // Where the other planes cut this one: lines through the cursor.
+                (Some(g), Some(frames)) => {
+                    let c = map.project(state.cursor).0;
+                    let reach = rect.width().max(rect.height()) * 2.0;
+                    for (k, other) in crate::PLANES.into_iter().enumerate().filter(|(_, p)| *p != self.plane) {
+                        let d = g.frame[2].cross(frames[k][2]);
+                        let dir = Vec2::new(d.dot(g.frame[0]) as f32, d.dot(g.frame[1]) as f32);
+                        if dir.length() < 1e-6 {
+                            continue;
+                        }
+                        let dir = dir.normalized() * reach;
+                        painter.line_segment([c - dir, c + dir], Stroke::new(1.0, plane_colour(other).gamma_multiply(0.7)));
+                    }
+                }
+                // The other planes, through the voxels they show.
+                _ => {
+                    for other in Plane::ALL.into_iter().filter(|&p| p != self.plane) {
+                        let s = plane_axes(&vol.geometry, other).slice;
+                        let colour = plane_colour(other).gamma_multiply(0.7);
+                        let k = nearest(state.cursor[s], vol.dims[s]) as f64;
+                        if s == axes.across {
+                            let x = img.min.x + (grid.u_of(k) / grid.size[0] as f64) as f32 * img.width();
+                            painter.vline(x, rect.y_range(), Stroke::new(1.0, colour));
+                        } else if s == axes.down {
+                            let y = img.min.y + (grid.v_of(k) / grid.size[1] as f64) as f32 * img.height();
+                            painter.hline(rect.x_range(), y, Stroke::new(1.0, colour));
+                        }
+                    }
                 }
             }
         }
         let font = FontId::proportional(12.0);
         let text = Color32::from_gray(200);
         let pad = 6.0;
-        painter.text(rect.left_top() + Vec2::new(pad + 2.0, pad), Align2::LEFT_TOP, self.plane.label(), FontId::proportional(13.0), plane_colour(self.plane));
+        let title = if map.oblique.is_some() { format!("{} (oblique)", self.plane.label()) } else { self.plane.label().to_string() };
+        painter.text(rect.left_top() + Vec2::new(pad + 2.0, pad), Align2::LEFT_TOP, title, FontId::proportional(13.0), plane_colour(self.plane));
         // Patient directions at the edges.
-        let [left, right, top, bottom] = edge_letters(self.plane);
+        let [left, right, top, bottom] = match &map.oblique {
+            Some(g) => [direction_letter(-g.frame[0]), direction_letter(g.frame[0]), direction_letter(-g.frame[1]), direction_letter(g.frame[1])],
+            None => edge_letters(self.plane),
+        };
         let letters = Color32::from_gray(160);
         painter.text(Pos2::new(rect.left() + pad, rect.center().y), Align2::LEFT_CENTER, left, font.clone(), letters);
         painter.text(Pos2::new(rect.right() - pad, rect.center().y), Align2::RIGHT_CENTER, right, font.clone(), letters);
         painter.text(Pos2::new(rect.center().x, rect.top() + pad), Align2::CENTER_TOP, top, font.clone(), letters);
         painter.text(Pos2::new(rect.center().x, rect.bottom() - pad), Align2::CENTER_BOTTOM, bottom, font.clone(), letters);
         // Slice position (as Slicer shows it) and number, and the window.
-        let n = vol.dims[axes.slice];
-        let slice = nearest(state.cursor[axes.slice], n);
-        let mut voxel = state.cursor;
-        voxel[axes.slice] = slice as f64;
-        let (world_axis, letter) = slice_world_axis(self.plane);
-        let mm = vol.geometry.world(voxel)[world_axis];
-        painter.text(rect.left_bottom() + Vec2::new(pad + 2.0, -pad), Align2::LEFT_BOTTOM, format!("{letter} {mm:.1} mm   {} / {n}", slice + 1), font.clone(), text);
+        let position = match &map.oblique {
+            Some(g) => {
+                let w = vol.geometry.world(state.cursor);
+                let slab = if state.slab.mode == SlabMode::Off { String::new() } else { format!("   {} {:.0} mm", state.slab.mode.label(), state.slab.mm.max(g.px)) };
+                format!("R {:.1}  A {:.1}  S {:.1} mm{slab}", w.x, w.y, w.z)
+            }
+            None => {
+                let n = vol.dims[axes.slice];
+                let slice = nearest(state.cursor[axes.slice], n);
+                let mut voxel = state.cursor;
+                voxel[axes.slice] = slice as f64;
+                let (world_axis, letter) = slice_world_axis(self.plane);
+                let mm = vol.geometry.world(voxel)[world_axis];
+                let slab = match state.slab.mode {
+                    SlabMode::Off => String::new(),
+                    m => format!("   {} {:.0} mm", m.label(), (2 * state.slab.half(vol.geometry.spacing[axes.slice]) + 1) as f64 * vol.geometry.spacing[axes.slice]),
+                };
+                format!("{letter} {mm:.1} mm   {} / {n}{slab}", slice + 1)
+            }
+        };
+        painter.text(rect.left_bottom() + Vec2::new(pad + 2.0, -pad), Align2::LEFT_BOTTOM, position, font.clone(), text);
         let (c, w) = state.window;
         painter.text(rect.right_bottom() + Vec2::new(-pad - 2.0, -pad), Align2::RIGHT_BOTTOM, format!("W {w:.0}  L {c:.0}"), font, text);
     }
@@ -502,5 +776,38 @@ mod tests {
                 assert!(moved[slice_world_axis(plane).0] > 0.0, "{plane:?}");
             }
         }
+    }
+
+    #[test]
+    fn slabs_combine_the_slices_around_the_cursor() {
+        // Axial slices whose values are their slice number (k).
+        let g = Geometry::from_axes([3, 3, 6, 1], [1.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        let vol = LoadedVolume::from_values("t", [3, 3, 6], (0..54).map(|n| (n / 9) as f32).collect(), g);
+        let grid = Grid::new(&vol, Plane::Axial);
+        assert!(grid.extract_slab(&vol.values, vol.dims, 2, 0, SlabMode::Max).iter().all(|&v| v == 2.0));
+        assert!(grid.extract_slab(&vol.values, vol.dims, 2, 1, SlabMode::Max).iter().all(|&v| v == 3.0));
+        assert!(grid.extract_slab(&vol.values, vol.dims, 2, 1, SlabMode::Min).iter().all(|&v| v == 1.0));
+        assert!(grid.extract_slab(&vol.values, vol.dims, 2, 1, SlabMode::Mean).iter().all(|&v| v == 2.0));
+        // At the edge the slab is cut short.
+        assert!(grid.extract_slab(&vol.values, vol.dims, 5, 2, SlabMode::Mean).iter().all(|&v| v == 4.0));
+    }
+
+    #[test]
+    fn oblique_maps_round_trip() {
+        let g = Geometry::from_axes([20, 20, 20, 1], [1.0, 1.0, 2.0], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::new(-10.0, -10.0, -20.0));
+        let vol = LoadedVolume::from_values("t", [20, 20, 20], vec![0.0; 8000], g);
+        let frame = crate::oblique::rotated(crate::oblique::standard_frame(Plane::Coronal), DVec3::new(1.0, 1.0, 0.0).normalize(), 0.4);
+        let cursor = DVec3::new(7.0, 9.0, 11.0);
+        let ob = ObliqueGrid::new(&vol, frame, cursor);
+        let grid = Grid::new(&vol, Plane::Coronal);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 300.0));
+        let map = ViewMap { plane: Plane::Coronal, axes: grid.axes, slice: 0, step: 1, rect, image: rect, size: ob.size, oblique: Some(ob) };
+        // The cursor lies on the plane; a screen point maps to a voxel on it and back.
+        let (p, d) = map.project(cursor);
+        assert!(d.abs() < 1e-9);
+        assert!((map.voxel_at(p) - cursor).length() < 1e-3, "through screen points (f32)");
+        let q = Pos2::new(120.0, 80.0);
+        let (back, d) = map.project(map.voxel_at(q));
+        assert!(back.distance(q) < 1e-3 && d.abs() < 1e-6);
     }
 }

@@ -13,6 +13,7 @@ mod perf;
 mod soft_tests;
 mod stent_tests;
 mod target_tests;
+mod thicken_tests;
 
 use mm_core::topology::{boundary_loops, connected_components};
 use mm_core::{measure, primitives, DVec3, Mesh};

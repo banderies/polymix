@@ -21,8 +21,8 @@ struct Globals {
 struct Object {
     color: vec4<f32>,
     // x: wireframe, y: flat shading, z: color mode (0 object, 1 face groups, 2 scalar field,
-    // 3 per-triangle RGB, 4 vertex colours),
-    // w: bit 0 dim (non-active object), bit 1 show cut-plane tint
+    // 3 per-triangle RGB, 4 vertex colours, 5 UV checker, 6 texture, 7 texture unlit),
+    // w: bit 0 dim (non-active object), bit 1 show cut-plane tint, bit 2 X-ray
     flags: vec4<u32>,
     // Material: x specular, y shininess, z rim, w metal; material2.x wrap.
     material: vec4<f32>,
@@ -32,6 +32,8 @@ struct Object {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var<uniform> object: Object;
 @group(1) @binding(1) var<storage, read> tri_flags: array<u32>;
+@group(1) @binding(2) var tex: texture_2d<f32>;
+@group(1) @binding(3) var tex_sampler: sampler;
 
 struct VsIn {
     @builtin(vertex_index) vid: u32,
@@ -90,6 +92,9 @@ fn hash_color(g: u32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    // Sampled first, in uniform control flow (images have their first row at the top; UVs
+    // start at the bottom).
+    let texel = textureSample(tex, tex_sampler, vec2<f32>(in.uv.x, 1.0 - in.uv.y));
     var n: vec3<f32>;
     if (object.flags.y != 0u) {
         // Screen-space derivative normal; framebuffer y points down, so negate to face the viewer.
@@ -121,6 +126,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         let odd = (i32(c.x) + i32(c.y)) & 1;
         let tint = vec3<f32>(0.55 + 0.4 * fract(in.uv.x), 0.6, 0.55 + 0.4 * fract(in.uv.y));
         base = select(tint, tint * 0.45, odd == 1);
+    } else if (object.flags.z == 6u || object.flags.z == 7u) {
+        base = texel.rgb;
     }
     if (!front) {
         // Back faces (holes, flipped normals) show as a muted blue-grey.
@@ -130,6 +137,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         // Selection shows on both sides (a deeper orange on the back, e.g. inside a vessel
         // selected with Allow Back Faces).
         base = select(vec3<f32>(0.78, 0.3, 0.05), vec3<f32>(1.0, 0.45, 0.08), front);
+    }
+
+    // Texture unlit: its colours as they are (the selection still shows).
+    if (object.flags.z == 7u && front && !selected) {
+        return vec4<f32>(base, object.color.a);
     }
 
     // Clay-style lighting in view space, shaped by the material.
@@ -192,6 +204,12 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
 
     if ((object.flags.w & 1u) != 0u) {
         col = mix(col, vec3<f32>(0.5), 0.35);
+    }
+    // X-ray: see-through, the parts seen edge-on (outlines, walls of a vessel) most opaque.
+    if ((object.flags.w & 4u) != 0u) {
+        let facing = abs(dot(nv, vv));
+        let a = 0.06 + 0.7 * pow(1.0 - facing, 2.0);
+        return vec4<f32>(mix(col, vec3<f32>(0.75, 0.88, 1.0), 0.45), a * object.color.a);
     }
     return vec4<f32>(col, object.color.a);
 }

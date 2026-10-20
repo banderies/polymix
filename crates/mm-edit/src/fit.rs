@@ -58,6 +58,36 @@ pub struct FitResult {
     pub mesh: Mesh,
     /// Human-readable fitted dimensions (e.g. "cylinder r 1.52, length 12.3").
     pub description: String,
+    /// Where it sits, for adjusting it (none for a convex hull or height field).
+    pub frame: Option<PrimitiveFrame>,
+}
+
+/// A primitive's centre, its axes (unit; the third its normal or axis) and half its size
+/// along each (0 where it is flat).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrimitiveFrame {
+    pub centre: DVec3,
+    pub axes: [DVec3; 3],
+    pub half: DVec3,
+}
+
+impl PrimitiveFrame {
+    /// Move the primitive by `offset` (along its axes), scale it by `scale` along them and
+    /// turn it by `turn` (radians) about its third axis: `mesh` follows, and the new frame is
+    /// returned.
+    pub fn adjust(&self, mesh: &mut Mesh, offset: DVec3, scale: DVec3, turn: f64) -> PrimitiveFrame {
+        let [u, v, n] = self.axes;
+        let (s, c) = turn.sin_cos();
+        let (u2, v2) = (u * c + v * s, v * c - u * s);
+        let centre = self.centre + u * offset.x + v * offset.y + n * offset.z;
+        let scale = scale.max(DVec3::splat(1e-6));
+        let o = self.centre;
+        mesh.transform(|p| {
+            let d = p - o;
+            centre + u2 * (d.dot(u) * scale.x) + v2 * (d.dot(v) * scale.y) + n * (d.dot(n) * scale.z)
+        });
+        PrimitiveFrame { centre, axes: [u2, v2, n], half: self.half * scale }
+    }
 }
 
 /// Points of a region with area weights and normals.
@@ -441,7 +471,8 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
             }
             let grid = primitives::plane_grid(size.x, size.y, n, n);
             let centre = c + u * mid.x + v * mid.y;
-            FitResult { mesh: place(grid, centre, u, v, nrm), description: format!("{} {:.4} × {:.4}", kind.label().to_lowercase(), size.x, size.y) }
+            let frame = PrimitiveFrame { centre, axes: [u, v, nrm], half: DVec3::new(size.x * 0.5, size.y * 0.5, 0.0) };
+            FitResult { mesh: place(grid, centre, u, v, nrm), description: format!("{} {:.4} × {:.4}", kind.label().to_lowercase(), size.x, size.y), frame: Some(frame) }
         }
         PrimitiveType::DiscFromPlane => {
             let (c, nrm, u, v) = plane_frame(&r);
@@ -449,14 +480,16 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
             let (cc, _) = fit_circle(&p2);
             let radius = p2.iter().map(|p| p.distance(cc)).fold(0.0, f64::max);
             let centre = c + u * cc.x + v * cc.y;
-            FitResult { mesh: place(disc(radius, 4 * n, n / 2), centre, u, v, nrm), description: format!("disc r {radius:.4}") }
+            let frame = PrimitiveFrame { centre, axes: [u, v, nrm], half: DVec3::new(radius, radius, 0.0) };
+            FitResult { mesh: place(disc(radius, 4 * n, n / 2), centre, u, v, nrm), description: format!("disc r {radius:.4}"), frame: Some(frame) }
         }
         PrimitiveType::SphereFromPlane => {
             let (c, nrm, u, v) = plane_frame(&r);
             let (cc, radius) = fit_circle(&project(&r, c, u, v));
             let centre = c + u * cc.x + v * cc.y;
             let s = primitives::uv_sphere(radius, 2 * n, n);
-            FitResult { mesh: place(s, centre, u, v, nrm), description: format!("sphere r {radius:.4}") }
+            let frame = PrimitiveFrame { centre, axes: [u, v, nrm], half: DVec3::splat(radius) };
+            FitResult { mesh: place(s, centre, u, v, nrm), description: format!("sphere r {radius:.4}"), frame: Some(frame) }
         }
         PrimitiveType::SphereBestFit => {
             let (centre, radius) = fit_sphere(&r.pts);
@@ -465,13 +498,15 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
             }
             let mut s = primitives::uv_sphere(radius, 2 * n, n);
             s.transform(|p| p + centre);
-            FitResult { mesh: s, description: format!("sphere r {radius:.4}") }
+            let frame = PrimitiveFrame { centre, axes: [DVec3::X, DVec3::Y, DVec3::Z], half: DVec3::splat(radius) };
+            FitResult { mesh: s, description: format!("sphere r {radius:.4}"), frame: Some(frame) }
         }
         PrimitiveType::Cylinder => {
             let f = cylinder_of(&r).ok_or_else(|| EditError::Failed("no cylinder fits the selection".into()))?;
             let (u, v) = mm_core::geom::orthonormal_basis(f.axis);
             let cyl = primitives::cylinder(f.radius, f.length, 2 * n, (n / 4).max(1), true);
-            FitResult { mesh: place(cyl, f.base, u, v, f.axis), description: format!("cylinder r {:.4}, length {:.4}", f.radius, f.length) }
+            let frame = PrimitiveFrame { centre: f.base + f.axis * (f.length * 0.5), axes: [u, v, f.axis], half: DVec3::new(f.radius, f.radius, f.length * 0.5) };
+            FitResult { mesh: place(cyl, f.base, u, v, f.axis), description: format!("cylinder r {:.4}, length {:.4}", f.radius, f.length), frame: Some(frame) }
         }
         PrimitiveType::LinearSweep => {
             let c = r.centroid();
@@ -485,12 +520,15 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
             }
             let along: Vec<f64> = r.pts.iter().map(|&p| (p - c).dot(axis)).collect();
             let (z0, z1) = along.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &z| (lo.min(z), hi.max(z)));
-            FitResult { mesh: place(prism(&ring, (z1 - z0).max(1e-9)), c + axis * z0, u, v, axis), description: format!("sweep length {:.4}", z1 - z0) }
+            let (lo, hi) = bounds2(&ring);
+            let mid = (lo + hi) * 0.5;
+            let frame = PrimitiveFrame { centre: c + u * mid.x + v * mid.y + axis * ((z0 + z1) * 0.5), axes: [u, v, axis], half: DVec3::new((hi.x - lo.x) * 0.5, (hi.y - lo.y) * 0.5, (z1 - z0) * 0.5) };
+            FitResult { mesh: place(prism(&ring, (z1 - z0).max(1e-9)), c + axis * z0, u, v, axis), description: format!("sweep length {:.4}", z1 - z0), frame: Some(frame) }
         }
         PrimitiveType::ConvexHull => {
             let m = convex_hull(&r.pts).ok_or_else(|| EditError::Failed("the selection is flat; no hull".into()))?;
             let d = format!("convex hull, {} triangles", m.triangle_count());
-            FitResult { mesh: m, description: d }
+            FitResult { mesh: m, description: d, frame: None }
         }
         PrimitiveType::HeightField => {
             let (c, nrm, u, v) = plane_frame(&r);
@@ -530,7 +568,7 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
             // Grid triangles are counter-clockwise around +normal only if (u, v, nrm) is
             // right-handed, which plane_frame guarantees.
             m = m.compacted().0;
-            FitResult { mesh: m, description: format!("height field {n} × {n}") }
+            FitResult { mesh: m, description: format!("height field {n} × {n}"), frame: None }
         }
     };
     Ok(res)

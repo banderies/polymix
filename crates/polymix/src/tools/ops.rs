@@ -22,6 +22,35 @@ pub struct OpOutput {
     pub preview: Option<Mesh>,
     /// Markers drawn in the view while previewing (e.g. a loft's End 1 / End 2).
     pub labels: Vec<(DVec3, String)>,
+    /// Frames of what was made, with handles to adjust it (Fit Primitive's gizmo).
+    pub frames: Vec<mm_edit::PrimitiveFrame>,
+}
+
+/// A handle of a result's frame: its centre (moves it) or the end of one of its axes (sizes
+/// it along that axis).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    Move,
+    Size(usize),
+}
+
+/// The handles of a frame and where they are.
+fn frame_handles(f: &mm_edit::PrimitiveFrame) -> Vec<(Handle, DVec3)> {
+    let mut out = vec![(Handle::Move, f.centre)];
+    for k in 0..3 {
+        if f.half[k] > 1e-9 {
+            out.push((Handle::Size(k), f.centre + f.axes[k] * f.half[k]));
+        }
+    }
+    out
+}
+
+/// The source object's texture and the UVs it is mapped with (Make Solid's
+/// Material-to-Vertex colours).
+#[derive(Clone)]
+pub struct SourceLook {
+    pub uvs: Arc<crate::scene::UvSet>,
+    pub texture: Arc<crate::scene::TextureImage>,
 }
 
 /// Context shown to operation panels.
@@ -52,6 +81,10 @@ pub trait OpSpec: Send + 'static {
     fn run_with(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, _target: Option<&TargetSurface>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         Self::run(mesh, selection, p, progress)
     }
+    /// [`OpSpec::run_with`] with the object's texture, for ops that use it.
+    fn run_look(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, target: Option<&TargetSurface>, _look: Option<&SourceLook>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_with(mesh, selection, p, target, progress)
+    }
     /// In-tool hotkeys (Meshmixer: D/F density ±10, T adaptive, G groups). Return true if
     /// the parameters changed.
     fn keys(_p: &mut Self::Params, _i: &egui::InputState) -> bool {
@@ -59,6 +92,20 @@ pub trait OpSpec: Send + 'static {
     }
     /// Test-script settings (`toolcmd:<cmd>`).
     fn script(_p: &mut Self::Params, _cmd: &str) {}
+    /// A click on the object (point and the surface's normal there), for ops that place
+    /// things on it. Return true if the parameters changed.
+    fn click(_p: &mut Self::Params, _at: DVec3, _normal: DVec3) -> bool {
+        false
+    }
+    /// Points to mark in the viewport (with their normals), e.g. what clicks placed.
+    fn marks(_p: &Self::Params) -> Vec<(DVec3, DVec3)> {
+        Vec::new()
+    }
+    /// A handle of result frame `frame` dragged by `by` (world): adjust the parameters.
+    /// Return true if they changed.
+    fn adjust(_p: &mut Self::Params, _frame: &mm_edit::PrimitiveFrame, _handle: Handle, _by: DVec3) -> bool {
+        false
+    }
 }
 
 /// Plain (unmodified) key press.
@@ -83,6 +130,10 @@ pub struct OpTool<S: OpSpec> {
     changed_at: Option<Instant>,
     pending_accept: bool,
     invalid: bool,
+    /// A handle being dragged: the frame, the handle, and the point dragged (world).
+    drag: Option<(usize, Handle, DVec3)>,
+    /// The object's texture, if it has one with UVs.
+    look: Option<SourceLook>,
 }
 
 impl<S: OpSpec> OpTool<S> {
@@ -97,6 +148,7 @@ impl<S: OpSpec> OpTool<S> {
         let bbox_diag = source.bounds().diagonal();
         let info = OpInfo { mesh: &source, selection: selection.as_deref().map(|v| v.as_slice()), avg_edge, bbox_diag, target: target.as_ref() };
         let params = S::defaults(&info);
+        let look = o.uvs.clone().filter(|u| u.topo == source.topology_version()).zip(o.texture.clone()).map(|(uvs, texture)| SourceLook { uvs, texture });
         Self {
             object: o.id,
             source,
@@ -112,6 +164,8 @@ impl<S: OpSpec> OpTool<S> {
             changed_at: if S::LIVE { Some(Instant::now() - Duration::from_secs(1)) } else { None },
             pending_accept: false,
             invalid: false,
+            drag: None,
+            look,
         }
     }
 
@@ -133,6 +187,8 @@ impl<S: OpSpec> OpTool<S> {
             changed_at: None,
             pending_accept: false,
             invalid: true,
+            drag: None,
+            look: None,
         }
     }
 
@@ -144,8 +200,9 @@ impl<S: OpSpec> OpTool<S> {
         let src = self.source.clone();
         let sel = self.selection.clone();
         let target = self.target.clone();
+        let look = self.look.clone();
         let p2 = p.clone();
-        let job = Job::spawn(S::NAME, ctx.clone(), move |progress| S::run_with(&src, sel.as_deref().map(|v| v.as_slice()), &p2, target.as_ref(), progress));
+        let job = Job::spawn(S::NAME, ctx.clone(), move |progress| S::run_look(&src, sel.as_deref().map(|v| v.as_slice()), &p2, target.as_ref(), look.as_ref(), progress));
         self.job = Some((p, job));
         self.error = None;
     }
@@ -220,6 +277,84 @@ impl<S: OpSpec> Tool for OpTool<S> {
     fn script(&mut self, cmd: &str, _cx: &mut ToolCx) {
         S::script(&mut self.params, cmd);
         self.changed_at = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
+        if self.invalid {
+            return;
+        }
+        // Handles of the result's frames: press near one and drag it (in the plane facing the
+        // view through the point grabbed).
+        let frames = self.result.as_ref().map(|(_, o)| o.frames.clone()).unwrap_or_default();
+        if let (true, Some(pos)) = (input.pressed, input.pos) {
+            let near = frames
+                .iter()
+                .enumerate()
+                .flat_map(|(i, f)| frame_handles(f).into_iter().map(move |(h, p)| (i, h, p)))
+                .filter_map(|(i, h, p)| cx.project(p).map(|s| (s.distance(pos), i, h, p)))
+                .filter(|(d, ..)| *d < 12.0)
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            if let Some((_, i, h, p)) = near {
+                self.drag = Some((i, h, p));
+                return;
+            }
+        }
+        if let Some((i, h, last)) = self.drag {
+            if input.released || !input.down {
+                self.drag = None;
+            } else if let (Some(pos), Some(f)) = (input.pos, frames.get(i)) {
+                let ray = cx.ray_at(pos);
+                let n = cx.camera.forward();
+                let denom = ray.dir.dot(n);
+                if denom.abs() > 1e-9 {
+                    let at = ray.origin + ray.dir * ((last - ray.origin).dot(n) / denom);
+                    if S::adjust(&mut self.params, f, h, at - last) {
+                        self.changed_at = Some(Instant::now() - Duration::from_secs(1));
+                    }
+                    self.drag = Some((i, h, at));
+                }
+            }
+            return;
+        }
+        if !input.clicked || input.command {
+            return;
+        }
+        let Some(pos) = input.pos else { return };
+        let Some((id, hit)) = cx.pick(pos, Some(self.object)) else { return };
+        let normal = cx.scene.get(id).map_or(DVec3::Z, |o| o.mesh.tri_normal(hit.tid));
+        if S::click(&mut self.params, hit.point, normal) {
+            self.changed_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+    }
+
+    fn overlay(&mut self, ov: &mut Overlay, cx: &mut ToolCx) {
+        // The result's frames: axes to their size handles, squares at the handles.
+        if let Some((_, out)) = &self.result {
+            for (i, f) in out.frames.iter().enumerate() {
+                for (h, p) in frame_handles(f) {
+                    let hot = self.drag.is_some_and(|(j, g, _)| j == i && g == h);
+                    let col = if hot { glam::Vec4::new(1.0, 0.9, 0.3, 1.0) } else { glam::Vec4::new(0.35, 0.75, 1.0, 1.0) };
+                    if let Handle::Size(_) = h {
+                        ov.line(f.centre, p, col);
+                    }
+                    let r = cx.world_per_point(p) * if h == Handle::Move { 6.0 } else { 4.5 };
+                    let n = (cx.camera.eye() - p).normalize_or(DVec3::Z);
+                    ov.plane_patch(p, n, r, col * glam::Vec4::new(1.0, 1.0, 1.0, 0.5), col);
+                }
+            }
+        }
+        // A ring (screen-sized) around each mark, on the surface.
+        for (p, n) in S::marks(&self.params) {
+            let r = cx.world_per_point(p) * 7.0;
+            let (u, v) = mm_core::geom::orthonormal_basis(n.normalize_or(DVec3::Z));
+            let at = |k: usize| {
+                let a = std::f64::consts::TAU * k as f64 / 24.0;
+                p + (u * a.cos() + v * a.sin()) * r
+            };
+            for k in 0..24 {
+                ov.line(at(k), at(k + 1), glam::Vec4::new(1.0, 0.78, 0.24, 1.0));
+            }
+        }
     }
 
     fn keys(&mut self, i: &egui::InputState, _cx: &mut ToolCx) -> bool {
@@ -472,6 +607,14 @@ pub struct ExtrudeParamsUi {
     pub preserve_boundary: bool,
     /// Offset: 0..100, relax the moved triangles afterwards.
     pub regularity: f64,
+    /// Offset: the region moves with the rest of the surface (off: an offset copy of it is
+    /// added as a separate shell, the original kept).
+    pub connected: bool,
+    /// Offset: 0..100, how closely each moved vertex is brought to its distance from the
+    /// original surface (0: along its normal only).
+    pub accuracy: f64,
+    /// Offset: the region keeps its face groups (off: it becomes a new group).
+    pub offset_groups: bool,
 }
 
 pub struct ExtrudeSpec;
@@ -490,6 +633,9 @@ impl OpSpec for ExtrudeSpec {
             falloff: 0.0,
             preserve_boundary: false,
             regularity: 25.0,
+            connected: true,
+            accuracy: 50.0,
+            offset_groups: true,
         }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
@@ -529,9 +675,16 @@ impl OpSpec for ExtrudeSpec {
                 ui.checkbox(&mut p.preserve_groups, "Preserve groups");
             }
             ExtrudeMode::Offset => {
-                ui.add(egui::Slider::new(&mut p.falloff, 0.0..=span).text("Soft transition"));
+                ui.checkbox(&mut p.connected, "Connected").on_hover_text("The region moves with the rest of the surface. Off: an offset copy of the region is added as a separate shell and the original stays");
+                if p.connected {
+                    ui.add(egui::Slider::new(&mut p.falloff, 0.0..=span).text("Soft transition"));
+                }
+                ui.add(egui::Slider::new(&mut p.accuracy, 0.0..=100.0).text("Accuracy")).on_hover_text("How closely each moved vertex is brought to the distance from the original surface (0: moved along its normal only, which crowds concave places)");
                 ui.add(egui::Slider::new(&mut p.regularity, 0.0..=100.0).text("Regularity")).on_hover_text("Relax the moved triangles");
-                ui.checkbox(&mut p.preserve_boundary, "Preserve boundary");
+                if p.connected {
+                    ui.checkbox(&mut p.preserve_boundary, "Preserve boundary");
+                }
+                ui.checkbox(&mut p.offset_groups, "Preserve groups").on_hover_text("Off: the offset region becomes a new face group");
             }
             ExtrudeMode::Extract => {
                 ui.small("Creates a new object: the selection thickened into a closed solid. The original is unchanged.");
@@ -568,8 +721,28 @@ impl OpSpec for ExtrudeSpec {
                 Ok(OpOutput { mesh: m, selection: Some(r.new_region_tris), message: format!("extruded with {n} side triangles"), ..Default::default() })
             }
             ExtrudeMode::Offset => {
+                let iterations = (p.accuracy / 10.0).round() as usize;
                 let mut m = mesh.clone();
-                let n = mm_edit::offset_selection_with(&mut m, tris, p.distance, p.falloff, p.preserve_boundary)?;
+                let (tris, n): (Vec<u32>, usize) = if p.connected {
+                    (tris.to_vec(), mm_edit::offset_selection_exact(&mut m, tris, p.distance, p.falloff, p.preserve_boundary, iterations)?)
+                } else {
+                    // An offset copy of the region, as a shell of its own.
+                    let (mut copy, _) = mesh.submesh(tris);
+                    let all: Vec<u32> = copy.triangle_ids().collect();
+                    let n = mm_edit::offset_selection_exact(&mut copy, &all, p.distance, 0.0, false, iterations)?;
+                    let before: std::collections::HashSet<u32> = m.triangle_ids().collect();
+                    let g = m.max_group_id() + 1 - copy.triangle_ids().map(|t| copy.tri_group(t)).min().unwrap_or(0);
+                    m.append_mesh(&copy, g);
+                    let new: Vec<u32> = m.triangle_ids().filter(|t| !before.contains(t)).collect();
+                    (new, n)
+                };
+                let tris = &tris[..];
+                if !p.offset_groups && p.connected {
+                    let g = m.max_group_id() + 1;
+                    for &t in tris {
+                        m.set_tri_group(t, g);
+                    }
+                }
                 let mut selection = tris.to_vec();
                 let iterations = (p.regularity / 10.0).round() as usize;
                 if iterations > 0 {
@@ -1457,6 +1630,9 @@ pub enum ColorTransfer {
     Automatic,
     NoColors,
     VertexToVertex,
+    /// The object's texture onto the solid's vertex colours (sampled where each vertex's
+    /// nearest point on the object lies in the texture).
+    MaterialToVertex,
 }
 
 impl MakeSolidUi {
@@ -1519,15 +1695,27 @@ impl OpSpec for MakeSolidSpec {
                 ColorTransfer::Automatic => "Automatic",
                 ColorTransfer::NoColors => "No Colors",
                 ColorTransfer::VertexToVertex => "Vertex-to-Vertex",
+                ColorTransfer::MaterialToVertex => "Material-to-Vertex",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut p.color_transfer, ColorTransfer::Automatic, "Automatic").on_hover_text("Keep the vertex colours if the input has any");
                 ui.selectable_value(&mut p.color_transfer, ColorTransfer::NoColors, "No Colors");
                 ui.selectable_value(&mut p.color_transfer, ColorTransfer::VertexToVertex, "Vertex-to-Vertex");
+                ui.selectable_value(&mut p.color_transfer, ColorTransfer::MaterialToVertex, "Material-to-Vertex").on_hover_text("The object's texture onto the solid's vertex colours (the object needs a texture and UVs)");
             });
         if p.cells() >= 512 {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "High accuracy: this can take a while and use a lot of memory.");
         }
+    }
+    fn run_look(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _target: Option<&TargetSurface>, look: Option<&SourceLook>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let mut out = Self::run(mesh, sel, p, progress)?;
+        if p.color_transfer == ColorTransfer::MaterialToVertex {
+            match look {
+                Some(look) => texture_to_vertex_colors(&mut out.mesh, mesh, look),
+                None => out.message += " — no texture to transfer (the object needs a texture and UVs)",
+            }
+        }
+        Ok(out)
     }
     fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let mut params = mm_solid::MakeSolidParams::from_sliders(mesh, p.accuracy, p.density);
@@ -1540,7 +1728,7 @@ impl OpSpec for MakeSolidSpec {
         // Groups and colours go on after the remesh so its group constraints don't keep the
         // raw borders.
         params.transfer_groups = p.transfer_groups && !p.remesh_result;
-        let colors = p.color_transfer != ColorTransfer::NoColors && mesh.has_vertex_colors();
+        let colors = matches!(p.color_transfer, ColorTransfer::Automatic | ColorTransfer::VertexToVertex) && mesh.has_vertex_colors();
         params.transfer_colors = colors && !p.remesh_result;
         params.offset = p.offset;
         params.min_edge_length = params.min_edge_length.map(|l| l * (p.cull_edges / 100.0).clamp(0.0, 1.0));
@@ -1582,15 +1770,44 @@ impl OpSpec for MakeSolidSpec {
 }
 pub type MakeSolidTool = OpTool<MakeSolidSpec>;
 
+/// Colour `out`'s vertices from `look`'s texture where each one's nearest point on `source`
+/// lies in it.
+fn texture_to_vertex_colors(out: &mut Mesh, source: &Mesh, look: &SourceLook) {
+    use rayon::prelude::*;
+    let bvh = mm_core::bvh::Bvh::build(source);
+    let ids: Vec<u32> = out.vertex_ids().collect();
+    let colours: Vec<(u32, [f32; 3])> = ids
+        .par_iter()
+        .filter_map(|&v| {
+            let hit = bvh.nearest(source, out.vertex(v), f64::INFINITY)?;
+            let c = look.uvs.corners.get(hit.tid as usize)?;
+            let b = hit.bary.as_vec3();
+            let uv = [c[0][0] * b.x + c[1][0] * b.y + c[2][0] * b.z, c[0][1] * b.x + c[1][1] * b.y + c[2][1] * b.z];
+            Some((v, look.texture.sample(uv)))
+        })
+        .collect();
+    for (v, c) in colours {
+        out.set_vertex_color(v, c);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Offset / Hollow (robust, SDF based)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct OffsetUi {
     pub hollow: bool,
     pub distance: f64,
     pub accuracy: f64,
+    /// Hollow: escape holes (resin drains out of the cavity through them), each a point on the
+    /// surface and the surface's outward normal there: [x, y, z, nx, ny, nz]. Click the
+    /// object to add one.
+    pub holes: Vec<[f64; 6]>,
+    /// Hole radius at the surface, mm.
+    pub hole_radius: f64,
+    /// 0..0.9: how much narrower the hole is where it meets the cavity.
+    pub hole_taper: f64,
 }
 
 pub struct OffsetSolidSpec;
@@ -1599,7 +1816,17 @@ impl OpSpec for OffsetSolidSpec {
     const NAME: &'static str = "Offset / Hollow";
     const USES_SELECTION: bool = false;
     fn defaults(info: &OpInfo) -> Self::Params {
-        OffsetUi { hollow: false, distance: info.avg_edge * 2.0, accuracy: 0.5 }
+        OffsetUi { hollow: false, distance: info.avg_edge * 2.0, accuracy: 0.5, holes: Vec::new(), hole_radius: 1.5, hole_taper: 0.0 }
+    }
+    fn click(p: &mut Self::Params, at: DVec3, normal: DVec3) -> bool {
+        if !p.hollow {
+            return false;
+        }
+        p.holes.push([at.x, at.y, at.z, normal.x, normal.y, normal.z]);
+        true
+    }
+    fn marks(p: &Self::Params) -> Vec<(DVec3, DVec3)> {
+        p.holes.iter().map(|h| (DVec3::new(h[0], h[1], h[2]), DVec3::new(h[3], h[4], h[5]))).collect()
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         ui.horizontal(|ui| {
@@ -1610,21 +1837,172 @@ impl OpSpec for OffsetSolidSpec {
         let range = if p.hollow { (info.avg_edge * 0.1)..=span } else { -span..=span };
         ui.add(egui::Slider::new(&mut p.distance, range).text(if p.hollow { "wall thickness" } else { "distance" }));
         ui.add(egui::Slider::new(&mut p.accuracy, 0.0..=1.0).text("accuracy"));
+        if p.hollow {
+            ui.separator();
+            ui.label(format!("Escape holes: {}", p.holes.len())).on_hover_text("Holes through the wall into the cavity, for resin or powder to drain out after printing");
+            ui.small("Click the object to add a hole there (straight through the wall, along the surface's normal).");
+            ui.add(egui::Slider::new(&mut p.hole_radius, 0.2..=10.0).logarithmic(true).suffix(" mm").text("hole radius"));
+            ui.add(egui::Slider::new(&mut p.hole_taper, 0.0..=0.9).text("taper"));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!p.holes.is_empty(), egui::Button::new("Remove last")).clicked() {
+                    p.holes.pop();
+                }
+                if ui.add_enabled(!p.holes.is_empty(), egui::Button::new("Clear holes")).clicked() {
+                    p.holes.clear();
+                }
+                if ui.button("Hole at the lowest point").on_hover_text("Where liquid gathers when the part stands as it is now (lowest along the scene's −Z)").clicked() {
+                    if let Some(v) = info.mesh.vertex_ids().min_by(|&a, &b| info.mesh.vertex(a).z.total_cmp(&info.mesh.vertex(b).z)) {
+                        let (at, n) = (info.mesh.vertex(v), info.mesh.vertex_normal(v));
+                        p.holes.push([at.x, at.y, at.z, n.x, n.y, n.z]);
+                    }
+                }
+            });
+        }
         ui.small("Robust volumetric offset: the result is always a closed, manifold solid. Negative distances shrink.");
     }
     fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let cells = (64.0 * 16f64.powf(p.accuracy)).round() as u32;
         let h = mm_solid::cell_size_for_resolution(&mesh.bounds().expanded(p.distance.abs()), cells);
-        let out = if p.hollow {
-            mm_solid::hollow(mesh, p.distance, h, Some(&|f| progress(f)))
+        let mut out = if p.hollow {
+            mm_solid::hollow(mesh, p.distance, h, Some(&|f| progress(f * 0.8)))
         } else {
             mm_solid::offset_solid(mesh, p.distance, h, Some(&|f| progress(f)))
         }
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(OpOutput { message: format!("{} triangles", out.triangle_count()), mesh: out, selection: None, ..Default::default() })
+        let mut made = 0;
+        if p.hollow {
+            for hole in &p.holes {
+                let (at, n) = (DVec3::new(hole[0], hole[1], hole[2]), DVec3::new(hole[3], hole[4], hole[5]));
+                let drill = escape_hole(at, n, p.hole_radius, p.hole_taper, p.distance.abs(), out.average_edge_length());
+                out = mm_edit::mesh_boolean(&out, &drill, mm_edit::BooleanOp::Difference).map_err(|e| anyhow::anyhow!("escape hole: {e}"))?.mesh;
+                made += 1;
+            }
+        }
+        let holes = if made > 0 { format!(", {made} escape hole{}", if made == 1 { "" } else { "s" }) } else { String::new() };
+        Ok(OpOutput { message: format!("{} triangles{holes}", out.triangle_count()), mesh: out, selection: None, ..Default::default() })
     }
 }
+
+/// A closed drill for an escape hole at `at` on a surface with outward normal `n`: a cylinder
+/// of `radius` (narrowing by `taper` towards its inner end) from just outside the surface to
+/// past the wall of `thickness`, its side about `edge` long.
+fn escape_hole(at: DVec3, n: DVec3, radius: f64, taper: f64, thickness: f64, edge: f64) -> Mesh {
+    let n = n.normalize_or(DVec3::Z);
+    let len = thickness * 2.0 + radius + 1.0;
+    let slices = ((std::f64::consts::TAU * radius / edge.max(radius * 0.1)).round() as usize).clamp(12, 96);
+    let mut c = mm_core::primitives::cylinder(radius, len, slices, ((len / edge.max(1e-3)).round() as usize).clamp(1, 64), true);
+    // From 0.5 mm (and a radius) outside the surface inwards; turned by an irrational angle so
+    // its vertices do not line up with the hollowed mesh's grid (exact booleans).
+    let start = at + n * (0.5 + radius * 0.25);
+    let u = n.any_orthonormal_vector();
+    let (u, w) = {
+        let (s, k) = 0.381966f64.sin_cos();
+        let v = n.cross(u);
+        (u * k + v * s, v * k - u * s)
+    };
+    for v in c.vertex_ids().collect::<Vec<_>>() {
+        let q = c.vertex(v);
+        let along = q.z / len;
+        let shrink = 1.0 - taper.clamp(0.0, 0.9) * (along * len / (thickness + radius * 0.25 + 0.5).max(1e-9)).min(1.0);
+        c.set_vertex(v, start - n * q.z + (u * q.x + w * q.y) * shrink);
+    }
+    // Pointing into the surface the frame is mirrored: keep the drill's outside outward.
+    c.reverse_orientation();
+    c
+}
 pub type OffsetSolidTool = OpTool<OffsetSolidSpec>;
+
+// ---------------------------------------------------------------------------
+// Thicken (a shell of a given wall thickness, open ends kept open)
+// ---------------------------------------------------------------------------
+
+/// Which way the wall grows from the surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub enum ThickenWay {
+    /// Outside the surface: the lumen keeps its shape.
+    Outward,
+    /// Inside the surface: the outside keeps its shape, the lumen narrows.
+    Inward,
+    /// Half each way.
+    Centered,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct ThickenUi {
+    /// Wall thickness, mm (0.1..20).
+    pub thickness: f64,
+    /// Which way the wall grows from the surface.
+    pub side: ThickenWay,
+    /// 0..1: how closely the new side follows the surface (its distance field's grid from a
+    /// third of the thickness at 0 to a twelfth at 1; finer is slower).
+    pub accuracy: f64,
+    /// Remesh the new wall and the rims to the surface's own edge length.
+    pub remesh: bool,
+}
+
+pub struct ThickenSpec;
+impl OpSpec for ThickenSpec {
+    type Params = ThickenUi;
+    const NAME: &'static str = "Thicken";
+    const USES_SELECTION: bool = false;
+    fn defaults(_: &OpInfo) -> Self::Params {
+        ThickenUi { thickness: 2.0, side: ThickenWay::Outward, accuracy: 0.33, remesh: true }
+    }
+    fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        ui.add(egui::Slider::new(&mut p.thickness, 0.1..=20.0).logarithmic(true).suffix(" mm").text("Wall thickness"));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut p.side, ThickenWay::Outward, "Outward").on_hover_text("The wall grows outside the surface: the lumen keeps its shape (a flow model)");
+            ui.selectable_value(&mut p.side, ThickenWay::Inward, "Inward").on_hover_text("The wall grows inside the surface: the outside keeps its shape and the lumen narrows");
+            ui.selectable_value(&mut p.side, ThickenWay::Centered, "Centred").on_hover_text("Half the wall each side of the surface");
+        });
+        ui.add(egui::Slider::new(&mut p.accuracy, 0.0..=1.0).text("Accuracy")).on_hover_text("How closely the new side follows the surface; finer is slower");
+        ui.checkbox(&mut p.remesh, "Remesh the new wall").on_hover_text("Even triangles of the surface's own size on the new side and the rims");
+        let ends = mm_edit::thicken::openings(info.mesh);
+        let rough: Vec<String> = ends.iter().enumerate().filter(|(_, (_, o))| o.flatness > mm_edit::thicken::FLAT_ENOUGH).map(|(i, _)| (i + 1).to_string()).collect();
+        ui.small(match ends.len() {
+            0 => "No open ends: the wall encloses a sealed cavity.".to_string(),
+            1 => "1 open end, kept open with a flat rim.".to_string(),
+            n => format!("{n} open ends, kept open with flat rims."),
+        });
+        if !rough.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(240, 180, 60), format!("Open end{} {} {} not flat: cut {} square first (Vessel → Trim branch, or Plane Cut) for a clean rim.", if rough.len() == 1 { "" } else { "s" }, rough.join(", "), if rough.len() == 1 { "is" } else { "are" }, if rough.len() == 1 { "it" } else { "them" }));
+        }
+        ui.small("The new side lies the thickness from the surface everywhere (it never folds into itself, unlike moving the surface along its normals), so the result is a closed wall ready to print.");
+    }
+    fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        let side = match p.side {
+            ThickenWay::Outward => mm_edit::ThickenSide::Outward,
+            ThickenWay::Inward => mm_edit::ThickenSide::Inward,
+            ThickenWay::Centered => mm_edit::ThickenSide::Centered,
+        };
+        let params = mm_edit::ThickenParams { thickness: p.thickness, side, cell_size: Some(p.thickness / (3.0 + 9.0 * p.accuracy.clamp(0.0, 1.0))), remesh: p.remesh };
+        let res = mm_edit::thicken(mesh, &params, Some(&|f| progress(f))).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let [lo, mean, hi] = res.measured;
+        let message = format!(
+            "Wall {:.2} mm (measured {lo:.2}–{hi:.2}, mean {mean:.2}); {} open end{} with flat rims; {} triangles{}",
+            p.thickness,
+            res.openings.len(),
+            if res.openings.len() == 1 { "" } else { "s" },
+            res.mesh.triangle_count(),
+            if res.rebuilt { ". The surface runs into itself, so its side of the wall was rebuilt from it (to within a fraction of the accuracy) rather than kept exactly" } else { "" }
+        );
+        let labels = res.openings.iter().enumerate().map(|(i, o)| (o.centre, format!("{}", i + 1))).collect();
+        Ok(OpOutput { mesh: res.mesh, message, labels, ..Default::default() })
+    }
+    fn script(p: &mut Self::Params, cmd: &str) {
+        let (k, v) = cmd.split_once(':').unwrap_or((cmd, ""));
+        match k {
+            "thickness" => p.thickness = v.parse().unwrap_or(p.thickness),
+            "outward" => p.side = ThickenWay::Outward,
+            "inward" => p.side = ThickenWay::Inward,
+            "centered" => p.side = ThickenWay::Centered,
+            "accuracy" => p.accuracy = v.parse().unwrap_or(p.accuracy),
+            "remesh" => p.remesh = v != "off",
+            _ => {}
+        }
+    }
+}
+pub type ThickenTool = OpTool<ThickenSpec>;
 
 // ---------------------------------------------------------------------------
 // Erase & Fill (F)
@@ -2519,6 +2897,26 @@ pub struct FitPrimitiveUi {
     /// One primitive for the whole selection instead of one per connected piece.
     pub single: bool,
     pub create_new_objects: bool,
+    /// The fitted primitive adjusted (the gizmo's handles, or these numbers).
+    pub adjust: FitAdjust,
+}
+
+/// A fitted primitive moved, sized and turned in its own frame (axes: its first, second and
+/// third — the plane's normal or the cylinder's axis).
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct FitAdjust {
+    /// Moved along its axes, mm.
+    pub offset: [f64; 3],
+    /// Scaled along its axes.
+    pub scale: [f64; 3],
+    /// Turned about its third axis, degrees.
+    pub turn_deg: f64,
+}
+
+impl Default for FitAdjust {
+    fn default() -> Self {
+        Self { offset: [0.0; 3], scale: [1.0; 3], turn_deg: 0.0 }
+    }
 }
 
 /// Connected pieces of a triangle set.
@@ -2551,7 +2949,30 @@ impl OpSpec for FitPrimitiveSpec {
     const NAME: &'static str = "Fit Primitive";
     fn defaults(_: &OpInfo) -> Self::Params {
         // Meshmixer's defaults.
-        FitPrimitiveUi { kind: mm_edit::PrimitiveType::Square, density: 32, single: false, create_new_objects: false }
+        FitPrimitiveUi { kind: mm_edit::PrimitiveType::Square, density: 32, single: false, create_new_objects: false, adjust: FitAdjust::default() }
+    }
+    fn adjust(p: &mut Self::Params, f: &mm_edit::PrimitiveFrame, h: Handle, by: DVec3) -> bool {
+        let a = &mut p.adjust;
+        match h {
+            Handle::Move => {
+                // Along the frame's axes before its turn (the offset's own axes).
+                let (s, c) = a.turn_deg.to_radians().sin_cos();
+                let [u2, v2, n] = f.axes;
+                let (u, v) = (u2 * c - v2 * s, u2 * s + v2 * c);
+                a.offset[0] += by.dot(u);
+                a.offset[1] += by.dot(v);
+                a.offset[2] += by.dot(n);
+            }
+            Handle::Size(k) => {
+                if f.half[k] <= 1e-9 {
+                    return false;
+                }
+                // The handle follows the pointer: the half size grows by the drag along the axis.
+                let half = (f.half[k] + by.dot(f.axes[k])).max(f.half[k] * 0.02);
+                a.scale[k] *= half / f.half[k];
+            }
+        }
+        by != DVec3::ZERO
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         egui::ComboBox::from_label("Primitive type").selected_text(p.kind.label()).show_ui(ui, |ui| {
@@ -2562,6 +2983,31 @@ impl OpSpec for FitPrimitiveSpec {
         ui.add(egui::Slider::new(&mut p.density, 4..=128).text("mesh density"));
         ui.checkbox(&mut p.single, "Single primitive").on_hover_text("One primitive for the whole selection instead of one per piece");
         ui.checkbox(&mut p.create_new_objects, "Create new objects").on_hover_text("Each primitive becomes its own object (otherwise it is added to this one)");
+        if !matches!(p.kind, mm_edit::PrimitiveType::ConvexHull | mm_edit::PrimitiveType::HeightField) {
+            egui::CollapsingHeader::new("Adjust").id_salt("fit.adjust").default_open(false).show(ui, |ui| {
+                ui.small("Drag the handles in the view: the centre moves it, the axis ends size it.");
+                let a = &mut p.adjust;
+                egui::Grid::new("fit.adjust.grid").num_columns(4).show(ui, |ui| {
+                    ui.label("Move");
+                    for k in 0..3 {
+                        ui.add(egui::DragValue::new(&mut a.offset[k]).speed(info.avg_edge * 0.5).suffix(" mm"));
+                    }
+                    ui.end_row();
+                    ui.label("Scale");
+                    for k in 0..3 {
+                        ui.add(egui::DragValue::new(&mut a.scale[k]).speed(0.01).range(0.01..=100.0));
+                    }
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Turn");
+                    ui.add(egui::DragValue::new(&mut a.turn_deg).speed(1.0).suffix("°"));
+                    if ui.button("Reset").clicked() {
+                        *a = FitAdjust::default();
+                    }
+                });
+            });
+        }
         if info.selection.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select the faces to fit first.");
         }
@@ -2570,8 +3016,14 @@ impl OpSpec for FitPrimitiveSpec {
         let tris = sel.ok_or_else(|| anyhow::anyhow!("select the faces to fit first"))?;
         let pieces = if p.single { vec![tris.to_vec()] } else { selection_pieces(mesh, tris) };
         let mut fits = Vec::new();
+        let mut frames = Vec::new();
+        let a = &p.adjust;
         for piece in &pieces {
-            fits.push(mm_edit::fit_primitive(mesh, piece, p.kind, p.density)?);
+            let mut f = mm_edit::fit_primitive(mesh, piece, p.kind, p.density)?;
+            if let Some(fr) = f.frame {
+                frames.push(fr.adjust(&mut f.mesh, DVec3::from(a.offset), DVec3::from(a.scale), a.turn_deg.to_radians()));
+            }
+            fits.push(f);
         }
         let message = fits.iter().map(|f| f.description.clone()).collect::<Vec<_>>().join("; ");
         let mut out = mesh.clone();
@@ -2587,6 +3039,7 @@ impl OpSpec for FitPrimitiveSpec {
                 message,
                 new_objects: fits.into_iter().map(|f| (name.clone(), f.mesh)).collect(),
                 preview: Some(preview),
+                frames,
                 ..Default::default()
             });
         }
@@ -2594,7 +3047,7 @@ impl OpSpec for FitPrimitiveSpec {
             let g = out.max_group_id() + 1;
             out.append_mesh(&f.mesh, g);
         }
-        Ok(OpOutput { mesh: out, selection: Some(tris.to_vec()), message, ..Default::default() })
+        Ok(OpOutput { mesh: out, selection: Some(tris.to_vec()), message, frames, ..Default::default() })
     }
 }
 pub type FitPrimitiveTool = OpTool<FitPrimitiveSpec>;
@@ -3128,6 +3581,179 @@ mod tests {
 }
 
 #[cfg(test)]
+mod offset_tool_tests {
+    use super::*;
+
+    #[test]
+    fn offset_connected_or_as_a_copy() {
+        let m = mm_core::primitives::icosphere(5.0, 3);
+        let top: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 3.0).collect();
+        let info = OpInfo { mesh: &m, selection: Some(&top), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let mut p = ExtrudeSpec::defaults(&info);
+        p.mode = ExtrudeMode::Offset;
+        p.distance = 1.0;
+        p.regularity = 0.0;
+        // Connected: the cap rises, nothing is added; its group kept, or a new one.
+        let out = ExtrudeSpec::run(&m, Some(&top), &p, &|_| true).unwrap();
+        assert_eq!(out.mesh.triangle_count(), m.triangle_count());
+        assert!(out.mesh.bounds().max.z > 5.9);
+        assert!(top.iter().all(|&t| out.mesh.tri_group(t) == m.tri_group(t)));
+        p.offset_groups = false;
+        let out = ExtrudeSpec::run(&m, Some(&top), &p, &|_| true).unwrap();
+        assert!(top.iter().all(|&t| out.mesh.tri_group(t) == m.max_group_id() + 1));
+        // Not connected: an offset copy of the cap beside the untouched sphere.
+        p.connected = false;
+        let out = ExtrudeSpec::run(&m, Some(&top), &p, &|_| true).unwrap();
+        assert_eq!(out.mesh.triangle_count(), m.triangle_count() + top.len());
+        assert!((out.mesh.bounds().max.z - 6.0).abs() < 0.05);
+        assert_eq!(out.selection.as_ref().unwrap().len(), top.len());
+        out.mesh.check_validity().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hollow_tool_tests {
+    use super::*;
+
+    #[test]
+    fn escape_holes_open_the_cavity() {
+        let m = mm_core::primitives::icosphere(10.0, 4);
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let mut p = OffsetSolidSpec::defaults(&info);
+        p.hollow = true;
+        p.distance = 2.0;
+        p.accuracy = 0.3;
+        // Clicks add holes only when hollowing.
+        assert!(OffsetSolidSpec::click(&mut p, DVec3::new(0.0, 0.0, 10.0), DVec3::Z));
+        let shells = |m: &Mesh| mm_core::topology::connected_components(m).len();
+        let mut closed = p.clone();
+        closed.holes.clear();
+        let sealed = OffsetSolidSpec::run(&m, None, &closed, &|_| true).unwrap().mesh;
+        assert_eq!(shells(&sealed), 2, "the outside and the cavity");
+        let out = OffsetSolidSpec::run(&m, None, &p, &|_| true).unwrap();
+        assert!(out.message.contains("1 escape hole"), "{}", out.message);
+        assert!(out.mesh.is_closed());
+        assert_eq!(shells(&out.mesh), 1, "the hole joins the cavity to the outside");
+        assert!(mm_core::measure::volume(&out.mesh) < mm_core::measure::volume(&sealed));
+        p.hollow = false;
+        assert!(!OffsetSolidSpec::click(&mut p, DVec3::ZERO, DVec3::Z));
+    }
+}
+
+#[cfg(test)]
+mod thicken_tool_tests {
+    use super::*;
+
+    #[test]
+    fn thicken_a_tube_through_the_tool() {
+        // An open tube of radius 3: a 2 mm wall outward, its two ends kept open.
+        let pts: Vec<DVec3> = (0..=80).map(|k| DVec3::new(0.0, 0.0, 0.25 * k as f64)).collect();
+        let m = mm_core::primitives::tube_along(&pts, &vec![3.0; pts.len()], 48);
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let p = ThickenSpec::defaults(&info);
+        assert_eq!((p.thickness, p.side), (2.0, ThickenWay::Outward));
+        let out = ThickenSpec::run(&m, None, &p, &|_| true).unwrap();
+        out.mesh.check_validity().unwrap();
+        assert!(out.mesh.is_closed() && out.mesh.is_consistently_oriented());
+        let all: Vec<u32> = out.mesh.triangle_ids().collect();
+        assert_eq!(crossings(&out.mesh, &all), 0);
+        assert!(out.message.starts_with("Wall 2.00 mm") && out.message.contains("2 open ends"), "{}", out.message);
+        assert_eq!(out.labels.len(), 2);
+    }
+
+    /// A clean bifurcating vessel with three flat-cut open ends (two capped tubes joined by
+    /// an exact union, the ends then cut open), for trying Thicken: written to
+    /// `POLYMIX_DEMO_VESSEL`.
+    #[test]
+    #[ignore]
+    fn write_a_demo_vessel() {
+        let Some(path) = std::env::var_os("POLYMIX_DEMO_VESSEL") else { return };
+        let tube = |from: DVec3, to: DVec3, r: f64| {
+            let n = 160;
+            let pts: Vec<DVec3> = (0..=n).map(|k| from.lerp(to, k as f64 / n as f64)).collect();
+            let mut m = mm_core::primitives::tube_along(&pts, &vec![r; pts.len()], 64);
+            let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&m).into_iter().map(|l| l.vertices).collect();
+            mm_edit::cap_planar_loops(&mut m, &loops, None, mm_edit::cut::CutFill::Flat).unwrap();
+            m
+        };
+        let trunk = tube(DVec3::new(0.0, 0.0, -30.0), DVec3::new(0.0, 0.0, 12.0), 3.5);
+        let branch = tube(DVec3::new(0.0, 0.0, 0.0), DVec3::new(18.0, 0.0, 22.0), 2.5);
+        let mut m = mm_edit::mesh_boolean(&trunk, &branch, mm_edit::BooleanOp::Union).unwrap().mesh;
+        let other = tube(DVec3::new(0.0, 0.0, 6.0), DVec3::new(-14.0, 0.0, 26.0), 2.8);
+        m = mm_edit::mesh_boolean(&m, &other, mm_edit::BooleanOp::Union).unwrap().mesh;
+        let open = |m: &mut Mesh, at: DVec3, dir: DVec3| {
+            let plane = mm_core::Plane::from_point_normal(at, dir.normalize());
+            mm_edit::cut::local_plane_cut(m, plane, at, mm_edit::cut::KeepSide::Below, mm_edit::cut::CutFill::None).unwrap();
+        };
+        open(&mut m, DVec3::new(0.0, 0.0, -26.0), DVec3::new(0.0, 0.0, -1.0));
+        open(&mut m, DVec3::new(15.0, 0.0, 18.3), DVec3::new(18.0, 0.0, 22.0));
+        open(&mut m, DVec3::new(-11.5, 0.0, 22.4), DVec3::new(-14.0, 0.0, 20.0));
+        let all: Vec<u32> = m.triangle_ids().collect();
+        eprintln!("demo vessel: {} triangles, {} open ends, valid {}, crossings {}", m.triangle_count(), mm_core::topology::boundary_loops(&m).len(), m.check_validity().is_ok(), crossings(&m, &all));
+        mm_io::write_mesh(std::path::Path::new(&path), &m, &mm_io::WriteOptions::default()).unwrap();
+    }
+
+    /// A mesh to thicken: `POLYMIX_THICKEN_MESH` (an STL/OBJ/…, or `objects/N.bin` from a
+    /// project), with the face groups in `POLYMIX_THICKEN_OPEN` (comma-separated) removed to
+    /// open those ends. Prints counts and timings only.
+    #[test]
+    #[ignore]
+    fn thicken_a_mesh_from_disk() {
+        let Some(path) = std::env::var_os("POLYMIX_THICKEN_MESH") else { return };
+        let path = std::path::PathBuf::from(path);
+        let mut m = if path.extension().is_some_and(|e| e == "bin") {
+            crate::project::mesh_from_bytes(&std::fs::read(&path).unwrap()).unwrap()
+        } else {
+            mm_io::read_mesh(&path).unwrap().mesh
+        };
+        if let Ok(groups) = std::env::var("POLYMIX_THICKEN_OPEN") {
+            let open: Vec<i32> = groups.split(',').filter_map(|g| g.trim().parse().ok()).collect();
+            let caps: Vec<u32> = m.triangle_ids().filter(|&t| open.contains(&m.tri_group(t))).collect();
+            m.remove_triangles(caps);
+            m.remove_isolated_vertices();
+        }
+        let ends = mm_edit::thicken::openings(&m);
+        eprintln!("{} triangles, {} open ends (flatness {:?})", m.triangle_count(), ends.len(), ends.iter().map(|e| (e.1.flatness * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+        for (side, remesh) in [(ThickenWay::Outward, true), (ThickenWay::Outward, false), (ThickenWay::Inward, true)] {
+            let p = ThickenUi { side, remesh, ..ThickenSpec::defaults(&OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None }) };
+            let t0 = std::time::Instant::now();
+            match ThickenSpec::run(&m, None, &p, &|_| true) {
+                Ok(out) => {
+                    let all: Vec<u32> = out.mesh.triangle_ids().collect();
+                    if std::env::var_os("POLYMIX_THICKEN_DEBUG").is_some() {
+                        let m = &out.mesh;
+                        let bvh = mm_core::Bvh::build(m);
+                        let mut pairs: std::collections::BTreeMap<(i32, i32, usize), usize> = Default::default();
+                        for t in m.triangle_ids() {
+                            let (tv, tp) = (m.triangle(t), m.tri_positions(t));
+                            bvh.query_aabb(&mm_core::Aabb::from_points(tp), |o| {
+                                if o > t && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
+                                    let c = m.tri_centroid(t);
+                                    let near = (0..ends.len()).min_by(|&a, &b| ends[a].1.centre.distance(c).total_cmp(&ends[b].1.centre.distance(c))).unwrap_or(0);
+                                    let far = ends[near].1.centre.distance(c) > 2.0 * ends[near].1.radius + 4.0;
+                                    *pairs.entry((m.tri_group(t), m.tri_group(o), if far { 99 } else { near + 1 })).or_default() += 1;
+                                }
+                            });
+                        }
+                        eprintln!("crossings by (group, group, opening or 99 = away from openings): {pairs:?}");
+                    }
+                    eprintln!(
+                        "{side:?} (remesh {remesh}): {:.1} s, valid {}, closed {}, oriented {}, crossings {}: {}",
+                        t0.elapsed().as_secs_f64(),
+                        out.mesh.check_validity().is_ok(),
+                        out.mesh.is_closed(),
+                        out.mesh.is_consistently_oriented(),
+                        crossings(&out.mesh, &all),
+                        out.message
+                    );
+                }
+                Err(e) => eprintln!("{side:?}: {:.1} s, failed: {e}", t0.elapsed().as_secs_f64()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod target_tests {
     use super::*;
     use mm_core::primitives;
@@ -3187,7 +3813,7 @@ mod fit_primitive_tests {
     fn one_primitive_per_piece_or_new_objects() {
         let m = primitives::plane_grid(6.0, 2.0, 24, 8);
         let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).x.abs() > 1.5).collect();
-        let p = FitPrimitiveUi { kind: mm_edit::PrimitiveType::Rectangle, density: 4, single: false, create_new_objects: false };
+        let p = FitPrimitiveUi { kind: mm_edit::PrimitiveType::Rectangle, density: 4, single: false, create_new_objects: false, adjust: FitAdjust::default() };
         let out = FitPrimitiveSpec::run(&m, Some(&sel), &p, &|_| true).unwrap();
         assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 3, "two rectangles added");
         let single = FitPrimitiveSpec::run(&m, Some(&sel), &FitPrimitiveUi { single: true, ..p }, &|_| true).unwrap();
@@ -3196,11 +3822,66 @@ mod fit_primitive_tests {
         assert_eq!(objects.new_objects.len(), 2);
         assert_eq!(objects.mesh.triangle_count(), m.triangle_count());
     }
+
+    #[test]
+    fn the_gizmo_moves_and_sizes_the_primitive() {
+        // A cylinder of radius 2 and length 10 along z, fitted, then lengthened and moved.
+        let m = primitives::cylinder(2.0, 10.0, 48, 10, false);
+        let all: Vec<u32> = m.triangle_ids().collect();
+        let mut p = FitPrimitiveUi { kind: mm_edit::PrimitiveType::Cylinder, density: 16, single: true, create_new_objects: true, adjust: FitAdjust::default() };
+        let out = FitPrimitiveSpec::run(&m, Some(&all), &p, &|_| true).unwrap();
+        let f = out.frames[0];
+        assert!((f.half.z - 5.0).abs() < 0.1 && (f.half.x - 2.0).abs() < 0.1, "{f:?}");
+        // The axis end dragged 2 mm outward: 4 mm longer (it grows both ways about the centre).
+        assert!(FitPrimitiveSpec::adjust(&mut p, &f, Handle::Size(2), f.axes[2] * 2.0));
+        let out = FitPrimitiveSpec::run(&m, Some(&all), &p, &|_| true).unwrap();
+        assert!((out.frames[0].half.z - 7.0).abs() < 0.1, "{:?}", out.frames[0]);
+        let b = out.new_objects[0].1.bounds();
+        assert!((b.max.z - b.min.z - 14.0).abs() < 0.2);
+        // The centre dragged 3 mm sideways: the primitive follows.
+        let g = out.frames[0];
+        assert!(FitPrimitiveSpec::adjust(&mut p, &g, Handle::Move, DVec3::X * 3.0));
+        let out = FitPrimitiveSpec::run(&m, Some(&all), &p, &|_| true).unwrap();
+        assert!((out.frames[0].centre - (g.centre + DVec3::X * 3.0)).length() < 1e-6);
+        assert!(!FitPrimitiveSpec::adjust(&mut p, &g, Handle::Move, DVec3::ZERO));
+    }
 }
 
 #[cfg(test)]
 mod color_transfer_tests {
     use super::*;
+
+    #[test]
+    fn material_to_vertex_colours_from_the_texture() {
+        // A sphere whose UVs put x > 0 on the texture's left (red) half and x < 0 on its right
+        // (blue) half.
+        let m = mm_core::primitives::icosphere(5.0, 3);
+        let corners: Vec<[[f32; 2]; 3]> = (0..m.max_tid() as u32).map(|t| if m.is_triangle(t) && m.tri_centroid(t).x > 0.0 { [[0.25, 0.5]; 3] } else { [[0.75, 0.5]; 3] }).collect();
+        let texture = crate::scene::TextureImage { width: 2, height: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255], stamp: 1, path: None };
+        assert_eq!(texture.sample([0.25, 0.5]), [1.0, 0.0, 0.0]);
+        let mid = texture.sample([0.5, 0.5]);
+        assert!((mid[0] - 0.5).abs() < 1e-6 && (mid[2] - 0.5).abs() < 1e-6, "bilinear between the two");
+        let look = SourceLook { uvs: Arc::new(crate::scene::UvSet::new(&m, corners)), texture: Arc::new(texture) };
+        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let p = MakeSolidUi { color_transfer: ColorTransfer::MaterialToVertex, accuracy: 0.2, remesh_result: false, ..MakeSolidSpec::defaults(&info) };
+        let out = MakeSolidSpec::run_look(&m, None, &p, None, Some(&look), &|_| true).unwrap().mesh;
+        let (mut red, mut blue) = (0, 0);
+        for v in out.vertex_ids() {
+            let c = out.vertex_color(v).unwrap();
+            let x = out.vertex(v).x;
+            if x > 1.0 {
+                assert!(c[0] > 0.9 && c[2] < 0.1, "{c:?} at x {x}");
+                red += 1;
+            } else if x < -1.0 {
+                assert!(c[2] > 0.9 && c[0] < 0.1, "{c:?} at x {x}");
+                blue += 1;
+            }
+        }
+        assert!(red > 10 && blue > 10);
+        // Without a texture: a note, no colours.
+        let out = MakeSolidSpec::run_look(&m, None, &p, None, None, &|_| true).unwrap();
+        assert!(out.message.contains("no texture"));
+    }
 
     #[test]
     fn make_solid_keeps_vertex_colors() {

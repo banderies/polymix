@@ -117,11 +117,11 @@ fn a_wall_doubling_back_keeps_its_layers_apart() {
     // Radius 3, narrowed to 1 from z = 19 to 40 by a lip that leans back (an undercut, as where
     // a stenosis meets a wider sinus): from z = 20 the wall runs back to z = 19 as it narrows,
     // so in the slices between, the lip and the narrow tube both lie inside the stent.
-    let corners = [(3.0, 0.0), (3.0, 20.0), (1.0, 19.0), (1.0, 40.0), (3.0, 40.0), (3.0, 60.0)];
+    let corners: [(f64, f64); 6] = [(3.0, 0.0), (3.0, 20.0), (1.0, 19.0), (1.0, 40.0), (3.0, 40.0), (3.0, 60.0)];
     let mut profile = vec![corners[0]];
     for w in corners.windows(2) {
         let ((r0, z0), (r1, z1)) = (w[0], w[1]);
-        let k = (((r1 - r0) as f64).hypot(z1 - z0) / 0.25).ceil() as usize;
+        let k = ((r1 - r0).hypot(z1 - z0) / 0.25).ceil() as usize;
         profile.extend((1..=k).map(|j| {
             let f = j as f64 / k as f64;
             (r0 + (r1 - r0) * f, z0 + (z1 - z0) * f)

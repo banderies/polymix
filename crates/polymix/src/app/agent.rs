@@ -108,7 +108,8 @@ pub fn tools() -> Vec<AgentTool> {
             "mesh_edit",
             "Edit the scene: discard_selection (delete the selected triangles), separate_selection (the selection becomes a new object; `keep_original` keeps it in the old one too), flip_normals (of the selection), new_face_group (the selection becomes a face group), duplicate, delete_object, separate_shells (one object per shell), combine_visible, add_shape (`shape`), clear_scene. Acts on the active object or `object`. Undoable (mesh_history).",
             json!({
-                "action": choice(&["discard_selection", "separate_selection", "flip_normals", "new_face_group", "duplicate", "delete_object", "separate_shells", "combine_visible", "add_shape", "clear_scene"], "What to do"),
+                "action": choice(&["discard_selection", "separate_selection", "flip_normals", "new_face_group", "duplicate", "delete_object", "separate_shells", "combine_visible", "add_shape", "clear_scene", "send_to_segmentation", "set_texture", "remove_texture", "make_reference", "make_editable"], "What to do (send_to_segmentation: the object's inside becomes a segment of the volume in the Segmentation workspace; set_texture: show the image at `path` on the object through its UVs)"),
+                "path": {"type": "string", "description": "set_texture: absolute path of a PNG, JPEG, BMP or TGA image"},
                 "object": object["object"],
                 "keep_original": {"type": "boolean", "description": "separate_selection: keep the triangles in the original object too"},
                 "shape": choice(&shapes, "Shape to add (action add_shape)")
@@ -138,6 +139,9 @@ pub fn tools() -> Vec<AgentTool> {
                 "colors": choice(&colors, "What colours the surface (group = face groups)"),
                 "boundaries": {"type": "boolean", "description": "Highlight open boundaries"},
                 "grid": {"type": "boolean"},
+                "grid_mm": {"type": "number", "description": "Grid spacing in mm (0: automatic)"},
+                "xray": {"type": "boolean", "description": "Every object see-through, edges seen edge-on most opaque"},
+                "image_slices": {"type": "boolean", "description": "Show the image open in the Segmentation tab as three planes among the meshes (through its crosshair, in LPS like meshes made from segments)"},
                 "orthographic": {"type": "boolean"},
                 "up": choice(&["y", "z"], "Up axis (z for medical / RAS data)")
             }),
@@ -188,6 +192,9 @@ struct Snap {
     material: usize,
     pivots: Vec<[f64; 3]>,
     uvs: bool,
+    /// The texture image's file name.
+    texture: Option<String>,
+    reference: bool,
 }
 
 impl Snap {
@@ -203,6 +210,8 @@ impl Snap {
             material: o.material,
             pivots: o.pivots.iter().map(|p| p.position.to_array()).collect(),
             uvs: o.uvs().is_some(),
+            reference: o.reference,
+            texture: o.texture.as_ref().map(|t| t.path.as_ref().and_then(|p| p.file_name()).map_or("(image)".to_string(), |n| n.to_string_lossy().to_string())),
         }
     }
 }
@@ -364,6 +373,17 @@ fn parse(ws: &MeshWorkspace, tool: &str, args: &Value) -> Result<Vec<MeshCommand
                 Some("flip_normals") => on_active(C::FlipNormals)?,
                 Some("new_face_group") => on_active(C::CreateFaceGroup)?,
                 Some("duplicate") => on_active(C::Duplicate)?,
+                Some("send_to_segmentation") => vec![C::SendToSegmentation(object()?)],
+                Some("set_texture") => {
+                    let path = std::path::PathBuf::from(arg_str(args, "path").ok_or("set_texture needs `path`")?);
+                    if !path.is_absolute() {
+                        return Err("`path` must be absolute".into());
+                    }
+                    vec![C::SetTexture(object()?, Some(path))]
+                }
+                Some("remove_texture") => vec![C::SetTexture(object()?, None)],
+                Some("make_reference") => vec![C::SetReference(object()?, true)],
+                Some("make_editable") => vec![C::SetReference(object()?, false)],
                 Some("separate_shells") => on_active(C::SeparateShells)?,
                 Some("delete_object") => vec![C::Delete(named()?.ok_or("delete_object needs `object`")?)],
                 Some("combine_visible") => vec![C::CombineVisible],
@@ -405,6 +425,15 @@ fn parse(ws: &MeshWorkspace, tool: &str, args: &Value) -> Result<Vec<MeshCommand
             }
             if let Some(b) = flag("grid") {
                 v.push(C::Grid(b));
+            }
+            if let Some(mm) = number("grid_mm") {
+                v.push(C::GridSize(mm));
+            }
+            if let Some(b) = flag("xray") {
+                v.push(C::XRay(b));
+            }
+            if let Some(b) = flag("image_slices") {
+                v.push(C::ImageSlices(b));
             }
             if let Some(b) = flag("orthographic") {
                 v.push(C::Orthographic(b));
@@ -540,7 +569,7 @@ fn scene(ws: &MeshWorkspace) -> AgentReply {
             "distance_mm": round(c.distance, 3),
             "up_axis": if c.up_axis == UpAxis::Z { "z" } else { "y" },
         },
-        "view": {"wireframe": v.wireframe, "normals": v.normals.key(), "colors": v.colors.key(), "boundaries": v.boundaries, "grid": v.show_grid},
+        "view": {"wireframe": v.wireframe, "normals": v.normals.key(), "colors": v.colors.key(), "boundaries": v.boundaries, "grid": v.show_grid, "grid_mm": v.grid_mm, "xray": v.xray, "image_slices": ws.slices.show, "image_for_slices": ws.slices.source.as_ref().map(|s| polymix_workspace::guard::scrub_paths(&s.name))},
     });
     AgentReply::later(move || {
         let mut out = fixed;
@@ -612,6 +641,8 @@ fn object(o: &Snap, limit: usize) -> Value {
         "area_mm2": round(stats.area, 4),
         // The signed volume only means something for a closed surface; negative = inside out.
         "volume_mm3": closed.then(|| round(stats.volume.abs(), 4)),
+        // Of the enclosed solid when closed, else of the surface.
+        "centre_of_mass_mm": vec3(mm_core::measure::center_of_mass(m).to_array(), 3),
         "orientation": if !closed { "open surface" } else if stats.volume >= 0.0 { "outward" } else { "inward (inside out)" },
         "edge_length_mm": {"min": round(if lo.is_finite() { lo } else { 0.0 }, 5), "mean": round(stats.avg_edge_length, 5), "max": round(hi, 5)},
         "closed": closed,
@@ -625,6 +656,8 @@ fn object(o: &Snap, limit: usize) -> Value {
         "material": o.material,
         "pivots_mm": o.pivots.iter().map(|p| vec3(*p, 4)).collect::<Vec<_>>(),
         "has_uvs": o.uvs,
+        "texture": o.texture,
+        "reference": o.reference,
     })
 }
 
@@ -713,6 +746,7 @@ mod tests {
         assert_eq!(cube["shells"]["count"], 1);
         assert_eq!(cube["valid"], true);
         assert_eq!(cube["bounds_mm"]["size"], json!([10.0, 10.0, 10.0]));
+        assert_eq!(cube["centre_of_mass_mm"], json!([0.0, 0.0, 0.0]), "a cube centred on the origin");
         let open = object(&Snap::of(&s.objects[1]), 20);
         assert_eq!(open["closed"], false);
         assert_eq!(open["volume_mm3"], Value::Null);

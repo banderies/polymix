@@ -23,6 +23,7 @@ mod triangulate;
 mod util;
 
 pub mod boolean;
+pub mod brush_alpha;
 pub mod bridge;
 pub mod cap;
 pub mod complex;
@@ -39,25 +40,33 @@ pub mod region;
 pub mod smooth;
 pub mod soft;
 pub mod stamp;
+pub mod stencil;
+pub mod thicken;
 pub mod stent;
 pub mod target;
 pub mod transform;
 pub mod tube;
 pub mod uv;
+pub mod uv_edit;
+pub mod uv_project;
 pub mod vessel;
 
+pub use brush_alpha::{AlphaImage, AlphaMap, DabFrame, Pattern, ScreenMap, ScreenStencil, Spacer};
 pub use boolean::{mesh_boolean, BooleanOp, BooleanResult};
 pub use bridge::{bridge, join_loops, BridgeParams, BridgeResult};
 pub use cap::{cap_planar_loops, CapResult};
-pub use complex::{convex_decomposition, generate_complex, ConvexParams};
+pub use complex::{
+    complex_cells, convex_decomposition, filter_complex, generate_complex, generate_complex_cells, CellFilter, ComplexCell, ComplexInfo, ConvexParams, FilterGroups,
+    FilterResult,
+};
 pub use cut::{
     local_intersection_curves, local_plane_cut, local_plane_cut_with, nearest_intersection_curve, plane_cut, plane_intersection_curves, CutFill,
     IntersectionCurve, KeepSide, LocalCutResult, PlaneCutParams, PlaneCutResult, Side,
 };
 pub use face_groups::{generate_face_groups, FaceGroupMode};
-pub use fit::{convex_hull, fit_cylinder, fit_primitive, CylinderFit, FitResult, PrimitiveType};
+pub use fit::{convex_hull, fit_cylinder, fit_primitive, CylinderFit, FitResult, PrimitiveFrame, PrimitiveType};
 pub use extrude::{
-    extract_solid, extrude_selection, offset_selection, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
+    extract_solid, extrude_selection, offset_selection, offset_selection_exact, offset_selection_with, offset_surface, ExtrudeDirection, ExtrudeParams, ExtrudeResult,
 };
 pub use hair::{hair_curves, hair_mesh, HairParams};
 pub use loft::{loft, loft_guided, AxisGuide, EndContinuity, EndDirection, LoftEnd, LoftParams, LoftShape};
@@ -68,10 +77,14 @@ pub use region::{discard, duplicate, flip_normals, separate};
 pub use smooth::smooth_boundary;
 pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion};
 pub use stamp::{stamp_polygon, StampFrame, StampResult, Stencil};
+pub use stencil::{icon_stencils, shape_stencils, stamp_loops, text_stencil, validate_loops, LoopsStampResult, StencilShape};
 pub use stent::{apply_stent, place_stent, StentParams, StentPlacement, StentReport, StentSection, VesselPath};
+pub use thicken::{thicken, Opening, ThickenParams, ThickenResult, ThickenSide};
 pub use target::{attract_to_target, icp_align, project_to_target, AttractParams, IcpParams, IcpResult};
 pub use tube::{add_tube, tube_mesh, tube_path, TubeEnd, TubeParams, TubePath};
 pub use uv::{unwrap, Packing, UnwrapElements, UnwrapParams, UnwrapType, UvLayout};
+pub use uv_edit::{uv_islands, UvIslands};
+pub use uv_project::{project_uvs, Projection, ProjectionAxis, SetUvParams};
 pub use transform::{align_to_principal_axes, center_on_origin, drop_to_ground, transform_mesh};
 pub use vessel::{estimate_vessel_cross_section, suggest_cut_plane, VesselCrossSection};
 

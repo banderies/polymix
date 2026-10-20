@@ -1,16 +1,51 @@
-//! Grow Hair (Meshmixer's Select > Edit > Grow Hair): strands rooted at random points of the
-//! selected faces, grown along the surface normal, bent by gravity according to their
-//! stiffness (which varies from root to tip), curled into a helix, optionally kept out of
-//! the object, and finally turned into tapered tubes.
+//! Grow Hair (Meshmixer's Select > Edit > Grow Hair): strands rooted on the selected faces,
+//! grown along the surface normal, bent by gravity according to their stiffness (which
+//! varies from root to tip), curled into a helix, optionally kept out of the object, and
+//! finally turned into tapered tubes.
+//!
+//! Three ways to root them ([`HairMode`]): a fixed number at random points, an even spread
+//! at a density per unit area (Poisson-disc: no two roots on the same side of the surface
+//! closer than [`fill_spacing`]), or
+//! hair patches: a few guide strands grown as above, the rest following the guides around
+//! them and gathered toward the nearest one's tip in clumps.
 
 use crate::tube_mesh;
 use glam::DVec3;
 use mm_core::{Bvh, Mesh};
+use std::collections::HashMap;
+
+/// How strands are rooted on the selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HairMode {
+    /// `count` strands at random points of the selection.
+    #[default]
+    Count,
+    /// Strands spread evenly over the selection, `density` per unit area (at most
+    /// [`MAX_HAIRS`]); no two roots closer than [`fill_spacing`] (unless they face apart,
+    /// on the two sides of a thin part).
+    FillDensity,
+    /// `clumps` evenly spread guide strands; the other `count - clumps` strands follow the
+    /// guides around them and are drawn toward the nearest guide's tip by `clumping`.
+    HairPatch,
+}
+
+/// Most strands Fill Density grows.
+pub const MAX_HAIRS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct HairParams {
-    /// Strands.
+    /// How strands are rooted.
+    pub mode: HairMode,
+    /// Strands (Count and Hair Patch modes; in Hair Patch, guides included).
     pub count: usize,
+    /// Fill Density: strands per unit area (per mm² for models in millimetres).
+    pub density: f64,
+    /// Hair Patch: guide strands, one per clump.
+    pub clumps: usize,
+    /// Hair Patch, 0..1: how far each strand is drawn toward its guide, growing from the
+    /// root to the tip (1 = the tips meet the guide's tip).
+    pub clumping: f64,
     /// Points along each strand.
     pub points: usize,
     pub length: f64,
@@ -37,7 +72,11 @@ pub struct HairParams {
 impl Default for HairParams {
     fn default() -> Self {
         Self {
+            mode: HairMode::Count,
             count: 200,
+            density: 1.0,
+            clumps: 12,
+            clumping: 0.7,
             points: 12,
             length: 10.0,
             curl_radius: 0.0,
@@ -62,80 +101,225 @@ impl Rng {
     }
 }
 
+/// Smallest distance between Fill Density roots: 0.6 / √density, a little over half the
+/// mean spacing, which an even (Poisson-disc) spread reaches easily.
+pub fn fill_spacing(density: f64) -> f64 {
+    0.6 / density.max(1e-300).sqrt()
+}
+
+/// Strands Fill Density grows on `area` (at most [`MAX_HAIRS`]).
+pub fn fill_count(area: f64, density: f64) -> usize {
+    let n = (area * density).round();
+    if n.is_finite() && n > 0.0 {
+        (n as usize).min(MAX_HAIRS)
+    } else {
+        0
+    }
+}
+
+/// Total area of the (live) triangles `tris`.
+pub fn selection_area(mesh: &Mesh, tris: &[u32]) -> f64 {
+    tris.iter().filter(|&&t| mesh.is_triangle(t)).map(|&t| mesh.tri_area(t)).sum()
+}
+
+/// A point of the surface and its smoothed normal.
+#[derive(Clone, Copy)]
+struct Root {
+    p: DVec3,
+    n: DVec3,
+}
+
+/// Uniformly random points on a set of triangles.
+struct AreaSampler {
+    tris: Vec<u32>,
+    cum: Vec<f64>,
+    total: f64,
+}
+
+impl AreaSampler {
+    fn new(mesh: &Mesh, tris: &[u32]) -> Self {
+        let tris: Vec<u32> = tris.iter().copied().filter(|&t| mesh.is_triangle(t) && mesh.tri_area(t) > 0.0).collect();
+        let mut cum = Vec::with_capacity(tris.len());
+        let mut total = 0.0;
+        for &t in &tris {
+            total += mesh.tri_area(t);
+            cum.push(total);
+        }
+        Self { tris, cum, total }
+    }
+
+    fn sample(&self, mesh: &Mesh, rng: &mut Rng) -> Root {
+        let t = self.tris[self.cum.partition_point(|&c| c < rng.next() * self.total).min(self.tris.len() - 1)];
+        let (mut s1, mut s2) = (rng.next(), rng.next());
+        if s1 + s2 > 1.0 {
+            s1 = 1.0 - s1;
+            s2 = 1.0 - s2;
+        }
+        let b = DVec3::new(1.0 - s1 - s2, s1, s2);
+        let [a, c, d] = mesh.tri_positions(t);
+        Root { p: a * b.x + c * b.y + d * b.z, n: normal_at(mesh, t, b) }
+    }
+}
+
+/// Up to `n` random points of the surface, no two facing the same way closer than `r` (dart
+/// throwing against a hash grid; gives up after 40 misses per point on average).
+fn poisson_roots(mesh: &Mesh, area: &AreaSampler, n: usize, r: f64, rng: &mut Rng) -> Vec<Root> {
+    let mut out: Vec<Root> = Vec::with_capacity(n);
+    let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+    let cell = |p: DVec3| (p / r).floor().to_array().map(|x| x as i64);
+    let mut tries = 0;
+    while out.len() < n && tries < 40 * n + 100 {
+        tries += 1;
+        let q = area.sample(mesh, rng);
+        let [x, y, z] = cell(q.p);
+        let mut free = true;
+        'scan: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &k in grid.get(&[x + dx, y + dy, z + dz]).into_iter().flatten() {
+                        // Roots facing apart (the two sides of a thin part) do not crowd
+                        // each other.
+                        if out[k].p.distance_squared(q.p) < r * r && out[k].n.dot(q.n) > 0.0 {
+                            free = false;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        if free {
+            grid.entry([x, y, z]).or_default().push(out.len());
+            out.push(q);
+        }
+    }
+    out
+}
+
 /// Smoothly interpolated normal at a point of triangle `t` (barycentric `b`).
 fn normal_at(m: &Mesh, t: u32, b: DVec3) -> DVec3 {
     let tv = m.triangle(t);
     (m.vertex_normal(tv[0]) * b.x + m.vertex_normal(tv[1]) * b.y + m.vertex_normal(tv[2]) * b.z).normalize_or(m.tri_normal(t))
 }
 
-/// Strand polylines rooted on `tris` of `mesh`.
-pub fn hair_curves(mesh: &Mesh, bvh: &Bvh, tris: &[u32], p: &HairParams) -> Vec<Vec<DVec3>> {
-    let tris: Vec<u32> = tris.iter().copied().filter(|&t| mesh.is_triangle(t) && mesh.tri_area(t) > 0.0).collect();
-    if tris.is_empty() || p.count == 0 || p.points < 2 || p.length.is_nan() || p.length <= 0.0 {
-        return Vec::new();
+/// Push a strand point out of the object to `clearance` above the surface; returns whether
+/// it moved.
+fn keep_out(mesh: &Mesh, bvh: &Bvh, q: &mut DVec3, clearance: f64, reach: f64) -> bool {
+    if let Some(h) = bvh.nearest(mesh, *q, reach) {
+        let nn = normal_at(mesh, h.tid, h.bary);
+        if (*q - h.point).dot(nn) < clearance {
+            *q = h.point + nn * clearance;
+            return true;
+        }
     }
-    let mut cum = Vec::with_capacity(tris.len());
-    let mut total = 0.0;
-    for &t in &tris {
-        total += mesh.tri_area(t);
-        cum.push(total);
-    }
-    let mut rng = Rng(p.seed.max(1));
+    false
+}
+
+/// One strand from `root`.
+fn grow(mesh: &Mesh, bvh: &Bvh, root: &Root, p: &HairParams, rng: &mut Rng) -> Vec<DVec3> {
     let down = p.down.normalize_or(-DVec3::Y);
     let seg = p.length / (p.points - 1) as f64;
     let clearance = p.base_radius.max(p.tip_radius) * 1.5;
-    (0..p.count)
-        .map(|_| {
-            let t = tris[cum.partition_point(|&c| c < rng.next() * total).min(tris.len() - 1)];
-            let (mut s1, mut s2) = (rng.next(), rng.next());
-            if s1 + s2 > 1.0 {
-                s1 = 1.0 - s1;
-                s2 = 1.0 - s2;
-            }
-            let b = DVec3::new(1.0 - s1 - s2, s1, s2);
-            let [a, c, d] = mesh.tri_positions(t);
-            let root = a * b.x + c * b.y + d * b.z;
-            let n = normal_at(mesh, t, b);
-            // Curl frame around the root normal, with a random start angle.
-            let (u, v) = mm_core::geom::orthonormal_basis(n);
-            let phase = rng.next() * std::f64::consts::TAU;
-            let mut dir = n;
-            let mut spine = root;
-            let mut pts = vec![root];
-            for k in 1..p.points {
+    let n = root.n;
+    // Curl frame around the root normal, with a random start angle.
+    let (u, v) = mm_core::geom::orthonormal_basis(n);
+    let phase = rng.next() * std::f64::consts::TAU;
+    let mut dir = n;
+    let mut spine = root.p;
+    let mut pts = vec![root.p];
+    for k in 1..p.points {
+        let s = k as f64 / (p.points - 1) as f64;
+        let stiff = p.hair_stiffness + (p.tip_stiffness - p.hair_stiffness) * s;
+        // Gravity turns the strand toward `down` at every step, more where it is soft
+        // (at full gravity and no stiffness, up to a full turn over the strand).
+        let max_turn = std::f64::consts::TAU / (p.points - 1) as f64;
+        let turn = (p.gravity.clamp(0.0, 1.0) * (1.0 - stiff.clamp(0.0, 1.0)) * max_turn).min(dir.angle_between(down));
+        if turn > 0.0 {
+            let axis = dir.cross(down);
+            let axis = if axis.length_squared() > 1e-18 { axis.normalize() } else { mm_core::geom::orthonormal_basis(dir).0 };
+            dir = (glam::DQuat::from_axis_angle(axis, turn) * dir).normalize();
+        }
+        spine += dir * seg;
+        let mut q = spine;
+        if p.curl_radius > 0.0 && p.curl_pitch > 0.0 {
+            let a = phase + std::f64::consts::TAU * (s * p.length) / p.curl_pitch;
+            // The helix grows in from the root so the strand starts on the surface.
+            q += (u * a.cos() + v * a.sin() - u * phase.cos() - v * phase.sin()) * (p.curl_radius * s.min(1.0));
+        }
+        if p.collisions && keep_out(mesh, bvh, &mut q, clearance, clearance * 4.0 + p.length) {
+            spine = q;
+        }
+        pts.push(q);
+    }
+    pts
+}
+
+/// Strand polylines rooted on `tris` of `mesh`. In Hair Patch mode the guide strands come
+/// first (`clumps` of them, fewer if `count` is smaller or the selection too small to
+/// spread them).
+pub fn hair_curves(mesh: &Mesh, bvh: &Bvh, tris: &[u32], p: &HairParams) -> Vec<Vec<DVec3>> {
+    let area = AreaSampler::new(mesh, tris);
+    if area.tris.is_empty() || p.points < 2 || p.length.is_nan() || p.length <= 0.0 {
+        return Vec::new();
+    }
+    let mut rng = Rng(p.seed.max(1));
+    match p.mode {
+        HairMode::Count => (0..p.count)
+            .map(|_| {
+                let r = area.sample(mesh, &mut rng);
+                grow(mesh, bvh, &r, p, &mut rng)
+            })
+            .collect(),
+        HairMode::FillDensity => {
+            let n = fill_count(area.total, p.density);
+            let roots = poisson_roots(mesh, &area, n, fill_spacing(p.density), &mut rng);
+            roots.iter().map(|r| grow(mesh, bvh, r, p, &mut rng)).collect()
+        }
+        HairMode::HairPatch => patches(mesh, bvh, &area, p, &mut rng),
+    }
+}
+
+/// Hair Patch strands: the guides, then the strands following them.
+fn patches(mesh: &Mesh, bvh: &Bvh, area: &AreaSampler, p: &HairParams, rng: &mut Rng) -> Vec<Vec<DVec3>> {
+    if p.count == 0 {
+        return Vec::new();
+    }
+    let n_guides = p.clumps.clamp(1, p.count);
+    // Guides spread evenly: no two closer than half their mean spacing.
+    let spacing = 0.5 * (area.total / n_guides as f64).sqrt();
+    let roots = poisson_roots(mesh, area, n_guides, spacing, rng);
+    let guides: Vec<Vec<DVec3>> = roots.iter().map(|r| grow(mesh, bvh, r, p, rng)).collect();
+    let clearance = p.base_radius.max(p.tip_radius) * 1.5;
+    let pull = p.clumping.clamp(0.0, 1.0);
+    let mut out = guides.clone();
+    for _ in guides.len()..p.count {
+        let r = area.sample(mesh, rng);
+        let root = r.p;
+        // The strand's shape: the guides around its root, blended by inverse squared
+        // distance, so the hair flows on smoothly from one patch to the next. Guides on the
+        // far side of a thin part (facing the other way) are not "around" it.
+        let facing = |i: &usize| roots[*i].n.dot(r.n) > 0.0;
+        let pool: Vec<usize> = if (0..guides.len()).any(|i| facing(&i)) { (0..guides.len()).filter(facing).collect() } else { (0..guides.len()).collect() };
+        let mut near: Vec<(f64, usize)> = pool.into_iter().map(|i| (guides[i][0].distance_squared(root), i)).collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        near.truncate(3);
+        let w: Vec<f64> = near.iter().map(|&(d2, _)| 1.0 / (d2 + 1e-12 * p.length * p.length)).collect();
+        let wsum: f64 = w.iter().sum();
+        let own = &guides[near[0].1];
+        let strand = (0..p.points)
+            .map(|k| {
                 let s = k as f64 / (p.points - 1) as f64;
-                let stiff = p.hair_stiffness + (p.tip_stiffness - p.hair_stiffness) * s;
-                // Gravity turns the strand toward `down` at every step, more where it is soft
-                // (at full gravity and no stiffness, up to a full turn over the strand).
-                let max_turn = std::f64::consts::TAU / (p.points - 1) as f64;
-                let turn = (p.gravity.clamp(0.0, 1.0) * (1.0 - stiff.clamp(0.0, 1.0)) * max_turn).min(dir.angle_between(down));
-                if turn > 0.0 {
-                    let axis = dir.cross(down);
-                    let axis = if axis.length_squared() > 1e-18 { axis.normalize() } else { mm_core::geom::orthonormal_basis(dir).0 };
-                    dir = (glam::DQuat::from_axis_angle(axis, turn) * dir).normalize();
+                let shape: DVec3 = near.iter().zip(&w).map(|(&(_, i), &wi)| (guides[i][k] - guides[i][0]) * (wi / wsum)).sum();
+                // Clumping: drawn toward its own guide, the more the nearer the tip.
+                let mut q = (root + shape).lerp(own[k], pull * s);
+                if p.collisions && k > 0 {
+                    keep_out(mesh, bvh, &mut q, clearance, clearance * 4.0 + p.length);
                 }
-                spine += dir * seg;
-                let mut q = spine;
-                if p.curl_radius > 0.0 && p.curl_pitch > 0.0 {
-                    let a = phase + std::f64::consts::TAU * (s * p.length) / p.curl_pitch;
-                    // The helix grows in from the root so the strand starts on the surface.
-                    q += (u * a.cos() + v * a.sin() - u * phase.cos() - v * phase.sin()) * (p.curl_radius * s.min(1.0));
-                }
-                if p.collisions {
-                    if let Some(h) = bvh.nearest(mesh, q, clearance * 4.0 + p.length) {
-                        let nn = normal_at(mesh, h.tid, h.bary);
-                        let off = (q - h.point).dot(nn);
-                        if off < clearance {
-                            q = h.point + nn * clearance;
-                            spine = q;
-                        }
-                    }
-                }
-                pts.push(q);
-            }
-            pts
-        })
-        .collect()
+                q
+            })
+            .collect();
+        out.push(strand);
+    }
+    out
 }
 
 /// Tapered tubes along the strands, as one mesh.
@@ -198,6 +382,96 @@ mod tests {
             let reach = c.iter().map(|q| (*q - c[0]).truncate().length()).fold(0.0, f64::max);
             assert!(reach > 1.5 && reach < 2.2, "{reach}");
             assert!((c[c.len() - 1].z - 20.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn fill_density_spreads_hair_evenly() {
+        // On a plane and on a curved cap.
+        let plane = primitives::plane_grid(20.0, 20.0, 10, 10);
+        let ball = primitives::icosphere(10.0, 4);
+        for (mesh, density) in [(&plane, 2.0), (&ball, 0.7)] {
+            let bvh = Bvh::build(mesh);
+            let tris: Vec<u32> = mesh.triangle_ids().filter(|&t| mesh.tri_centroid(t).z > -2.0).collect();
+            let area = selection_area(mesh, &tris);
+            let p = HairParams { mode: HairMode::FillDensity, density, gravity: 0.0, collisions: false, ..Default::default() };
+            let curves = hair_curves(mesh, &bvh, &tris, &p);
+            let want = area * density;
+            assert!((curves.len() as f64 - want).abs() <= 0.02 * want, "{} strands for {want}", curves.len());
+            // No two roots closer than the spacing.
+            let r = fill_spacing(density);
+            let roots: Vec<DVec3> = curves.iter().map(|c| c[0]).collect();
+            let closest = (0..roots.len()).flat_map(|i| (i + 1..roots.len()).map(move |j| (i, j))).map(|(i, j)| roots[i].distance(roots[j])).fold(f64::MAX, f64::min);
+            assert!(closest >= r, "{closest} < {r}");
+            // Rooted on the selection.
+            assert!(roots.iter().all(|q| q.z > -2.5));
+        }
+        // The count follows the density.
+        let bvh = Bvh::build(&plane);
+        let all: Vec<u32> = plane.triangle_ids().collect();
+        let n = |density: f64| hair_curves(&plane, &bvh, &all, &HairParams { mode: HairMode::FillDensity, density, collisions: false, ..Default::default() }).len();
+        assert_eq!(n(0.25), 100);
+        assert_eq!(n(1000.0), MAX_HAIRS);
+    }
+
+    #[test]
+    fn hair_patches_gather_into_clumps() {
+        let plane = primitives::plane_grid(20.0, 20.0, 10, 10);
+        let bvh = Bvh::build(&plane);
+        let all: Vec<u32> = plane.triangle_ids().collect();
+        let base = HairParams { mode: HairMode::HairPatch, count: 400, clumps: 10, length: 6.0, gravity: 0.5, collisions: false, ..Default::default() };
+        let tip = |c: &Vec<DVec3>| c[c.len() - 1];
+        // Each strand's guide is the one whose root is nearest its own root.
+        let spread = |clumping: f64| -> (f64, f64, usize) {
+            let curves = hair_curves(&plane, &bvh, &all, &HairParams { clumping, ..base });
+            assert_eq!(curves.len(), 400);
+            let guides = &curves[..10];
+            let (mut at_root, mut at_tip) = (0.0, 0.0);
+            let mut tips = Vec::new();
+            for c in &curves[10..] {
+                assert!(c[0].z.abs() < 1e-12, "rooted on the plane");
+                let g = guides.iter().min_by(|a, b| a[0].distance(c[0]).total_cmp(&b[0].distance(c[0]))).unwrap();
+                at_root += g[0].distance(c[0]);
+                at_tip += tip(g).distance(tip(c));
+                let t = tip(c);
+                if !tips.iter().any(|q: &DVec3| q.distance(t) < 1e-6) {
+                    tips.push(t);
+                }
+            }
+            (at_root / 390.0, at_tip / 390.0, tips.len())
+        };
+        // Unclumped, the strands keep their spacing up to the tips; fully clumped, every tip
+        // meets its guide's, so there are as many tufts as guides.
+        let (root0, tip0, _) = spread(0.0);
+        assert!((tip0 - root0).abs() < 0.05 * root0, "{tip0} vs {root0}");
+        let (root1, tip1, tufts) = spread(1.0);
+        assert!(tip1 < 1e-9 * root1, "{tip1}");
+        assert_eq!(tufts, 10);
+        let (root_half, tip_half, _) = spread(0.6);
+        assert!((tip_half / root_half - 0.4).abs() < 0.05, "{}", tip_half / root_half);
+        // Guides are spread out, not bunched.
+        let curves = hair_curves(&plane, &bvh, &all, &base);
+        let g: Vec<DVec3> = curves[..10].iter().map(|c| c[0]).collect();
+        let closest = (0..10).flat_map(|i| (i + 1..10).map(move |j| (i, j))).map(|(i, j)| g[i].distance(g[j])).fold(f64::MAX, f64::min);
+        assert!(closest >= 0.5 * (400.0f64 / 10.0).sqrt(), "{closest}");
+    }
+
+    #[test]
+    fn the_two_sides_of_a_thin_part_are_haired_apart() {
+        // A plate 0.1 thick, hair on its top and bottom.
+        let mut slab = primitives::cube(10.0, 8);
+        slab.transform(|q| DVec3::new(q.x, q.y, q.z * 0.01));
+        let bvh = Bvh::build(&slab);
+        let faces: Vec<u32> = slab.triangle_ids().filter(|&t| slab.tri_normal(t).z.abs() > 0.9).collect();
+        let area = selection_area(&slab, &faces);
+        let p = HairParams { mode: HairMode::FillDensity, density: 4.0, gravity: 0.0, collisions: false, ..Default::default() };
+        let n = hair_curves(&slab, &bvh, &faces, &p).len() as f64;
+        assert!((n - area * 4.0).abs() <= 0.02 * area * 4.0, "{n} for {}", area * 4.0);
+        // Strands follow guides on their own side.
+        let patch = HairParams { mode: HairMode::HairPatch, count: 300, clumps: 8, clumping: 0.5, ..p };
+        for c in hair_curves(&slab, &bvh, &faces, &patch) {
+            let up = c[0].z > 0.0;
+            assert_eq!(c[c.len() - 1].z > c[0].z, up, "{:?}", c[0]);
         }
     }
 }

@@ -54,7 +54,9 @@ pub const TOOLS: &[ToolInfo] = &[
     t("makesolid", "Make Solid", "Rebuild a closed, manifold, non-self-intersecting surface"),
     t("makepattern", "Make Pattern", "Turn the object into a frame of tubes, or perforate / fill it"),
     t("unwrap", "Unwrap", "Compute UVs (texture coordinates)"),
+    t("setuv", "Set UVs", "Assign UVs by planar, cylindrical, spherical or box projection, without unwrapping"),
     t("convex", "Convex Decomposition", "Approximate the object by convex pieces"),
+    t("filtercomplex", "Filter Complex", "Keep cells of a complex (Generate Complex) by which inputs they are inside, joined into one object"),
     t("hair", "Grow Hair", "Strands on the selected triangles"),
     t("pivot", "Create Pivot", "Drop a point with a coordinate frame on the object (clicks)"),
     t("planecut", "Plane Cut", "Cut the object with a plane (drag a line; Shift+click a vessel for a square cut)"),
@@ -67,6 +69,7 @@ pub const TOOLS: &[ToolInfo] = &[
     t("extract", "Extract", "Copy the selected region into a new, thickened object"),
     t("mirror", "Mirror", "Mirror the object across a plane"),
     t("offset", "Offset / Hollow", "Offset the whole surface, or hollow it out"),
+    t("thicken", "Thicken", "A wall of a given thickness on one side of the surface, open ends kept open with flat rims (a hollow model to print)"),
     t("boolean", "Boolean", "Union, difference or intersection with another object"),
     t("bridge", "Bridge boundaries", "Join two open boundaries with a tube (pick their markers)"),
     t("deviation", "Deviation", "Colour map of the distance to a reference object, with statistics"),
@@ -139,6 +142,13 @@ pub enum MeshCommand {
     SplitComplex,
     Duplicate,
     Delete(ObjectId),
+    /// Send a closed object to the Segmentation workspace, where its inside becomes a segment
+    /// of the volume shown there.
+    SendToSegmentation(ObjectId),
+    /// Show an image on the object through its UVs (`None`: remove its texture).
+    SetTexture(ObjectId, Option<std::path::PathBuf>),
+    /// Make the object a reference (a see-through guide) or editable again.
+    SetReference(ObjectId, bool),
     ClearScene,
     AddShape(Shape),
     Activate(ObjectId),
@@ -157,6 +167,12 @@ pub enum MeshCommand {
     Colors(ColorMode),
     Boundaries(bool),
     Grid(bool),
+    /// The Segmentation tab's image as slices among the meshes.
+    ImageSlices(bool),
+    /// Grid spacing in mm (0: automatic).
+    GridSize(f64),
+    /// Every object see-through (X-ray).
+    XRay(bool),
     Orthographic(bool),
     Up(UpAxis),
     /// Open a tool by its name in [`TOOLS`] (the open tool is accepted first).
@@ -275,6 +291,45 @@ impl MeshWorkspace {
                 commands::create_face_group(&mut self.cmd_cx(), false);
                 changed(self)
             }
+            C::SetReference(id, on) => {
+                let o = self.scene.get_mut(id).ok_or("no such object")?;
+                o.reference = on;
+                o.color.w = if on { 0.35 } else { 1.0 };
+                let name = o.name.clone();
+                if on && self.scene.active == Some(id) {
+                    self.scene.active = self.scene.objects.iter().find(|o| !o.reference).map(|o| o.id);
+                }
+                self.status = format!("{name} is {}", if on { "a reference (see-through, not picked or exported with the visible objects)" } else { "editable again" });
+                Ok(self.status.clone())
+            }
+            C::SetTexture(id, path) => {
+                let tex = match &path {
+                    Some(p) => Some(std::sync::Arc::new(crate::scene::TextureImage::load(p).map_err(|e| format!("{e:#}"))?)),
+                    None => None,
+                };
+                let o = self.scene.get_mut(id).ok_or("no such object")?;
+                let has_uvs = o.uvs.as_ref().is_some_and(|u| u.topo == o.mesh.topology_version());
+                let name = o.name.clone();
+                o.texture = tex;
+                self.status = match (&path, has_uvs) {
+                    (None, _) => format!("Texture removed from {name}"),
+                    (Some(p), true) => {
+                        if !matches!(self.view.colors, ColorMode::Texture | ColorMode::TextureUnlit) {
+                            self.view.colors = ColorMode::Texture;
+                        }
+                        format!("{} shown on {name}", p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()))
+                    }
+                    (Some(_), false) => format!("Texture set on {name}; it shows once the object has UVs (Edit → Unwrap)"),
+                };
+                Ok(self.status.clone())
+            }
+            C::SendToSegmentation(id) => {
+                let o = self.object(id)?;
+                let (name, mesh) = (o.name.clone(), o.mesh.clone());
+                self.to_segmentation.push((name.clone(), (*mesh).clone()));
+                self.status = format!("Sent {name} to the Segmentation tab");
+                Ok(self.status.clone())
+            }
             C::SeparateShells | C::CombineVisible | C::GenerateComplex | C::SplitComplex | C::Duplicate | C::Delete(_) | C::ClearScene | C::AddShape(_) => {
                 if !self.accept_tools(0, ctx, vp) {
                     return Err("Wait for the open tool to finish computing (or cancel it).".into());
@@ -385,6 +440,22 @@ impl MeshWorkspace {
             C::Grid(on) => {
                 self.view.show_grid = on;
                 Ok(format!("Grid {}", if on { "shown" } else { "hidden" }))
+            }
+            C::XRay(on) => {
+                self.view.xray = on;
+                Ok(format!("X-ray {}", if on { "on" } else { "off" }))
+            }
+            C::GridSize(mm) => {
+                self.view.grid_mm = mm.max(0.0);
+                Ok(if mm > 0.0 { format!("Grid every {mm} mm") } else { "Grid spacing automatic".into() })
+            }
+            C::ImageSlices(on) => {
+                self.slices.show = on;
+                Ok(match (on, &self.slices.source) {
+                    (false, _) => "Image slices hidden".into(),
+                    (true, Some(s)) => format!("Slices of {} shown", s.name),
+                    (true, None) => "Image slices: open an image in the Segmentation tab to see its slices".into(),
+                })
             }
             C::Orthographic(on) => {
                 self.camera.orthographic = on;
@@ -608,7 +679,7 @@ pub(super) mod tests {
         assert!(ws.execute(MeshCommand::SelectBoundary { boundary: 0, add: false }, &ctx, vp).unwrap_err().contains("has 0"));
         ws.execute(MeshCommand::Redo, &ctx, vp).unwrap();
         ws.execute(MeshCommand::SelectBoundary { boundary: 0, add: false }, &ctx, vp).unwrap();
-        assert!(ws.scene.get(id).unwrap().selection.len() > 0);
+        assert!(!ws.scene.get(id).unwrap().selection.is_empty());
         assert!(ws.execute(MeshCommand::Delete(9999), &ctx, vp).is_err());
         ws.execute(MeshCommand::Rename(id, "box".into()), &ctx, vp).unwrap();
         assert_eq!(ws.scene.get(id).unwrap().name, "box");

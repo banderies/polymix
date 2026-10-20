@@ -387,6 +387,7 @@ impl Tool for PlaneCutTool {
                         if let Some(o) = cx.scene.get_mut(id) {
                             o.set_mesh(mesh);
                         }
+                        cx.scene.record_tool_frame("Plane Cut", self.origin, super::pivot::frame_from(self.normal, None));
                         *cx.status = msg;
                         return ToolOutcome::Close;
                     }

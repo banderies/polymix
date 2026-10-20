@@ -86,6 +86,29 @@ pub trait Workspace {
     }
 }
 
+/// Where derived images are saved (prepared images, masked volumes): the Volume workspace
+/// lists them.
+pub fn derived_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("volume").join("derived"))
+}
+
+/// A file in `dir` for a derived image: `source`'s name made safe, with `suffix`, not taken yet.
+pub fn derived_path(dir: &std::path::Path, source: &str, suffix: &str, ext: &str) -> PathBuf {
+    let base = source.trim_end_matches(".gz").trim_end_matches(".nii");
+    let mut safe: String = base.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect();
+    safe = safe.trim().chars().take(60).collect();
+    if safe.is_empty() {
+        safe = "image".into();
+    }
+    let mut p = dir.join(format!("{safe}{suffix}{ext}"));
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("{safe}{suffix} {n}{ext}"));
+        n += 1;
+    }
+    p
+}
+
 /// Where Polymix keeps per-user files (autosave, parts, logs, catalogs).
 pub fn data_dir() -> Option<PathBuf> {
     // Test runs point this elsewhere so they never touch the user's files.

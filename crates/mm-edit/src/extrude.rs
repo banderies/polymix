@@ -288,6 +288,57 @@ pub fn offset_selection(mesh: &mut Mesh, tris: &[u32], distance: f64, falloff_wi
 /// [`offset_selection`]; with `keep_mesh_boundary`, open-boundary vertices of the region stay
 /// put too (and the soft transition ramps away from them).
 pub fn offset_selection_with(mesh: &mut Mesh, tris: &[u32], distance: f64, falloff_width: f64, keep_mesh_boundary: bool) -> EditResult<usize> {
+    let (verts, weight) = offset_weights(mesh, tris, falloff_width, keep_mesh_boundary)?;
+    let moves: Vec<(u32, DVec3)> = verts
+        .iter()
+        .filter(|&&v| weight[&v] > 0.0)
+        .map(|&v| (v, mesh.vertex(v) + mesh.vertex_normal(v) * (distance * weight[&v])))
+        .collect();
+    for &(v, p) in &moves {
+        mesh.set_vertex(v, p);
+    }
+    Ok(moves.len())
+}
+
+/// [`offset_selection_with`], then each moved vertex corrected `iterations` times towards its
+/// intended distance (`distance` × its transition weight) from the region as it was: moving
+/// along the normals alone crowds the surface in concave places and thins it over sharp convex
+/// ones, where a true offset keeps the distance everywhere.
+pub fn offset_selection_exact(mesh: &mut Mesh, tris: &[u32], distance: f64, falloff_width: f64, keep_mesh_boundary: bool, iterations: usize) -> EditResult<usize> {
+    let (verts, weight) = offset_weights(mesh, tris, falloff_width, keep_mesh_boundary)?;
+    let original = mesh.clone();
+    let region = valid_unique_tris(mesh, tris);
+    let n = offset_selection_with(mesh, tris, distance, falloff_width, keep_mesh_boundary)?;
+    if iterations == 0 || distance == 0.0 {
+        return Ok(n);
+    }
+    let bvh = mm_core::bvh::Bvh::build_subset(&original, &region);
+    let moved: Vec<u32> = verts.into_iter().filter(|v| weight[v] > 0.0).collect();
+    for _ in 0..iterations {
+        let mut change = 0f64;
+        for &v in &moved {
+            let target = distance * weight[&v];
+            let p = mesh.vertex(v);
+            let Some(hit) = bvh.nearest(&original, p, f64::INFINITY) else { continue };
+            let side = original.tri_normal(hit.tid) * target.signum();
+            let d = p - hit.point;
+            // Away from the nearest point, on the side the offset goes (the normal there if the
+            // vertex has crossed to the other side or sits on the surface).
+            let dir = if d.length() > 1e-12 * (1.0 + target.abs()) && d.dot(side) > 0.0 { d.normalize() } else { side };
+            let q = hit.point + dir * target.abs();
+            change = change.max(q.distance(p));
+            mesh.set_vertex(v, q);
+        }
+        if change < 1e-6 * distance.abs() {
+            break;
+        }
+    }
+    Ok(n)
+}
+
+/// The region's vertices and how far each moves (0 on the fixed border, ramping to 1 over
+/// `falloff_width`).
+fn offset_weights(mesh: &Mesh, tris: &[u32], falloff_width: f64, keep_mesh_boundary: bool) -> EditResult<(Vec<u32>, HashMap<u32, f64>)> {
     let region = valid_unique_tris(mesh, tris);
     if region.is_empty() {
         return Err(EditError::EmptySelection);
@@ -340,15 +391,7 @@ pub fn offset_selection_with(mesh: &mut Mesh, tris: &[u32], distance: f64, fallo
             }
         }
     }
-    let moves: Vec<(u32, DVec3)> = verts
-        .iter()
-        .filter(|&&v| weight[&v] > 0.0)
-        .map(|&v| (v, mesh.vertex(v) + mesh.vertex_normal(v) * (distance * weight[&v])))
-        .collect();
-    for &(v, p) in &moves {
-        mesh.set_vertex(v, p);
-    }
-    Ok(moves.len())
+    Ok((verts, weight))
 }
 
 /// Move every vertex along its (area-weighted) normal by `distance`. Naive: may

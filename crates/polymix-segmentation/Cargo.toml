@@ -10,7 +10,10 @@ polymix-workspace = { path = "../polymix-workspace" }
 polymix-imaging = { path = "../polymix-imaging" }
 mm-volume = { path = "../mm-volume" }
 mm-segment = { path = "../mm-segment" }
+mm-image = { path = "../mm-image" }
 mm-core = { path = "../mm-core" }
+mm-solid = { path = "../mm-solid" }
+mm-edit = { path = "../mm-edit" }
 egui.workspace = true
 eframe.workspace = true
 glam.workspace = true

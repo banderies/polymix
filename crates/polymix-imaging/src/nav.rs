@@ -6,6 +6,7 @@
 //! | right drag | pan (the image follows the cursor) |
 //! | middle drag | zoom (up = in, about where the drag started) |
 //! | left + right drag | window (across) and level (up / down) |
+//! | ⌥ / Alt + left drag | turn the other two planes about this view's normal (oblique planes) |
 //! | wheel | scroll through slices, one per notch; ⌘ / Ctrl + wheel or pinch zooms |
 //! | left click | point at a spot (e.g. move the crosshair) |
 //! | double-click | the view fills the layout, and back (a view on its own: back to the automatic view) |
@@ -26,6 +27,7 @@ enum Gesture {
     Pan,
     Zoom,
     Window,
+    Rotate,
 }
 
 /// Zoom and pan of one image view, and the state of the gesture in progress.
@@ -56,6 +58,8 @@ pub struct NavEvents {
     pub slices: i32,
     /// Window / level drag in points: x widens the window, y (down) lowers the level.
     pub window: Option<Vec2>,
+    /// An ⌥ / Alt + left drag: the pointer before and after this frame's movement.
+    pub rotate: Option<(Pos2, Pos2)>,
     /// A left click (no drag), where.
     pub clicked: Option<Pos2>,
     pub double_clicked: bool,
@@ -118,7 +122,9 @@ impl Nav {
                 if let (Some(a), Some(b)) = (press, pos) {
                     delta = b - a;
                 }
-                self.gesture = if r.dragged_by(PointerButton::Primary) {
+                self.gesture = if r.dragged_by(PointerButton::Primary) && ui.input(|i| i.modifiers.alt) {
+                    Some(Gesture::Rotate)
+                } else if r.dragged_by(PointerButton::Primary) {
                     Some(Gesture::Slices)
                 } else if r.dragged_by(PointerButton::Secondary) {
                     Some(Gesture::Pan)
@@ -140,6 +146,11 @@ impl Nav {
                     self.slice_drag -= n as f32 * DRAG_PER_SLICE;
                     ev.slices += n;
                     self.gesture_slices += n;
+                }
+                Some(Gesture::Rotate) => {
+                    if let (Some(b), true) = (pos, delta != Vec2::ZERO) {
+                        ev.rotate = Some((b - delta, b));
+                    }
                 }
                 Some(Gesture::Pan) => {
                     self.pan += delta;

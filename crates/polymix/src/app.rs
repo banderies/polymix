@@ -2,6 +2,7 @@
 
 mod agent;
 mod command;
+pub(crate) mod slices;
 
 pub use command::{MeshCommand, Shape, STANDARD_VIEWS};
 
@@ -74,16 +75,22 @@ pub enum ColorMode {
     Vertex,
     /// A checker texture through the UVs (Unwrap); the object colour without UVs.
     UvChecker,
+    /// The object's texture image through its UVs, lit like the surface.
+    Texture,
+    /// The texture's colours as they are (no lighting).
+    TextureUnlit,
 }
 
 impl ColorMode {
-    pub const ALL: [ColorMode; 4] = [ColorMode::Vertex, ColorMode::Group, ColorMode::Constant, ColorMode::UvChecker];
+    pub const ALL: [ColorMode; 6] = [ColorMode::Vertex, ColorMode::Group, ColorMode::Constant, ColorMode::UvChecker, ColorMode::Texture, ColorMode::TextureUnlit];
     pub fn label(self) -> &'static str {
         match self {
             ColorMode::Constant => "Constant color",
             ColorMode::Group => "Group colors",
             ColorMode::Vertex => "Vertex colors",
             ColorMode::UvChecker => "UV checker",
+            ColorMode::Texture => "Texture",
+            ColorMode::TextureUnlit => "Texture (unlit)",
         }
     }
     fn key(self) -> &'static str {
@@ -92,6 +99,8 @@ impl ColorMode {
             ColorMode::Group => "group",
             ColorMode::Vertex => "vertex",
             ColorMode::UvChecker => "uv",
+            ColorMode::Texture => "texture",
+            ColorMode::TextureUnlit => "texture_unlit",
         }
     }
     fn from_key(k: &str) -> Option<Self> {
@@ -127,6 +136,11 @@ pub enum ExportScope {
     AllVisible,
     /// The active object's selected triangles.
     Selection,
+    /// One file per face group of the active object (Meshmixer's "sequence, one file per
+    /// region"), named after the group.
+    PerGroup,
+    /// One file per visible object, named after it.
+    PerObject,
 }
 
 pub(crate) use polymix_workspace::data_dir;
@@ -156,8 +170,20 @@ pub enum ScaleMode {
 }
 
 /// Imported meshes waiting for an answer to the import prompts.
+/// What an imported file brings besides its mesh: texture coordinates (by triangle id) and a
+/// texture image.
+#[derive(Default)]
+struct ImportLook {
+    uvs: Option<Vec<[[f32; 2]; 3]>>,
+    texture: Option<std::sync::Arc<crate::scene::TextureImage>>,
+    /// Imported as a reference (File → Import reference…).
+    reference: bool,
+}
+
 struct PendingImport {
     meshes: Vec<(String, Mesh, String)>,
+    /// One per mesh.
+    looks: Vec<ImportLook>,
     /// Append / Replace decided (or not needed).
     placement: Option<bool /*replace*/>,
     remember: bool,
@@ -210,8 +236,12 @@ pub struct ViewOptions {
     /// target's depth.
     pub zoom_near: bool,
     pub show_grid: bool,
+    /// Grid spacing in mm (0: chosen from the scene's size).
+    pub grid_mm: f64,
     /// Draw the target surface see-through.
     pub transparent_target: bool,
+    /// Every object see-through, edges seen edge-on most opaque.
+    pub xray: bool,
     /// Background colour at the top of the view.
     pub background: [f32; 3],
     pub show_view_cube: bool,
@@ -222,7 +252,7 @@ pub struct ViewOptions {
 
 impl Default for ViewOptions {
     fn default() -> Self {
-        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, nav_custom: NavBindings::FUSION360, brush_scroll: BrushScroll::Shift, zoom_speed: 1.0, zoom_to_cursor: true, zoom_near: true, show_grid: false, transparent_target: true, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
+        Self { wireframe: false, normals: NormalMode::Group, colors: ColorMode::Vertex, boundaries: true, show_stats: true, sharp_edges: true, crease_deg: DEFAULT_CREASE_DEG, nav_mode: NavMode::Fusion360, nav_custom: NavBindings::FUSION360, brush_scroll: BrushScroll::Shift, zoom_speed: 1.0, zoom_to_cursor: true, zoom_near: true, show_grid: false, grid_mm: 0.0, transparent_target: true, xray: false, background: renderer::DEFAULT_BACKGROUND, show_view_cube: true, theme: ui_util::Theme::Dark, show_pivots: true }
     }
 }
 
@@ -243,7 +273,7 @@ enum SwitchTo {
 }
 
 /// Create a tool by name. Shared by the palette, hotkeys, menus and test scripts.
-fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
+pub(crate) fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
     Some(match name {
         "select" => Box::new(tools::select::SelectTool::default()),
         "inspector" => Box::new(tools::inspector::InspectorTool::new(cx)),
@@ -294,17 +324,20 @@ fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "extract" => Box::new(tools::ops::ExtrudeTool::new(cx, tools::ops::ExtrudeMode::Extract)),
         "mirror" => Box::new(tools::ops::MirrorTool::new(cx)),
         "offset" => Box::new(tools::ops::OffsetSolidTool::new(cx)),
+        "thicken" => Box::new(tools::ops::ThickenTool::new(cx)),
         "boolean" => Box::new(tools::ops::BooleanTool::new(cx)),
         "bridge" => Box::new(tools::ops::BridgeTool::new(cx)),
         "deviation" => Box::new(tools::deviation::DeviationTool::new(cx)),
         "cfdcheck" => Box::new(tools::cfd_check::CfdCheckTool::new(cx)),
         "centerline" => Box::new(tools::centerline_tool::CenterlineTool::new(cx)),
         "stent" => Box::new(tools::stent::StentTool::new(cx)),
+        "filtercomplex" => Box::new(tools::complex::FilterComplexTool::new(cx)),
+        "setuv" => Box::new(tools::unwrap::UnwrapTool::new_projection(cx)),
         _ => return None,
     })
 }
 
-type ImportResult = Vec<(String, Mesh, String)>;
+type ImportResult = Vec<(String, Mesh, String, ImportLook)>;
 type BoundaryKey = (ObjectId, u64, usize);
 
 pub struct MeshWorkspace {
@@ -364,6 +397,10 @@ pub struct MeshWorkspace {
     show_objects: bool,
     /// The object browser folded to its title (click it to open again).
     objects_folded: bool,
+    /// Meshes for the Segmentation workspace (Send to Segmentation), taken by the shell.
+    pub(crate) to_segmentation: Vec<(String, Mesh)>,
+    /// The Segmentation tab's image as slices among the meshes.
+    pub(crate) slices: slices::ImageSlices,
     /// Width of the object browser (drag its left edge).
     objects_width: f32,
     prefs: Prefs,
@@ -442,6 +479,8 @@ impl MeshWorkspace {
             hotbox: None,
             show_objects: true,
             objects_folded: false,
+            to_segmentation: Vec::new(),
+            slices: slices::ImageSlices::new(),
             objects_width: 230.0,
             prefs: Prefs::default(),
             show_prefs: false,
@@ -472,7 +511,9 @@ impl MeshWorkspace {
                 .and_then(|k| ColorMode::from_key(&k))
                 .unwrap_or(if flag("group_colors", false) { ColorMode::Group } else { ColorMode::Vertex });
             app.view.show_grid = flag("grid", false);
+            app.view.grid_mm = st.get_string("grid_mm").and_then(|v| v.parse().ok()).unwrap_or(0.0);
             app.view.transparent_target = flag("transparent_target", true);
+            app.view.xray = flag("xray", false);
             app.view.show_view_cube = flag("view_cube", true);
             app.view.show_pivots = flag("pivots", true);
             if let Some(t) = st.get_string("theme").and_then(|k| ui_util::Theme::from_key(&k)) {
@@ -612,6 +653,8 @@ impl MeshWorkspace {
                 group_names: o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect(),
                 uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
                 pivots: o.pivots.clone(),
+                texture: o.texture.as_ref().and_then(|t| t.path.clone()),
+                reference: o.reference,
             })
             .collect();
         crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) }
@@ -662,6 +705,11 @@ impl MeshWorkspace {
     // ------------------------------------------------------------------
 
     fn start_import(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
+        self.start_import_as(files, false, ctx);
+    }
+
+    /// [`Self::start_import`]; as references (see-through guides) when `reference`.
+    fn start_import_as(&mut self, files: Vec<PathBuf>, reference: bool, ctx: &egui::Context) {
         let (projects, files): (Vec<PathBuf>, Vec<PathBuf>) =
             files.into_iter().partition(|f| f.extension().is_some_and(|e| e.eq_ignore_ascii_case(crate::project::EXTENSION)));
         if let Some(p) = projects.into_iter().next() {
@@ -705,10 +753,36 @@ impl MeshWorkspace {
                         rep.nonmanifold_split, rep.degenerate, rep.duplicate
                     );
                 }
-                out.push((imported.name, imported.mesh, notes));
+                let texture = match &imported.texture {
+                    Some(p) => match crate::scene::TextureImage::load(p) {
+                        Ok(t) => {
+                            notes += &format!(" — texture {}", p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()));
+                            Some(std::sync::Arc::new(t))
+                        }
+                        Err(e) => {
+                            notes += &format!(" — texture not loaded ({e})");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if reference {
+                    notes += " — as a reference";
+                }
+                out.push((imported.name, imported.mesh, notes, ImportLook { uvs: imported.uvs, texture, reference }));
             }
             Ok(out)
         }));
+    }
+
+    /// The image the Segmentation tab shows, for the image slices (`None`: none is open).
+    pub fn set_image_source(&mut self, source: Option<slices::SliceSource>) {
+        self.slices.set_source(source);
+    }
+
+    /// Meshes sent to the Segmentation workspace (Send to Segmentation), taken by the shell.
+    pub fn take_for_segmentation(&mut self) -> Vec<(String, Mesh)> {
+        std::mem::take(&mut self.to_segmentation)
     }
 
     /// Add meshes made in another workspace (Segmentation's Make mesh), in file coordinates
@@ -729,6 +803,7 @@ impl MeshWorkspace {
             })
             .collect();
         if let Some(p) = &mut self.pending_import {
+            p.looks.extend(meshes.iter().map(|_| ImportLook::default()));
             p.meshes.append(&mut meshes);
             return;
         }
@@ -738,7 +813,8 @@ impl MeshWorkspace {
             ImportMode::Append => Some(false),
             ImportMode::Replace => Some(true),
         };
-        self.pending_import = Some(PendingImport { meshes, placement, remember: false });
+        let looks = meshes.iter().map(|_| ImportLook::default()).collect();
+        self.pending_import = Some(PendingImport { meshes, looks, placement, remember: false });
     }
 
     fn poll_jobs(&mut self) {
@@ -746,14 +822,15 @@ impl MeshWorkspace {
             if let Some(res) = job.poll() {
                 self.import_job = None;
                 match res {
-                    Ok(meshes) => {
+                    Ok(imported) => {
                         let placement = match self.prefs.import_mode {
                             _ if self.scene.is_empty() => Some(false),
                             ImportMode::Ask => None,
                             ImportMode::Append => Some(false),
                             ImportMode::Replace => Some(true),
                         };
-                        self.pending_import = Some(PendingImport { meshes, placement, remember: false });
+                        let (meshes, looks) = imported.into_iter().map(|(n, m, note, look)| ((n, m, note), look)).unzip();
+                        self.pending_import = Some(PendingImport { meshes, looks, placement, remember: false });
                     }
                     Err(e) => self.status = format!("Import failed: {e:#}"),
                 }
@@ -805,6 +882,7 @@ impl MeshWorkspace {
                     if ui.button("Cancel").clicked() {
                         choice = Some(false);
                         pending.meshes.clear();
+                        pending.looks.clear();
                     }
                 });
             });
@@ -870,6 +948,7 @@ impl MeshWorkspace {
         }
         let first_import = self.scene.is_empty();
         let mut notes = Vec::new();
+        let mut looks = pending.looks.into_iter();
         for (name, mut mesh, mut note) in pending.meshes {
             if self.prefs.flip_zy {
                 mesh.transform(flip_zy_in);
@@ -878,7 +957,18 @@ impl MeshWorkspace {
                 mesh.transform(|p| p * factor);
                 note += &format!(" — scaled × {factor}");
             }
-            self.scene.add(name, mesh);
+            let look = looks.next().unwrap_or_default();
+            let id = self.scene.add(name, mesh);
+            if let Some(o) = self.scene.get_mut(id) {
+                if let Some(uvs) = look.uvs {
+                    o.uvs = Some(std::sync::Arc::new(crate::scene::UvSet::new(&o.mesh, uvs)));
+                }
+                o.texture = look.texture;
+                if look.reference {
+                    o.reference = true;
+                    o.color = glam::Vec4::new(0.62, 0.66, 0.72, 0.35);
+                }
+            }
             notes.push(note);
         }
         self.status = notes.join("  |  ");
@@ -919,6 +1009,9 @@ impl MeshWorkspace {
                 so.group_names = o.group_names.into_iter().collect();
                 so.uvs = o.uvs.map(|c| std::sync::Arc::new(crate::scene::UvSet::new(&so.mesh, c)));
                 so.pivots = o.pivots;
+                so.reference = o.reference;
+                // The texture is read again from its file (missing: the object shows without it).
+                so.texture = o.texture.and_then(|p| crate::scene::TextureImage::load(&p).ok()).map(std::sync::Arc::new);
             }
             ids.push(id);
         }
@@ -984,6 +1077,8 @@ impl MeshWorkspace {
                     group_names: groups,
                     uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
                     pivots: o.pivots.clone(),
+                    texture: o.texture.as_ref().and_then(|t| t.path.clone()),
+                    reference: o.reference,
                 }
             })
             .collect();
@@ -1053,10 +1148,14 @@ impl MeshWorkspace {
         if mm_io::Format::from_path(&path).is_none() {
             return Err(format!("Unknown mesh format for {} (use .stl, .obj, .ply, .off, .3mf, .amf, .dae, .wrl or .smesh)", path.display()));
         }
+        if matches!(scope, ExportScope::PerGroup | ExportScope::PerObject) {
+            return self.export_sequence(path, scope, ctx);
+        }
         let mesh: Mesh = match scope {
+            ExportScope::PerGroup | ExportScope::PerObject => unreachable!("handled above"),
             ExportScope::AllVisible => {
                 let mut m = Mesh::new();
-                for o in self.scene.objects.iter().filter(|o| o.visible) {
+                for o in self.scene.objects.iter().filter(|o| o.visible && !o.reference) {
                     m.append_mesh(&o.mesh, 0);
                 }
                 m
@@ -1085,6 +1184,67 @@ impl MeshWorkspace {
         self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |_| {
             mm_io::write_mesh(&p2, &mesh, &opts)?;
             Ok(format!("Exported {} triangles to {}", mesh.triangle_count(), p2.display()))
+        }));
+        Ok(msg)
+    }
+
+    /// Export one file per face group of the active object, or per visible object, next to
+    /// `path`: its name with the group's (or object's) name added.
+    fn export_sequence(&mut self, path: PathBuf, scope: ExportScope, ctx: &egui::Context) -> Result<String, String> {
+        let safe = |s: &str| -> String { s.chars().map(|c| if c.is_alphanumeric() || "-_ ".contains(c) { c } else { '_' }).collect::<String>().trim().replace(' ', "_") };
+        let stem = path.file_stem().map_or("mesh".to_string(), |s| s.to_string_lossy().to_string());
+        let ext = path.extension().map_or("stl".to_string(), |e| e.to_string_lossy().to_string());
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut parts: Vec<(String, Mesh)> = Vec::new();
+        match scope {
+            ExportScope::PerGroup => {
+                let o = self.scene.active().ok_or("Nothing to export.")?;
+                let mut groups: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+                for t in o.mesh.triangle_ids() {
+                    groups.entry(o.mesh.tri_group(t)).or_default().push(t);
+                }
+                for (g, tris) in groups {
+                    let name = o.group_names.get(&g).cloned().unwrap_or_else(|| format!("group_{g}"));
+                    parts.push((name, o.mesh.submesh(&tris).0));
+                }
+            }
+            _ => {
+                for o in self.scene.objects.iter().filter(|o| o.visible && !o.reference) {
+                    parts.push((o.name.clone(), (*o.mesh).clone()));
+                }
+            }
+        }
+        if parts.is_empty() {
+            return Err("Nothing to export.".into());
+        }
+        let flip = self.prefs.flip_zy;
+        let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, ..Default::default() };
+        let mut seen = std::collections::HashSet::new();
+        let files: Vec<(PathBuf, Mesh)> = parts
+            .into_iter()
+            .map(|(name, mut m)| {
+                if flip {
+                    m.transform(flip_zy_out);
+                }
+                let mut base = format!("{stem}_{}", safe(&name));
+                let mut k = 2;
+                while !seen.insert(base.clone()) {
+                    base = format!("{stem}_{}_{k}", safe(&name));
+                    k += 1;
+                }
+                (dir.join(format!("{base}.{ext}")), m)
+            })
+            .collect();
+        let n = files.len();
+        let msg = format!("Exporting {n} files to {}", dir.display());
+        self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |progress| {
+            for (i, (p, m)) in files.iter().enumerate() {
+                if !progress(i as f32 / n as f32) {
+                    anyhow::bail!("cancelled");
+                }
+                mm_io::write_mesh(p, m, &opts)?;
+            }
+            Ok(format!("Exported {n} files to {}", dir.display()))
         }));
         Ok(msg)
     }
@@ -1242,6 +1402,19 @@ impl MeshWorkspace {
                     ui.close();
                     self.import_dialog(&ctx);
                 }
+                if ui.button("Import reference…").on_hover_text("A mesh shown see-through as a guide (e.g. the original segmentation behind an edited model): not picked in the view nor exported with the visible objects, until made editable").clicked() {
+                    ui.close();
+                    if let Some(files) = rfd::FileDialog::new().add_filter("Meshes", &["stl", "obj", "ply", "off", "3mf", "amf"]).pick_files() {
+                        self.start_import_as(files, true, &ctx);
+                    }
+                }
+                if ui.button("Import parts folder…").on_hover_text("Add a folder of mesh files to Meshmix as parts").clicked() {
+                    ui.close();
+                    if let Some(msg) = crate::parts::import_parts_folder_dialog() {
+                        self.status = msg;
+                        self.library = None;
+                    }
+                }
                 if ui.button("Export active…").clicked() {
                     ui.close();
                     self.export_dialog(&ctx, ExportScope::Active);
@@ -1253,6 +1426,14 @@ impl MeshWorkspace {
                 if ui.button("Export selected triangles…").clicked() {
                     ui.close();
                     self.export_dialog(&ctx, ExportScope::Selection);
+                }
+                if ui.button("Export one file per region…").on_hover_text("Each face group of the active object to its own file, named after the group (e.g. a vessel's wall and its inlet / outlet patches)").clicked() {
+                    ui.close();
+                    self.export_dialog(&ctx, ExportScope::PerGroup);
+                }
+                if ui.button("Export one file per object…").on_hover_text("Each visible object to its own file, named after it").clicked() {
+                    ui.close();
+                    self.export_dialog(&ctx, ExportScope::PerObject);
                 }
                 ui.menu_button("Add shape", |ui| {
                     // Meshmixer's Import Sphere / Plane (no bunny: Polymix ships no sample scans).
@@ -1361,6 +1542,15 @@ impl MeshWorkspace {
                     .on_hover_text("On: tumble freely in every direction (trackball). Off: turntable that keeps the up axis vertical.");
                 ui.checkbox(&mut self.show_objects, "Object browser");
                 ui.checkbox(&mut self.view.show_stats, "Statistics");
+                let image = self.slices.source.as_ref().map(|s| s.name.clone());
+                let mut show = self.slices.show;
+                if ui.checkbox(&mut show, "Image slices").on_hover_text(match &image {
+                    Some(n) => format!("{n} (open in the Segmentation tab) as three planes among the meshes"),
+                    None => "The image open in the Segmentation tab as three planes among the meshes (open one there first)".into(),
+                }).changed() {
+                    ui.close();
+                    self.run(MeshCommand::ImageSlices(show), &ctx, vp);
+                }
                 ui.separator();
                 ui.label("Navigation").on_hover_text("Mouse buttons for tumble / pan / zoom (Meshmixer: Preferences → Navigation Mode). See Help → Controls.");
                 ui.horizontal(|ui| {
@@ -1403,6 +1593,15 @@ impl MeshWorkspace {
                     self.next_view();
                 }
                 ui.checkbox(&mut self.view.show_grid, "Show grid");
+                ui.horizontal(|ui| {
+                    ui.label("Grid size");
+                    let auto = grid_step(self.scene.bounds().diagonal(), 0.0);
+                    ui.add(egui::DragValue::new(&mut self.view.grid_mm).range(0.0..=10_000.0).speed(0.1).suffix(" mm").custom_formatter(move |v, _| if v <= 0.0 { format!("auto ({auto:.3} mm)") } else { format!("{v} mm") }))
+                        .on_hover_text("Spacing of the grid lines (every fifth is brighter); 0: chosen from the scene's size");
+                    if self.view.grid_mm > 0.0 && ui.small_button("Auto").clicked() {
+                        self.view.grid_mm = 0.0;
+                    }
+                });
                 ui.checkbox(&mut self.view.show_view_cube, "Show view cube");
                 ui.checkbox(&mut self.view.show_pivots, "Show pivots");
                 ui.horizontal(|ui| {
@@ -1415,6 +1614,7 @@ impl MeshWorkspace {
                     }
                 });
                 ui.checkbox(&mut self.view.transparent_target, "Transparent target").on_hover_text("Draw the target surface see-through");
+                ui.checkbox(&mut self.view.xray, "X-ray").on_hover_text("Every object see-through, the parts seen edge-on (outlines, a vessel's walls) most opaque: shows what lies inside (a stent in a vessel, a lumen in a wall)");
                 ui.menu_button("Standard views", |ui| {
                     for (k, (name, _, _)) in STANDARD_VIEWS.iter().enumerate() {
                         if ui.button(*name).clicked() {
@@ -1480,33 +1680,8 @@ impl MeshWorkspace {
         let mut command: Option<MeshCommand> = None;
         match cat {
             Category::Meshmix => {
-                let lib = self.library.get_or_insert_with(crate::parts::Library::load);
-                let mut drop: Option<String> = None;
-                for (title, user, kind) in [("Solid parts", false, mm_edit::PartKind::Solid), ("Open parts", false, mm_edit::PartKind::Open), ("My parts", true, mm_edit::PartKind::Solid)] {
-                    let items: Vec<&crate::parts::LibPart> = lib.parts.iter().filter(|p| p.file.is_some() == user && (user || p.part.kind == kind)).collect();
-                    if items.is_empty() {
-                        continue;
-                    }
-                    ui_util::section(ui, title);
-                    ui.horizontal_wrapped(|ui| {
-                        for p in items {
-                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(72.0, 86.0), egui::Sense::click());
-                            let v = ui.visuals();
-                            let bg = if resp.hovered() { v.widgets.hovered.bg_fill } else { v.widgets.inactive.bg_fill };
-                            ui.painter().rect_filled(rect, 4.0, bg);
-                            let img = egui::Rect::from_min_size(rect.min + egui::vec2(6.0, 4.0), egui::vec2(60.0, 60.0));
-                            crate::parts::paint_thumbnail(ui.painter(), img, &p.thumb);
-                            ui.painter().text(rect.center_bottom() - egui::vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, &p.part.name, egui::FontId::proportional(11.0), v.text_color());
-                            let kind = if p.part.kind == mm_edit::PartKind::Open { "open part: welded into the surface" } else { "solid part" };
-                            if resp.on_hover_text(format!("{} ({kind})", p.part.name)).clicked() && has_obj {
-                                drop = Some(format!("drop:{}", p.part.name));
-                            }
-                        }
-                    });
-                }
-                ui.small("Click a part, then press on the model where it goes and drag to size it. Make your own with Select > Convert To.");
-                if let Some(name) = drop {
-                    self.switch_to(SwitchTo::Tool(name), &ctx, vp);
+                if let Some(name) = crate::parts::library_panel(ui, &mut self.library, has_obj, &mut self.status) {
+                    self.switch_to(SwitchTo::Tool(format!("drop:{name}")), &ctx, vp);
                 }
             }
             Category::Edit => {
@@ -1536,6 +1711,9 @@ impl MeshWorkspace {
                     if ui.button("Unwrap").on_hover_text("Compute UVs (texture coordinates) for OBJ export").clicked() {
                         open = Some("unwrap");
                     }
+                    if ui.button("Set UVs").on_hover_text("UVs by planar, cylindrical, spherical or box projection (no unwrapping)").clicked() {
+                        open = Some("setuv");
+                    }
                     if ui.button("Make Pattern").on_hover_text("Turn the object into a frame of tubes, or perforate / fill it with tubes, balls or a lattice").clicked() {
                         open = Some("makepattern");
                     }
@@ -1550,6 +1728,9 @@ impl MeshWorkspace {
                     }
                     if ui.button("Offset / Hollow").clicked() {
                         open = Some("offset");
+                    }
+                    if ui.button("Thicken").on_hover_text("A wall of a given thickness on one side of the surface, open ends kept open (to print a hollow vessel)").clicked() {
+                        open = Some("thicken");
                     }
                     if ui.button("Boolean").clicked() {
                         open = Some("boolean");
@@ -1576,6 +1757,9 @@ impl MeshWorkspace {
                     if ui.button("Generate Complex").on_hover_text("Cells of the overlapping visible closed objects (A − B, A ∩ B, B − A, …), one face group each").clicked() {
                         command = Some(MeshCommand::GenerateComplex);
                     }
+                    if ui.button("Filter Complex").on_hover_text("Keep cells of a complex by which inputs they are inside (A & B, A - B, n == 1, …)").clicked() {
+                        open = Some("filtercomplex");
+                    }
                     if ui.button("Split Complex").on_hover_text("One object per face group").clicked() {
                         command = Some(MeshCommand::SplitComplex);
                     }
@@ -1601,6 +1785,9 @@ impl MeshWorkspace {
                     }
                     if ui.button("Cap open ends").on_hover_text("Flat-cap every open boundary").clicked() {
                         open = Some("cap");
+                    }
+                    if ui.button("Thicken into a shell").on_hover_text("A wall of a given thickness around the lumen (or inside it), the cut ends kept open with flat rims: a hollow model to print").clicked() {
+                        open = Some("thicken");
                     }
                     if ui.button("Measure diameter").clicked() {
                         open = Some("measure");
@@ -1740,6 +1927,8 @@ impl MeshWorkspace {
         let mut solo = None;
         let mut show_all = false;
         let mut duplicate = None;
+        let mut send = None;
+        let (mut texture, mut untexture, mut toggle_reference) = (None, None, None);
         let mut new_target: Option<Option<ObjectId>> = None;
         let target = self.scene.target;
         let rename_id = egui::Id::NULL.with("renaming");
@@ -1807,6 +1996,22 @@ impl MeshWorkspace {
                                 duplicate = Some(o.id);
                                 ui.close();
                             }
+                            if ui.button("Texture…").on_hover_text("An image (PNG, JPEG, BMP, TGA) shown on the object through its UVs (Edit → Unwrap makes them; OBJ files bring theirs)").clicked() {
+                                texture = Some(o.id);
+                                ui.close();
+                            }
+                            if ui.button(if o.reference { "Make editable" } else { "Make reference" }).on_hover_text("A reference is shown see-through as a guide, not picked in the view nor exported with the visible objects").clicked() {
+                                toggle_reference = Some(o.id);
+                                ui.close();
+                            }
+                            if o.texture.is_some() && ui.button("Remove texture").clicked() {
+                                untexture = Some(o.id);
+                                ui.close();
+                            }
+                            if ui.button("Send to Segmentation").on_hover_text("Its inside becomes a segment of the volume shown in the Segmentation tab (a closed mesh, in the volume's space: LPS as from Make mesh or 3D Slicer, or RAS)").clicked() {
+                                send = Some(o.id);
+                                ui.close();
+                            }
                             if target == Some(o.id) {
                                 if ui.button("Clear target").clicked() {
                                     new_target = Some(None);
@@ -1848,6 +2053,25 @@ impl MeshWorkspace {
         if let Some(t) = new_target {
             commands::set_target(&mut self.cmd_cx(), t);
         }
+        if let Some(id) = send {
+            let vp = self.vp_prev(&ctx);
+            self.run(MeshCommand::SendToSegmentation(id), &ctx, vp);
+        }
+        if let Some(id) = texture {
+            if let Some(path) = rfd::FileDialog::new().set_title("Texture image").add_filter("Image", &["png", "jpg", "jpeg", "bmp", "tga"]).pick_file() {
+                let vp = self.vp_prev(&ctx);
+                self.run(MeshCommand::SetTexture(id, Some(path)), &ctx, vp);
+            }
+        }
+        if let Some(id) = toggle_reference {
+            let vp = self.vp_prev(&ctx);
+            let on = !self.scene.get(id).is_some_and(|o| o.reference);
+            self.run(MeshCommand::SetReference(id, on), &ctx, vp);
+        }
+        if let Some(id) = untexture {
+            let vp = self.vp_prev(&ctx);
+            self.run(MeshCommand::SetTexture(id, None), &ctx, vp);
+        }
         if let Some(id) = duplicate {
             if self.accept_tools_for_command(&ctx, self.vp_prev(&ctx)) {
                 self.scene.active = Some(id);
@@ -1888,6 +2112,10 @@ impl MeshWorkspace {
                         ui.label(format!("{:.3}", mm_core::measure::volume(m)));
                         ui.end_row();
                     }
+                    let c = mm_core::measure::center_of_mass(m);
+                    ui.label("Centre of mass").on_hover_text(if open == 0 { "Of the enclosed solid (uniform density)" } else { "Of the surface (an open mesh encloses no solid)" });
+                    ui.label(format!("{:.2}, {:.2}, {:.2}", c.x, c.y, c.z));
+                    ui.end_row();
                     ui.label("Area");
                     ui.label(format!("{:.3}", mm_core::measure::surface_area(m)));
                     ui.end_row();
@@ -2161,7 +2389,12 @@ impl MeshWorkspace {
     /// Frame the visible objects (F, the Fit button).
     fn focus_scene(&mut self) {
         self.remember_view();
-        self.camera.fit(&self.scene.bounds(), self.vp_aspect);
+        let mut b = self.scene.bounds();
+        // Image slices shown count too.
+        if let Some(planes) = self.slices.frame().and_then(|f| crate::image_planes::bounds(&f.volume, &f.settings)) {
+            b = if self.scene.objects.iter().any(|o| o.visible) { b.union(&planes) } else { planes };
+        }
+        self.camera.fit(&b, self.vp_aspect);
     }
 
     fn standard_view(&mut self, yaw: f64, pitch: f64) {
@@ -2566,7 +2799,7 @@ impl MeshWorkspace {
             }
         }
         if self.view.show_grid {
-            lines.extend(grid_lines(&self.camera, &self.scene.bounds()));
+            lines.extend(grid_lines(&self.camera, &self.scene.bounds(), self.view.grid_mm));
         }
         lines.extend(overlay.lines.iter().copied());
 
@@ -2601,11 +2834,14 @@ impl MeshWorkspace {
                     }
                 } else if let Some(g) = self.gpu.get(&o.id) {
                     let see_through = self.view.transparent_target && self.scene.target == Some(o.id);
-                    objs.push((g, o.color.w < 0.999 || see_through));
+                    objs.push((g, o.color.w < 0.999 || see_through || self.view.xray));
                 }
             }
             let input = renderer::FrameInput { globals, objects: objs, lines: &lines, overlay_tris: &overlay.tris };
-            let tex = self.renderer.as_mut().unwrap().render(rs, size, &input);
+            let planes = self.slices.frame();
+            let r = self.renderer.as_mut().unwrap();
+            r.set_image_planes(planes);
+            let tex = r.render(rs, size, &input);
             ui.painter().image(tex, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         } else {
             ui.painter().rect_filled(rect, 0.0, Color32::from_gray(30));
@@ -2748,12 +2984,18 @@ impl MeshWorkspace {
                 group_normals: self.view.normals == NormalMode::Group,
                 vertex_colors: self.view.colors == ColorMode::Vertex,
                 uv_checker: self.view.colors == ColorMode::UvChecker || self.tools.last().is_some_and(|t| t.shows_uvs()),
+                texture_mode: match self.view.colors {
+                    ColorMode::Texture => 1,
+                    ColorMode::TextureUnlit => 2,
+                    _ => 0,
+                },
+                xray: self.view.xray,
                 material: crate::materials::MATERIALS[o.material.min(crate::materials::MATERIALS.len() - 1)],
             };
             if let Some((pid, pm)) = preview {
                 if pid == o.id {
                     let g = self.preview_gpu.get_or_insert_with(|| renderer.create_mesh(&rs.device));
-                    renderer.sync_mesh(&rs.device, &rs.queue, g, pm, None, 0, &style, (&mut no_moves, 0), None, None);
+                    renderer.sync_mesh(&rs.device, &rs.queue, g, pm, None, 0, &style, (&mut no_moves, 0), None, None, None);
                     continue;
                 }
             }
@@ -2764,7 +3006,8 @@ impl MeshWorkspace {
                 (None, None) => None,
             };
             let uvs = o.uvs.as_deref().filter(|u| u.topo == o.mesh.topology_version()).map(|u| (u.stamp, u.corners.as_slice()));
-            renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars, uvs);
+            let texture = o.texture.as_deref().map(|t| (t.stamp, t.width, t.height, t.rgba.as_slice()));
+            renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars, uvs, texture);
         }
         if preview.is_none() {
             self.preview_gpu = None;
@@ -3237,7 +3480,9 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         st.set_string("boundaries", b(self.view.boundaries));
         st.set_string("color_mode", self.view.colors.key().to_string());
         st.set_string("grid", b(self.view.show_grid));
+        st.set_string("grid_mm", self.view.grid_mm.to_string());
         st.set_string("transparent_target", b(self.view.transparent_target));
+        st.set_string("xray", b(self.view.xray));
         st.set_string("view_cube", b(self.view.show_view_cube));
         st.set_string("pivots", b(self.view.show_pivots));
         st.set_string("theme", self.view.theme.key().to_string());
@@ -3410,6 +3655,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         self.handle_keys(&ctx, vp_prev);
         self.help_window(&ctx);
         self.preferences_window(&ctx);
+        self.slices.window(&ctx);
         self.finish_import(&ctx);
         self.recovery_window(&ctx);
         self.space_window(&ctx);
@@ -3418,17 +3664,27 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     }
 }
 
-/// Floor grid under the scene, perpendicular to the up axis, with "nice" spacing (1, 2 or 5
-/// times a power of ten) and every fifth line brighter.
-fn grid_lines(camera: &Camera, b: &mm_core::Aabb) -> Vec<ColorVertex> {
+/// The grid's spacing: `fixed` (mm) when set, else "nice" for a scene `size` across (1, 2 or 5
+/// times a power of ten, about a twentieth of it).
+fn grid_step(size: f64, fixed: f64) -> f64 {
+    if fixed > 0.0 {
+        return fixed;
+    }
+    let raw = size.max(1e-6) / 20.0;
+    let pow = 10f64.powf(raw.log10().floor());
+    [1.0, 2.0, 5.0, 10.0].into_iter().map(|m| m * pow).find(|s| *s >= raw).unwrap_or(10.0 * pow)
+}
+
+/// Floor grid under the scene, perpendicular to the up axis, spaced `fixed` mm apart (0:
+/// chosen from the scene's size), every fifth line brighter.
+fn grid_lines(camera: &Camera, b: &mm_core::Aabb, fixed: f64) -> Vec<ColorVertex> {
     if b.is_empty() {
         return Vec::new();
     }
     let up = camera.world_up();
     let size = b.diagonal().max(1e-6);
-    let raw = size / 20.0;
-    let pow = 10f64.powf(raw.log10().floor());
-    let step = [1.0, 2.0, 5.0, 10.0].into_iter().map(|m| m * pow).find(|s| *s >= raw).unwrap_or(10.0 * pow);
+    // At most 400 lines each way (a fine grid under a large scene covers its middle).
+    let step = grid_step(size, fixed).max(size * 0.75 / 400.0);
     // In-plane axes and the floor height (just below the scene).
     let (u, v) = if up == glam::DVec3::Z { (glam::DVec3::X, glam::DVec3::Y) } else { (glam::DVec3::X, glam::DVec3::Z) };
     let floor = b.min.dot(up) - size * 1e-3;
@@ -3452,6 +3708,22 @@ fn grid_lines(camera: &Camera, b: &mm_core::Aabb) -> Vec<ColorVertex> {
         out.push(ColorVertex::new(z.as_vec3(), col));
     }
     out
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    #[test]
+    fn grid_spacing_fixed_or_from_the_scene() {
+        assert_eq!(grid_step(100.0, 0.0), 5.0);
+        assert_eq!(grid_step(30.0, 0.0), 2.0);
+        assert_eq!(grid_step(100.0, 2.5), 2.5);
+        // A fine grid under a large scene stays at 400 lines each way.
+        let b = mm_core::Aabb { min: glam::DVec3::splat(-500.0), max: glam::DVec3::splat(500.0) };
+        let lines = grid_lines(&Camera::default(), &b, 0.01);
+        assert!(lines.len() <= 4 * 801 + 8, "{}", lines.len());
+    }
 }
 
 #[cfg(test)]

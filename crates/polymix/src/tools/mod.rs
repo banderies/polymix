@@ -37,6 +37,7 @@ pub mod deviation;
 pub mod cfd_check;
 pub mod centerline_tool;
 pub mod stent;
+pub mod complex;
 
 /// Screen-space description of the 3D viewport.
 #[derive(Clone, Copy, Debug)]
@@ -173,7 +174,8 @@ pub fn step_brush_size(size_pct: &mut f32, grow: bool) {
 pub fn pick_ray(scene: &mut Scene, ray: &Ray, only: Option<ObjectId>) -> Option<(ObjectId, RayHit)> {
     let mut best: Option<(ObjectId, RayHit)> = None;
     for o in scene.objects.iter_mut() {
-        if !o.visible || only.is_some_and(|id| id != o.id) {
+        // References are guides, not picked (unless asked for by id).
+        if !o.visible || only.is_some_and(|id| id != o.id) || (o.reference && only.is_none()) {
             continue;
         }
         let bvh = o.bvh();

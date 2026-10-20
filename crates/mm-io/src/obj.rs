@@ -1,6 +1,6 @@
-//! Wavefront OBJ: `v` (optionally with `r g b`), `f` in all index forms with negative
-//! (relative) indices, polygons (fan-triangulated), and `g`/`o` as face groups. Other
-//! statements are ignored.
+//! Wavefront OBJ: `v` (optionally with `r g b`), `vt`, `f` in all index forms with negative
+//! (relative) indices, polygons (fan-triangulated), `g`/`o` as face groups, and `mtllib` /
+//! `usemtl` for the texture of the most used material. Other statements are ignored.
 
 use crate::parse::{find_byte, parse_f64, parse_i64, show, strip_bom, trim, Lines, Tokens};
 use crate::{fan, put_xyz, write_parallel, Raw};
@@ -21,7 +21,14 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
     let mut cur_g: Vec<u8> = Vec::new();
     let mut cur_gid: Option<i32> = None;
     let mut poly: SmallVec<[u32; 8]> = SmallVec::new();
+    let mut poly_vt: SmallVec<[Option<u32>; 8]> = SmallVec::new();
     let mut short_faces = 0usize;
+    let mut vts: Vec<[f32; 2]> = Vec::new();
+    // Per triangle: its corners' `vt` (if any face has them).
+    let mut tri_vt: Vec<[Option<u32>; 3]> = Vec::new();
+    let mut mtllib: Option<String> = None;
+    let mut material: Option<String> = None;
+    let mut material_faces: HashMap<String, usize> = HashMap::new();
 
     let mut lines = Lines::new(data);
     while let Some(line) = lines.next() {
@@ -54,13 +61,36 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
                 }
                 positions.push(DVec3::new(vals[0], vals[1], vals[2]));
             }
+            b"vt" => {
+                let u = tk.next().and_then(parse_f64).unwrap_or(0.0) as f32;
+                let v = tk.next().and_then(parse_f64).unwrap_or(0.0) as f32;
+                vts.push([u, v]);
+            }
+            b"mtllib" => mtllib = Some(String::from_utf8_lossy(trim(tk.rest())).into_owned()),
+            b"usemtl" => material = Some(String::from_utf8_lossy(trim(tk.rest())).into_owned()),
             b"f" | b"fo" => {
                 poly.clear();
+                poly_vt.clear();
                 let nv = positions.len() as i64;
                 for t in tk.by_ref() {
                     let idx_tok = match find_byte(t, b'/') {
-                        Some(i) => &t[..i],
-                        None => t,
+                        Some(i) => {
+                            // v/vt or v/vt/vn: the texture coordinate's index (relative ones too).
+                            let rest = &t[i + 1..];
+                            let vt_tok = match find_byte(rest, b'/') {
+                                Some(j) => &rest[..j],
+                                None => rest,
+                            };
+                            poly_vt.push(parse_i64(vt_tok).and_then(|k| {
+                                let k = if k > 0 { k - 1 } else { vts.len() as i64 + k };
+                                (0..vts.len() as i64).contains(&k).then_some(k as u32)
+                            }));
+                            &t[..i]
+                        }
+                        None => {
+                            poly_vt.push(None);
+                            t
+                        }
                     };
                     let i = parse_i64(idx_tok)
                         .ok_or_else(|| anyhow!("line {}: bad face index '{}'", lines.line_no, show(t)))?;
@@ -92,6 +122,12 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
                 if added == 0 {
                     short_faces += 1;
                 }
+                for i in 1..=added {
+                    tri_vt.push([poly_vt[0], poly_vt[i], poly_vt[i + 1]]);
+                }
+                if let Some(m) = &material {
+                    *material_faces.entry(m.clone()).or_default() += added;
+                }
                 groups.extend(std::iter::repeat_n(g, added));
             }
             b"g" => {
@@ -116,6 +152,12 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
         }
     }
     let mut raw = Raw { positions, triangles: tris, colors, ..Default::default() };
+    if tri_vt.iter().flatten().any(Option::is_some) {
+        raw.uvs = Some(tri_vt.iter().map(|c| c.map(|k| k.map_or([0.0; 2], |k| vts[k as usize]))).collect());
+    }
+    if let (Some(lib), Some((m, _))) = (mtllib, material_faces.into_iter().max_by_key(|(_, n)| *n)) {
+        raw.material = Some((lib, m));
+    }
     if group_ids.len() > 1 {
         raw.groups = Some(groups);
     }
@@ -181,3 +223,21 @@ pub(crate) fn write<W: Write + ?Sized>(
     })?;
     Ok(())
 }
+
+/// The diffuse texture (`map_Kd`) of `material` in the material library `mtl`, next to it.
+pub(crate) fn diffuse_map(mtl: &std::path::Path, material: &str) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(mtl).ok()?;
+    let mut current = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("newmtl") {
+            current = name.trim() == material;
+        } else if let (true, Some(rest)) = (current, line.strip_prefix("map_Kd")) {
+            // Options (-s, -o, …) come first; the file name is last.
+            let file = rest.split_whitespace().last()?;
+            return Some(mtl.parent()?.join(file.replace('\\', "/")));
+        }
+    }
+    None
+}
+

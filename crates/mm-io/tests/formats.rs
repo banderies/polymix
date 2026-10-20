@@ -722,3 +722,32 @@ fn obj_writes_texture_coordinates() {
     let back = read_mesh_from_bytes(text.as_bytes(), Format::Obj).unwrap();
     assert_same_triangles(&m, &back.mesh, 1e-6);
 }
+
+#[test]
+fn obj_texture_coordinates_and_material_texture() {
+    let dir = std::env::temp_dir().join(format!("mm-io-obj-uv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A quad (two triangles) with its own texture coordinates, and a material with a map.
+    std::fs::write(dir.join("m.mtl"), "newmtl other\nmap_Kd nope.png\nnewmtl skin\nKd 1 1 1\nmap_Kd -s 1 1 1 tex/skin.png\n").unwrap();
+    std::fs::write(
+        dir.join("q.obj"),
+        "mtllib m.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nusemtl skin\nf 1/1 2/2 3/3 4/4\n",
+    )
+    .unwrap();
+    let m = mm_io::read_mesh(&dir.join("q.obj")).unwrap();
+    let uvs = m.uvs.expect("uvs read");
+    assert_eq!(uvs.len(), m.mesh.max_tid());
+    // Each corner's UV equals its vertex position (x, y) in this quad.
+    for t in m.mesh.triangle_ids() {
+        for (j, v) in m.mesh.triangle(t).into_iter().enumerate() {
+            let p = m.mesh.vertex(v);
+            assert_eq!(uvs[t as usize][j], [p.x as f32, p.y as f32]);
+        }
+    }
+    assert_eq!(m.texture, Some(dir.join("tex/skin.png")));
+    // Without `vt`: no UVs.
+    std::fs::write(dir.join("p.obj"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+    let p = mm_io::read_mesh(&dir.join("p.obj")).unwrap();
+    assert!(p.uvs.is_none() && p.texture.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}

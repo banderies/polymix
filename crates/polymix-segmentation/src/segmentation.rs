@@ -33,6 +33,54 @@ pub struct Segment {
     pub visible: bool,
     /// Its value in the label map (1–255).
     pub label: u8,
+    pub status: Status,
+}
+
+/// How far a segment's work has got (as 3D Slicer flags it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Status {
+    #[default]
+    NotStarted,
+    InProgress,
+    Completed,
+    Flagged,
+}
+
+impl Status {
+    pub const ALL: [Status; 4] = [Status::NotStarted, Status::InProgress, Status::Completed, Status::Flagged];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::NotStarted => "Not started",
+            Status::InProgress => "In progress",
+            Status::Completed => "Completed",
+            Status::Flagged => "Flagged",
+        }
+    }
+
+    /// As Slicer's `Segmentation.Status` tag has it.
+    pub fn key(self) -> &'static str {
+        match self {
+            Status::NotStarted => "notstarted",
+            Status::InProgress => "inprogress",
+            Status::Completed => "completed",
+            Status::Flagged => "flagged",
+        }
+    }
+
+    pub fn colour(self) -> Color32 {
+        match self {
+            Status::NotStarted => Color32::from_gray(120),
+            Status::InProgress => Color32::from_rgb(240, 180, 60),
+            Status::Completed => Color32::from_rgb(110, 200, 110),
+            Status::Flagged => Color32::from_rgb(235, 90, 80),
+        }
+    }
+
+    /// The next one round (clicking the flag).
+    pub fn next(self) -> Status {
+        Status::ALL[(Status::ALL.iter().position(|s| *s == self).unwrap_or(0) + 1) % 4]
+    }
 }
 
 /// Where edits may change voxels.
@@ -190,7 +238,7 @@ impl Segmentation {
         let n = (1..).find(|n| !self.segments.iter().any(|s| s.name == format!("Segment_{n}"))).unwrap_or(1);
         let [r, g, b] = PALETTE[self.next_colour % PALETTE.len()];
         self.next_colour += 1;
-        self.segments.push(Segment { name: name.unwrap_or_else(|| format!("Segment_{n}")), colour: Color32::from_rgb(r, g, b), visible: true, label });
+        self.segments.push(Segment { name: name.unwrap_or_else(|| format!("Segment_{n}")), colour: Color32::from_rgb(r, g, b), visible: true, label, status: Status::NotStarted });
         self.selected = Some(self.segments.len() - 1);
         self.changed(true);
         self.selected

@@ -22,7 +22,7 @@ const WARN: egui::Color32 = egui::Color32::from_rgb(240, 170, 90);
 
 /// Where derived images are saved.
 pub fn derived_dir() -> Option<PathBuf> {
-    polymix_workspace::data_dir().map(|d| d.join("volume").join("derived"))
+    polymix_workspace::derived_dir()
 }
 
 /// Whether image operations apply to this volume (readable intensity images).
@@ -58,19 +58,7 @@ fn with_progress<T: Send>(progress: ProgressFn, lo: f32, span: f32, f: impl FnOn
 
 /// A file name for a derived image: the source's name made safe, with a suffix, not taken yet.
 fn output_path(dir: &Path, source: &str, suffix: &str, ext: &str) -> PathBuf {
-    let base = source.trim_end_matches(".gz").trim_end_matches(".nii");
-    let mut safe: String = base.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect();
-    safe = safe.trim().chars().take(60).collect();
-    if safe.is_empty() {
-        safe = "image".into();
-    }
-    let mut p = dir.join(format!("{safe}{suffix}{ext}"));
-    let mut n = 2;
-    while p.exists() {
-        p = dir.join(format!("{safe}{suffix} {n}{ext}"));
-        n += 1;
-    }
-    p
+    polymix_workspace::derived_path(dir, source, suffix, ext)
 }
 
 /// Save an image as NIfTI next to the other derived images: 16-bit integers when every value
