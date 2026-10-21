@@ -7,6 +7,7 @@ use dicom_core::Tag;
 use dicom_dictionary_std::tags;
 use dicom_object::{InMemDicomObject, OpenFileOptions};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// Geometry and content of one frame of an Enhanced multi-frame file.
@@ -78,23 +79,23 @@ pub struct Instance {
 }
 
 fn text(obj: &InMemDicomObject, tag: Tag) -> String {
-    obj.element_opt(tag).ok().flatten().and_then(|e| e.to_str().ok()).map(|s| s.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string()).unwrap_or_default()
+    obj.get(tag).and_then(|e| e.to_str().ok()).map(|s| s.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string()).unwrap_or_default()
 }
 
 fn multi(obj: &InMemDicomObject, tag: Tag) -> Vec<String> {
-    obj.element_opt(tag).ok().flatten().and_then(|e| e.to_multi_str().ok()).map(|v| v.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
+    obj.get(tag).and_then(|e| e.to_multi_str().ok()).map(|v| v.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
 }
 
 fn float(obj: &InMemDicomObject, tag: Tag) -> Option<f64> {
-    obj.element_opt(tag).ok().flatten().and_then(|e| e.to_float64().ok()).filter(|v| v.is_finite())
+    obj.get(tag).and_then(|e| e.to_float64().ok()).filter(|v| v.is_finite())
 }
 
 fn floats(obj: &InMemDicomObject, tag: Tag) -> Vec<f64> {
-    obj.element_opt(tag).ok().flatten().and_then(|e| e.to_multi_float64().ok()).unwrap_or_default()
+    obj.get(tag).and_then(|e| e.to_multi_float64().ok()).unwrap_or_default()
 }
 
 fn int(obj: &InMemDicomObject, tag: Tag) -> Option<i64> {
-    obj.element_opt(tag).ok().flatten().and_then(|e| e.to_int::<i64>().ok())
+    obj.get(tag).and_then(|e| e.to_int::<i64>().ok())
 }
 
 fn arr<const N: usize>(v: Vec<f64>) -> Option<[f64; N]> {
@@ -103,7 +104,7 @@ fn arr<const N: usize>(v: Vec<f64>) -> Option<[f64; N]> {
 
 /// The first item of a sequence.
 fn item(obj: &InMemDicomObject, tag: Tag) -> Option<&InMemDicomObject> {
-    obj.element_opt(tag).ok().flatten()?.items()?.first()
+    obj.get(tag)?.items()?.first()
 }
 
 /// A field from a functional-group macro (e.g. Plane Position) of a per-frame item, else of
@@ -114,9 +115,13 @@ fn group<'a>(frame: Option<&'a InMemDicomObject>, shared: Option<&'a InMemDicomO
 
 /// Read the header of a DICOM file (Part 10, with or without the preamble).
 pub fn read(path: &Path) -> Result<Instance> {
+    read_with_size(path, std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+}
+
+/// [`read`] for a file whose size (`bytes`) the caller already knows, as a folder scan does.
+pub fn read_with_size(path: &Path, bytes: u64) -> Result<Instance> {
     let obj = OpenFileOptions::new().read_until(tags::PIXEL_DATA).open_file(path).with_context(|| "not readable as DICOM".to_string())?;
     let ts = obj.meta().transfer_syntax().trim_end_matches('\0').to_string();
-    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut i = from_object(&obj, path, bytes, ts);
     // Some objects (DICOMDIR) carry their SOP class only in the file header.
     if i.sop_class.is_empty() {
@@ -189,7 +194,7 @@ fn from_object(obj: &InMemDicomObject, path: &Path, bytes: u64, transfer_syntax:
         fields: Vec::new(),
     };
     // Enhanced multi-frame: geometry per frame from the functional groups.
-    let per_frame = obj.element_opt(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE).ok().flatten().and_then(|e| e.items());
+    let per_frame = obj.get(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE).and_then(|e| e.items());
     if let Some(items) = per_frame.filter(|f| !f.is_empty()) {
         let shared = item(obj, tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE);
         for f in items {
@@ -276,70 +281,131 @@ pub fn is_jpegls(ts: &str) -> bool {
     matches!(ts.trim_end_matches(['\0', ' ']), "1.2.840.10008.1.2.4.80" | "1.2.840.10008.1.2.4.81")
 }
 
-/// The bytes of frame `frame` in encapsulated pixel data: by the basic offset table, one
-/// fragment per frame, or a new frame at each fragment starting a JPEG stream.
-fn frame_bytes(fragments: &[Vec<u8>], offsets: &[u32], frames: usize, frame: usize) -> Result<Vec<u8>> {
-    if frames <= 1 {
-        return Ok(fragments.concat());
-    }
-    if fragments.len() == frames {
-        return fragments.get(frame).cloned().context("frame out of range");
-    }
-    let mut starts = Vec::new();
-    if offsets.len() == frames {
-        let mut at = 0u64;
-        let mut first = vec![usize::MAX; frames];
-        for (i, f) in fragments.iter().enumerate() {
-            if let Some(k) = offsets.iter().rposition(|&o| o as u64 <= at) {
-                if first[k] == usize::MAX {
-                    first[k] = i;
+/// Where each frame of encapsulated pixel data starts among its fragments: by the basic
+/// offset table, one fragment per frame, or a new frame at each fragment starting a JPEG
+/// stream. Built once per object rather than once per frame.
+struct FrameTable {
+    frames: usize,
+    /// First fragment of each frame (`usize::MAX`: not found), when there is neither one frame
+    /// nor one fragment per frame.
+    starts: Vec<usize>,
+}
+
+impl FrameTable {
+    fn new(fragments: &[Vec<u8>], offsets: &[u32], frames: usize) -> Self {
+        let mut starts = Vec::new();
+        if frames > 1 && fragments.len() != frames {
+            if offsets.len() == frames {
+                // A fragment belongs to the last frame whose offset is at or before it. With
+                // ascending offsets those frames are a growing prefix, so one merge pass along
+                // the fragments finds them.
+                let ascending = offsets.windows(2).all(|w| w[0] <= w[1]);
+                let mut at = 0u64;
+                let mut passed = 0;
+                let mut first = vec![usize::MAX; frames];
+                for (i, f) in fragments.iter().enumerate() {
+                    let k = if ascending {
+                        while passed < offsets.len() && offsets[passed] as u64 <= at {
+                            passed += 1;
+                        }
+                        passed.checked_sub(1)
+                    } else {
+                        offsets.iter().rposition(|&o| o as u64 <= at)
+                    };
+                    if let Some(k) = k {
+                        if first[k] == usize::MAX {
+                            first[k] = i;
+                        }
+                    }
+                    at += f.len() as u64 + 8;
+                }
+                starts = first;
+            } else {
+                for (i, f) in fragments.iter().enumerate() {
+                    if f.starts_with(&[0xff, 0xd8]) {
+                        starts.push(i);
+                    }
                 }
             }
-            at += f.len() as u64 + 8;
         }
-        starts = first;
-    } else {
-        for (i, f) in fragments.iter().enumerate() {
-            if f.starts_with(&[0xff, 0xd8]) {
-                starts.push(i);
-            }
-        }
+        Self { frames, starts }
     }
-    let s = *starts.get(frame).filter(|&&s| s != usize::MAX).context("cannot find the frame in the pixel data")?;
-    let e = starts.iter().skip(frame + 1).copied().find(|&e| e != usize::MAX).unwrap_or(fragments.len());
-    Ok(fragments[s..e].concat())
+
+    /// The bytes of frame `frame`, borrowed when they are a single fragment.
+    fn frame<'a>(&self, fragments: &'a [Vec<u8>], frame: usize) -> Result<Cow<'a, [u8]>> {
+        if self.frames <= 1 {
+            return Ok(match fragments {
+                [one] => Cow::Borrowed(one.as_slice()),
+                _ => Cow::Owned(fragments.concat()),
+            });
+        }
+        if fragments.len() == self.frames {
+            return fragments.get(frame).map(|f| Cow::Borrowed(f.as_slice())).context("frame out of range");
+        }
+        let s = *self.starts.get(frame).filter(|&&s| s != usize::MAX).context("cannot find the frame in the pixel data")?;
+        let e = self.starts.iter().skip(frame + 1).copied().find(|&e| e != usize::MAX).unwrap_or(fragments.len());
+        Ok(if e == s + 1 { Cow::Borrowed(fragments[s].as_slice()) } else { Cow::Owned(fragments[s..e].concat()) })
+    }
+}
+
+/// What decoding the frames of one JPEG-LS object needs, read from it once: the fragments,
+/// where each frame starts, and how samples become grey values. Frames can then be decoded
+/// in parallel.
+pub(crate) struct JlsFrames<'a> {
+    fragments: &'a [Vec<u8>],
+    table: FrameTable,
+    bits: Option<i64>,
+    signed: bool,
+    slope: f64,
+    intercept: f64,
+}
+
+impl<'a> JlsFrames<'a> {
+    pub(crate) fn new(obj: &'a dicom_object::DefaultDicomObject) -> Result<Self> {
+        use dicom_core::value::Value;
+        let px = obj.element(tags::PIXEL_DATA).context("no pixel data")?;
+        let Value::PixelSequence(seq) = px.value() else { anyhow::bail!("JPEG-LS pixel data are not encapsulated") };
+        let int = |tag: Tag| obj.get(tag).and_then(|e| e.to_int::<i64>().ok());
+        let float = |tag: Tag| obj.get(tag).and_then(|e| e.to_float64().ok());
+        let frames = int(tags::NUMBER_OF_FRAMES).unwrap_or(1).max(1) as usize;
+        Ok(Self {
+            fragments: seq.fragments(),
+            table: FrameTable::new(seq.fragments(), seq.offset_table(), frames),
+            bits: int(tags::BITS_STORED),
+            signed: int(tags::PIXEL_REPRESENTATION) == Some(1),
+            slope: float(tags::RESCALE_SLOPE).filter(|s| *s != 0.0).unwrap_or(1.0),
+            intercept: float(tags::RESCALE_INTERCEPT).unwrap_or(0.0),
+        })
+    }
+
+    /// Grey values (modality LUT applied) of frame `frame`, with its columns and rows.
+    pub(crate) fn frame(&self, frame: u32) -> Result<(usize, usize, Vec<f32>)> {
+        let bytes = self.table.frame(self.fragments, frame as usize)?;
+        let img = crate::jpegls::decode(&bytes)?;
+        let bits = self.bits.unwrap_or(img.bits as i64).clamp(1, 16) as u32;
+        let (signed, slope, intercept) = (self.signed, self.slope, self.intercept);
+        let value = |s: u16| -> f32 {
+            let mut v = s as i32;
+            if signed {
+                let shift = 32 - bits;
+                v = (v << shift) >> shift;
+            }
+            (v as f64 * slope + intercept) as f32
+        };
+        let nc = img.components;
+        let grey = if nc >= 3 {
+            img.samples.chunks(nc).map(|p| 0.299 * value(p[0]) + 0.587 * value(p[1]) + 0.114 * value(p[2])).collect()
+        } else {
+            img.samples.iter().step_by(nc).map(|&s| value(s)).collect()
+        };
+        Ok((img.width, img.height, grey))
+    }
 }
 
 /// Grey values (modality LUT applied) of frame `frame` of a JPEG-LS compressed object, with
 /// its columns and rows.
 pub fn jpegls_frame(obj: &dicom_object::DefaultDicomObject, frame: u32) -> Result<(usize, usize, Vec<f32>)> {
-    use dicom_core::value::Value;
-    let px = obj.element(tags::PIXEL_DATA).context("no pixel data")?;
-    let Value::PixelSequence(seq) = px.value() else { anyhow::bail!("JPEG-LS pixel data are not encapsulated") };
-    let int = |tag: Tag| obj.element_opt(tag).ok().flatten().and_then(|e| e.to_int::<i64>().ok());
-    let float = |tag: Tag| obj.element_opt(tag).ok().flatten().and_then(|e| e.to_float64().ok());
-    let frames = int(tags::NUMBER_OF_FRAMES).unwrap_or(1).max(1) as usize;
-    let bytes = frame_bytes(seq.fragments(), seq.offset_table(), frames, frame as usize)?;
-    let img = crate::jpegls::decode(&bytes)?;
-    let bits = int(tags::BITS_STORED).unwrap_or(img.bits as i64).clamp(1, 16) as u32;
-    let signed = int(tags::PIXEL_REPRESENTATION) == Some(1);
-    let slope = float(tags::RESCALE_SLOPE).filter(|s| *s != 0.0).unwrap_or(1.0);
-    let intercept = float(tags::RESCALE_INTERCEPT).unwrap_or(0.0);
-    let value = |s: u16| -> f32 {
-        let mut v = s as i32;
-        if signed {
-            let shift = 32 - bits;
-            v = (v << shift) >> shift;
-        }
-        (v as f64 * slope + intercept) as f32
-    };
-    let nc = img.components;
-    let grey = if nc >= 3 {
-        img.samples.chunks(nc).map(|p| 0.299 * value(p[0]) + 0.587 * value(p[1]) + 0.114 * value(p[2])).collect()
-    } else {
-        img.samples.iter().step_by(nc).map(|&s| value(s)).collect()
-    };
-    Ok((img.width, img.height, grey))
+    JlsFrames::new(obj)?.frame(frame)
 }
 
 /// What a non-image (or not-a-volume) DICOM object is, by SOP class; `None` for images.
@@ -457,6 +523,92 @@ mod tests {
         for (ts, file) in [(uids::JPEG_LOSSLESS_SV1, "jpeg/grey12_lossless_sv1.jpg"), (uids::JPEG2000_LOSSLESS, "j2k/grey12.j2k")] {
             assert_eq!(decode_encapsulated(ts, std::fs::read(root.join(file)).unwrap()), raw, "{ts}");
             assert!(transfer_syntax_name(ts).1);
+        }
+    }
+
+    /// How frames were found before the table, once per frame.
+    fn frame_bytes_per_frame(fragments: &[Vec<u8>], offsets: &[u32], frames: usize, frame: usize) -> Result<Vec<u8>> {
+        if frames <= 1 {
+            return Ok(fragments.concat());
+        }
+        if fragments.len() == frames {
+            return fragments.get(frame).cloned().context("frame out of range");
+        }
+        let mut starts = Vec::new();
+        if offsets.len() == frames {
+            let mut at = 0u64;
+            let mut first = vec![usize::MAX; frames];
+            for (i, f) in fragments.iter().enumerate() {
+                if let Some(k) = offsets.iter().rposition(|&o| o as u64 <= at) {
+                    if first[k] == usize::MAX {
+                        first[k] = i;
+                    }
+                }
+                at += f.len() as u64 + 8;
+            }
+            starts = first;
+        } else {
+            for (i, f) in fragments.iter().enumerate() {
+                if f.starts_with(&[0xff, 0xd8]) {
+                    starts.push(i);
+                }
+            }
+        }
+        let s = *starts.get(frame).filter(|&&s| s != usize::MAX).context("cannot find the frame in the pixel data")?;
+        let e = starts.iter().skip(frame + 1).copied().find(|&e| e != usize::MAX).unwrap_or(fragments.len());
+        Ok(fragments[s..e].concat())
+    }
+
+    #[test]
+    fn frame_table_finds_the_frames_as_before() {
+        // Random fragment layouts: ascending, shuffled, short and missing offset tables, JPEG
+        // starts or not, one frame or one fragment per frame.
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move |n: u64| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s % n.max(1)
+        };
+        for round in 0..4000 {
+            let count = 1 + rnd(12) as usize;
+            let fragments: Vec<Vec<u8>> = (0..count).map(|i| {
+                let mut f: Vec<u8> = (0..2 * (1 + rnd(6))).map(|_| rnd(256) as u8).collect();
+                if rnd(3) == 0 {
+                    f[..2].copy_from_slice(&[0xff, 0xd8]);
+                }
+                f[1] ^= i as u8 & 1;
+                f
+            }).collect();
+            let frames = 1 + rnd(count as u64 + 2) as usize;
+            let mut at = 0u32;
+            let positions: Vec<u32> = fragments.iter().map(|f| {
+                let p = at;
+                at += f.len() as u32 + 8;
+                p
+            }).collect();
+            let mut offsets: Vec<u32> = match rnd(4) {
+                0 => Vec::new(),
+                1 => (0..frames).map(|_| positions[rnd(count as u64) as usize] + rnd(3) as u32).collect(),
+                _ => {
+                    let mut o: Vec<u32> = (0..frames).map(|_| positions[rnd(count as u64) as usize]).collect();
+                    o.sort();
+                    o
+                }
+            };
+            if rnd(5) == 0 {
+                offsets.truncate(frames.saturating_sub(1));
+            }
+            let table = FrameTable::new(&fragments, &offsets, frames);
+            for f in 0..frames + 1 {
+                let old = frame_bytes_per_frame(&fragments, &offsets, frames, f);
+                let new = table.frame(&fragments, f);
+                match (old, new) {
+                    (Ok(a), Ok(b)) => assert_eq!(a, b.as_ref(), "round {round} frame {f}"),
+                    (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                    (a, b) => panic!("round {round} frame {f}: {:?} / {:?}", a.map(|v| v.len()), b.map(|v| v.len())),
+                }
+            }
         }
     }
 }

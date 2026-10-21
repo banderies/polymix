@@ -42,6 +42,54 @@ pub(crate) struct Traced {
     pub seed: [usize; 3],
     pub darker: bool,
     pub voxels: Vec<usize>,
+    /// Its outline across and down the slice (made once, drawn every frame).
+    pub outline: Vec<[(f64, f64); 2]>,
+}
+
+/// The outline of a region of a slice (`voxels` of a `dims` grid, on the slice across `axes`):
+/// the edges between voxels in it and voxels not in it (or the slice's edge), those in a line
+/// joined into one.
+pub(crate) fn outline(voxels: &[usize], dims: [usize; 3], axes: PlaneAxes) -> Vec<[(f64, f64); 2]> {
+    let (na, nd) = (dims[axes.across], dims[axes.down]);
+    let stride = [1, dims[0], dims[0] * dims[1]];
+    let mut inside = vec![false; na * nd];
+    for &i in voxels {
+        let (a, d) = ((i / stride[axes.across]) % dims[axes.across], (i / stride[axes.down]) % dims[axes.down]);
+        inside[d * na + a] = true;
+    }
+    let at = |a: i64, d: i64| a >= 0 && d >= 0 && (a as usize) < na && (d as usize) < nd && inside[d as usize * na + a as usize];
+    let mut lines = Vec::new();
+    // Along each row: the edges above it (between it and the row before).
+    for d in 0..=nd as i64 {
+        let mut from = None;
+        for a in 0..=na as i64 {
+            let edge = a < na as i64 && at(a, d) != at(a, d - 1);
+            match (edge, from) {
+                (true, None) => from = Some(a),
+                (false, Some(a0)) => {
+                    lines.push([(a0 as f64 - 0.5, d as f64 - 0.5), (a as f64 - 0.5, d as f64 - 0.5)]);
+                    from = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    // Down each column: the edges left of it.
+    for a in 0..=na as i64 {
+        let mut from = None;
+        for d in 0..=nd as i64 {
+            let edge = d < nd as i64 && at(a, d) != at(a - 1, d);
+            match (edge, from) {
+                (true, None) => from = Some(d),
+                (false, Some(d0)) => {
+                    lines.push([(a as f64 - 0.5, d0 as f64 - 0.5), (a as f64 - 0.5, d as f64 - 0.5)]);
+                    from = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    lines
 }
 
 /// The region of Threshold's local histogram: a shape on a slice, and its values (sorted).
@@ -137,8 +185,9 @@ impl SegmentationWorkspace {
                     Some((map, v)) => {
                         let seed = [0, 1, 2].map(|a| v[a].round().clamp(0.0, vol.dims[a] as f64 - 1.0) as usize);
                         if self.traced.as_ref().is_none_or(|t| t.seed != seed || t.darker != darker || t.map.plane != map.plane) {
-                            let axes = [map.axes.across, map.axes.down, map.axes.slice];
-                            self.traced = Some(Traced { map, seed, darker, voxels: trace_level(vol, axes, seed, darker) });
+                            let voxels = trace_level(vol, [map.axes.across, map.axes.down, map.axes.slice], seed, darker);
+                            let outline = outline(&voxels, vol.dims, map.axes);
+                            self.traced = Some(Traced { map, seed, darker, voxels, outline });
                         } else if let Some(t) = &mut self.traced {
                             t.map = map;
                         }
@@ -405,32 +454,81 @@ impl SegmentationWorkspace {
             }
         }
         if let (Some(t), Some(Effect::LevelTracing)) = (&self.traced, self.effect) {
-            let painter = ui.painter_at(t.map.rect);
+            // The region's outline, worked out when it was traced: only placed on the screen.
             let m = &t.map;
-            let (na, nd) = (self.volume.as_ref().map_or(0, |v| v.dims[m.axes.across]), self.volume.as_ref().map_or(0, |v| v.dims[m.axes.down]));
-            let dims = self.volume.as_ref().map_or([0; 3], |v| v.dims);
-            let stride = [1, dims[0], dims[0] * dims[1]];
-            let mut inside = vec![false; na * nd];
-            for &i in &t.voxels {
-                let (a, d) = ((i / stride[m.axes.across]) % dims[m.axes.across], (i / stride[m.axes.down]) % dims[m.axes.down]);
-                inside[d * na + a] = true;
-            }
-            let at = |a: i64, d: i64| a >= 0 && d >= 0 && (a as usize) < na && (d as usize) < nd && inside[d as usize * na + a as usize];
             let stroke = Stroke::new(1.5, LINE);
-            // The region's outline: the edges between voxels in it and voxels not in it.
-            for d in 0..nd as i64 {
-                for a in 0..na as i64 {
-                    if !at(a, d) {
-                        continue;
-                    }
-                    let (x, y) = (a as f64, d as f64);
-                    for (da, dd, p, q) in [(-1, 0, (x - 0.5, y - 0.5), (x - 0.5, y + 0.5)), (1, 0, (x + 0.5, y - 0.5), (x + 0.5, y + 0.5)), (0, -1, (x - 0.5, y - 0.5), (x + 0.5, y - 0.5)), (0, 1, (x - 0.5, y + 0.5), (x + 0.5, y + 0.5))] {
-                        if !at(a + da, d + dd) {
-                            painter.line_segment([m.screen(p.0, p.1), m.screen(q.0, q.1)], stroke);
-                        }
+            ui.painter_at(m.rect).extend(t.outline.iter().map(|[p, q]| egui::Shape::line_segment([m.screen(p.0, p.1), m.screen(q.0, q.1)], stroke)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The outline a voxel edge at a time, as it was drawn: for each voxel of the region, its
+    /// sides against voxels not in it.
+    fn unit_edges(voxels: &[usize], dims: [usize; 3], axes: PlaneAxes) -> Vec<[(i64, i64); 2]> {
+        let (na, nd) = (dims[axes.across], dims[axes.down]);
+        let stride = [1, dims[0], dims[0] * dims[1]];
+        let mut inside = vec![false; na * nd];
+        for &i in voxels {
+            inside[(i / stride[axes.down]) % dims[axes.down] * na + (i / stride[axes.across]) % dims[axes.across]] = true;
+        }
+        let at = |a: i64, d: i64| a >= 0 && d >= 0 && (a as usize) < na && (d as usize) < nd && inside[d as usize * na + a as usize];
+        let mut out = Vec::new();
+        for d in 0..nd as i64 {
+            for a in 0..na as i64 {
+                if !at(a, d) {
+                    continue;
+                }
+                // Corners in half voxels (twice the coordinates, so they are whole).
+                let (x, y) = (2 * a, 2 * d);
+                for (da, dd, p, q) in [(-1, 0, (x - 1, y - 1), (x - 1, y + 1)), (1, 0, (x + 1, y - 1), (x + 1, y + 1)), (0, -1, (x - 1, y - 1), (x + 1, y - 1)), (0, 1, (x - 1, y + 1), (x + 1, y + 1))] {
+                    if !at(a + da, d + dd) {
+                        out.push([p, q]);
                     }
                 }
             }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn outlines_join_the_voxel_edges() {
+        let dims = [13, 9, 7];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for case in 0..60 {
+            let plane = [Plane::Axial, Plane::Sagittal, Plane::Coronal][case % 3];
+            let g = mm_volume::geometry::Geometry::from_axes([13, 9, 7, 1], [1.0; 3], [glam::DVec3::X, glam::DVec3::Y, glam::DVec3::Z], glam::DVec3::ZERO);
+            let axes = plane_axes(&g, plane);
+            let slice = case % dims[axes.slice];
+            // Random voxels of a slice, from sparse to full.
+            let mut voxels = Vec::new();
+            for d in 0..dims[axes.down] {
+                for a in 0..dims[axes.across] {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    if state % 10 < (case % 11) as u64 {
+                        let mut v = [0; 3];
+                        (v[axes.across], v[axes.down], v[axes.slice]) = (a, d, slice);
+                        voxels.push((v[2] * dims[1] + v[1]) * dims[0] + v[0]);
+                    }
+                }
+            }
+            // Each joined line, cut back into voxel edges, gives each edge once.
+            let mut joined: Vec<[(i64, i64); 2]> = Vec::new();
+            for [p, q] in outline(&voxels, dims, axes) {
+                let (p, q) = (((p.0 * 2.0) as i64, (p.1 * 2.0) as i64), ((q.0 * 2.0) as i64, (q.1 * 2.0) as i64));
+                assert!(p.0 == q.0 || p.1 == q.1, "lines run across or down");
+                let n = ((q.0 - p.0).abs() + (q.1 - p.1).abs()) / 2;
+                let step = ((q.0 - p.0).signum() * 2, (q.1 - p.1).signum() * 2);
+                joined.extend((0..n).map(|k| [(p.0 + k * step.0, p.1 + k * step.1), (p.0 + (k + 1) * step.0, p.1 + (k + 1) * step.1)]));
+            }
+            joined.sort_unstable();
+            assert_eq!(joined, unit_edges(&voxels, dims, axes), "case {case}");
         }
     }
 }

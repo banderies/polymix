@@ -17,7 +17,8 @@
 //! kept in projects.
 
 use super::*;
-use crate::jobs::Job;
+use crate::jobs::{Job, ProgressFn};
+use crate::renderer::ColorVertex;
 use crate::scene::{next_stamp, UvSet};
 use crate::ui_util;
 use glam::DAffine2;
@@ -25,6 +26,7 @@ use mm_edit::uv_edit::{self as uve, Corners, UvIslands};
 use mm_edit::uv_project::{self, Projection, ProjectionAxis, SetUvParams};
 use mm_edit::{Packing, UnwrapElements, UnwrapParams, UnwrapType};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -64,37 +66,142 @@ struct Layout {
     /// Edges where the UVs break (island borders, seams): (triangle, corner) for the edge
     /// from that corner to the next.
     border: Arc<Vec<(u32, u8)>>,
+    /// Triangles in the islands (those with UVs).
+    tris: usize,
 }
 
 impl Layout {
     fn new(mesh: &Mesh, uvs: Arc<UvSet>) -> Self {
-        let islands = uve::uv_islands(mesh, &uvs.corners);
-        let c = &uvs.corners;
-        let same = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() <= 1e-6 && (a[1] - b[1]).abs() <= 1e-6;
-        let mut border = Vec::new();
-        for t in mesh.triangle_ids().filter(|&t| (t as usize) < c.len()) {
-            let tv = mesh.triangle(t);
-            for (k, e) in mesh.tri_edges(t).into_iter().enumerate() {
-                let o = mesh.edge_other_triangle(e, t);
-                let joined = o != mm_core::INVALID && (o as usize) < c.len() && {
-                    let ov = mesh.triangle(o);
-                    [tv[k], tv[(k + 1) % 3]].iter().all(|&v| {
-                        let (i, j) = (tv.iter().position(|&x| x == v).unwrap_or(0), ov.iter().position(|&x| x == v).unwrap_or(0));
-                        same(c[t as usize][i], c[o as usize][j])
-                    })
-                };
-                if !joined {
-                    border.push((t, k as u8));
-                }
-            }
-        }
-        Self { uvs, islands: Arc::new(islands), border: Arc::new(border) }
+        let (islands, border) = uve::uv_islands_and_breaks(mesh, &uvs.corners);
+        let tris = islands.islands.iter().map(Vec::len).sum();
+        Self { uvs, islands: Arc::new(islands), border: Arc::new(border), tris }
     }
 
     /// The same islands with other corners (an edit).
     fn with(&self, corners: Vec<Corners>) -> Self {
-        Self { uvs: Arc::new(UvSet { topo: self.uvs.topo, corners, stamp: next_stamp() }), islands: self.islands.clone(), border: self.border.clone() }
+        Self { uvs: Arc::new(UvSet { topo: self.uvs.topo, corners, stamp: next_stamp() }), islands: self.islands.clone(), border: self.border.clone(), tris: self.tris }
     }
+}
+
+/// What a SetUV projection works from, taken from the tool and the scene when it starts.
+struct ProjectionInput {
+    mesh: Arc<Mesh>,
+    tris: Vec<u32>,
+    /// The selection rather than the whole object.
+    partial: bool,
+    p: SetUvParams,
+    view: (DVec3, DVec3),
+    aspect: f64,
+    /// The UVs the other triangles keep.
+    base: Option<Arc<UvSet>>,
+}
+
+/// A projected layout and its summary, or why the projection failed.
+type Projected = Result<(Layout, String), String>;
+
+impl ProjectionInput {
+    /// The projection. `progress` hears of each step; it stops the work (`None`) when it
+    /// returns false.
+    fn compute(self, progress: ProgressFn) -> Option<Projected> {
+        let Self { mesh, tris, partial, p, view, aspect, base } = self;
+        let q = match uv_project::project_uvs(&mesh, &tris, &p, Some(view), aspect) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        if !progress(0.5) {
+            return None;
+        }
+        let mut corners: Vec<Corners> = base.map(|b| b.corners.clone()).unwrap_or_default();
+        corners.resize(mesh.max_tid(), [[0.0; 2]; 3]);
+        for (k, &t) in tris.iter().enumerate() {
+            corners[t as usize] = q[k].map(|c| [c.x as f32, c.y as f32]);
+        }
+        if !progress(0.6) {
+            return None;
+        }
+        let layout = Layout::new(&mesh, Arc::new(UvSet::new(&mesh, corners)));
+        let kind = match p.projection {
+            Projection::Planar => "Planar",
+            Projection::Cylindrical => "Cylindrical",
+            Projection::Spherical => "Spherical",
+            Projection::Box => "Box",
+        };
+        let of = if partial { format!("{} selected triangles", tris.len()) } else { "the whole object".to_string() };
+        let msg = format!("{kind} projection of {of}: {} islands", layout.islands.len());
+        Some(Ok((layout, msg)))
+    }
+}
+
+/// SetUV settings bit for bit, so that a value typed as "nan" is the same value from one
+/// frame to the next (and is projected once, to report it, rather than waited on forever).
+type SettingsKey = (Projection, ProjectionAxis, Option<[u64; 3]>, Option<u64>, [u64; 2], [u64; 2], u64);
+
+fn settings_key(p: &SetUvParams) -> SettingsKey {
+    (p.projection, p.axis, p.center.map(|c| c.map(f64::to_bits)), p.size.map(f64::to_bits), p.scale.map(f64::to_bits), p.offset.map(f64::to_bits), p.rotation.to_bits())
+}
+
+/// What a background projection was started for: its result is shown only while all of it is
+/// still so.
+#[derive(Clone, PartialEq)]
+struct ProjectionTag {
+    p: SettingsKey,
+    view: [u64; 6],
+    aspect: u64,
+    /// The UVs shown when it started.
+    shown: Option<u64>,
+}
+
+/// How long the SetUV settings must stay unchanged before they are projected (a drag of a
+/// field or slider projects once it pauses, not at every step).
+const PROJECT_AFTER: Duration = Duration::from_millis(180);
+
+/// The layout drawing (see [`paint_layout`]): everything it was drawn from, and once it has
+/// stayed the same for a frame, its triangles.
+struct Picture {
+    uvs: u64,
+    islands: Arc<UvIslands>,
+    border: Arc<Vec<(u32, u8)>>,
+    selected: Vec<bool>,
+    view: (DVec2, f32, egui::Pos2),
+    budget: usize,
+    clip: egui::Rect,
+    pixels_per_point: f32,
+    options: egui::epaint::TessellationOptions,
+    colours: [egui::Color32; 3],
+    mesh: Option<Arc<egui::Mesh>>,
+}
+
+/// A selection box (see [`uve::islands_bounds`]) with what it was computed from.
+struct KeptBounds {
+    uvs: u64,
+    islands: Arc<UvIslands>,
+    which: Vec<usize>,
+    sheet: DVec2,
+    bounds: Option<(DVec2, DVec2)>,
+}
+
+/// The box of the islands `which` of `layout` (see [`uve::islands_bounds`]), from `kept` when
+/// it was computed for the same UVs: a frame asks for it several times (the fields, the
+/// handles, a move's snapping), and once all islands are selected each scan reads every
+/// corner.
+fn island_bounds(kept: &mut Vec<KeptBounds>, layout: &Layout, which: &[usize], sheet: DVec2) -> Option<(DVec2, DVec2)> {
+    if let Some(k) = kept.iter().find(|k| k.uvs == layout.uvs.stamp && Arc::ptr_eq(&k.islands, &layout.islands) && k.which == which && k.sheet == sheet) {
+        return k.bounds;
+    }
+    let bounds = uve::islands_bounds(&layout.uvs.corners, &layout.islands, which, sheet);
+    // A few: a drag asks for its starting layout's box and the moved one's.
+    kept.insert(0, KeptBounds { uvs: layout.uvs.stamp, islands: layout.islands.clone(), which: which.to_vec(), sheet, bounds });
+    kept.truncate(4);
+    bounds
+}
+
+/// The selected islands' tint in the 3D view, with what it was made from.
+struct Tint {
+    islands: Arc<UvIslands>,
+    selected: Vec<bool>,
+    shape: u64,
+    eye: DVec3,
+    tris: Vec<ColorVertex>,
 }
 
 /// What the tool shows: the layout and what made it (with a summary). Undo / redo swap these.
@@ -128,11 +235,32 @@ struct Editor {
     turn_by: f64,
     /// Where the layout was drawn last.
     canvas: Option<egui::Rect>,
+    /// What the current move, turn or scale drag did last: its transform, the islands it
+    /// moved and the UVs that made (a frame with the same transform has nothing to do).
+    applied: Option<(DAffine2, Vec<usize>, u64)>,
+    /// Selection boxes of the layouts shown lately (see [`island_bounds`]).
+    bounds: Vec<KeptBounds>,
+    /// The layout window's drawing.
+    picture: Option<Picture>,
 }
 
 impl Default for Editor {
     fn default() -> Self {
-        Self { open: false, selected: Vec::new(), of: 0, zoom: 1.0, pan: egui::Vec2::ZERO, drag: None, snap: true, keep_ratio: true, turn_by: 45.0, canvas: None }
+        Self {
+            open: false,
+            selected: Vec::new(),
+            of: 0,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            drag: None,
+            snap: true,
+            keep_ratio: true,
+            turn_by: 45.0,
+            canvas: None,
+            applied: None,
+            bounds: Vec::new(),
+            picture: None,
+        }
     }
 }
 
@@ -152,8 +280,18 @@ pub struct UnwrapTool {
     before: Option<Option<Arc<UvSet>>>,
     /// UVs a projection of part of the object keeps on the other triangles.
     project_base: Option<(Vec<u32>, Option<Arc<UvSet>>)>,
+    /// When the SetUV settings changed, while they wait to settle before being projected.
+    projecting: Option<Instant>,
+    /// A projection computing in the background, and what it is for.
+    project_job: Option<(ProjectionTag, Job<Option<Projected>>)>,
+    /// The object's own UVs being read into a layout (Unwrap opened on an object with UVs).
+    loading: Option<Job<Layout>>,
     error: Option<String>,
     editor: Editor,
+    /// The panel's small drawing of the layout.
+    thumbnail: Option<Picture>,
+    /// The selected islands' tint in the 3D view.
+    tint: Option<Tint>,
 }
 
 /// How many steps the tool keeps for undo.
@@ -183,17 +321,24 @@ impl UnwrapTool {
             redo: Vec::new(),
             before: None,
             project_base: None,
+            projecting: None,
+            project_job: None,
+            loading: None,
             error: None,
             editor: Editor::default(),
+            thumbnail: None,
+            tint: None,
         };
         // Edit the UVs the object has; unwrap otherwise.
-        let existing = t.object.and_then(|id| cx.scene.get(id)).and_then(|o| Some((o.mesh.clone(), o.uvs()?.corners.clone())));
+        let existing = t.object.and_then(|id| cx.scene.get(id)).and_then(|o| Some((o.mesh.clone(), o.uvs.clone().filter(|u| u.topo == o.mesh.topology_version())?)));
         match existing {
-            Some((mesh, corners)) => {
-                let layout = Layout::new(&mesh, Arc::new(UvSet::new(&mesh, corners)));
-                let msg = format!("The object's UVs: {} islands", layout.islands.len());
-                t.shown = Shown { layout: Some(layout), made: Some((Made::Existing, msg)), edited: false };
+            // Finding the islands of a big layout takes a moment: the panel waits for it
+            // (and shows it) instead of the tool opening late.
+            Some((mesh, uvs)) if method == UvMethod::Unwrap => {
+                t.loading = Some(Job::spawn("Reading the UVs", cx.egui.clone(), move |_| Ok(Layout::new(&mesh, Arc::new(UvSet::new(&mesh, uvs.corners.clone()))))));
             }
+            // A projection follows at once, and keeps these as its undo step.
+            Some((mesh, uvs)) => t.show_existing(Layout::new(&mesh, Arc::new(UvSet::new(&mesh, uvs.corners.clone())))),
             None if method == UvMethod::Unwrap => t.start(cx),
             None => {}
         }
@@ -201,6 +346,37 @@ impl UnwrapTool {
             t.project(cx);
         }
         t
+    }
+
+    /// Show the object's own UVs (as read when the tool opened).
+    fn show_existing(&mut self, layout: Layout) {
+        let msg = format!("The object's UVs: {} islands", layout.islands.len());
+        self.shown = Shown { layout: Some(layout), made: Some((Made::Existing, msg)), edited: false };
+    }
+
+    /// Take the object's own layout once it has been read.
+    fn poll_loading(&mut self) {
+        if let Some(r) = self.loading.as_ref().and_then(|j| j.poll()) {
+            self.loaded(r);
+        }
+    }
+
+    /// Wait for the object's own layout if it is still being read: what follows (an unwrap,
+    /// a projection, an edit) acts on it, as when it was read on opening.
+    fn settle_loading(&mut self) {
+        if let Some(job) = self.loading.take() {
+            self.loaded(wait_for(&job));
+        }
+    }
+
+    /// The object's own layout, read: shown unless something else is by now.
+    fn loaded(&mut self, r: anyhow::Result<Layout>) {
+        self.loading = None;
+        match r {
+            Ok(layout) if self.shown.layout.is_none() => self.show_existing(layout),
+            Ok(_) => {}
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
     }
 
     fn mesh(&self, cx: &ToolCx) -> Option<Arc<Mesh>> {
@@ -212,6 +388,8 @@ impl UnwrapTool {
     }
 
     fn start(&mut self, cx: &mut ToolCx) {
+        // The unwrap's result is an undo step on top of the object's own layout.
+        self.settle_loading();
         let Some(mesh) = self.mesh(cx) else { return };
         if let Some((_, j)) = &self.job {
             j.cancel();
@@ -262,45 +440,109 @@ impl UnwrapTool {
         self.sheet().y / self.sheet().x
     }
 
-    /// SetUV: project now (it is quick).
+    /// SetUV: project now (agents' settings, opening, switching to it), in place of any
+    /// projection still waiting or computing.
     fn project(&mut self, cx: &mut ToolCx) {
+        self.projecting = None;
+        self.project_job = None;
+        let Some(input) = self.projection_input(cx) else { return };
+        if let Some(r) = input.compute(&|_| true) {
+            self.projected(cx, r);
+        }
+    }
+
+    /// What a projection of the current settings works from.
+    fn projection_input(&mut self, cx: &mut ToolCx) -> Option<ProjectionInput> {
+        // The object's own layout, if it is still being read, is what a projection replaces.
+        self.settle_loading();
         // An unwrap still running would replace the projection when it ends.
         if let Some((_, j)) = self.job.take() {
             j.cancel();
         }
-        let Some((mesh, tris, partial)) = self.targets(cx) else { return };
+        let (mesh, tris, partial) = self.targets(cx)?;
         // The other triangles keep the UVs they had when these triangles were first projected
         // (so adjusting the projection does not pile up).
         if self.project_base.as_ref().is_none_or(|b| b.0 != tris) {
             let own = self.object.and_then(|id| cx.scene.get(id)).and_then(|o| o.uvs.clone());
             self.project_base = Some((tris.clone(), self.shown.layout.as_ref().map(|l| l.uvs.clone()).or(own)));
         }
-        let p = self.s.projection;
-        match uv_project::project_uvs(&mesh, &tris, &p, Some(self.view), self.aspect()) {
-            Ok(q) => {
-                let base = self.project_base.clone().and_then(|b| b.1).filter(|b| b.topo == mesh.topology_version());
-                let mut corners: Vec<Corners> = base.map(|b| b.corners.clone()).unwrap_or_default();
-                corners.resize(mesh.max_tid(), [[0.0; 2]; 3]);
-                for (k, &t) in tris.iter().enumerate() {
-                    corners[t as usize] = q[k].map(|c| [c.x as f32, c.y as f32]);
-                }
-                let layout = Layout::new(&mesh, Arc::new(UvSet::new(&mesh, corners)));
-                let kind = match p.projection {
-                    Projection::Planar => "Planar",
-                    Projection::Cylindrical => "Cylindrical",
-                    Projection::Spherical => "Spherical",
-                    Projection::Box => "Box",
-                };
-                let of = if partial { format!("{} selected triangles", tris.len()) } else { "the whole object".to_string() };
-                let msg = format!("{kind} projection of {of}: {} islands", layout.islands.len());
+        let base = self.project_base.clone().and_then(|b| b.1).filter(|b| b.topo == mesh.topology_version());
+        Some(ProjectionInput { mesh, tris, partial, p: self.s.projection, view: self.view, aspect: self.aspect(), base })
+    }
+
+    /// Show a projection of the current settings.
+    fn projected(&mut self, cx: &mut ToolCx, r: Projected) {
+        match r {
+            Ok((layout, msg)) => {
                 // Changing the projection's settings replaces the last projection (one undo
                 // step for the whole adjustment) unless it was edited since.
                 let record = self.shown.edited || !matches!(self.shown.made, Some((Made::Project(..), _)));
-                let made = Made::Project(p, self.view_key(), self.aspect());
+                let made = Made::Project(self.s.projection, self.view_key(), self.aspect());
                 self.set(cx, Shown { layout: Some(layout), made: Some((made, msg)), edited: false }, record);
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("SetUV: {e}")),
+        }
+    }
+
+    /// The SetUV settings changed in the panel: they are projected once they have stayed so
+    /// for a moment (in the background; a projection of a big object takes a while).
+    fn project_soon(&mut self) {
+        // One of older settings is of no use now.
+        self.project_job = None;
+        self.projecting = Some(Instant::now());
+    }
+
+    fn projection_tag(&self) -> ProjectionTag {
+        ProjectionTag { p: settings_key(&self.s.projection), view: self.view_key().map(f64::to_bits), aspect: self.aspect().to_bits(), shown: self.shown.layout.as_ref().map(|l| l.uvs.stamp) }
+    }
+
+    /// Start the projection of settled settings.
+    fn start_projection(&mut self, cx: &mut ToolCx) {
+        let Some(changed) = self.projecting else { return };
+        let left = PROJECT_AFTER.saturating_sub(changed.elapsed());
+        if !left.is_zero() {
+            cx.egui.request_repaint_after(left);
+            return;
+        }
+        self.projecting = None;
+        let Some(input) = self.projection_input(cx) else { return };
+        let tag = self.projection_tag();
+        self.project_job = Some((tag, Job::spawn("Projecting", cx.egui.clone(), move |progress| Ok(input.compute(progress)))));
+    }
+
+    /// Take a finished background projection.
+    fn poll_projection(&mut self, cx: &mut ToolCx) {
+        if let Some(r) = self.project_job.as_ref().and_then(|(_, j)| j.poll()) {
+            if let Some((tag, _)) = self.project_job.take() {
+                self.projection_done(cx, &tag, r);
+            }
+        }
+    }
+
+    /// A background projection's result: shown if it is still for the settings and the
+    /// layout it started from (whatever changes the layout settles projections first, so
+    /// it is).
+    fn projection_done(&mut self, cx: &mut ToolCx, tag: &ProjectionTag, r: anyhow::Result<Option<Projected>>) {
+        match r {
+            Ok(Some(r)) if *tag == self.projection_tag() => self.projected(cx, r),
+            Ok(_) => {}
+            Err(e) => self.error = Some(format!("SetUV: {e:#}")),
+        }
+    }
+
+    /// Finish what the layout still waits for (the object's own layout being read, SetUV
+    /// settings waiting to settle or being projected) before acting on it or on its islands,
+    /// so that edits, undo and accepting act on what the settings show, as when projections
+    /// were taken at once.
+    fn settle(&mut self, cx: &mut ToolCx) {
+        self.settle_loading();
+        if let Some((tag, job)) = self.project_job.take() {
+            let r = wait_for(&job);
+            self.projection_done(cx, &tag, r);
+        }
+        if self.projecting.is_some() {
+            self.project(cx);
         }
     }
 
@@ -334,6 +576,7 @@ impl UnwrapTool {
     }
 
     fn undo(&mut self, cx: &mut ToolCx) -> bool {
+        self.settle(cx);
         let Some(prev) = self.undo.pop() else { return false };
         self.editor.drag = None;
         self.redo.push(std::mem::replace(&mut self.shown, prev));
@@ -342,6 +585,7 @@ impl UnwrapTool {
     }
 
     fn redo(&mut self, cx: &mut ToolCx) -> bool {
+        self.settle(cx);
         let Some(next) = self.redo.pop() else { return false };
         self.editor.drag = None;
         self.undo.push(std::mem::replace(&mut self.shown, next));
@@ -364,6 +608,7 @@ impl UnwrapTool {
 
     /// Edit the corners of the selected islands (one undo step).
     fn edit(&mut self, cx: &mut ToolCx, f: impl FnOnce(&mut [Corners], &UvIslands, &[usize], DVec2) -> Result<(), String>) -> Result<(), String> {
+        self.settle(cx);
         self.sync_selection();
         let which = self.which();
         let Some(layout) = self.shown.layout.clone() else { return Err("no UVs yet".into()) };
@@ -375,6 +620,7 @@ impl UnwrapTool {
     }
 
     fn edit_selected(&mut self, cx: &mut ToolCx, f: impl FnOnce(&mut [Corners], &UvIslands, &[usize], DVec2)) -> Result<(), String> {
+        self.settle(cx);
         self.sync_selection();
         if !self.editor.selected.contains(&true) {
             return Err("select islands first".into());
@@ -436,6 +682,17 @@ fn targets(scene: &mut Scene, object: Option<ObjectId>) -> Option<(Arc<Mesh>, Ve
     }
 }
 
+/// The result of `job`, waiting for it here (as long as the work took when it was done in
+/// place).
+fn wait_for<T: Send + 'static>(job: &Job<T>) -> anyhow::Result<T> {
+    loop {
+        if let Some(r) = job.poll() {
+            return r;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Screen placement of the sheet in a layout view.
 #[derive(Clone, Copy)]
 struct View {
@@ -466,16 +723,17 @@ impl View {
     }
 }
 
-/// Draw the sheet and the layout: every island's edges (thinned out on big meshes), the UV
-/// breaks stronger, the selected islands filled.
-fn paint_layout(painter: &egui::Painter, view: &View, layout: &Layout, selected: &[bool], visuals: &egui::Visuals, budget: usize) {
+/// The sheet and the layout: every island's edges (thinned out on big meshes), the UV breaks
+/// stronger, the selected islands filled.
+fn layout_shapes(view: &View, layout: &Layout, selected: &[bool], visuals: &egui::Visuals, budget: usize) -> Vec<egui::Shape> {
+    let mut shapes = Vec::new();
     let sheet = egui::Rect::from_two_pos(view.screen(DVec2::ZERO), view.screen(view.sheet));
-    painter.rect_filled(sheet, 0.0, visuals.extreme_bg_color);
+    shapes.push(egui::epaint::RectShape::filled(sheet, 0.0, visuals.extreme_bg_color).into());
     let faint = egui::Stroke::new(0.5, visuals.text_color().gamma_multiply(0.12));
     for k in 1..10 {
         let f = k as f64 / 10.0;
-        painter.line_segment([view.screen(DVec2::new(view.sheet.x * f, 0.0)), view.screen(DVec2::new(view.sheet.x * f, view.sheet.y))], faint);
-        painter.line_segment([view.screen(DVec2::new(0.0, view.sheet.y * f)), view.screen(DVec2::new(view.sheet.x, view.sheet.y * f))], faint);
+        shapes.push(egui::Shape::LineSegment { points: [view.screen(DVec2::new(view.sheet.x * f, 0.0)), view.screen(DVec2::new(view.sheet.x * f, view.sheet.y))], stroke: faint });
+        shapes.push(egui::Shape::LineSegment { points: [view.screen(DVec2::new(0.0, view.sheet.y * f)), view.screen(DVec2::new(view.sheet.x, view.sheet.y * f))], stroke: faint });
     }
     let c = &layout.uvs.corners;
     let isl = &layout.islands;
@@ -495,14 +753,13 @@ fn paint_layout(painter: &egui::Painter, view: &View, layout: &Layout, selected:
                 m.add_triangle(i, i + 1, i + 2);
             }
         }
-        painter.add(egui::Shape::mesh(m));
+        shapes.push(egui::Shape::mesh(m));
     }
     // Inner edges, thinned out.
     let wire = egui::Stroke::new(0.5, visuals.text_color().gamma_multiply(0.45));
-    let n = isl.of_tri.iter().filter(|&&i| i != u32::MAX).count();
-    let step = n.div_ceil(budget).max(1);
+    let step = layout.tris.div_ceil(budget).max(1);
     for q in c.iter().zip(&isl.of_tri).filter(|(_, &i)| i != u32::MAX).map(|(q, _)| q).step_by(step) {
-        painter.add(egui::Shape::closed_line(q.iter().map(|p| view.uv(*p)).collect(), wire));
+        shapes.push(egui::Shape::closed_line(q.iter().map(|p| view.uv(*p)).collect(), wire));
     }
     // Breaks.
     let edge = egui::Stroke::new(1.0, visuals.text_color().gamma_multiply(0.8));
@@ -511,10 +768,69 @@ fn paint_layout(painter: &egui::Painter, view: &View, layout: &Layout, selected:
     for &(t, k) in layout.border.iter().step_by(step) {
         if let Some(q) = c.get(t as usize) {
             let (a, b) = (q[k as usize], q[(k as usize + 1) % 3]);
-            painter.line_segment([view.uv(a), view.uv(b)], if is_sel(t) { edge_sel } else { edge });
+            shapes.push(egui::Shape::LineSegment { points: [view.uv(a), view.uv(b)], stroke: if is_sel(t) { edge_sel } else { edge } });
         }
     }
-    painter.rect_stroke(sheet, 0.0, egui::Stroke::new(1.0, visuals.widgets.inactive.fg_stroke.color), egui::StrokeKind::Outside);
+    shapes.push(egui::epaint::RectShape::stroke(sheet, 0.0, egui::Stroke::new(1.0, visuals.widgets.inactive.fg_stroke.color), egui::StrokeKind::Outside).into());
+    shapes
+}
+
+/// Draw [`layout_shapes`]. Tens of thousands of thin lines took milliseconds to tessellate
+/// again every frame the panel or window was drawn, so once the picture has stayed the same
+/// for a frame they are tessellated here, the way egui does at the end of the frame (the same
+/// pixels per point, options and culling by the painter's clip), and the triangles are kept in
+/// `kept` with everything they were drawn from. A picture that changes every frame (a drag, a
+/// zoom) is drawn as shapes, as before, rather than tessellated twice.
+fn paint_layout(painter: &egui::Painter, view: &View, layout: &Layout, selected: &[bool], visuals: &egui::Visuals, budget: usize, kept: &mut Option<Picture>) {
+    let ctx = painter.ctx();
+    let pixels_per_point = ctx.pixels_per_point();
+    let options = ctx.tessellation_options(|o| *o);
+    let colours = [visuals.extreme_bg_color, visuals.text_color(), visuals.widgets.inactive.fg_stroke.color];
+    let clip = painter.clip_rect();
+    let same = |p: &Picture| {
+        p.uvs == layout.uvs.stamp
+            && Arc::ptr_eq(&p.islands, &layout.islands)
+            && Arc::ptr_eq(&p.border, &layout.border)
+            && p.selected == selected
+            && p.view == (view.sheet, view.scale, view.centre)
+            && p.budget == budget
+            && p.clip == clip
+            && p.pixels_per_point == pixels_per_point
+            && p.options == options
+            && p.colours == colours
+    };
+    match kept {
+        Some(p) if same(p) => {
+            let mesh = p.mesh.get_or_insert_with(|| {
+                // Lines, rectangles and plain triangles use no font texture and no prepared
+                // discs.
+                let mut tessellator = egui::epaint::Tessellator::new(pixels_per_point, options, ctx.fonts(|f| f.font_image_size()), Vec::new());
+                tessellator.set_clip_rect(clip);
+                let mut mesh = egui::Mesh::default();
+                for shape in layout_shapes(view, layout, selected, visuals, budget) {
+                    tessellator.tessellate_shape(shape, &mut mesh);
+                }
+                Arc::new(mesh)
+            });
+            painter.add(egui::Shape::Mesh(mesh.clone()));
+        }
+        _ => {
+            painter.extend(layout_shapes(view, layout, selected, visuals, budget));
+            *kept = Some(Picture {
+                uvs: layout.uvs.stamp,
+                islands: layout.islands.clone(),
+                border: layout.border.clone(),
+                selected: selected.to_vec(),
+                view: (view.sheet, view.scale, view.centre),
+                budget,
+                clip,
+                pixels_per_point,
+                options,
+                colours,
+                mesh: None,
+            });
+        }
+    }
 }
 
 /// Handles of a selection box on screen: the four corners and the turn handle.
@@ -536,6 +852,12 @@ const HANDLE: f32 = 6.0;
 impl UnwrapTool {
     /// The UV Layout window's controls and canvas.
     fn editor_ui(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) {
+        // A click or drag here acts on the islands shown: a projection still to come is taken
+        // first, as when projections were taken at once.
+        let pressed = ui.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|p| ui.clip_rect().contains(p)));
+        if pressed && (self.projecting.is_some() || self.project_job.is_some()) {
+            self.settle(cx);
+        }
         self.sync_selection();
         let Some(layout) = self.shown.layout.clone() else {
             ui.label(if self.job.is_some() { "Unwrapping…" } else { "No UVs yet." });
@@ -597,7 +919,7 @@ impl UnwrapTool {
         });
         // Exact values for the selection.
         let which = self.which();
-        if let Some((lo, hi)) = uve::islands_bounds(&layout.uvs.corners, &layout.islands, &which, sheet) {
+        if let Some((lo, hi)) = island_bounds(&mut self.editor.bounds, &layout, &which, sheet) {
             let (mut pos, mut size) = (lo, hi - lo);
             let mut turn_now = false;
             let mut resp = Vec::new();
@@ -653,10 +975,35 @@ impl UnwrapTool {
         // its widget when they do.
         let (rect, _) = ui.allocate_exact_size(ui.available_size().max(egui::vec2(200.0, 200.0)), egui::Sense::hover());
         let response = ui.interact(rect, egui::Id::NULL.with("uv_layout_canvas"), egui::Sense::click_and_drag());
-        self.canvas(ui, cx, rect, &response, &layout);
+        self.canvas(ui, cx, rect, &response, layout);
     }
 
-    fn canvas(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx, rect: egui::Rect, response: &egui::Response, layout: &Layout) {
+    /// `base` with the islands `which` moved by `xf`, for a move, turn or scale drag. The
+    /// drag's own UVs from its last frame are rewritten in place when nothing else holds them
+    /// (there only these islands differ from `base`), with a new stamp, instead of copying all
+    /// of `base`'s corners every frame; a UV set held anywhere else is never changed.
+    fn dragged(&mut self, cx: &mut ToolCx, base: &Layout, which: &[usize], xf: DAffine2, sheet: DVec2) -> Layout {
+        let last = self.editor.applied.as_ref().filter(|(_, w, _)| w == which).map(|a| a.2);
+        let ours = self.shown.layout.as_ref().is_some_and(|l| Some(l.uvs.stamp) == last && Arc::ptr_eq(&l.islands, &base.islands));
+        if let Some(mut layout) = self.shown.layout.take_if(|_| ours) {
+            // A live drag shows them on the object too; the caller puts the new ones there.
+            if let Some(o) = self.object.and_then(|id| cx.scene.get_mut(id)) {
+                if o.uvs.as_ref().is_some_and(|u| Arc::ptr_eq(u, &layout.uvs)) {
+                    o.uvs = None;
+                }
+            }
+            if let Some(uvs) = Arc::get_mut(&mut layout.uvs) {
+                uve::transform_islands_from(&mut uvs.corners, &base.uvs.corners, &base.islands, which, xf, sheet);
+                uvs.stamp = next_stamp();
+                return layout;
+            }
+        }
+        let mut corners = base.uvs.corners.clone();
+        uve::transform_islands(&mut corners, &base.islands, which, xf, sheet);
+        base.with(corners)
+    }
+
+    fn canvas(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx, rect: egui::Rect, response: &egui::Response, layout: Layout) {
         let sheet = self.sheet();
         let view = View::fit(rect, sheet, self.editor.zoom, self.editor.pan);
         self.editor.canvas = Some(rect);
@@ -683,9 +1030,9 @@ impl UnwrapTool {
             self.editor.pan = egui::Vec2::ZERO;
         }
         let which = self.which();
-        let bounds = uve::islands_bounds(&layout.uvs.corners, &layout.islands, &which, sheet);
+        let bounds = island_bounds(&mut self.editor.bounds, &layout, &which, sheet);
         let handles = bounds.map(|(lo, hi)| Handles::new(&view, lo, hi));
-        let island_at = |p: egui::Pos2| uve::island_at(&layout.uvs.corners, &layout.islands, view.sheet_at(p) / sheet);
+        let island_at = |layout: &Layout, p: egui::Pos2| uve::island_at(&layout.uvs.corners, &layout.islands, view.sheet_at(p) / sheet);
         // Start a drag.
         if response.drag_started_by(egui::PointerButton::Secondary) || response.drag_started_by(egui::PointerButton::Middle) {
             self.editor.drag = Some(Drag::Pan);
@@ -703,7 +1050,7 @@ impl UnwrapTool {
                     let pts = [lo, DVec2::new(hi.x, lo.y), hi, DVec2::new(lo.x, hi.y)];
                     Drag::Scale { base: layout.clone(), pivot: pts[(k + 2) % 4], from: pts[k] }
                 }
-                _ => match island_at(p) {
+                _ => match island_at(&layout, p) {
                     Some(i) => {
                         if !self.editor.selected.get(i).copied().unwrap_or(false) {
                             self.select(&[i], mods.shift);
@@ -713,6 +1060,7 @@ impl UnwrapTool {
                     None => Drag::Select { from: p, to: p, add: mods.shift },
                 },
             });
+            self.editor.applied = None;
             // Moving, turning and scaling are one undo step each.
             if matches!(self.editor.drag, Some(Drag::Move { .. } | Drag::Turn { .. } | Drag::Scale { .. })) {
                 self.undo.push(self.shown.clone());
@@ -722,8 +1070,11 @@ impl UnwrapTool {
                 self.redo.clear();
             }
         }
-        // Follow it.
+        // Follow it. This frame's own handle on the shown layout goes first, so that a drag's
+        // UVs are held only where they are shown (see `dragged`); only a move, turn or scale
+        // changes them, and then nothing below needs the layout from before.
         let live = layout.islands.of_tri.len() <= LIVE_DRAG_TRIANGLES;
+        drop(layout);
         if let Some(drag) = &mut self.editor.drag {
             let cur = pointer.map(|p| view.sheet_at(p));
             let which = self.editor.selected.iter().enumerate().filter(|(_, &s)| s).map(|(i, _)| i).collect::<Vec<_>>();
@@ -741,7 +1092,7 @@ impl UnwrapTool {
                 (Drag::Move { base, from }, Some(cur)) => {
                     let mut d = cur - *from;
                     if self.editor.snap {
-                        if let Some((lo, hi)) = uve::islands_bounds(&base.uvs.corners, &base.islands, &which, sheet) {
+                        if let Some((lo, hi)) = island_bounds(&mut self.editor.bounds, base, &which, sheet) {
                             d += uve::snap_to_sheet(lo + d, hi + d, sheet, 8.0 / view.scale as f64);
                         }
                     }
@@ -768,16 +1119,23 @@ impl UnwrapTool {
                 _ => None,
             };
             if let Some((base, xf)) = xf {
-                let mut corners = base.uvs.corners.clone();
-                uve::transform_islands(&mut corners, &base.islands, &which, xf, sheet);
-                self.shown = Shown { layout: Some(base.with(corners)), made: self.shown.made.clone(), edited: true };
-                if live {
-                    self.show(cx);
+                // Held still: the islands are where this transform put them already.
+                let shown = self.shown.layout.as_ref().map(|l| l.uvs.stamp);
+                let done = self.editor.applied.as_ref().is_some_and(|a| a.0 == xf && a.1 == which && Some(a.2) == shown);
+                if !done {
+                    let moved = self.dragged(cx, &base, &which, xf, sheet);
+                    self.editor.applied = Some((xf, which, moved.uvs.stamp));
+                    self.shown = Shown { layout: Some(moved), made: self.shown.made.clone(), edited: true };
+                    if live {
+                        self.show(cx);
+                    }
                 }
             }
         }
+        let Some(layout) = self.shown.layout.clone() else { return };
         let released = !ui.input(|i| i.pointer.any_down());
         if released {
+            self.editor.applied = None;
             match self.editor.drag.take() {
                 Some(Drag::Select { from, to, add }) => {
                     let (a, b) = (view.sheet_at(from) / sheet, view.sheet_at(to) / sheet);
@@ -790,7 +1148,7 @@ impl UnwrapTool {
         }
         if response.clicked() {
             if let Some(p) = response.interact_pointer_pos() {
-                match island_at(p) {
+                match island_at(&layout, p) {
                     Some(i) if mods.shift => {
                         self.sync_selection();
                         if let Some(s) = self.editor.selected.get_mut(i) {
@@ -806,11 +1164,11 @@ impl UnwrapTool {
         // Paint.
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-        let layout = self.shown.layout.clone().unwrap_or_else(|| layout.clone());
+        let layout = self.shown.layout.clone().unwrap_or(layout);
         let view = View::fit(rect, sheet, self.editor.zoom, self.editor.pan);
-        paint_layout(&painter, &view, &layout, &self.editor.selected, ui.visuals(), 40_000);
+        paint_layout(&painter, &view, &layout, &self.editor.selected, ui.visuals(), 40_000, &mut self.editor.picture);
         let which = self.which();
-        if let Some((lo, hi)) = uve::islands_bounds(&layout.uvs.corners, &layout.islands, &which, sheet) {
+        if let Some((lo, hi)) = island_bounds(&mut self.editor.bounds, &layout, &which, sheet) {
             let h = Handles::new(&view, lo, hi);
             let stroke = egui::Stroke::new(1.0, ui_util::ACCENT);
             painter.rect_stroke(h.rect, 0.0, stroke, egui::StrokeKind::Middle);
@@ -835,7 +1193,7 @@ impl UnwrapTool {
 
     /// The SetUV settings. Returns whether they changed.
     fn projection_ui(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> bool {
-        let before = (self.s.projection, self.view);
+        let before = (settings_key(&self.s.projection), self.view);
         let object = self.object;
         let Some(selected) = object.and_then(|id| cx.scene.get(id)).map(|o| o.selection.len()) else { return false };
         let aspect = self.aspect();
@@ -880,7 +1238,7 @@ impl UnwrapTool {
         if let Some(c) = &mut p.center {
             ui.horizontal(|ui| {
                 for (v, l) in c.iter_mut().zip(["X ", "Y ", "Z "]) {
-                    ui.add(egui::DragValue::new(v).speed(0.5).prefix(l));
+                    ui.add(egui::DragValue::new(v).speed(0.5).prefix(l).update_while_editing(false));
                 }
             });
         }
@@ -896,32 +1254,32 @@ impl UnwrapTool {
                 });
             }
             if let Some(s) = &mut p.size {
-                ui.add(egui::DragValue::new(s).speed(0.5).range(1e-6..=1e9).prefix("Size ").suffix(" mm")).on_hover_text(hint);
+                ui.add(egui::DragValue::new(s).speed(0.5).range(1e-6..=1e9).prefix("Size ").suffix(" mm").update_while_editing(false)).on_hover_text(hint);
             }
         }
         egui::Grid::new("setuv").num_columns(3).show(ui, |ui| {
             ui.label("Scale");
-            ui.add(egui::DragValue::new(&mut p.scale[0]).speed(0.01).prefix("U "));
-            ui.add(egui::DragValue::new(&mut p.scale[1]).speed(0.01).prefix("V "));
+            ui.add(egui::DragValue::new(&mut p.scale[0]).speed(0.01).prefix("U ").update_while_editing(false));
+            ui.add(egui::DragValue::new(&mut p.scale[1]).speed(0.01).prefix("V ").update_while_editing(false));
             ui.end_row();
             ui.label("Offset");
-            ui.add(egui::DragValue::new(&mut p.offset[0]).speed(0.005).prefix("U "));
-            ui.add(egui::DragValue::new(&mut p.offset[1]).speed(0.005).prefix("V "));
+            ui.add(egui::DragValue::new(&mut p.offset[0]).speed(0.005).prefix("U ").update_while_editing(false));
+            ui.add(egui::DragValue::new(&mut p.offset[1]).speed(0.005).prefix("V ").update_while_editing(false));
             ui.end_row();
         });
-        ui.add(egui::Slider::new(&mut p.rotation, -180.0..=180.0).suffix("°").text("rotation")).on_hover_text("Turn the projection about its axis");
+        ui.add(egui::Slider::new(&mut p.rotation, -180.0..=180.0).suffix("°").text("rotation").update_while_editing(false)).on_hover_text("Turn the projection about its axis");
         ui.small(if selected > 0 { format!("Projects the {selected} selected triangles; the others keep their UVs.") } else { "Projects the whole object (select triangles first to project part of it).".to_string() });
-        (self.s.projection, self.view) != before
+        (settings_key(&self.s.projection), self.view) != before
     }
 }
 
 /// The small layout picture in the panel.
-fn draw_layout(ui: &mut egui::Ui, layout: &Layout, selected: &[bool], sheet: DVec2) -> egui::Response {
+fn draw_layout(ui: &mut egui::Ui, layout: &Layout, selected: &[bool], sheet: DVec2, kept: &mut Option<Picture>) -> egui::Response {
     let w = ui.available_width().min(260.0);
     let h = w * (sheet.y / sheet.x) as f32;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(w, h.min(400.0)), egui::Sense::click());
     let view = View::fit(rect, sheet, 1.0, egui::Vec2::ZERO);
-    paint_layout(&ui.painter_at(rect), &view, layout, selected, ui.visuals(), 12_000);
+    paint_layout(&ui.painter_at(rect), &view, layout, selected, ui.visuals(), 12_000, kept);
     response.on_hover_text("Open the UV Layout editor")
 }
 
@@ -939,6 +1297,8 @@ impl Tool for UnwrapTool {
     }
 
     fn set_settings(&mut self, changes: &serde_json::Value, cx: &mut ToolCx) -> Result<(), String> {
+        // Changes from the panel come first.
+        self.settle(cx);
         let old = self.s;
         self.s = merged(&self.s, changes).map_err(|e| format!("Unwrap: {e}"))?;
         match self.s.method {
@@ -957,7 +1317,7 @@ impl Tool for UnwrapTool {
         let which = self.which();
         serde_json::json!({
             "object": self.object,
-            "computing": self.job.is_some(),
+            "computing": self.job.is_some() || self.loading.is_some() || self.projecting.is_some() || self.project_job.is_some(),
             "result": self.shown.made.as_ref().map(|(m, msg)| serde_json::json!({
                 "message": msg,
                 "for_current_settings": match (m, self.s.method) {
@@ -996,6 +1356,7 @@ impl Tool for UnwrapTool {
 
     fn act(&mut self, action: &str, args: &serde_json::Value, cx: &mut ToolCx) -> Result<String, String> {
         let a = Args(args);
+        self.settle(cx);
         self.sync_selection();
         let r = match action {
             "select_islands" => {
@@ -1054,7 +1415,17 @@ impl Tool for UnwrapTool {
     }
 
     fn busy(&self) -> Option<(String, f32)> {
-        self.job.as_ref().map(|(_, j)| ("Unwrapping".to_string(), j.progress()))
+        if let Some((_, j)) = &self.job {
+            return Some(("Unwrapping".to_string(), j.progress()));
+        }
+        if let Some(j) = &self.loading {
+            return Some(("Reading the UVs".to_string(), j.progress()));
+        }
+        self.project_job.as_ref().map(|(_, j)| ("Projecting".to_string(), j.progress()))
+    }
+
+    fn pending(&self) -> bool {
+        self.projecting.is_some()
     }
 
     fn keys(&mut self, input: &egui::InputState, cx: &mut ToolCx) -> bool {
@@ -1071,6 +1442,7 @@ impl Tool for UnwrapTool {
         if !input.clicked {
             return;
         }
+        self.settle(cx);
         let Some(pos) = input.pos else { return };
         let Some((_, hit)) = cx.pick(pos, self.object) else { return };
         let Some(i) = self.shown.layout.as_ref().and_then(|l| l.islands.island_of(hit.tid)) else { return };
@@ -1093,22 +1465,35 @@ impl Tool for UnwrapTool {
             return;
         }
         let eye = cx.camera.eye();
-        let col = Vec4::new(1.0, 0.62, 0.2, 0.38);
-        let mut n = 0;
-        for (i, _) in self.editor.selected.iter().enumerate().filter(|(_, &s)| s) {
-            for &t in layout.islands.islands.get(i).into_iter().flatten() {
-                if n > 200_000 {
-                    return;
+        let (selected, shape) = (&self.editor.selected, o.mesh.shape_version());
+        // Made again only when the islands, the selection, the shape or the eye change (not
+        // for every frame the panel redraws, say).
+        let current = self.tint.as_ref().is_some_and(|k| Arc::ptr_eq(&k.islands, &layout.islands) && k.selected == *selected && k.shape == shape && k.eye == eye);
+        if !current {
+            let col = Vec4::new(1.0, 0.62, 0.2, 0.38);
+            let mut tint = Overlay::default();
+            let mut n = 0;
+            'islands: for (i, _) in selected.iter().enumerate().filter(|(_, &s)| s) {
+                for &t in layout.islands.islands.get(i).into_iter().flatten() {
+                    if n > 200_000 {
+                        break 'islands;
+                    }
+                    n += 1;
+                    let [a, b, c] = o.mesh.tri_positions(t).map(|p| p + (eye - p) * 0.0015);
+                    tint.tri(a, b, c, col);
                 }
-                n += 1;
-                let [a, b, c] = o.mesh.tri_positions(t).map(|p| p + (eye - p) * 0.0015);
-                ov.tri(a, b, c, col);
             }
+            self.tint = Some(Tint { islands: layout.islands.clone(), selected: selected.clone(), shape, eye, tris: tint.tris });
+        }
+        if let Some(k) = &self.tint {
+            ov.tris.extend_from_slice(&k.tris);
         }
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         self.poll(cx);
+        self.poll_loading();
+        self.poll_projection(cx);
         ui_util::section(ui, "Unwrap");
         if self.mesh(cx).is_none() {
             ui.label("No active object.");
@@ -1120,6 +1505,10 @@ impl Tool for UnwrapTool {
             ui.selectable_value(&mut self.s.method, UvMethod::Project, "Project (SetUV)").on_hover_text("Project the selection (or the whole object) without unwrapping");
         });
         if self.s.method != method {
+            // A projection still to come is the last of the method left.
+            if method == UvMethod::Project {
+                self.settle(cx);
+            }
             self.project_base = None;
             if self.s.method == UvMethod::Project {
                 self.project(cx);
@@ -1159,9 +1548,12 @@ impl Tool for UnwrapTool {
             } else {
                 vec![("Width", &mut p.width), ("Height", &mut p.height)]
             };
+            // In SetUV the sheet's proportions are projected: a typed size counts once it is
+            // entered, not at each digit.
+            let typing = self.s.method == UvMethod::Unwrap;
             for (label, v) in rows {
                 ui.label(label);
-                ui.add(egui::DragValue::new(v).speed(1.0).range(0.0..=10_000.0).suffix(" mm"));
+                ui.add(egui::DragValue::new(v).speed(1.0).range(0.0..=10_000.0).suffix(" mm").update_while_editing(typing));
                 ui.end_row();
             }
         });
@@ -1170,22 +1562,29 @@ impl Tool for UnwrapTool {
             UvMethod::Unwrap => {
                 let current = self.s.unwrap;
                 let stale = self.shown.made.as_ref().is_none_or(|m| m.0 != Made::Unwrap(current)) && self.job.as_ref().is_none_or(|j| j.0 != current);
-                if ui.add_enabled(stale, egui::Button::new(if self.shown.layout.is_some() { "Update" } else { "Unwrap" })).clicked() {
+                if ui.add_enabled(stale && self.loading.is_none(), egui::Button::new(if self.shown.layout.is_some() { "Update" } else { "Unwrap" })).clicked() {
                     self.project_base = None;
                     self.start(cx);
                 }
                 if let Some((_, j)) = &self.job {
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        polymix_workspace::spinner(ui);
                         ui.add(egui::ProgressBar::new(j.progress()));
                     });
                     cx.egui.request_repaint_after(std::time::Duration::from_millis(50));
                 }
+                if self.loading.is_some() {
+                    ui.horizontal(|ui| {
+                        polymix_workspace::spinner(ui);
+                        ui.label("Reading the object's UVs…");
+                    });
+                }
             }
             UvMethod::Project => {
                 if self.projection_ui(ui, cx) || sheet_changed {
-                    self.project(cx);
+                    self.project_soon();
                 }
+                self.start_projection(cx);
             }
         }
         if let Some((_, msg)) = &self.shown.made {
@@ -1196,7 +1595,7 @@ impl Tool for UnwrapTool {
         }
         self.sync_selection();
         if let Some(layout) = self.shown.layout.clone() {
-            if draw_layout(ui, &layout, &self.editor.selected, self.sheet()).clicked() {
+            if draw_layout(ui, &layout, &self.editor.selected, self.sheet(), &mut self.thumbnail).clicked() {
                 self.editor.open = true;
             }
             ui.horizontal(|ui| {
@@ -1215,7 +1614,8 @@ impl Tool for UnwrapTool {
             ui.colored_label(ui.visuals().warn_fg_color, e);
         }
         ui.small("UVs are kept while the shape changes (sculpting, transforms) and dropped by edits that change triangles. Export them with OBJ.");
-        let (accept, cancel) = ui_util::accept_cancel(ui, self.shown.layout.is_some() && self.job.is_none());
+        let waiting = self.job.is_some() || self.projecting.is_some() || self.project_job.is_some();
+        let (accept, cancel) = ui_util::accept_cancel(ui, self.shown.layout.is_some() && !waiting);
         if self.editor.open && self.shown.layout.is_some() {
             let ctx = cx.egui.clone();
             let mut open = true;
@@ -1241,6 +1641,8 @@ impl Tool for UnwrapTool {
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
         self.poll(cx);
+        // What the settings show is what is accepted.
+        self.settle(cx);
         if self.job.is_some() {
             return false;
         }
@@ -1265,6 +1667,10 @@ impl Tool for UnwrapTool {
         if let Some((_, j)) = &self.job {
             j.cancel();
         }
+        // Dropped jobs are told to stop.
+        self.loading = None;
+        self.projecting = None;
+        self.project_job = None;
         self.restore(cx);
         true
     }
@@ -1287,13 +1693,16 @@ mod tests {
         f(&mut cx, id);
     }
 
+    /// Until the unwrap, the reading of the object's UVs and a background projection are done.
     fn wait(tool: &mut UnwrapTool, cx: &mut ToolCx) {
         let t0 = Instant::now();
-        while tool.job.is_some() && t0.elapsed() < Duration::from_secs(20) {
+        while (tool.job.is_some() || tool.loading.is_some() || tool.project_job.is_some()) && t0.elapsed() < Duration::from_secs(20) {
             std::thread::sleep(Duration::from_millis(5));
             tool.poll(cx);
+            tool.poll_loading();
+            tool.poll_projection(cx);
         }
-        assert!(tool.job.is_none() && tool.error.is_none(), "{:?}", tool.error);
+        assert!(tool.job.is_none() && tool.loading.is_none() && tool.project_job.is_none() && tool.error.is_none(), "{:?}", tool.error);
     }
 
     /// Two separate squares (two islands).
@@ -1341,10 +1750,13 @@ mod tests {
             assert!(tool.accept(cx));
             assert_eq!(cx.scene.get(id).unwrap().uvs().unwrap().corners, last);
             assert!(cx.status.starts_with("Unwrap"), "{}", cx.status);
-            // Reopening edits the UVs the object has instead of unwrapping again.
-            let tool = UnwrapTool::new(cx);
+            // Reopening edits the UVs the object has instead of unwrapping again (read in the
+            // background).
+            let mut tool = UnwrapTool::new(cx);
             assert!(tool.job.is_none());
+            wait(&mut tool, cx);
             assert_eq!(tool.shown.layout.as_ref().unwrap().uvs.corners, last);
+            assert!(matches!(tool.shown.made, Some((Made::Existing, _))));
         });
     }
 
@@ -1539,6 +1951,392 @@ mod tests {
             assert!(tool.state(cx.scene)["result"]["message"].as_str().unwrap().contains("1 selected"));
             assert!(tool.accept(cx));
             assert!(cx.status.starts_with("Set UVs"), "{}", cx.status);
+        });
+    }
+
+    /// The scene's undo and redo steps.
+    fn history_labels(cx: &ToolCx) -> (Vec<String>, Vec<String>) {
+        let (undo, redo) = cx.history.labels();
+        (undo.iter().map(|s| s.to_string()).collect(), redo.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// An icosphere unwrapped by components (several islands, many breaks).
+    fn sphere_layout() -> (Mesh, Layout) {
+        let m = primitives::icosphere(10.0, 3);
+        let l = mm_edit::unwrap(&m, &UnwrapParams { elements: UnwrapElements::Components, kind: UnwrapType::Conformal, ..Default::default() }).unwrap();
+        let corners = l.uv.iter().map(|c| c.map(|q| q.as_vec2().to_array())).collect();
+        let layout = Layout::new(&m, Arc::new(UvSet::new(&m, corners)));
+        (m, layout)
+    }
+
+    #[test]
+    fn unwrap_layout_picture_is_what_egui_would_draw() {
+        // The kept picture gives the very primitives egui made of the shapes drawn one by one:
+        // on screen pixels and on a Retina screen, zoomed in so that most shapes fall outside
+        // the clip, and with budgets that thin the lines out.
+        let (_, layout) = sphere_layout();
+        assert!(layout.islands.len() > 1 && !layout.border.is_empty());
+        let mut selected = vec![false; layout.islands.len()];
+        selected[1] = true;
+        let sheet = DVec2::new(200.0, 250.0);
+        let rect = egui::Rect::from_min_size(egui::pos2(30.5, 40.0), egui::vec2(410.0, 300.0));
+        for (ppp, zoom, budget) in [(1.0, 1.0, 40_000), (2.0, 1.0, 12_000), (2.0, 3.0, 300), (1.5, 0.7, 7)] {
+            let ctx = egui::Context::default();
+            let frame = |paint: &mut dyn FnMut(&egui::Painter, &View, &egui::Visuals)| {
+                let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() };
+                raw.viewports.insert(egui::ViewportId::ROOT, egui::ViewportInfo { native_pixels_per_point: Some(ppp), ..Default::default() });
+                let out = ctx.run_ui(raw, |ui| {
+                    let view = View::fit(rect, sheet, zoom, egui::vec2(12.0, -7.0));
+                    paint(&ui.painter_at(rect), &view, ui.visuals());
+                });
+                assert_eq!(out.pixels_per_point, ppp);
+                ctx.tessellate(out.shapes, out.pixels_per_point)
+            };
+            frame(&mut |_, _, _| {});
+            let shapes = frame(&mut |painter, view, visuals| painter.extend(layout_shapes(view, &layout, &selected, visuals, budget)));
+            // Drawn as shapes, then tessellated here (the picture stayed the same), then reused.
+            let mut kept = None;
+            let mut draw = || frame(&mut |painter, view, visuals| paint_layout(painter, view, &layout, &selected, visuals, budget, &mut kept));
+            let made = draw();
+            let tessellated = draw();
+            let again = draw();
+            let mesh = |kept: &Option<Picture>| kept.as_ref().and_then(|p| p.mesh.clone());
+            let first = mesh(&kept).unwrap();
+            let again2 = frame(&mut |painter, view, visuals| paint_layout(painter, view, &layout, &selected, visuals, budget, &mut kept));
+            assert!(Arc::ptr_eq(&first, &mesh(&kept).unwrap()), "later frames reuse the picture");
+            for got in [&made, &tessellated, &again, &again2] {
+                assert_eq!(got.len(), shapes.len());
+                for (a, b) in got.iter().zip(&shapes) {
+                    assert_eq!(a.clip_rect, b.clip_rect);
+                    let (egui::epaint::Primitive::Mesh(a), egui::epaint::Primitive::Mesh(b)) = (&a.primitive, &b.primitive) else { panic!("meshes only") };
+                    assert!(!b.vertices.is_empty());
+                    assert_eq!(a, b, "ppp {ppp} zoom {zoom} budget {budget}");
+                }
+            }
+        }
+        // Anything it shows changing draws it again.
+        let ctx = egui::Context::default();
+        let mut kept = None;
+        let mut draw = |selected: &[bool], layout: &Layout, zoom: f32| {
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| paint_layout(&ui.painter_at(rect), &View::fit(rect, sheet, zoom, egui::Vec2::ZERO), layout, selected, ui.visuals(), 500, &mut kept));
+            }
+            kept.as_ref().and_then(|p| p.mesh.clone()).unwrap()
+        };
+        let a = draw(&selected, &layout, 1.0);
+        assert!(Arc::ptr_eq(&a, &draw(&selected, &layout, 1.0)));
+        let b = draw(&vec![true; layout.islands.len()], &layout, 1.0);
+        assert!(!Arc::ptr_eq(&a, &b));
+        let c = draw(&vec![true; layout.islands.len()], &layout, 2.0);
+        assert!(!Arc::ptr_eq(&b, &c));
+        let moved = layout.with(layout.uvs.corners.clone());
+        assert!(!Arc::ptr_eq(&c, &draw(&vec![true; layout.islands.len()], &moved, 2.0)));
+    }
+
+    #[test]
+    fn unwrap_kept_selection_boxes_are_the_boxes() {
+        let (_, layout) = sphere_layout();
+        let mut kept = Vec::new();
+        let n = layout.islands.len();
+        for which in [vec![], vec![0], vec![1, 2], (0..n).collect::<Vec<_>>(), vec![0]] {
+            for sheet in [DVec2::new(200.0, 250.0), DVec2::new(1e-9, 3.0)] {
+                let want = uve::islands_bounds(&layout.uvs.corners, &layout.islands, &which, sheet);
+                assert_eq!(island_bounds(&mut kept, &layout, &which, sheet), want);
+                assert_eq!(island_bounds(&mut kept, &layout, &which, sheet), want, "kept");
+            }
+        }
+        assert!(kept.len() <= 4);
+        // Other corners (an edit) are other boxes.
+        let mut corners = layout.uvs.corners.clone();
+        uve::move_islands(&mut corners, &layout.islands, &[0], DVec2::new(5.0, 1.0), DVec2::new(200.0, 250.0));
+        let moved = layout.with(corners);
+        let want = uve::islands_bounds(&moved.uvs.corners, &moved.islands, &[0], DVec2::new(200.0, 250.0));
+        assert_eq!(island_bounds(&mut kept, &moved, &[0], DVec2::new(200.0, 250.0)), want);
+        assert_ne!(want, island_bounds(&mut kept, &layout, &[0], DVec2::new(200.0, 250.0)));
+    }
+
+    #[test]
+    fn unwrap_tint_is_kept_until_it_changes() {
+        // A grid of more than 200 000 triangles in one island: the tint stops after 200 001 of
+        // them, as before.
+        let m = primitives::plane_grid(50.0, 50.0, 330, 310);
+        let corners: Vec<Corners> = (0..m.max_tid() as u32).map(|t| m.tri_positions(t).map(|p| [(p.x / 50.0 + 0.5) as f32, (p.y / 50.0 + 0.5) as f32])).collect();
+        with_tool(m, |cx, id| {
+            let o = cx.scene.get_mut(id).unwrap();
+            o.uvs = Some(Arc::new(UvSet::new(&o.mesh, corners)));
+            let mut tool = UnwrapTool::new(cx);
+            wait(&mut tool, cx);
+            assert_eq!(tool.shown.layout.as_ref().unwrap().islands.len(), 1);
+            // As it was made every frame before.
+            let reference = |tool: &UnwrapTool, cx: &ToolCx| {
+                let mut ov = Overlay::default();
+                let layout = tool.shown.layout.as_ref().unwrap();
+                let o = cx.scene.get(tool.object.unwrap()).unwrap();
+                let eye = cx.camera.eye();
+                let mut n = 0;
+                'all: for (i, _) in tool.editor.selected.iter().enumerate().filter(|(_, &s)| s) {
+                    for &t in layout.islands.islands.get(i).into_iter().flatten() {
+                        if n > 200_000 {
+                            break 'all;
+                        }
+                        n += 1;
+                        let [a, b, c] = o.mesh.tri_positions(t).map(|p| p + (eye - p) * 0.0015);
+                        ov.tri(a, b, c, Vec4::new(1.0, 0.62, 0.2, 0.38));
+                    }
+                }
+                ov.tris
+            };
+            let tint = |tool: &mut UnwrapTool, cx: &mut ToolCx| {
+                let mut ov = Overlay::default();
+                ov.tri(DVec3::ZERO, DVec3::X, DVec3::Y, Vec4::ONE);
+                tool.overlay(&mut ov, cx);
+                ov.tris[3..].to_vec()
+            };
+            let bytes = |v: &[ColorVertex]| bytemuck::cast_slice::<ColorVertex, u8>(v).to_vec();
+            assert!(tint(&mut tool, cx).is_empty(), "nothing selected");
+            tool.select(&[0], false);
+            let first = tint(&mut tool, cx);
+            assert_eq!(first.len(), 200_001 * 3);
+            assert_eq!(bytes(&first), bytes(&reference(&tool, cx)));
+            assert_eq!(bytes(&tint(&mut tool, cx)), bytes(&first), "kept");
+            // The eye moves: made again.
+            cx.camera.tumble(30.0, 10.0);
+            let turned = tint(&mut tool, cx);
+            assert_eq!(bytes(&turned), bytes(&reference(&tool, cx)));
+            assert_ne!(bytes(&turned), bytes(&first));
+            // The shape changes: made again.
+            let o = cx.scene.get_mut(id).unwrap();
+            let p = o.mesh.vertex(5);
+            o.mesh_mut().set_vertex(5, p + DVec3::Z);
+            assert_eq!(bytes(&tint(&mut tool, cx)), bytes(&reference(&tool, cx)));
+            tool.select(&[], false);
+            assert!(tint(&mut tool, cx).is_empty());
+        });
+    }
+
+    #[test]
+    fn unwrap_drag_rewrites_only_its_own_uvs() {
+        with_tool(two_squares(), |cx, id| {
+            let mut tool = UnwrapTool::new(cx);
+            wait(&mut tool, cx);
+            tool.editor.open = true;
+            tool.editor.snap = false;
+            let ctx = cx.egui.clone();
+            let frame = |tool: &mut UnwrapTool, cx: &mut ToolCx, events: Vec<egui::Event>| {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1200.0))), events, ..Default::default() };
+                let _ = ctx.run_ui(raw, |ui| {
+                    let _ = tool.panel(ui, cx);
+                });
+            };
+            // Island 0 selected first: the window's rows for the selection are there before the
+            // drag, so the canvas stays where it is.
+            tool.select(&[0], false);
+            frame(&mut tool, cx, vec![]);
+            frame(&mut tool, cx, vec![]);
+            let base = tool.shown.layout.clone().unwrap();
+            let base_corners = base.uvs.corners.clone();
+            let view = View::fit(tool.editor.canvas.unwrap(), tool.sheet(), tool.editor.zoom, tool.editor.pan);
+            let sheet = tool.sheet();
+            // The middle of the square, away from the selection's handles.
+            let (lo, hi) = uve::islands_bounds(&base.uvs.corners, &base.islands, &[0], sheet).unwrap();
+            let p = view.screen((lo + hi) * 0.5);
+            let press = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(&mut tool, cx, vec![egui::Event::PointerMoved(p), press(p, true)]);
+            // What the islands should be with the pointer at `q`: the drag's start moved there.
+            let expect = |q: egui::Pos2| {
+                let mut c = base_corners.clone();
+                uve::transform_islands(&mut c, &base.islands, &[0], DAffine2::from_translation(view.sheet_at(q) - view.sheet_at(p)), sheet);
+                c
+            };
+            let mut held: Option<(Arc<UvSet>, Vec<Corners>, u64)> = None;
+            let mut last = std::ptr::null();
+            for k in 1..=6 {
+                let q = p + egui::vec2(9.0 * k as f32, -4.0 * k as f32);
+                frame(&mut tool, cx, vec![egui::Event::PointerMoved(q)]);
+                let shown = tool.shown.layout.as_ref().unwrap().uvs.clone();
+                assert_eq!(shown.corners, expect(q), "move {k}");
+                assert_eq!(cx.scene.get(id).unwrap().uvs.as_ref().map(|u| u.stamp), Some(shown.stamp), "the model shows it");
+                // The first move copies the drag's start; later ones rewrite their own UVs, but
+                // not those something else held.
+                assert_eq!(Arc::as_ptr(&shown) == last, k != 1 && k != 4, "move {k}");
+                last = Arc::as_ptr(&shown);
+                // Held still: nothing is made again.
+                frame(&mut tool, cx, vec![]);
+                frame(&mut tool, cx, vec![]);
+                assert_eq!(tool.shown.layout.as_ref().unwrap().uvs.stamp, shown.stamp, "held still");
+                if k == 3 {
+                    // Something else holds these UVs (an autosave, say): they never change.
+                    held = Some((shown.clone(), shown.corners.clone(), shown.stamp));
+                }
+                drop(shown);
+            }
+            frame(&mut tool, cx, vec![press(p + egui::vec2(54.0, -24.0), false)]);
+            frame(&mut tool, cx, vec![]);
+            let (h, corners, stamp) = held.unwrap();
+            assert_eq!((h.corners.clone(), h.stamp), (corners, stamp));
+            let after = tool.shown.layout.clone().unwrap();
+            assert_eq!(after.uvs.corners, expect(p + egui::vec2(54.0, -24.0)));
+            assert_eq!(cx.scene.get(id).unwrap().uvs().unwrap().corners, after.uvs.corners);
+            // The drag's start was never touched, and undo brings it back.
+            assert_eq!(base.uvs.corners, base_corners);
+            assert_eq!(tool.undo.len(), 1);
+            assert!(tool.undo(cx));
+            assert_eq!(cx.scene.get(id).unwrap().uvs().unwrap().corners, base_corners);
+            assert!(tool.redo(cx));
+            assert_eq!(cx.scene.get(id).unwrap().uvs().unwrap().corners, after.uvs.corners);
+        });
+    }
+
+    #[test]
+    fn unwrap_setuv_projects_once_the_settings_settle() {
+        with_tool(primitives::icosphere(10.0, 3), |cx, id| {
+            let mut tool = UnwrapTool::new_projection(cx);
+            assert!(matches!(tool.shown.made, Some((Made::Project(..), _))));
+            let steps = tool.undo.len();
+            // A field dragged: each change waits; nothing is projected meanwhile.
+            for k in 1..=3 {
+                tool.s.projection.rotation = 10.0 * k as f64;
+                tool.project_soon();
+                tool.start_projection(cx);
+                assert!(tool.pending() && tool.busy().is_none() && tool.project_job.is_none());
+            }
+            assert_eq!(tool.state(cx.scene)["computing"], true);
+            std::thread::sleep(PROJECT_AFTER + Duration::from_millis(20));
+            tool.start_projection(cx);
+            assert!(!tool.pending() && tool.busy().is_some_and(|b| b.0 == "Projecting"));
+            wait(&mut tool, cx);
+            let shown = tool.shown.layout.clone().unwrap();
+            assert_eq!(cx.scene.get(id).unwrap().uvs.as_ref().map(|u| u.stamp), Some(shown.uvs.stamp));
+            assert_eq!(tool.undo.len(), steps, "adjusting a projection replaces it");
+            // The same as projecting at once.
+            tool.project(cx);
+            assert_eq!(tool.shown.layout.as_ref().unwrap().uvs.corners, shown.uvs.corners);
+            assert_eq!(*tool.shown.layout.as_ref().unwrap().border, *shown.border);
+            assert_eq!(*tool.shown.layout.as_ref().unwrap().islands, *shown.islands);
+            // A projection of settings changed since is dropped.
+            tool.s.projection.rotation = 50.0;
+            tool.project_soon();
+            tool.projecting = Some(Instant::now() - PROJECT_AFTER);
+            tool.start_projection(cx);
+            let (tag, job) = tool.project_job.take().unwrap();
+            tool.s.projection.rotation = 60.0;
+            let r = wait_for(&job);
+            let before = tool.shown.layout.as_ref().unwrap().uvs.stamp;
+            tool.projection_done(cx, &tag, r);
+            assert_eq!(tool.shown.layout.as_ref().unwrap().uvs.stamp, before);
+            // A value typed as "nan" is projected once, to say so, and not waited on forever.
+            tool.s.projection.offset[0] = f64::NAN;
+            tool.project_soon();
+            tool.projecting = Some(Instant::now() - PROJECT_AFTER);
+            tool.start_projection(cx);
+            while tool.project_job.is_some() {
+                std::thread::sleep(Duration::from_millis(2));
+                tool.poll_projection(cx);
+            }
+            assert!(tool.error.as_deref().is_some_and(|e| e.starts_with("SetUV")), "{:?}", tool.error);
+            // (The field shows it as infinity, which is projected too, once.)
+            let ctx = cx.egui.clone();
+            let t0 = Instant::now();
+            for k in 0.. {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0))), ..Default::default() };
+                let _ = ctx.run_ui(raw, |ui| {
+                    let _ = tool.panel(ui, cx);
+                });
+                if k > 3 && !tool.pending() && tool.project_job.is_none() {
+                    break;
+                }
+                assert!(t0.elapsed() < Duration::from_secs(20), "settles");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(tool.error.as_deref().is_some_and(|e| e.starts_with("SetUV")), "{:?}", tool.error);
+        });
+    }
+
+    #[test]
+    fn unwrap_setuv_waiting_is_taken_before_what_follows() {
+        // Undo, an edit, an agent's settings and accepting each act as if the projection of
+        // the settings shown had been taken when they changed.
+        let changed = |tool: &mut UnwrapTool, cx: &mut ToolCx| {
+            tool.s.projection.rotation = 33.0;
+            tool.project_soon();
+            tool.start_projection(cx);
+            assert!(tool.pending());
+        };
+        let at_once = |tool: &mut UnwrapTool, cx: &mut ToolCx| {
+            tool.s.projection.rotation = 33.0;
+            tool.project(cx);
+        };
+        type Then = fn(&mut UnwrapTool, &mut ToolCx);
+        let thens: [(&str, Then); 4] = [
+            ("undo", |t, cx| assert!(t.undo(cx))),
+            ("edit", |t, cx| {
+                t.act("select_islands", &serde_json::json!({"islands": "all"}), cx).unwrap();
+                t.act("rotate", &serde_json::json!({"degrees": 90.0}), cx).unwrap();
+            }),
+            ("settings", |t, cx| t.set_settings(&serde_json::json!({"projection": {"projection": "Box"}}), cx).unwrap()),
+            ("accept", |t, cx| assert!(t.accept(cx))),
+        ];
+        for (what, then) in thens {
+            let mut results = Vec::new();
+            for wait_first in [false, true] {
+                with_tool(primitives::cube(10.0, 3), |cx, id| {
+                    let mut tool = UnwrapTool::new_projection(cx);
+                    tool.act("select_islands", &serde_json::json!({"islands": "0"}), cx).unwrap();
+                    tool.act("move", &serde_json::json!({"du": 3.0, "dv": 1.0}), cx).unwrap();
+                    if wait_first {
+                        changed(&mut tool, cx);
+                    } else {
+                        at_once(&mut tool, cx);
+                    }
+                    then(&mut tool, cx);
+                    assert!(!tool.pending() && tool.project_job.is_none());
+                    let shown = tool.shown.layout.as_ref().map(|l| l.uvs.corners.clone());
+                    let object = cx.scene.get(id).unwrap().uvs().map(|u| u.corners.clone());
+                    results.push((shown, object, tool.undo.len(), tool.redo.len(), history_labels(cx)));
+                });
+            }
+            assert!(results[0] == results[1], "{what}");
+        }
+    }
+
+    #[test]
+    fn unwrap_reads_existing_uvs_in_the_background() {
+        let (m, layout) = sphere_layout();
+        let corners = layout.uvs.corners.clone();
+        for method in [UvMethod::Unwrap, UvMethod::Project] {
+            with_tool(m.clone(), |cx, id| {
+                let o = cx.scene.get_mut(id).unwrap();
+                o.uvs = Some(Arc::new(UvSet::new(&o.mesh, corners.clone())));
+                let mut tool = if method == UvMethod::Unwrap { UnwrapTool::new(cx) } else { UnwrapTool::new_projection(cx) };
+                if method == UvMethod::Project {
+                    // Projecting stays at once, with the object's layout its undo step.
+                    assert!(tool.loading.is_none() && tool.undo.len() == 1);
+                    assert_eq!(tool.undo[0].layout.as_ref().unwrap().uvs.corners, corners);
+                    return;
+                }
+                assert!(tool.shown.layout.is_none() && tool.busy().is_some_and(|b| b.0 == "Reading the UVs"));
+                wait(&mut tool, cx);
+                let read = tool.shown.layout.clone().unwrap();
+                assert_eq!(read.uvs.corners, corners);
+                assert_eq!(*read.islands, *layout.islands);
+                assert_eq!(*read.border, *layout.border);
+                assert_eq!(read.tris, layout.tris);
+                // Accepting them unchanged adds no undo step to the scene.
+                let steps = history_labels(cx);
+                assert!(tool.accept(cx));
+                assert_eq!(history_labels(cx), steps);
+            });
+        }
+        // An agent's settings while they are read: the unwrap starts on top of them.
+        with_tool(m, |cx, id| {
+            let o = cx.scene.get_mut(id).unwrap();
+            o.uvs = Some(Arc::new(UvSet::new(&o.mesh, corners.clone())));
+            let mut tool = UnwrapTool::new(cx);
+            tool.set_settings(&serde_json::json!({"border": 2.0}), cx).unwrap();
+            assert!(tool.loading.is_none() && tool.job.is_some());
+            wait(&mut tool, cx);
+            assert_eq!(tool.undo.len(), 1);
+            assert!(matches!(tool.undo[0].made, Some((Made::Existing, _))));
         });
     }
 }

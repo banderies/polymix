@@ -3,6 +3,7 @@
 //! `usemtl` for the texture of the most used material. Other statements are ignored.
 
 use crate::parse::{find_byte, parse_f64, parse_i64, show, strip_bom, trim, Lines, Tokens};
+use crate::weld::{FastMap, Key3};
 use crate::{fan, put_xyz, write_parallel, Raw};
 use anyhow::{anyhow, bail, Result};
 use glam::DVec3;
@@ -24,11 +25,16 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
     let mut poly_vt: SmallVec<[Option<u32>; 8]> = SmallVec::new();
     let mut short_faces = 0usize;
     let mut vts: Vec<[f32; 2]> = Vec::new();
-    // Per triangle: its corners' `vt` (if any face has them).
-    let mut tri_vt: Vec<[Option<u32>; 3]> = Vec::new();
+    // Per triangle: its corners' `vt`. Made at the first face that has any (the triangles
+    // before it get none), so files without texture coordinates never pay for it.
+    let mut tri_vt: Option<Vec<[Option<u32>; 3]>> = None;
     let mut mtllib: Option<String> = None;
     let mut material: Option<String> = None;
-    let mut material_faces: HashMap<String, usize> = HashMap::new();
+    // Triangles per material, in order of first use; `cur_mat` indexes the current
+    // material's entry once a face has used it since its `usemtl`.
+    let mut material_ids: HashMap<String, usize> = HashMap::new();
+    let mut material_faces: Vec<(String, usize)> = Vec::new();
+    let mut cur_mat: Option<usize> = None;
 
     let mut lines = Lines::new(data);
     while let Some(line) = lines.next() {
@@ -67,7 +73,10 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
                 vts.push([u, v]);
             }
             b"mtllib" => mtllib = Some(String::from_utf8_lossy(trim(tk.rest())).into_owned()),
-            b"usemtl" => material = Some(String::from_utf8_lossy(trim(tk.rest())).into_owned()),
+            b"usemtl" => {
+                material = Some(String::from_utf8_lossy(trim(tk.rest())).into_owned());
+                cur_mat = None;
+            }
             b"f" | b"fo" => {
                 poly.clear();
                 poly_vt.clear();
@@ -122,11 +131,22 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
                 if added == 0 {
                     short_faces += 1;
                 }
-                for i in 1..=added {
-                    tri_vt.push([poly_vt[0], poly_vt[i], poly_vt[i + 1]]);
+                if tri_vt.is_none() && added > 0 && poly_vt.iter().any(Option::is_some) {
+                    tri_vt = Some(vec![[None; 3]; tris.len() - added]);
+                }
+                if let Some(tri_vt) = &mut tri_vt {
+                    for i in 1..=added {
+                        tri_vt.push([poly_vt[0], poly_vt[i], poly_vt[i + 1]]);
+                    }
                 }
                 if let Some(m) = &material {
-                    *material_faces.entry(m.clone()).or_default() += added;
+                    let k = *cur_mat.get_or_insert_with(|| {
+                        *material_ids.entry(m.clone()).or_insert_with(|| {
+                            material_faces.push((m.clone(), 0));
+                            material_faces.len() - 1
+                        })
+                    });
+                    material_faces[k].1 += added;
                 }
                 groups.extend(std::iter::repeat_n(g, added));
             }
@@ -152,7 +172,7 @@ pub(crate) fn read(data: &[u8]) -> Result<Raw> {
         }
     }
     let mut raw = Raw { positions, triangles: tris, colors, ..Default::default() };
-    if tri_vt.iter().flatten().any(Option::is_some) {
+    if let Some(tri_vt) = tri_vt.filter(|t| t.iter().flatten().any(Option::is_some)) {
         raw.uvs = Some(tri_vt.iter().map(|c| c.map(|k| k.map_or([0.0; 2], |k| vts[k as usize]))).collect());
     }
     if let (Some(lib), Some((m, _))) = (mtllib, material_faces.into_iter().max_by_key(|(_, n)| *n)) {
@@ -189,13 +209,14 @@ pub(crate) fn write<W: Write + ?Sized>(
     // Texture coordinates: one `vt` per distinct value, faces as `v/vt`.
     let mut vt_index: Vec<[u32; 3]> = Vec::new();
     if let Some(uvs) = uvs {
-        let mut ids: std::collections::HashMap<[u32; 2], u32> = std::collections::HashMap::new();
+        // Distinct by bit pattern (so -0.0 and 0.0 stay apart, as written).
+        let mut ids: FastMap<Key3<u32>, u32> = FastMap::default();
         let mut vts: Vec<[f32; 2]> = Vec::new();
         vt_index = uvs
             .iter()
             .map(|c| {
                 c.map(|q| {
-                    *ids.entry([q[0].to_bits(), q[1].to_bits()]).or_insert_with(|| {
+                    *ids.entry(Key3([q[0].to_bits(), q[1].to_bits(), 0])).or_insert_with(|| {
                         vts.push(q);
                         vts.len() as u32 - 1
                     })
@@ -241,3 +262,50 @@ pub(crate) fn diffuse_map(mtl: &std::path::Path, material: &str) -> Option<std::
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const QUAD: &str = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 2 0 0\nvt 0 0\nvt 1 0\nvt 1 1\n";
+
+    #[test]
+    fn texture_coordinates_start_at_the_first_face_that_has_them() {
+        // Two faces without `vt`, then one with, one with `v//vn`, and one with a bad index.
+        let text = format!("{QUAD}f 1 2 3\nf 1 3 4\nf 1/1 2/2 3/3 4/1\nf 2//1 5//1 3//1\nf 2/9 5/-1 3\n");
+        let raw = read(text.as_bytes()).unwrap();
+        assert_eq!(raw.triangles.len(), 6);
+        let (z, a, b, c) = ([0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]);
+        assert_eq!(raw.uvs.unwrap(), vec![[z; 3], [z; 3], [a, b, c], [a, c, a], [z; 3], [z, c, z]]);
+        // `vt` lines that no face uses, or none at all: no UVs.
+        for text in [format!("{QUAD}f 1 2 3\nf 1//1 3//1 4//1\n"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_string(), format!("{QUAD}f 1/7 2/8 3/9\n")] {
+            assert!(read(text.as_bytes()).unwrap().uvs.is_none(), "{text}");
+        }
+        // A face too short for a triangle does not start them.
+        let raw = read(format!("{QUAD}f 1/1 2/2\nf 1 2 3\nf 1/1 2/2 3/3\n").as_bytes()).unwrap();
+        assert_eq!(raw.uvs.unwrap(), vec![[z; 3], [a, b, c]]);
+    }
+
+    #[test]
+    fn the_material_with_the_most_triangles_is_used() {
+        // `a`: a triangle, then two more after `b`'s quad (2 triangles); faces before the first
+        // `usemtl` count for none.
+        let text = format!("{QUAD}mtllib lib.mtl\nf 1 2 3 4 5\nusemtl a\nf 1 2 3\nusemtl b\nf 1 2 3 4\nusemtl a\nf 1 3 4\nf 2 3 5\n");
+        assert_eq!(read(text.as_bytes()).unwrap().material, Some(("lib.mtl".to_string(), "a".to_string())));
+        let text = format!("{QUAD}mtllib lib.mtl\nusemtl a\nf 1 2 3\nusemtl b\nf 1 2 3 4 5\nusemtl a\nf 1 3 4\n");
+        assert_eq!(read(text.as_bytes()).unwrap().material, Some(("lib.mtl".to_string(), "b".to_string())));
+        // No library, no material.
+        assert_eq!(read(format!("{QUAD}usemtl a\nf 1 2 3\n").as_bytes()).unwrap().material, None);
+    }
+
+    #[test]
+    fn written_texture_coordinates_are_distinct_by_bits() {
+        let pos = [DVec3::ZERO, DVec3::X, DVec3::Y];
+        let uvs = [[[0.0f32, -0.0], [-0.0, 0.0], [0.0, 0.0]], [[0.0, -0.0], [0.5, 0.5], [-0.0, 0.0]]];
+        let mut out = Vec::new();
+        write(&mut out, &pos, &[[0, 1, 2], [0, 2, 1]], None, None, Some(&uvs[..]), false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let vt: Vec<&str> = text.lines().filter(|l| l.starts_with("vt ")).collect();
+        assert_eq!(vt, ["vt 0 -0", "vt -0 0", "vt 0 0", "vt 0.5 0.5"]);
+        assert!(text.contains("f 1/1 2/2 3/3\nf 1/1 3/4 2/2\n"), "{text}");
+    }
+}

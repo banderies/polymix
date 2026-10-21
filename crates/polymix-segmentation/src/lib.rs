@@ -30,6 +30,7 @@ use mm_volume::slice::{plane_axes, Plane};
 use polymix_imaging::{LabelOverlay, SliceOptions, SliceResponse, SliceView, ViewState, VolumeView3d};
 use polymix_workspace::jobs::Job;
 use polymix_workspace::Workspace;
+use rayon::prelude::*;
 use segmentation::{EditableArea, Masking, Mode, Overwrite, Segmentation};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -127,11 +128,38 @@ struct PreviewKey {
     label: u8,
 }
 
-/// What the slice views' labels show: the segmentation (at a version) or a preview.
+/// What the slice views' labels show: the segmentation (at a version) or a preview, in the
+/// segments' colours (at a style version).
 #[derive(Clone, Copy, PartialEq)]
 enum OverlayKey {
-    Labels(u64),
-    Preview(u64),
+    Labels(u64, u64),
+    Preview(u64, u64),
+}
+
+/// The last brush dab of the stroke going on: where, how, and the label map's version after
+/// it. While all of it holds, painting that dab again would change nothing.
+#[derive(Clone, Copy, PartialEq)]
+struct DabKey {
+    at: DVec3,
+    label: u8,
+    erase: bool,
+    radius: f64,
+    disc: Option<usize>,
+    masking: Masking,
+    version: u64,
+}
+
+/// The Overlay menu's image being read in the background. Dropping it (another is chosen, or
+/// the overlay is removed) stops the read.
+struct OverlayLoad {
+    job: Job<polymix_imaging::Fusion>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for OverlayLoad {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 pub struct SegmentationWorkspace {
@@ -165,6 +193,8 @@ pub struct SegmentationWorkspace {
     running: Option<Running>,
     /// Where the brush stroke in progress last was.
     stroke: Option<DVec3>,
+    /// Its last dab.
+    last_dab: Option<DabKey>,
     preview: Option<(PreviewKey, u64, Vec<u8>)>,
     previews_made: u64,
     /// What the slice views' labels show, and the version handed to them.
@@ -215,7 +245,9 @@ pub struct SegmentationWorkspace {
     /// Overlay menu opens), and the one being loaded.
     overlay_choices: Vec<(Volume, String)>,
     wants_choices: bool,
-    fusion_job: Option<Job<polymix_imaging::Fusion>>,
+    /// The Overlay menu was open last frame.
+    overlay_menu_open: bool,
+    fusion_job: Option<OverlayLoad>,
     /// Threshold's local histogram: the region drawn and its values.
     local: Option<sketch::LocalRegion>,
     /// Segment statistics last measured (label, measures), for the label map at a version.
@@ -264,6 +296,7 @@ impl SegmentationWorkspace {
             opacity: 0.5,
             running: None,
             stroke: None,
+            last_dab: None,
             preview: None,
             previews_made: 0,
             overlay: (None, 0),
@@ -288,6 +321,7 @@ impl SegmentationWorkspace {
             vessels: vessels::Vessels::default(),
             overlay_choices: Vec::new(),
             wants_choices: false,
+            overlay_menu_open: false,
             fusion_job: None,
             local: None,
             stats: None,
@@ -331,6 +365,7 @@ impl SegmentationWorkspace {
         self.running = None;
         self.agent_op = false;
         self.stroke = None;
+        self.last_dab = None;
         self.preview = None;
         self.sketch = None;
         self.traced = None;
@@ -339,7 +374,9 @@ impl SegmentationWorkspace {
         self.local = None;
         self.stats = None;
         self.fusion_job = None;
+        // The list is made again for the new volume.
         self.overlay_choices.clear();
+        self.wants_choices = true;
         if !keep {
             self.measure.items.clear();
             self.vessels = vessels::Vessels::default();
@@ -362,16 +399,17 @@ impl SegmentationWorkspace {
     /// Measure every segment (in the background; the table shows when done).
     fn measure(&mut self, ctx: &egui::Context) {
         let (None, Some(vol), Some(seg)) = (&self.running, self.volume.clone(), &self.seg) else { return };
-        let (labels, version) = (seg.segments.iter().map(|s| s.label).collect::<Vec<_>>(), seg.version);
-        let masks: Vec<(u8, mm_segment::Mask)> = labels.iter().map(|&l| (l, seg.mask_of(l))).collect();
+        let (wanted, version) = (seg.segments.iter().map(|s| s.label).collect::<Vec<_>>(), seg.version);
+        // One copy of the label map; each segment's mask is made when it is measured.
+        let (labels, dims) = (seg.labels.clone(), seg.dims);
         let job = Job::spawn("Measuring segments", ctx.clone(), move |progress| {
-            let n = masks.len().max(1);
+            let n = wanted.len().max(1);
             let mut rows = Vec::new();
-            for (k, (label, mask)) in masks.iter().enumerate() {
+            for (k, &label) in wanted.iter().enumerate() {
                 if !progress(k as f32 / n as f32) {
                     anyhow::bail!("cancelled");
                 }
-                rows.extend(mm_segment::segment_stats(mask, &vol).map(|s| (*label, s)));
+                rows.extend(mm_segment::segment_stats(&mm_segment::Mask::from_labels(dims, &labels, label), &vol).map(|s| (label, s)));
             }
             Ok(Outcome::Stats { version, rows })
         });
@@ -472,13 +510,13 @@ impl SegmentationWorkspace {
         let bypass = effect == Effect::Logical && st.bypass_masking;
         // Split volume: an image per visible segment.
         if effect == Effect::SplitVolume {
-            let visible: Vec<(String, mm_segment::Mask)> = seg.segments.iter().filter(|s| s.visible).map(|s| (s.name.clone(), seg.mask_of(s.label))).collect();
+            let visible: Vec<(String, u8)> = seg.segments.iter().filter(|s| s.visible).map(|s| (s.name.clone(), s.label)).collect();
             if visible.is_empty() {
                 self.message = Some(("Split volume works on the visible segments: show some".into(), true));
                 return;
             }
-            let (pad, blank, vol) = (st.split_pad_mm as f64, st.split_blank.then_some(st.mask_outside), vol.clone());
-            let job = Job::spawn("Splitting the volume", ctx.clone(), move |progress| Ok(Outcome::Volumes { paths: effects::split_volume(&vol, &visible, pad, blank, progress)? }));
+            let (pad, blank, vol, labels) = (st.split_pad_mm as f64, st.split_blank.then_some(st.mask_outside), vol.clone(), seg.labels.clone());
+            let job = Job::spawn("Splitting the volume", ctx.clone(), move |progress| Ok(Outcome::Volumes { paths: effects::split_volume(&vol, &labels, &visible, pad, blank, progress)? }));
             self.running = Some(Running { what: "Splitting the volume".into(), job, bypass: false });
             return;
         }
@@ -495,7 +533,7 @@ impl SegmentationWorkspace {
             }
             let job = Job::spawn("Level set", ctx.clone(), move |progress| {
                 let (c, w) = f.window;
-                let speed: Vec<f32> = f.values.iter().map(|&v| (0.5 + (v as f64 - c) / w.max(1e-12)).clamp(0.0, 1.0) as f32).collect();
+                let speed: Vec<f32> = f.values.par_iter().map(|&v| (0.5 + (v as f64 - c) / w.max(1e-12)).clamp(0.0, 1.0) as f32).collect();
                 let grown = mm_segment::level_set(&vol, &segment, Some(&speed), &params, progress)?;
                 Ok(Outcome::Edit { label, mask: grown, mode: Mode::Set, what: "Level set (overlay)".into() })
             });
@@ -512,7 +550,7 @@ impl SegmentationWorkspace {
             let (mut labels, sigma, vol) = (seg.labels.clone(), st.smoothing_mm as f64, vol.clone());
             let job = Job::spawn("Joint smoothing", ctx.clone(), move |_| {
                 mm_segment::joint_smooth(&mut labels, vol.dims, vol.geometry.spacing, &visible, sigma);
-                let edits = visible.iter().map(|&l| (l, mm_segment::Mask { dims: vol.dims, data: labels.iter().map(|&x| (x == l) as u8).collect() }, Mode::Set)).collect();
+                let edits = visible.iter().map(|&l| (l, mm_segment::Mask::from_labels(vol.dims, &labels, l), Mode::Set)).collect();
                 Ok(Outcome::Edits { edits, what: "Joint smoothing".into() })
             });
             self.running = Some(Running { what: "Joint smoothing".into(), job, bypass });
@@ -520,15 +558,17 @@ impl SegmentationWorkspace {
         }
         // Margin, Smoothing and Hollow on every visible segment, one after another, as one edit.
         if st.apply_visible && matches!(effect, Effect::Margin | Effect::Smoothing | Effect::Hollow) {
-            let visible: Vec<(u8, mm_segment::Mask)> = seg.segments.iter().filter(|s| s.visible).map(|s| (s.label, seg.mask_of(s.label))).collect();
-            let (s, vol) = (st.clone(), vol.clone());
+            let visible: Vec<u8> = seg.segments.iter().filter(|s| s.visible).map(|s| s.label).collect();
+            // One copy of the label map; each segment's mask is made when its turn comes.
+            let (s, vol, labels, dims) = (st.clone(), vol.clone(), seg.labels.clone(), seg.dims);
             let job = Job::spawn(effect.label(), ctx.clone(), move |progress| {
                 let n = visible.len().max(1);
                 let mut edits = Vec::new();
-                for (k, (label, segment)) in visible.into_iter().enumerate() {
+                for (k, &label) in visible.iter().enumerate() {
                     if !progress(k as f32 / n as f32) {
                         anyhow::bail!("cancelled");
                     }
+                    let segment = mm_segment::Mask::from_labels(dims, &labels, label);
                     if let Outcome::Edit { label, mask, mode, .. } = effects::run(effect, &s, &vol, Op { label, segment, other: None, seed: None })? {
                         edits.push((label, mask, mode));
                     }
@@ -569,20 +609,9 @@ impl SegmentationWorkspace {
                 seg.changed(true);
                 (format!("{what}: {} voxels changed", polymix_workspace::style::format_count(n)), false)
             }
-            Ok(Outcome::Split { label, keep, islands }) => {
+            Ok(Outcome::Split { label, slots, islands }) => {
                 seg.checkpoint();
-                let base = seg.index_of(label).map(|k| seg.segments[k].name.clone()).unwrap_or_default();
-                let all = Masking::default();
-                seg.apply(&vol, &keep, label, Mode::Set, &all);
-                let mut made = 0;
-                for (k, island) in islands.iter().enumerate() {
-                    let Some(idx) = seg.push_segment(Some(format!("{base}_{}", k + 2))) else { break };
-                    let l = seg.segments[idx].label;
-                    seg.apply(&vol, island, l, Mode::Add, &all);
-                    made += 1;
-                }
-                seg.selected = seg.index_of(label);
-                seg.changed(true);
+                let made = seg.split(&vol, label, &slots, islands);
                 (format!("Split into {} segments", made + 1), false)
             }
             Ok(Outcome::Meshes(meshes)) => {
@@ -610,11 +639,11 @@ impl SegmentationWorkspace {
                 for &(from, to) in &made {
                     map[from as usize] = to;
                 }
-                for (l, &m) in seg.labels.iter_mut().zip(&imported.labels) {
+                seg.labels.par_iter_mut().zip(&imported.labels).for_each(|(l, &m)| {
                     if map[m as usize] != 0 {
                         *l = map[m as usize];
                     }
-                }
+                });
                 seg.changed(true);
                 let notes = if imported.notes.is_empty() { String::new() } else { format!(" ({})", imported.notes.join("; ")) };
                 (format!("{what}: {} segment(s) added{notes}", made.len()), false)
@@ -643,8 +672,8 @@ impl SegmentationWorkspace {
                 self.volume_outbox.push(path);
                 (format!("Saved “{name}” among the derived images (Volume tab)"), false)
             }
-            Ok(Outcome::Saved { path, version }) => {
-                if seg.version == version {
+            Ok(Outcome::Saved { path, version, style_version }) => {
+                if seg.version == version && seg.style_version == style_version {
                     seg.modified = false;
                 }
                 (format!("Saved {path}"), false)
@@ -671,49 +700,25 @@ impl SegmentationWorkspace {
         let from = self.stroke.unwrap_or(at);
         // Pixel mode: the voxels under the stroke only.
         let radius = if st.pixel_mode { 0.0 } else { st.brush_mm as f64 };
-        let voxels = effects::stroke(vol.dims, vol.geometry.spacing, from, at, radius, disc);
-        if seg.paint(vol, &voxels, label, erase, &self.masking) > 0 {
-            seg.changed(false);
-        }
+        // The dab at `from` ended the last step of the stroke; unless something changed since,
+        // painting it again would change nothing.
+        let key = |at: DVec3, version: u64| DabKey { at, label, erase, radius, disc, masking: self.masking, version };
+        let painted = self.stroke.is_some() && self.last_dab == Some(key(from, seg.version));
+        let voxels = effects::stroke(vol.dims, vol.geometry.spacing, from, at, radius, disc, painted);
+        seg.paint(vol, &voxels, label, erase, &self.masking);
+        self.last_dab = Some(key(at, seg.version));
         self.stroke = Some(at);
     }
 
     /// Scissors drawn in the 3D view: fill or erase the voxels whose centres appear inside (or
     /// outside) `polygon` on the screen, through the whole depth.
     fn cut_3d(&mut self, vol: &LoadedVolume, polygon: &[egui::Pos2], project: impl Fn(DVec3) -> Option<egui::Pos2> + Sync) {
-        use rayon::prelude::*;
         let Some(op) = self.settings.as_ref().map(|s| s.scissors_op) else { return };
         if polygon.len() < 3 {
             return;
         }
-        let [nx, ny, _] = vol.dims;
-        let (lo, hi) = polygon.iter().fold((egui::pos2(f32::INFINITY, f32::INFINITY), egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY)), |(a, b), p| (a.min(*p), b.max(*p)));
-        let inside = |p: egui::Pos2| {
-            if p.x < lo.x || p.y < lo.y || p.x > hi.x || p.y > hi.y {
-                return false;
-            }
-            // Even-odd rule.
-            let mut c = false;
-            let mut j = polygon.len() - 1;
-            for i in 0..polygon.len() {
-                let (a, b) = (polygon[i], polygon[j]);
-                if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
-                    c = !c;
-                }
-                j = i;
-            }
-            c
-        };
         let outside = matches!(op, effects::ScissorsOp::EraseOutside | effects::ScissorsOp::FillOutside);
-        let data: Vec<u8> = (0..vol.voxel_count())
-            .into_par_iter()
-            .map(|n| {
-                let v = DVec3::new((n % nx) as f64, ((n / nx) % ny) as f64, (n / (nx * ny)) as f64);
-                let hit = project(v).is_some_and(inside);
-                (hit != outside) as u8
-            })
-            .collect();
-        let mask = mm_segment::Mask { dims: vol.dims, data };
+        let mask = mm_segment::Mask { dims: vol.dims, data: screen_cut(vol.dims, polygon, outside, project) };
         let (mode, fill) = match op {
             effects::ScissorsOp::FillInside | effects::ScissorsOp::FillOutside => (Mode::Add, true),
             _ => (Mode::Remove, false),
@@ -749,10 +754,12 @@ impl SegmentationWorkspace {
     }
 
     fn end_stroke(&mut self) {
+        self.last_dab = None;
         if self.stroke.take().is_some() {
             if let Some(seg) = &mut self.seg {
-                // The 3D view catches up once per stroke.
-                seg.changed(true);
+                // The 3D view catches up once per stroke (the slice views and the voxel
+                // counts followed every dab).
+                seg.stroke_finished();
             }
         }
     }
@@ -851,13 +858,11 @@ impl SegmentationWorkspace {
             if e == sd.effect {
                 let key = PreviewKey { version: seg.version, range: (f32::NAN, f32::NAN), masking: self.masking, label: 0 };
                 if self.preview.as_ref().is_none_or(|(k, _, _)| k.version != key.version || k.masking != key.masking || !k.range.0.is_nan()) {
-                    let mut preview = seg.scratch_copy();
-                    for &l in &sd.seeds {
-                        let mask = mm_segment::Mask { dims: vol.dims, data: sd.labels.iter().map(|&x| (x == l) as u8).collect() };
-                        preview.apply(vol, &mask, l, Mode::Add, &self.masking);
-                    }
+                    // The last preview's buffer is filled again.
+                    let mut labels = self.preview.take().map(|p| p.2).unwrap_or_default();
+                    seg.seeded_preview(vol, &sd.labels, &sd.seeds, &self.masking, &mut labels);
                     self.previews_made += 1;
-                    self.preview = Some((key, self.previews_made, preview.labels));
+                    self.preview = Some((key, self.previews_made, labels));
                 }
                 return;
             }
@@ -869,11 +874,11 @@ impl SegmentationWorkspace {
         };
         let key = PreviewKey { version: seg.version, range: st.threshold, masking: self.masking, label };
         if self.preview.as_ref().is_none_or(|(k, _, _)| *k != key) {
-            let mut preview = seg.scratch_copy();
-            let mask = mm_segment::ops::threshold(vol, st.threshold.0, st.threshold.1);
-            preview.apply(vol, &mask, label, Mode::Set, &self.masking);
+            // Every frame of a drag over the range: one pass into the last preview's buffer.
+            let mut labels = self.preview.take().map(|p| p.2).unwrap_or_default();
+            seg.threshold_preview(vol, st.threshold, label, &self.masking, &mut labels);
             self.previews_made += 1;
-            self.preview = Some((key, self.previews_made, preview.labels));
+            self.preview = Some((key, self.previews_made, labels));
         }
     }
 
@@ -885,7 +890,7 @@ impl SegmentationWorkspace {
         for g in seg.segments.iter().filter(|g| g.visible) {
             visible[g.label as usize] = true;
         }
-        Some((seg.labels.iter().map(|&l| if visible[l as usize] { l } else { 0 }).collect(), seg.version))
+        Some((seg.labels.par_iter().map(|&l| if visible[l as usize] { l } else { 0 }).collect(), seg.version))
     }
 
     /// Start Grow from seeds or Watershed from the visible segments.
@@ -900,11 +905,7 @@ impl SegmentationWorkspace {
     fn apply_seeded(&mut self) {
         let (Some(vol), Some(seg), Some(sd)) = (self.volume.clone(), &mut self.seg, self.seeded.take()) else { return };
         seg.checkpoint();
-        let mut n = 0;
-        for &l in &sd.seeds {
-            let mask = mm_segment::Mask { dims: vol.dims, data: sd.labels.iter().map(|&x| (x == l) as u8).collect() };
-            n += seg.apply(&vol, &mask, l, Mode::Add, &self.masking);
-        }
+        let n = seg.apply_seeded(&vol, &sd.labels, &sd.seeds, &self.masking);
         seg.changed(true);
         self.preview = None;
         self.say(format!("{}: {} voxels changed", sd.effect.label(), polymix_workspace::style::format_count(n)), false);
@@ -965,13 +966,13 @@ impl SegmentationWorkspace {
 
     fn make_mesh(&mut self, ctx: &egui::Context) {
         let (None, Some(vol), Some(seg), Some(st)) = (&self.running, &self.volume, &self.seg, &self.settings) else { return };
-        let chosen: Vec<(String, mm_segment::Mask)> = seg.segments.iter().enumerate().filter(|(k, s)| if st.mesh_all_visible { s.visible } else { seg.selected == Some(*k) }).map(|(_, s)| (s.name.clone(), seg.mask_of(s.label))).collect();
+        let chosen: Vec<(String, u8)> = seg.segments.iter().enumerate().filter(|(k, s)| if st.mesh_all_visible { s.visible } else { seg.selected == Some(*k) }).map(|(_, s)| (s.name.clone(), s.label)).collect();
         if chosen.is_empty() {
             self.say("Select a segment first", true);
             return;
         }
-        let (geometry, smoothing) = (vol.geometry.clone(), st.mesh_smoothing_mm as f64);
-        let job = Job::spawn("Making meshes", ctx.clone(), move |progress| Ok(Outcome::Meshes(effects::meshes(chosen, &geometry, smoothing, progress)?)));
+        let (geometry, smoothing, labels, dims) = (vol.geometry.clone(), st.mesh_smoothing_mm as f64, seg.labels.clone(), seg.dims);
+        let job = Job::spawn("Making meshes", ctx.clone(), move |progress| Ok(Outcome::Meshes(effects::meshes(&labels, dims, &chosen, &geometry, smoothing, progress)?)));
         self.running = Some(Running { what: "Making meshes".into(), job, bypass: false });
     }
 
@@ -990,7 +991,7 @@ impl SegmentationWorkspace {
 
     fn save_to(&mut self, path: PathBuf, ctx: &egui::Context) {
         let (None, Some(vol), Some(seg)) = (&self.running, &self.volume, &self.seg) else { return };
-        let (labels, dims, geometry, version) = (seg.labels.clone(), seg.dims, vol.geometry.clone(), seg.version);
+        let (labels, dims, geometry, version, style_version) = (seg.labels.clone(), seg.dims, vol.geometry.clone(), seg.version, seg.style_version);
         let infos: Vec<SegmentInfo> = seg.segments.iter().map(|s| SegmentInfo { name: s.name.clone(), colour: [s.colour.r(), s.colour.g(), s.colour.b()], label: s.label, status: s.status.key().to_string() }).collect();
         let job = Job::spawn("Saving", ctx.clone(), move |_| {
             let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -1000,7 +1001,7 @@ impl SegmentationWorkspace {
             } else {
                 mm_segment::write_seg_nrrd(&path, &labels, dims, &geometry, &infos)?;
             }
-            Ok(Outcome::Saved { path: path.display().to_string(), version })
+            Ok(Outcome::Saved { path: path.display().to_string(), version, style_version })
         });
         self.running = Some(Running { what: "Saving".into(), job, bypass: false });
     }
@@ -1346,6 +1347,8 @@ impl SegmentationWorkspace {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        // The Overlay menu asks for its list as it opens (not every frame it is open).
+        let was_open = std::mem::take(&mut self.overlay_menu_open);
         ui.horizontal(|ui| {
             let Some(src) = &self.source else {
                 ui.weak("No volume");
@@ -1380,8 +1383,7 @@ impl SegmentationWorkspace {
             }
             polymix_imaging::layers::display_controls(ui, "segmentation", state, v);
             let mut pick = None;
-            ui.menu_button("Overlay ▾", |ui| {
-                self.wants_choices = true;
+            let menu = ui.menu_button("Overlay ▾", |ui| {
                 if self.overlay_choices.is_empty() {
                     ui.weak("No other image overlaps this one (images are listed in the Volume tab)");
                 }
@@ -1393,11 +1395,16 @@ impl SegmentationWorkspace {
                         }
                     }
                 });
-            })
-            .response
-            .on_hover_text("Show another image over this one (fusion), or compare them (wipe, toggle): e.g. vesselness over the angiogram, or before / after N4");
+            });
+            if menu.inner.is_some() {
+                self.overlay_menu_open = true;
+                if !was_open {
+                    self.wants_choices = true;
+                }
+            }
+            menu.response.on_hover_text("Show another image over this one (fusion), or compare them (wipe, toggle): e.g. vesselness over the angiogram, or before / after N4");
             if self.fusion_job.is_some() {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
             }
             if let Some(k) = pick {
                 let vol = v.clone();
@@ -1432,13 +1439,18 @@ impl SegmentationWorkspace {
     /// Load overlay choice `k` (in the background) to show over `vol`.
     fn start_overlay(&mut self, vol: Arc<LoadedVolume>, k: usize, ctx: &egui::Context) {
         let Some((other, label)) = self.overlay_choices.get(k).cloned() else { return };
-        self.fusion_job = Some(Job::spawn("Loading the overlay", ctx.clone(), move |progress| {
-            // (The loader reports from several threads: no progress for it.)
-            let o = load_volume(&other, MAX_VOXELS, &|_| true)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        // Replacing the load in progress (another choice) stops it.
+        let job = Job::spawn("Loading the overlay", ctx.clone(), move |progress| {
+            // (The loader reports from several threads: no progress for it, but it stops when
+            // the load is no longer wanted.)
+            let o = load_volume(&other, MAX_VOXELS, &|_| !c.load(Ordering::Relaxed))?;
             progress(0.8);
             let values = polymix_imaging::Fusion::resampled(&vol, &o);
             Ok(polymix_imaging::Fusion::new(label, values, polymix_imaging::ColourMap::Hot))
-        }));
+        });
+        self.fusion_job = Some(OverlayLoad { job, cancel });
     }
 
     /// The image shown, with the crosshair and window: for the image slices in the Mesh tab.
@@ -1514,9 +1526,10 @@ impl SegmentationWorkspace {
         };
         // Slice views: the labels (or the threshold preview) under a version of their own.
         self.update_preview(&vol);
+        let style = self.seg.as_ref().map_or(0, |s| s.style_version);
         let shown: Option<(OverlayKey, &[u8])> = match (&self.preview, &self.seg) {
-            (Some((_, id, labels)), _) => Some((OverlayKey::Preview(*id), labels)),
-            (None, Some(seg)) => Some((OverlayKey::Labels(seg.version), &seg.labels)),
+            (Some((_, id, labels)), _) => Some((OverlayKey::Preview(*id, style), labels)),
+            (None, Some(seg)) => Some((OverlayKey::Labels(seg.version, style), &seg.labels)),
             _ => None,
         };
         let previous = self.overlay;
@@ -1640,7 +1653,7 @@ impl Workspace for SegmentationWorkspace {
             self.loading = None;
             self.finish_loading(r, keep);
         }
-        if let Some(r) = self.fusion_job.as_ref().and_then(|j| j.poll()) {
+        if let Some(r) = self.fusion_job.as_ref().and_then(|j| j.job.poll()) {
             self.fusion_job = None;
             match r {
                 Ok(f) => {
@@ -1717,6 +1730,105 @@ impl Workspace for SegmentationWorkspace {
     }
 }
 
+/// The voxels of a `dims` grid whose centres `project` puts inside `polygon` on the screen (or
+/// outside it, or behind the camera, when `outside`): 1, the others 0.
+fn screen_cut(dims: [usize; 3], polygon: &[egui::Pos2], outside: bool, project: impl Fn(DVec3) -> Option<egui::Pos2> + Sync) -> Vec<u8> {
+    let [nx, ny, nz] = dims;
+    let shape = ScreenPolygon::new(polygon);
+    let mut data = vec![0u8; nx * ny * nz];
+    data.par_chunks_mut(nx.max(1)).enumerate().for_each(|(r, row)| {
+        let (j, k) = ((r % ny) as f64, (r / ny) as f64);
+        // A row of voxels appears on the screen along the straight line between its ends (when
+        // both are in front of the camera). With both ends a point or more past one side of
+        // the shape's box, none of it can be inside.
+        let ends = (project(DVec3::new(0.0, j, k)), project(DVec3::new((nx - 1) as f64, j, k)));
+        let missed = ends.0.zip(ends.1).is_some_and(|(a, b)| shape.both_outside(a, b, 1.0));
+        for (i, out) in row.iter_mut().enumerate() {
+            let hit = !missed && project(DVec3::new(i as f64, j, k)).is_some_and(|p| shape.contains(p));
+            *out = (hit != outside) as u8;
+        }
+    });
+    data
+}
+
+/// A shape drawn on the screen, for telling whether points are inside it by the even-odd
+/// rule. Its edges are sorted into bands across it, so that a point is tested against the few
+/// edges crossing its band rather than against every edge; the others could not cross the
+/// ray from it, so the answer is the same.
+struct ScreenPolygon {
+    lo: egui::Pos2,
+    hi: egui::Pos2,
+    /// Bands per point down the screen (1 unless the shape is very tall), and the last band.
+    scale: f32,
+    last: usize,
+    /// The edges (a, b) crossing band `k` are `edges[starts[k]..starts[k + 1]]`.
+    starts: Vec<usize>,
+    edges: Vec<(egui::Pos2, egui::Pos2)>,
+}
+
+impl ScreenPolygon {
+    /// Bands at most: a shape taller than this many points has bands of more than a point.
+    const MAX_BANDS: usize = 1 << 14;
+
+    fn new(polygon: &[egui::Pos2]) -> Self {
+        let (lo, hi) = polygon.iter().fold((egui::pos2(f32::INFINITY, f32::INFINITY), egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY)), |(a, b), p| (a.min(*p), b.max(*p)));
+        let scale = if hi.y - lo.y > (Self::MAX_BANDS - 1) as f32 { (Self::MAX_BANDS - 1) as f32 / (hi.y - lo.y) } else { 1.0 };
+        let last = ((hi.y - lo.y) * scale) as usize;
+        let mut shape = Self { lo, hi, scale, last, starts: Vec::new(), edges: Vec::new() };
+        let bands = last + 1;
+        // Edge (polygon[i], polygon[j]) as the even-odd test pairs them; a level edge never
+        // crosses the ray.
+        let pairs = || (0..polygon.len()).map(|i| (polygon[i], polygon[(i + polygon.len() - 1) % polygon.len()])).filter(|(a, b)| a.y != b.y);
+        let span = |(a, b): (egui::Pos2, egui::Pos2)| shape.band(a.y.min(b.y))..=shape.band(a.y.max(b.y));
+        let mut starts = vec![0usize; bands + 1];
+        for e in pairs() {
+            for k in span(e) {
+                starts[k + 1] += 1;
+            }
+        }
+        for k in 0..bands {
+            starts[k + 1] += starts[k];
+        }
+        let mut next = starts.clone();
+        let mut edges = vec![(egui::Pos2::ZERO, egui::Pos2::ZERO); starts[bands]];
+        for e in pairs() {
+            for k in span(e) {
+                edges[next[k]] = e;
+                next[k] += 1;
+            }
+        }
+        shape.starts = starts;
+        shape.edges = edges;
+        shape
+    }
+
+    /// The band of height `y` (within the shape's box). It never decreases as `y` grows, so
+    /// an edge from `y0` to `y1` is in the band of every height between.
+    fn band(&self, y: f32) -> usize {
+        (((y - self.lo.y) * self.scale) as usize).min(self.last)
+    }
+
+    /// Both points are at least `margin` past the same side of the shape's box: so is the
+    /// line between them.
+    fn both_outside(&self, a: egui::Pos2, b: egui::Pos2, margin: f32) -> bool {
+        (a.x < self.lo.x - margin && b.x < self.lo.x - margin) || (a.x > self.hi.x + margin && b.x > self.hi.x + margin) || (a.y < self.lo.y - margin && b.y < self.lo.y - margin) || (a.y > self.hi.y + margin && b.y > self.hi.y + margin)
+    }
+
+    fn contains(&self, p: egui::Pos2) -> bool {
+        if p.x < self.lo.x || p.y < self.lo.y || p.x > self.hi.x || p.y > self.hi.y {
+            return false;
+        }
+        let k = self.band(p.y);
+        let mut c = false;
+        for &(a, b) in &self.edges[self.starts[k]..self.starts[k + 1]] {
+            if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+                c = !c;
+            }
+        }
+        c
+    }
+}
+
 /// Segment statistics as CSV (a header row, then a row per segment still there).
 fn stats_csv(rows: &[(u8, mm_segment::SegmentStats)], seg: &Segmentation) -> String {
     let mut out = String::from("segment,label,voxels,volume_ml,surface_cm2,mean,sd,median,min,max,max_diameter_mm,roundness,elongation,principal_1_mm,principal_2_mm,principal_3_mm,centre_r_mm,centre_a_mm,centre_s_mm\n");
@@ -1743,3 +1855,223 @@ fn stats_csv(rows: &[(u8, mm_segment::SegmentStats)], seg: &Segmentation) -> Str
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xorshift(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed | 1;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// The even-odd test against every edge, as the 3D scissors made it.
+    fn inside_every_edge(polygon: &[egui::Pos2], p: egui::Pos2) -> bool {
+        let (lo, hi) = polygon.iter().fold((egui::pos2(f32::INFINITY, f32::INFINITY), egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY)), |(a, b), p| (a.min(*p), b.max(*p)));
+        if p.x < lo.x || p.y < lo.y || p.x > hi.x || p.y > hi.y {
+            return false;
+        }
+        let mut c = false;
+        let mut j = polygon.len() - 1;
+        for i in 0..polygon.len() {
+            let (a, b) = (polygon[i], polygon[j]);
+            if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+                c = !c;
+            }
+            j = i;
+        }
+        c
+    }
+
+    #[test]
+    fn banded_edges_tell_inside_as_every_edge_does() {
+        let mut next = xorshift(17);
+        let mut shapes: Vec<Vec<egui::Pos2>> = Vec::new();
+        // Free-form loops as dragged, a circle, a rectangle, a self-crossing star, repeated
+        // points and level edges, a shape taller than the bands allow at a point each, and a
+        // tiny one.
+        for k in 0..12 {
+            let (c, r) = (egui::pos2(300.0 + next() as f32 * 200.0, 250.0 + next() as f32 * 200.0), 10.0 + next() as f32 * 250.0);
+            let n = 20 + (next() * 600.0) as usize;
+            shapes.push(
+                (0..n)
+                    .map(|i| {
+                        let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                        let wobble = 1.0 + 0.3 * ((t * (k + 2) as f32).sin() + next() as f32 * 0.2);
+                        c + egui::Vec2::angled(t) * r * wobble
+                    })
+                    .collect(),
+            );
+        }
+        shapes.push((0..64).map(|k| egui::pos2(400.0, 300.0) + egui::Vec2::angled(k as f32 / 64.0 * std::f32::consts::TAU) * 123.4).collect());
+        shapes.push(vec![egui::pos2(100.5, 80.25), egui::pos2(700.0, 80.25), egui::pos2(700.0, 500.75), egui::pos2(100.5, 500.75)]);
+        shapes.push((0..10).map(|k| egui::pos2(400.0, 300.0) + egui::Vec2::angled(k as f32 * 0.8 * std::f32::consts::TAU) * 200.0).collect());
+        shapes.push(vec![egui::pos2(10.0, 10.0), egui::pos2(10.0, 10.0), egui::pos2(50.0, 10.0), egui::pos2(50.0, 40.0), egui::pos2(30.0, 40.0), egui::pos2(30.0, 20.0), egui::pos2(10.0, 40.0)]);
+        shapes.push(vec![egui::pos2(0.0, -30_000.0), egui::pos2(40.0, 25_000.0), egui::pos2(-35.0, 2.0)]);
+        shapes.push(vec![egui::pos2(5.0, 5.0), egui::pos2(6.0, 5.5), egui::pos2(5.5, 5.9)]);
+        for (s, polygon) in shapes.iter().enumerate() {
+            let shape = ScreenPolygon::new(polygon);
+            let (lo, hi) = (shape.lo, shape.hi);
+            let mut points: Vec<egui::Pos2> = (0..20_000).map(|_| egui::pos2(lo.x - 5.0 + next() as f32 * (hi.x - lo.x + 10.0), lo.y - 5.0 + next() as f32 * (hi.y - lo.y + 10.0))).collect();
+            // On the vertices, at the vertices' heights, on whole and half points.
+            points.extend(polygon.iter().copied());
+            points.extend(polygon.iter().map(|p| egui::pos2(p.x - 0.5, p.y)));
+            points.extend(polygon.iter().map(|p| egui::pos2(p.x.round() + 0.5, p.y.round())));
+            points.extend([egui::pos2(f32::NAN, lo.y + 1.0), egui::pos2(lo.x + 1.0, f32::NAN)]);
+            for p in points {
+                assert_eq!(shape.contains(p), inside_every_edge(polygon, p), "shape {s} at {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scissors_cut_as_testing_every_voxel() {
+        let mut next = xorshift(29);
+        let dims = [37, 23, 19];
+        let rect = Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(500.0, 380.0));
+        for case in 0..40 {
+            // A camera somewhere around the grid (sometimes inside it, so that some voxels are
+            // behind it), looking near its middle.
+            let centre = DVec3::new(18.0, 11.0, 9.0);
+            let dir = DVec3::new(next() - 0.5, next() - 0.5, next() - 0.5).normalize();
+            let eye = centre + dir * [6.0, 30.0, 60.0, 200.0][case % 4];
+            let target = centre + DVec3::new(next() - 0.5, next() - 0.5, next() - 0.5) * 8.0;
+            let look = glam::camera::rh::view::look_at_mat4(eye.as_vec3(), target.as_vec3(), glam::Vec3::Z);
+            let m = (glam::camera::rh::proj::directx::perspective(0.4 + next() as f32 * 0.8, 1.3, 0.1, 1000.0) * look).as_dmat4();
+            let project = move |v: DVec3| {
+                let c = m * v.extend(1.0);
+                if c.w <= 1e-9 {
+                    return None;
+                }
+                Some(egui::pos2(rect.min.x + ((c.x / c.w + 1.0) * 0.5) as f32 * rect.width(), rect.min.y + ((1.0 - c.y / c.w) * 0.5) as f32 * rect.height()))
+            };
+            let c = rect.min + egui::vec2(next() as f32, next() as f32) * rect.size();
+            let r = 5.0 + next() as f32 * 200.0;
+            let n = [4, 12, 64, 300][case % 4];
+            let polygon: Vec<egui::Pos2> = (0..n).map(|k| c + egui::Vec2::angled(k as f32 / n as f32 * std::f32::consts::TAU) * r * (1.0 + 0.4 * next() as f32)).collect();
+            for outside in [false, true] {
+                let every: Vec<u8> = (0..dims.iter().product::<usize>())
+                    .map(|n| {
+                        let v = DVec3::new((n % dims[0]) as f64, ((n / dims[0]) % dims[1]) as f64, (n / (dims[0] * dims[1])) as f64);
+                        (project(v).is_some_and(|p| inside_every_edge(&polygon, p)) != outside) as u8
+                    })
+                    .collect();
+                assert!(screen_cut(dims, &polygon, outside, project) == every, "case {case}");
+            }
+        }
+    }
+
+    /// A workspace showing a 24 × 20 × 16 volume of 0.8 × 0.6 × 1.1 mm voxels, values rising
+    /// along i, with three segments.
+    fn painting_ws() -> SegmentationWorkspace {
+        let mut ws = SegmentationWorkspace::new(&egui::Context::default(), None);
+        let dims = [24, 20, 16];
+        let g = Geometry::from_axes([24, 20, 16, 1], [0.8, 0.6, 1.1], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        let values = (0..dims.iter().product::<usize>()).map(|n| (n % 24) as f32 * 4.0).collect();
+        ws.finish_loading(Ok(LoadedVolume::from_values("t", dims, values, g)), false);
+        let seg = ws.seg.as_mut().unwrap();
+        for _ in 0..3 {
+            seg.add_segment(None);
+        }
+        ws
+    }
+
+    /// The labels after painting every dab of a step from `from` to `at`, as strokes did.
+    fn paint_every_dab(reference: &[u8], ws: &SegmentationWorkspace, vol: &LoadedVolume, from: DVec3, at: DVec3, plane: Option<Plane>, erase: bool) -> Vec<u8> {
+        let st = ws.settings.as_ref().unwrap();
+        let seg = ws.seg.as_ref().unwrap();
+        let disc = plane.filter(|_| !st.sphere).map(|p| plane_axes(&vol.geometry, p).slice);
+        let radius = if st.pixel_mode { 0.0 } else { st.brush_mm as f64 };
+        let spacing = vol.geometry.spacing;
+        let mm = (0..3).map(|k| ((at[k] - from[k]) * spacing[k]).powi(2)).sum::<f64>().sqrt();
+        let step = (radius * 0.5).max(spacing.iter().cloned().fold(f64::INFINITY, f64::min) * 0.5);
+        let n = (mm / step).ceil().max(1.0) as usize;
+        let mut voxels = Vec::new();
+        for s in 0..=n {
+            effects::dab(vol.dims, spacing, from.lerp(at, s as f64 / n as f64), radius, disc, &mut voxels);
+        }
+        voxels.sort_unstable();
+        voxels.dedup();
+        let mut copy = Segmentation::new(vol.dims);
+        copy.labels = reference.to_vec();
+        copy.segments = seg.segments.clone();
+        copy.paint(vol, &voxels, seg.selected_segment().unwrap().label, erase, &ws.masking);
+        copy.labels
+    }
+
+    #[test]
+    fn brush_strokes_paint_what_all_their_dabs_do() {
+        let mut next = xorshift(5);
+        for case in 0..24 {
+            let mut ws = painting_ws();
+            let vol = ws.volume.clone().unwrap();
+            let mut reference = ws.seg.as_ref().unwrap().labels.clone();
+            let st = ws.settings.as_mut().unwrap();
+            st.brush_mm = [0.3, 1.0, 2.2, 3.5][case % 4];
+            st.sphere = case % 3 == 0;
+            st.pixel_mode = case % 7 == 6;
+            for stroke in 0..4 {
+                let erase = (case + stroke) % 3 == 2;
+                let plane = [Some(Plane::Axial), Some(Plane::Sagittal), None][(case + stroke) % 3];
+                ws.seg.as_mut().unwrap().selected = Some((case + stroke) % 3);
+                let mut from: Option<DVec3> = None;
+                for step in 0..12 {
+                    // Some steps do not move; between some, the masking, the segment or the
+                    // labels change (the step's start is then painted again).
+                    let at = match (from, step % 4) {
+                        (Some(f), 3) => f,
+                        _ => DVec3::new(next() * 23.0, next() * 19.0, next() * 15.0),
+                    };
+                    match (step + case) % 9 {
+                        4 => ws.masking.area = [EditableArea::Everywhere, EditableArea::OutsideAll, EditableArea::Inside(2)][step % 3],
+                        5 => ws.masking.intensity = if ws.masking.intensity.is_some() { None } else { Some((10.0, 60.0)) },
+                        6 => ws.seg.as_mut().unwrap().selected = Some(step % 3),
+                        7 if from.is_some() => {
+                            let seg = ws.seg.as_mut().unwrap();
+                            let i = (next() * seg.labels.len() as f64) as usize;
+                            seg.labels[i] = 3;
+                            reference[i] = 3;
+                            seg.changed(true);
+                        }
+                        _ => {}
+                    }
+                    reference = paint_every_dab(&reference, &ws, &vol, from.unwrap_or(at), at, plane, erase);
+                    ws.brush(&vol, plane, at, erase);
+                    from = Some(at);
+                    assert!(ws.seg.as_ref().unwrap().labels == reference, "case {case}, stroke {stroke}, step {step}");
+                }
+                ws.end_stroke();
+            }
+        }
+    }
+
+    #[test]
+    fn saving_clears_the_edited_mark_only_for_what_was_saved() {
+        let mut ws = painting_ws();
+        let saved = |ws: &mut SegmentationWorkspace, version: u64, style_version: u64| ws.finish_op(Ok(Outcome::Saved { path: "s.seg.nrrd".into(), version, style_version }), false);
+        let now = |ws: &SegmentationWorkspace| (ws.seg.as_ref().unwrap().version, ws.seg.as_ref().unwrap().style_version);
+        let (v, s) = now(&ws);
+        saved(&mut ws, v, s);
+        assert!(!ws.seg.as_ref().unwrap().modified);
+        // A colour changed while saving: still edited; saved again, not.
+        ws.seg.as_mut().unwrap().restyled();
+        assert!(ws.seg.as_ref().unwrap().modified);
+        saved(&mut ws, v, s);
+        assert!(ws.seg.as_ref().unwrap().modified);
+        let (v, s) = now(&ws);
+        assert_eq!(v, ws.seg.as_ref().unwrap().version, "a colour leaves the labels' version");
+        saved(&mut ws, v, s);
+        assert!(!ws.seg.as_ref().unwrap().modified);
+        // A stroke: edited, the labels at a new version.
+        let vol = ws.volume.clone().unwrap();
+        ws.brush(&vol, Some(Plane::Axial), DVec3::new(5.0, 5.0, 5.0), false);
+        ws.end_stroke();
+        assert!(ws.seg.as_ref().unwrap().modified && now(&ws).0 > v);
+        saved(&mut ws, v, s);
+        assert!(ws.seg.as_ref().unwrap().modified);
+    }
+}

@@ -47,6 +47,38 @@ fn spans(polygon: &[(f64, f64)], size: [usize; 2]) -> Vec<(usize, usize, usize)>
     out
 }
 
+/// The voxels of a slice inside `polygon` (see the module documentation), row by row: (down,
+/// first across, last across), inclusive, clamped to the slice of `size` (across, down)
+/// voxels, in increasing order of down and, within a row, of across. Where two crossings of a
+/// row meet at a voxel centre (where the polygon touches itself, or turns back on a row), the
+/// spans either side of them share that voxel: it is listed twice.
+pub fn polygon_spans(polygon: &[(f64, f64)], size: [usize; 2]) -> Vec<(usize, usize, usize)> {
+    spans(polygon, size)
+}
+
+/// The voxels of [`polygon_prism`], by index, each once: slice by slice from `from` to `to`
+/// (at most the last slice), row by row and along each row.
+pub fn polygon_voxels(dims: [usize; 3], axes: [usize; 3], polygon: &[(f64, f64)], from: usize, to: usize) -> Vec<usize> {
+    let stride = [1, dims[0], dims[0] * dims[1]];
+    let to = to.min(dims[axes[2]].saturating_sub(1));
+    let rows = spans(polygon, [dims[axes[0]], dims[axes[1]]]);
+    let mut out = Vec::new();
+    for s in from..=to {
+        // The end of the last span on the same row: a span starting there shares it.
+        let mut last: Option<(usize, usize)> = None;
+        for &(d, a0, a1) in &rows {
+            let a0 = match last {
+                Some((ld, la)) if ld == d && la >= a0 => la + 1,
+                _ => a0,
+            };
+            last = Some((d, a1));
+            let base = d * stride[axes[1]] + s * stride[axes[2]];
+            out.extend((a0..=a1).map(|a| base + a * stride[axes[0]]));
+        }
+    }
+    out
+}
+
 /// The voxels inside `polygon` on slices `from..=to` along `axes[2]` (see the module
 /// documentation).
 pub fn polygon_prism(dims: [usize; 3], axes: [usize; 3], polygon: &[(f64, f64)], from: usize, to: usize) -> Mask {
@@ -230,6 +262,28 @@ mod tests {
         // A circle of radius 3 has about π · 9 voxels.
         let m = polygon_prism([20, 20, 1], [0, 1, 2], &circle((10.0, 10.0), 3.0, 1.0, 64), 0, 0);
         assert!((m.count() as f64 - std::f64::consts::PI * 9.0).abs() < 5.0, "{}", m.count());
+    }
+
+    #[test]
+    fn polygon_spans_and_voxels_are_the_prism() {
+        let dims = [10, 8, 6];
+        // Touching itself at (3, 2): row 2's spans meet at voxel 3.
+        let pinch = [(1.0, 0.0), (3.0, 2.0), (5.0, 0.0), (5.0, 4.0), (3.0, 2.0), (1.0, 4.0)];
+        assert_eq!(polygon_spans(&pinch, [10, 8]).iter().filter(|s| s.0 == 2).copied().collect::<Vec<_>>(), [(2, 1, 3), (2, 3, 5)]);
+        let shapes: [&[(f64, f64)]; 5] = [&pinch, &[(1.5, 0.5), (4.5, 0.5), (4.5, 2.5), (1.5, 2.5)], &[(-5.0, -5.0), (20.0, -5.0), (-5.0, 20.0)], &[(1.0, 1.0), (3.0, 3.0)], &circle((4.0, 3.0), 2.6, 1.0, 17)];
+        for poly in shapes {
+            for axes in [[0, 1, 2], [1, 2, 0], [2, 0, 1]] {
+                for (from, to) in [(0, 0), (1, 4), (3, 99), (7, 2)] {
+                    let m = polygon_prism(dims, axes, poly, from, to);
+                    let v = polygon_voxels(dims, axes, poly, from, to);
+                    let mut sorted = v.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    assert_eq!(sorted.len(), v.len(), "each voxel once");
+                    assert_eq!(sorted, (0..m.len()).filter(|&n| m.data[n] != 0).collect::<Vec<_>>(), "{axes:?} {from} {to}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -30,13 +30,15 @@
 
 use crate::constraints::*;
 use crate::quadric::Quadric;
-use crate::region::Region;
+use crate::region::{IdVals, Region, PAR_MIN_LEN};
+use crate::remesh::usable_reference;
 use crate::util::*;
 use crate::{ProgressFn, RemeshError};
 use mm_core::geom::closest_point_on_triangle;
 use mm_core::{Bvh, DVec3, Mesh, INVALID};
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::{Duration, Instant};
@@ -124,6 +126,25 @@ pub struct ReduceReport {
 
 /// Quadric-error simplification in place. See the module docs.
 pub fn reduce(mesh: &mut Mesh, params: &ReduceParams, progress: Option<ProgressFn>) -> Result<ReduceReport, RemeshError> {
+    reduce_with_reference(mesh, params, None, progress)
+}
+
+/// [`reduce`] with the reference surface of [`ReduceTarget::MaxDeviation`] already at hand:
+/// `reference` is a mesh with the same content as `mesh` (typically the mesh it was cloned
+/// from) and a fresh [`Bvh::build`] of it, which saves the copy and the tree build. It is used
+/// only without a region and while its versions and id ranges match `mesh` (and the tree is
+/// current and covers every triangle); otherwise the setup builds its own. As for
+/// [`crate::remesh::remesh_with_reference`], the result is the same only for a tree exactly
+/// as `Bvh::build` makes it (never a refit one, which the versions cannot tell apart) and a
+/// reference not changed through `positions_mut` since.
+///
+/// A cancel during the setup returns a cancelled report with the mesh unchanged.
+pub fn reduce_with_reference(
+    mesh: &mut Mesh,
+    params: &ReduceParams,
+    reference: Option<(&Mesh, &Bvh)>,
+    progress: Option<ProgressFn>,
+) -> Result<ReduceReport, RemeshError> {
     let start = Instant::now();
     match params.target {
         ReduceTarget::Percentage(p) if !(p > 0.0 && p <= 100.0) => {
@@ -138,7 +159,20 @@ pub fn reduce(mesh: &mut Mesh, params: &ReduceParams, progress: Option<ProgressF
         return Err(RemeshError::InvalidParameter("quality / normal thresholds must be finite".into()));
     }
     let mut prog = Progress::new(progress);
-    let mut r = Reducer::new(mesh, params);
+    let cancelled = |mesh: &Mesh| {
+        let mut region = Region::new(mesh, params.region.as_deref());
+        let n = region.triangle_count(mesh);
+        let region_triangles = if region.enabled() { Some(region.triangles(mesh)) } else { None };
+        Ok(ReduceReport { initial_triangles: n, final_triangles: n, region_triangles, cancelled: true, elapsed: start.elapsed(), ..Default::default() })
+    };
+    if !prog.report(0.0) {
+        return cancelled(mesh);
+    }
+    let reference = reference.filter(|&r| params.region.is_none() && usable_reference(mesh, r));
+    let mut r = Reducer::new(&mut *mesh, params, reference);
+    if !prog.report(0.0) {
+        return cancelled(mesh);
+    }
     let initial = r.count;
     let target = match params.target {
         ReduceTarget::TriangleCount(n) => n,
@@ -178,30 +212,97 @@ fn heap_key(cost: f32, e: u32) -> Reverse<u64> {
     Reverse(((cost.to_bits() as u64) << 32) | e as u64)
 }
 
+/// Error quadric of triangle `t` (area-weighted plane).
+#[inline]
+fn tri_quadric(m: &Mesh, t: u32) -> Quadric {
+    let [a, b, c] = m.tri_positions(t);
+    let cr = cross3(a, b, c);
+    let l = cr.length();
+    if l > 0.0 {
+        Quadric::from_point_normal(a, cr / l, 0.5 * l)
+    } else {
+        Quadric::default()
+    }
+}
+
+/// Quadric of vertex `v`: its triangles' quadrics (`tq`) plus the penalty planes of its
+/// feature edges (and of its boundary edges when the boundary is free).
+fn vertex_quadric(m: &Mesh, ec: &ConsVec<ECons>, free_boundary: bool, v: u32, tq: impl Fn(u32) -> Quadric) -> Quadric {
+    let mut s = Quadric::default();
+    if !m.is_vertex(v) {
+        return s;
+    }
+    for t in m.vertex_triangles(v) {
+        s.add(&tq(t));
+    }
+    for &e in m.vertex_edges(v) {
+        let bnd = m.is_boundary_edge(e);
+        let feature = ec.get(e).kind == E_FEATURE;
+        if !(feature || (bnd && free_boundary)) {
+            continue;
+        }
+        let [a, b] = m.edge_vertices(e);
+        let (pa, pb) = (m.vertex(a), m.vertex(b));
+        let d = pb - pa;
+        let w = PENALTY_WEIGHT * d.length_squared();
+        for t in m.edge_triangles(e) {
+            if t == INVALID {
+                continue;
+            }
+            let n = d.cross(m.tri_normal(t)).normalize_or_zero();
+            if n != DVec3::ZERO {
+                s.add(&Quadric::from_point_normal(pa, n, w));
+            }
+        }
+    }
+    s
+}
+
+/// Vertex quadrics. Without a region they are indexed by vertex id; with one, through a slot
+/// per region vertex (only those are ever read or merged), so a small region on a large
+/// mesh sums its own quadrics only.
+struct Quadrics {
+    /// Region mode: slot + 1 per region vertex (kept like the region's own flags, see
+    /// [`IdVals`]). `None` without a region.
+    slot: Option<IdVals<u32>>,
+    q: Vec<Quadric>,
+}
+
+impl Quadrics {
+    /// Index of vertex `v`'s quadric; `MAPS` says whether the slots are in a hash map (see
+    /// [`IdVals::at`]).
+    #[inline]
+    fn at<const MAPS: bool>(&self, v: u32) -> usize {
+        match &self.slot {
+            None => v as usize,
+            Some(slot) => slot.at::<MAPS>(v) as usize - 1,
+        }
+    }
+}
+
 struct Reducer<'m> {
     mesh: &'m mut Mesh,
     region: Region,
-    vc: Vec<VCons>,
-    ec: Vec<ECons>,
-    q: Vec<Quadric>,
-    /// Cost bits of the newest heap key per edge (older keys are stale).
-    key_cost: Vec<u32>,
+    vc: ConsVec<VCons>,
+    ec: ConsVec<ECons>,
+    q: Quadrics,
+    /// Cost bits of the newest heap key per edge (older keys are stale). Only read for
+    /// edges with a key in the heap, which always wrote it first.
+    key_cost: IdVals<u32>,
     heap: BinaryHeap<Reverse<u64>>,
     min_dot: f64,
     min_q: f64,
-    dev: Option<Deviation>,
+    dev: Option<Deviation<'m>>,
     count: usize,
     collapses: usize,
-    stamp: Stamp,
     uniform: bool,
 }
 
 impl<'m> Reducer<'m> {
-    fn new(mesh: &'m mut Mesh, p: &ReduceParams) -> Self {
+    fn new(mesh: &'m mut Mesh, p: &ReduceParams, given: Option<(&'m Mesh, &'m Bvh)>) -> Self {
         let mut region = Region::new(mesh, p.region.as_deref());
-        let mut stamp = Stamp::default();
-        let edges = region.edges(mesh, &mut stamp);
-        let verts = region.vertices(mesh, &mut stamp);
+        let edges = region.edges(mesh);
+        let verts = region.vertices(mesh);
         let opts = ConstraintOptions {
             boundary: if p.preserve_boundary { BoundaryRule::Fixed } else { BoundaryRule::Free },
             sharp_deg: None,
@@ -213,97 +314,81 @@ impl<'m> Reducer<'m> {
         let count = region.triangle_count(mesh);
 
         let m: &Mesh = mesh;
-        let tq: Vec<Quadric> = (0..m.max_tid() as u32)
-            .into_par_iter()
-            .map(|t| {
-                if !m.is_triangle(t) {
-                    return Quadric::default();
-                }
-                let [a, b, c] = m.tri_positions(t);
-                let cr = cross3(a, b, c);
-                let l = cr.length();
-                if l > 0.0 {
-                    Quadric::from_point_normal(a, cr / l, 0.5 * l)
-                } else {
-                    Quadric::default()
-                }
-            })
-            .collect();
-        let ecr = &cons.e;
         let free_boundary = !p.preserve_boundary;
-        let q: Vec<Quadric> = (0..m.max_vid() as u32)
-            .into_par_iter()
-            .map(|v| {
-                let mut s = Quadric::default();
-                if !m.is_vertex(v) {
-                    return s;
-                }
-                for t in m.vertex_triangles(v) {
-                    s.add(&tq[t as usize]);
-                }
-                for &e in m.vertex_edges(v) {
-                    let bnd = m.is_boundary_edge(e);
-                    let feature = ecr.get(e as usize).is_some_and(|c| c.kind == E_FEATURE);
-                    if !(feature || (bnd && free_boundary)) {
-                        continue;
-                    }
-                    let [a, b] = m.edge_vertices(e);
-                    let (pa, pb) = (m.vertex(a), m.vertex(b));
-                    let d = pb - pa;
-                    let w = PENALTY_WEIGHT * d.length_squared();
-                    for t in m.edge_triangles(e) {
-                        if t == INVALID {
-                            continue;
-                        }
-                        let n = d.cross(m.tri_normal(t)).normalize_or_zero();
-                        if n != DVec3::ZERO {
-                            s.add(&Quadric::from_point_normal(pa, n, w));
-                        }
-                    }
-                }
-                s
-            })
-            .collect();
+        let q = if region.enabled() {
+            // Only region vertices; each computes its triangles' quadrics itself (the same
+            // values a table holds), which beats a table over a large mesh.
+            let mut slot = IdVals::new(region.is_sparse(), m.max_vid());
+            for (i, &v) in verts.iter().enumerate() {
+                slot.set(v, i as u32 + 1);
+            }
+            let q = verts
+                .par_iter()
+                .with_min_len(PAR_MIN_LEN)
+                .map(|&v| vertex_quadric(m, &cons.e, free_boundary, v, |t| tri_quadric(m, t)))
+                .collect();
+            Quadrics { slot: Some(slot), q }
+        } else {
+            let tq: Vec<Quadric> = (0..m.max_tid() as u32)
+                .into_par_iter()
+                .with_min_len(PAR_MIN_LEN)
+                .map(|t| if m.is_triangle(t) { tri_quadric(m, t) } else { Quadric::default() })
+                .collect();
+            let q = (0..m.max_vid() as u32)
+                .into_par_iter()
+                .with_min_len(PAR_MIN_LEN)
+                .map(|v| vertex_quadric(m, &cons.e, free_boundary, v, |t| tq[t as usize]))
+                .collect();
+            Quadrics { slot: None, q }
+        };
 
         let dev = match p.target {
-            ReduceTarget::MaxDeviation(tol) => Some(Deviation::new(m, &mut region, &cons.v, &verts, tol)),
+            ReduceTarget::MaxDeviation(tol) => Some(Deviation::new(m, &mut region, &cons.v, &verts, tol, given)),
             _ => None,
         };
-        let ne = m.max_eid();
+        let key_cost = IdVals::new(region.is_sparse(), m.max_eid());
         Reducer {
             mesh,
             region,
             vc: cons.v,
             ec: cons.e,
             q,
-            key_cost: vec![u32::MAX; ne],
+            // An entry is always written before it is read, so it can start at zero.
+            key_cost,
             heap: BinaryHeap::new(),
             min_dot: p.max_normal_change_deg.clamp(0.0, 180.0).to_radians().cos().max(0.0),
             min_q: p.min_triangle_quality.clamp(0.0, 1.0),
             dev,
             count,
             collapses: 0,
-            stamp,
             uniform: p.uniform,
         }
     }
 
-    fn evaluate(&self, e: u32) -> Option<Cand> {
+    /// The collapse of edge `e`, if any, with its cost. Like the other hot functions it is
+    /// compiled once per storage of the per-id state (`MAPS`, see [`IdVals::at`]).
+    fn evaluate<const MAPS: bool>(&self, e: u32) -> Option<Cand> {
         let m = &*self.mesh;
         if !m.is_edge(e) {
             return None;
         }
-        let c = self.ec[e as usize];
+        // Only edges of region triangles: outside edges are unconstrained (free / none), and
+        // collapsing one into a fixed region-border vertex would edit outside triangles.
+        let [t0, t1] = m.edge_triangles(e);
+        if !(self.region.contains_in::<MAPS>(t0) || self.region.contains_in::<MAPS>(t1)) {
+            return None;
+        }
+        let c = self.ec.at::<MAPS>(e);
         if c.kind == E_FIXED {
             return None;
         }
         let [a, b] = m.edge_vertices(e);
-        let ra = removable(self.vc[a as usize], c);
-        let rb = removable(self.vc[b as usize], c);
+        let ra = removable(self.vc.at::<MAPS>(a), c);
+        let rb = removable(self.vc.at::<MAPS>(b), c);
         if !ra && !rb {
             return None;
         }
-        let q = self.q[a as usize].sum(&self.q[b as usize]);
+        let q = self.q.q[self.q.at::<MAPS>(a)].sum(&self.q.q[self.q.at::<MAPS>(b)]);
         let (pa, pb) = (m.vertex(a), m.vertex(b));
         let (keep, rem, pos) = if ra && rb {
             let pos = if self.uniform {
@@ -326,33 +411,43 @@ impl<'m> Reducer<'m> {
         Some(Cand { cost: cost as f32, keep, rem, pos })
     }
 
-    fn push(&mut self, e: u32) {
-        match self.evaluate(e) {
+    fn push<const MAPS: bool>(&mut self, e: u32) {
+        match self.evaluate::<MAPS>(e) {
             Some(c) => {
-                self.key_cost[e as usize] = c.cost.to_bits();
+                self.key_cost.set(e, c.cost.to_bits());
                 self.heap.push(heap_key(c.cost, e));
             }
-            None => self.key_cost[e as usize] = u32::MAX,
+            None => self.key_cost.set(e, u32::MAX),
         }
     }
 
-    fn fill_heap(&mut self) {
-        let edges = self.region.edges(self.mesh, &mut self.stamp);
+    fn fill_heap<const MAPS: bool>(&mut self) {
+        let edges = self.region.edges(self.mesh);
         let this = &*self;
         let keys: Vec<Reverse<u64>> =
-            edges.par_iter().filter_map(|&e| this.evaluate(e).map(|c| heap_key(c.cost, e))).collect();
-        self.key_cost.iter_mut().for_each(|k| *k = u32::MAX);
+            edges.par_iter().with_min_len(PAR_MIN_LEN).filter_map(|&e| this.evaluate::<MAPS>(e).map(|c| heap_key(c.cost, e))).collect();
+        // Entries of edges without a key need no reset: the new heap holds only these keys,
+        // and pushing a key writes its entry first.
         for k in &keys {
-            self.key_cost[(k.0 & 0xffff_ffff) as usize] = (k.0 >> 32) as u32;
+            self.key_cost.set((k.0 & 0xffff_ffff) as u32, (k.0 >> 32) as u32);
         }
         self.heap = BinaryHeap::from(keys);
     }
 
     fn run(&mut self, target: usize, prog: &mut Progress) {
+        // The region never grows here, so the storage stays what it started as.
+        if self.region.is_sparse() {
+            self.run_in::<true>(target, prog)
+        } else {
+            self.run_in::<false>(target, prog)
+        }
+    }
+
+    fn run_in<const MAPS: bool>(&mut self, target: usize, prog: &mut Progress) {
         let initial = self.count;
         let span = (initial - target).max(1) as f32;
         for _round in 0..3 {
-            self.fill_heap();
+            self.fill_heap::<MAPS>();
             let heap0 = self.heap.len().max(1) as f32;
             let before = self.collapses;
             let mut pops = 0usize;
@@ -370,12 +465,12 @@ impl<'m> Reducer<'m> {
                     }
                 }
                 let e = (ent.0 & 0xffff_ffff) as u32;
-                if self.key_cost[e as usize] != (ent.0 >> 32) as u32 || !self.mesh.is_edge(e) {
+                if self.key_cost.at::<MAPS>(e) != (ent.0 >> 32) as u32 || !self.mesh.is_edge(e) {
                     continue; // stale: a fresher key for this edge is in the heap
                 }
-                self.key_cost[e as usize] = u32::MAX;
-                let Some(c) = self.evaluate(e) else { continue };
-                self.try_collapse(e, c);
+                self.key_cost.set(e, u32::MAX);
+                let Some(c) = self.evaluate::<MAPS>(e) else { continue };
+                self.try_collapse::<MAPS>(e, c);
             }
             if self.count <= target || self.collapses == before || self.dev.is_some() {
                 break;
@@ -383,7 +478,7 @@ impl<'m> Reducer<'m> {
         }
     }
 
-    fn try_collapse(&mut self, e: u32, c: Cand) -> bool {
+    fn try_collapse<const MAPS: bool>(&mut self, e: u32, c: Cand) -> bool {
         let m = &*self.mesh;
         let Cand { keep, rem, pos, .. } = c;
         if m.can_collapse(keep, rem).is_err() {
@@ -395,7 +490,7 @@ impl<'m> Reducer<'m> {
                 continue;
             }
             if let Some(x) = m.find_edge(rem, o) {
-                if self.ec[x as usize].kind != E_NONE {
+                if self.ec.at::<MAPS>(x).kind != E_NONE {
                     return false;
                 }
             }
@@ -413,8 +508,9 @@ impl<'m> Reducer<'m> {
             return false;
         }
         self.mesh.set_vertex(keep, pos);
-        let qr = self.q[rem as usize];
-        self.q[keep as usize].add(&qr);
+        let qr = self.q.q[self.q.at::<MAPS>(rem)];
+        let k = self.q.at::<MAPS>(keep);
+        self.q.q[k].add(&qr);
         if let Some(dev) = self.dev.as_mut() {
             dev.commit();
         }
@@ -422,7 +518,7 @@ impl<'m> Reducer<'m> {
         self.collapses += 1;
         let around: SmallVec<[u32; 16]> = self.mesh.vertex_edges(keep).iter().copied().collect();
         for e2 in around {
-            self.push(e2);
+            self.push::<MAPS>(e2);
         }
         true
     }
@@ -459,10 +555,10 @@ fn optimal_position(q: &Quadric, pa: DVec3, pb: DVec3) -> DVec3 {
 /// `bound + δ` stays within tolerance is accepted without touching its samples; only
 /// samples of the two removed triangles and of triangles whose bound would exceed the
 /// tolerance are measured exactly (and re-homed onto the nearest fan triangle).
-struct Deviation {
+struct Deviation<'a> {
     tol: f64,
-    reference: Mesh,
-    bvh: Bvh,
+    reference: Cow<'a, Mesh>,
+    bvh: Cow<'a, Bvh>,
     pts: Vec<DVec3>,
     next: Vec<u32>,
     head: Vec<u32>,
@@ -473,10 +569,17 @@ struct Deviation {
     pending_bounds: SmallVec<[(u32, f64); 32]>,
 }
 
-impl Deviation {
-    fn new(m: &Mesh, region: &mut Region, vc: &[VCons], verts: &[u32], tol: f64) -> Self {
-        let reference = if region.enabled() { m.submesh(&region.triangles_with_collar(m)).0 } else { m.clone() };
-        let bvh = Bvh::build(&reference);
+impl<'a> Deviation<'a> {
+    /// `given`: a ready copy of `m` and its tree (checked by the caller), used without a region.
+    fn new(m: &Mesh, region: &mut Region, vc: &ConsVec<VCons>, verts: &[u32], tol: f64, given: Option<(&'a Mesh, &'a Bvh)>) -> Self {
+        let (reference, bvh) = match given {
+            Some((r, bvh)) if !region.enabled() => (Cow::Borrowed(r), Cow::Borrowed(bvh)),
+            _ => {
+                let r = if region.enabled() { m.submesh(&region.triangles_with_collar(m)).0 } else { m.clone() };
+                let bvh = Bvh::build(&r);
+                (Cow::Owned(r), Cow::Owned(bvh))
+            }
+        };
         let mut d = Deviation {
             tol,
             reference,
@@ -490,7 +593,7 @@ impl Deviation {
             pending_bounds: SmallVec::new(),
         };
         for &v in verts {
-            if vc[v as usize].kind == V_FIXED {
+            if vc.get(v).kind == V_FIXED {
                 continue;
             }
             let Some(&t) = m.vertex_triangles(v).first() else { continue };
@@ -642,6 +745,7 @@ impl Deviation {
     fn measured_max(&self, m: &Mesh) -> f64 {
         (0..m.max_tid() as u32)
             .into_par_iter()
+            .with_min_len(PAR_MIN_LEN)
             .filter(|&t| m.is_triangle(t))
             .map(|t| {
                 let [a, b, c] = m.tri_positions(t);
@@ -655,5 +759,41 @@ impl Deviation {
                 mx
             })
             .reduce(|| 0.0, f64::max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn region_quadrics_match_a_whole_mesh_table() {
+        // An open curved surface with face groups: boundary and group-border penalty planes,
+        // and outside triangles in the quadrics of the region border vertices.
+        let mut mesh = primitives::plane_grid(4.0, 4.0, 30, 30);
+        for v in mesh.vertex_ids().collect::<Vec<_>>() {
+            let p = mesh.vertex(v);
+            mesh.set_vertex(v, p + DVec3::Z * (0.3 * (2.0 * p.x).sin() * p.y.cos()));
+        }
+        for t in mesh.triangle_ids().collect::<Vec<_>>() {
+            let g = (mesh.tri_centroid(t).x > 0.4) as i32;
+            mesh.set_tri_group(t, g);
+        }
+        let region: Vec<u32> = mesh.triangle_ids().filter(|&t| mesh.tri_centroid(t).y > -1.0).collect();
+        let tq: Vec<Quadric> = (0..mesh.max_tid() as u32).map(|t| tri_quadric(&mesh, t)).collect();
+        for preserve_boundary in [true, false] {
+            let p = ReduceParams { preserve_boundary, region: Some(region.clone()), ..Default::default() };
+            let mut m = mesh.clone();
+            let mut r = Reducer::new(&mut m, &p, None);
+            let verts = r.region.vertices(r.mesh);
+            assert!(verts.len() > 100);
+            for v in verts {
+                // The old table path: every vertex's quadric from a table of triangle quadrics.
+                let want = vertex_quadric(&mesh, &r.ec, !preserve_boundary, v, |t| tq[t as usize]);
+                // Same sums in the same order: equal to the bit.
+                assert_eq!(format!("{:?}", r.q.q[r.q.at::<true>(v)]), format!("{want:?}"), "vertex {v}");
+            }
+        }
     }
 }

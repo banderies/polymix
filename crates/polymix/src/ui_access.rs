@@ -37,7 +37,10 @@ impl egui::Plugin for Capture {
     fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
         let mut c = self.0.lock().unwrap_or_else(|e| e.into_inner());
         c.frame += 1;
-        c.tree = output.platform_output.accesskit_update.clone();
+        // Taken rather than copied: nothing after this hook reads the tree, because eframe is
+        // built without its `accesskit` feature (no screen-reader adapter). Switch back to
+        // clone() if that feature is ever turned on.
+        c.tree = output.platform_output.accesskit_update.take();
     }
 }
 
@@ -395,6 +398,48 @@ mod tests {
         assert!(text.contains("text \"Holes: 2\"") && !text.contains("#8"), "{text}");
         let only = snapshot(&tree(), &json!({"contains": "accept"}));
         assert_eq!(only["widgets"].as_str().unwrap().lines().count(), 1);
+    }
+
+    /// Copies the tree each pass ends with, before the capture plugin (added after it) sees it.
+    struct Spy(Arc<Mutex<Vec<Option<TreeUpdate>>>>);
+
+    impl egui::Plugin for Spy {
+        fn debug_name(&self) -> &'static str {
+            "tree spy"
+        }
+
+        fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+            self.0.lock().unwrap().push(output.platform_output.accesskit_update.clone());
+        }
+    }
+
+    #[test]
+    fn capture_keeps_each_frames_whole_tree() {
+        let ctx = egui::Context::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        ctx.add_plugin(Spy(seen.clone()));
+        let access = UiAccess::new(&ctx);
+        ctx.enable_accesskit();
+        let raw = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() };
+        for i in 0..3 {
+            let out = ctx.run_ui(raw(), |ui| {
+                let _ = ui.button("Accept");
+                let mut v = i as f32;
+                ui.add(egui::Slider::new(&mut v, 0.0..=10.0).text("Density"));
+                ui.label(format!("Frame {i}"));
+            });
+            // Taken from the output: nothing after the hook reads it.
+            assert!(out.platform_output.accesskit_update.is_none());
+            let c = access.captured.lock().unwrap();
+            let seen = seen.lock().unwrap();
+            assert_eq!(c.frame, seen.len() as u64);
+            let last = seen.last().cloned().flatten();
+            assert!(last.as_ref().is_some_and(|t| t.nodes.len() > 3));
+            assert_eq!(c.tree, last, "the captured tree is the whole tree of the frame");
+        }
+        let tree = access.captured.lock().unwrap().tree.clone().unwrap();
+        let text = snapshot(&tree, &json!({}))["widgets"].as_str().unwrap().to_string();
+        assert!(text.contains("button \"Accept\"") && text.contains("Frame 2"), "{text}");
     }
 
     #[test]

@@ -141,8 +141,7 @@ pub fn dicom_file(path: &Path, out: &Path, o: &DeidOptions) -> Result<bool> {
         obj.remove_element(t);
     }
     for t in EMPTY {
-        if obj.element_opt(t).ok().flatten().is_some() {
-            let vr = obj.element(t)?.vr();
+        if let Some(vr) = obj.get(t).map(|e| e.vr()) {
             obj.put(DataElement::new(t, vr, PrimitiveValue::Empty));
         }
     }
@@ -151,14 +150,14 @@ pub fn dicom_file(path: &Path, out: &Path, o: &DeidOptions) -> Result<bool> {
     obj.put(DataElement::new(tags::PATIENT_IDENTITY_REMOVED, VR::CS, PrimitiveValue::from("YES")));
     obj.put(DataElement::new(tags::DEIDENTIFICATION_METHOD, VR::LO, PrimitiveValue::from("Polymix: DICOM PS3.15 basic profile (subset)")));
     for t in UIDS {
-        let old = obj.element_opt(t).ok().flatten().and_then(|e| e.to_str().ok().map(|s| s.to_string()));
+        let old = obj.get(t).and_then(|e| e.to_str().ok().map(|s| s.to_string()));
         if let Some(old) = old {
             obj.put(DataElement::new(t, VR::UI, PrimitiveValue::from(replacement_uid(&old, &o.salt).as_str())));
         }
     }
     if o.shift_days != 0 {
         for t in DATES {
-            let old = obj.element_opt(t).ok().flatten().and_then(|e| e.to_str().ok().map(|s| s.to_string()));
+            let old = obj.get(t).and_then(|e| e.to_str().ok().map(|s| s.to_string()));
             if let Some(new) = old.as_deref().and_then(|d| shift_date(d, o.shift_days)) {
                 obj.put(DataElement::new(t, VR::DA, PrimitiveValue::from(new.as_str())));
             }
@@ -170,7 +169,7 @@ pub fn dicom_file(path: &Path, out: &Path, o: &DeidOptions) -> Result<bool> {
             obj.remove_element(t);
         }
     }
-    let sop = obj.element_opt(tags::SOP_INSTANCE_UID).ok().flatten().and_then(|e| e.to_str().ok().map(|s| s.to_string())).unwrap_or_default();
+    let sop = obj.get(tags::SOP_INSTANCE_UID).and_then(|e| e.to_str().ok().map(|s| s.to_string())).unwrap_or_default();
     let meta = obj.meta_mut();
     meta.media_storage_sop_instance_uid = sop;
     meta.update_information_group_length();

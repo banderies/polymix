@@ -73,8 +73,89 @@ enum FrameMode {
 /// Screen distance (points) within which a click picks a drawn pivot.
 pub const PICK_POINTS: f32 = 12.0;
 
+/// What a mesh is: the allocation it lives in and its shape version. Shape versions are never
+/// reused, and the tool never edits the mesh, so the pair stays the same while the mesh does.
+type MeshId = (usize, u64);
+
+fn mesh_id(m: &Mesh) -> MeshId {
+    (m as *const Mesh as usize, m.shape_version())
+}
+
+/// A face group of a mesh with a group version.
+type GroupKey = (MeshId, u64, i32);
+
+/// Whole-mesh sums the placement modes read, kept from one hover to the next (the pivot
+/// under the pointer is placed every frame).
+#[derive(Default)]
+struct PlaceCache {
+    /// For a face group: the sums of its triangles' area-weighted centroids, areas, and
+    /// area-weighted normals.
+    group: Option<(GroupKey, (DVec3, f64, DVec3))>,
+    /// For a face group: the sums of its border's length-weighted midpoints and lengths.
+    border: Option<(GroupKey, (DVec3, f64))>,
+    /// The mesh's open boundaries.
+    loops: Option<(MeshId, Vec<mm_core::topology::EdgeLoop>)>,
+}
+
+impl PlaceCache {
+    /// Group `g`'s sums, added up in triangle order as Snap To Group Center always has.
+    fn group(&mut self, m: &Mesh, g: i32) -> (DVec3, f64, DVec3) {
+        let key = (mesh_id(m), m.group_version(), g);
+        match self.group {
+            Some((k, sums)) if k == key => sums,
+            _ => {
+                let (mut c, mut a, mut n) = (DVec3::ZERO, 0.0, DVec3::ZERO);
+                for x in m.triangle_ids().filter(|&x| m.tri_group(x) == g) {
+                    c += m.tri_centroid(x) * m.tri_area(x);
+                    a += m.tri_area(x);
+                    n += m.tri_normal(x) * m.tri_area(x);
+                }
+                self.group = Some((key, (c, a, n)));
+                (c, a, n)
+            }
+        }
+    }
+
+    /// Group `g`'s border sums, in edge order.
+    fn border(&mut self, m: &Mesh, g: i32) -> (DVec3, f64) {
+        let key = (mesh_id(m), m.group_version(), g);
+        match self.border {
+            Some((k, sums)) if k == key => sums,
+            _ => {
+                let (mut c, mut len) = (DVec3::ZERO, 0.0);
+                for e in m.edge_ids() {
+                    let [a, b] = m.edge_triangles(e);
+                    let ga = m.tri_group(a);
+                    let gb = if b == mm_core::INVALID { None } else { Some(m.tri_group(b)) };
+                    if (ga == g || gb == Some(g)) && gb != Some(ga) {
+                        let l = m.edge_length(e);
+                        c += m.edge_midpoint(e) * l;
+                        len += l;
+                    }
+                }
+                self.border = Some((key, (c, len)));
+                (c, len)
+            }
+        }
+    }
+
+    fn loops(&mut self, m: &Mesh) -> &[mm_core::topology::EdgeLoop] {
+        let key = mesh_id(m);
+        if self.loops.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.loops = Some((key, mm_core::topology::boundary_loops(m)));
+        }
+        self.loops.as_ref().map_or(&[], |(_, l)| l.as_slice())
+    }
+}
+
 /// Position, frame z axis and (optionally) frame x axis for a click at `hit`.
+#[cfg(test)]
 fn place(m: &Mesh, bvh: &mm_core::Bvh, hit: &mm_core::bvh::RayHit, ray: &Ray, mode: Placement) -> Option<(DVec3, DVec3, Option<DVec3>)> {
+    place_cached(m, bvh, hit, ray, mode, &mut PlaceCache::default())
+}
+
+/// [`place`], with the whole-mesh sums from `cache` (and kept there).
+fn place_cached(m: &Mesh, bvh: &mm_core::Bvh, hit: &mm_core::bvh::RayHit, ray: &Ray, mode: Placement, cache: &mut PlaceCache) -> Option<(DVec3, DVec3, Option<DVec3>)> {
     let t = hit.tid;
     let tv = m.triangle(t);
     let nt = m.tri_normal(t);
@@ -89,8 +170,6 @@ fn place(m: &Mesh, bvh: &mm_core::Bvh, hit: &mm_core::bvh::RayHit, ray: &Ray, mo
         })
     };
     let edge_normal = |e: u32| m.edge_triangles(e).into_iter().filter(|&x| x != mm_core::INVALID).map(|x| m.tri_normal(x)).sum::<DVec3>().normalize_or(nt);
-    let group_tris = |g: i32| m.triangle_ids().filter(move |&x| m.tri_group(x) == g);
-    let area_normal = |tris: &mut dyn Iterator<Item = u32>| tris.map(|x| m.tri_normal(x) * m.tri_area(x)).sum::<DVec3>().normalize_or(nt);
     Some(match mode {
         Placement::Vertex => {
             let v = *tv.iter().min_by(|&&a, &&b| m.vertex(a).distance(hit.point).total_cmp(&m.vertex(b).distance(hit.point)))?;
@@ -109,35 +188,20 @@ fn place(m: &Mesh, bvh: &mm_core::Bvh, hit: &mm_core::bvh::RayHit, ray: &Ray, mo
         }
         Placement::FaceCenter => (m.tri_centroid(t), nt, Some(m.vertex(tv[1]) - m.vertex(tv[0]))),
         Placement::GroupCenter => {
-            let g = m.tri_group(t);
-            let (mut c, mut a) = (DVec3::ZERO, 0.0);
-            for x in group_tris(g) {
-                c += m.tri_centroid(x) * m.tri_area(x);
-                a += m.tri_area(x);
-            }
-            (c / a.max(1e-300), area_normal(&mut group_tris(g)), None)
+            let (c, a, n) = cache.group(m, m.tri_group(t));
+            (c / a.max(1e-300), n.normalize_or(nt), None)
         }
         Placement::GroupBorderCenter => {
             let g = m.tri_group(t);
-            let (mut c, mut len) = (DVec3::ZERO, 0.0);
-            for e in m.edge_ids() {
-                let [a, b] = m.edge_triangles(e);
-                let ga = m.tri_group(a);
-                let gb = if b == mm_core::INVALID { None } else { Some(m.tri_group(b)) };
-                if (ga == g || gb == Some(g)) && gb != Some(ga) {
-                    let l = m.edge_length(e);
-                    c += m.edge_midpoint(e) * l;
-                    len += l;
-                }
-            }
+            let (c, len) = cache.border(m, g);
             if len <= 0.0 {
                 return None;
             }
-            (c / len, area_normal(&mut group_tris(g)), None)
+            (c / len, cache.group(m, g).2.normalize_or(nt), None)
         }
         Placement::BoundaryCenter => {
             // The open boundary nearest to the click; its frame faces out of the opening.
-            let loops = mm_core::topology::boundary_loops(m);
+            let loops = cache.loops(m);
             let lp = loops.iter().min_by(|a, b| {
                 let d = |l: &mm_core::topology::EdgeLoop| l.vertices.iter().map(|&v| m.vertex(v).distance(hit.point)).fold(f64::MAX, f64::min);
                 d(a).total_cmp(&d(b))
@@ -243,11 +307,39 @@ pub struct PivotTool {
     sym_axis: usize,
     /// The symmetry plane is square to an axis of the object's own frame, not the world's.
     sym_local: bool,
+    cache: PlaceCache,
+    /// The last symmetry plane, for the object, mesh, axis, space and object frame it is of
+    /// (Create Symmetric shows the mirrored pivot every frame).
+    sym: std::cell::Cell<Option<(SymKey, (DVec3, DVec3))>>,
 }
+
+type SymKey = (ObjectId, MeshId, usize, bool, [u64; 4]);
 
 impl PivotTool {
     pub fn new(_cx: &mut ToolCx) -> Self {
-        Self { placement: Placement::FaceCenter, frame: FrameMode::Geometry, hover: None, link_to_target: false, symmetric: false, sym_axis: 0, sym_local: false }
+        Self {
+            placement: Placement::FaceCenter,
+            frame: FrameMode::Geometry,
+            hover: None,
+            link_to_target: false,
+            symmetric: false,
+            sym_axis: 0,
+            sym_local: false,
+            cache: PlaceCache::default(),
+            sym: std::cell::Cell::new(None),
+        }
+    }
+
+    /// [`symmetry_plane`] of `o` for the tool's settings, worked out again only when
+    /// something it depends on changed.
+    fn symmetry_plane_of(&self, o: &SceneObject) -> (DVec3, DVec3) {
+        let key = (o.id, mesh_id(&o.mesh), self.sym_axis, self.sym_local, o.frame.to_array().map(f64::to_bits));
+        if let Some((_, plane)) = self.sym.get().filter(|(k, _)| *k == key) {
+            return plane;
+        }
+        let plane = symmetry_plane(o, self.sym_axis, self.sym_local);
+        self.sym.set(Some((key, plane)));
+        plane
     }
 
     /// The frame for a pivot whose geometric frame is `geometry`, by the frame mode (`toward`
@@ -266,7 +358,7 @@ impl PivotTool {
         Some(Pivot { position: f.pivot.position, frame: self.oriented(f.pivot.frame, -cx.camera.forward(), cx.camera.right()) })
     }
 
-    fn candidate(&self, cx: &mut ToolCx, pos: egui::Pos2) -> Option<Pivot> {
+    fn candidate(&mut self, cx: &mut ToolCx, pos: egui::Pos2) -> Option<Pivot> {
         let ray = cx.ray_at(pos);
         let right = cx.camera.right();
         match self.placement {
@@ -279,7 +371,7 @@ impl PivotTool {
                 let (id, hit) = cx.pick(pos, cx.scene.active)?;
                 let o = cx.scene.get_mut(id)?;
                 let bvh = o.bvh();
-                let (p, n, x) = place(&o.mesh, &bvh, &hit, &ray, mode)?;
+                let (p, n, x) = place_cached(&o.mesh, &bvh, &hit, &ray, mode, &mut self.cache)?;
                 Some(Pivot { position: p, frame: self.oriented(frame_from(n, x), -ray.dir, right) })
             }
         }
@@ -296,7 +388,7 @@ impl PivotTool {
     /// owner's.
     fn plane(&self, scene: &Scene) -> Option<(DVec3, DVec3)> {
         let o = scene.active().or_else(|| self.owner(scene).and_then(|id| scene.get(id)))?;
-        Some(symmetry_plane(o, self.sym_axis, self.sym_local))
+        Some(self.symmetry_plane_of(o))
     }
 
     /// Add `p` (and its mirror image with Create Symmetric) to the owner object.
@@ -321,7 +413,7 @@ impl PivotTool {
     fn mirror(&self, cx: &mut ToolCx, index: usize) -> Result<String, String> {
         let o = cx.scene.active().ok_or("no active object")?;
         let p = *o.pivots.get(index).ok_or("the active object has no such pivot")?;
-        let (c, n) = symmetry_plane(o, self.sym_axis, self.sym_local);
+        let (c, n) = self.symmetry_plane_of(o);
         cx.history.push("Mirror pivot", cx.scene);
         let o = cx.scene.active_mut().ok_or("no active object")?;
         o.pivots.push(mirror_pivot(&p, c, n));
@@ -480,7 +572,7 @@ impl Tool for PivotTool {
                         let dir = a.opt_point("along").map(DVec3::from_array).and_then(|d| d.try_normalize()).unwrap_or(-n);
                         let ray = Ray::new(h.point - dir * 1e-3, dir);
                         let hit = mm_core::bvh::RayHit { tid: h.tid, t: 1e-3, point: h.point, bary: h.bary };
-                        let (p, z, x) = place(&o.mesh, &bvh, &hit, &ray, mode).ok_or("no pivot can be placed there in this placement mode")?;
+                        let (p, z, x) = place_cached(&o.mesh, &bvh, &hit, &ray, mode, &mut self.cache).ok_or("no pivot can be placed there in this placement mode")?;
                         Pivot { position: p, frame: self.oriented(frame_from(z, x), toward, right) }
                     }
                 };
@@ -674,6 +766,117 @@ mod tests {
         let (p, n, _) = place(&tube, &bvh, &hit, &ray, Placement::BoundaryCenter).unwrap();
         assert!((p - DVec3::new(10.0, 0.0, 0.0)).length() < 1e-6 || (p - DVec3::new(-10.0, 0.0, 0.0)).length() < 1e-6, "{p:?}");
         assert!(n.dot(p.normalize()) > 0.99, "{n:?}");
+    }
+
+    /// The whole-mesh placements worked out from scratch, as every hover did.
+    fn place_from_scratch(m: &Mesh, hit: &mm_core::bvh::RayHit, mode: Placement) -> Option<(DVec3, DVec3, Option<DVec3>)> {
+        let t = hit.tid;
+        let nt = m.tri_normal(t);
+        let group_tris = |g: i32| m.triangle_ids().filter(move |&x| m.tri_group(x) == g);
+        let area_normal = |tris: &mut dyn Iterator<Item = u32>| tris.map(|x| m.tri_normal(x) * m.tri_area(x)).sum::<DVec3>().normalize_or(nt);
+        Some(match mode {
+            Placement::GroupCenter => {
+                let g = m.tri_group(t);
+                let (mut c, mut a) = (DVec3::ZERO, 0.0);
+                for x in group_tris(g) {
+                    c += m.tri_centroid(x) * m.tri_area(x);
+                    a += m.tri_area(x);
+                }
+                (c / a.max(1e-300), area_normal(&mut group_tris(g)), None)
+            }
+            Placement::GroupBorderCenter => {
+                let g = m.tri_group(t);
+                let (mut c, mut len) = (DVec3::ZERO, 0.0);
+                for e in m.edge_ids() {
+                    let [a, b] = m.edge_triangles(e);
+                    let ga = m.tri_group(a);
+                    let gb = if b == mm_core::INVALID { None } else { Some(m.tri_group(b)) };
+                    if (ga == g || gb == Some(g)) && gb != Some(ga) {
+                        let l = m.edge_length(e);
+                        c += m.edge_midpoint(e) * l;
+                        len += l;
+                    }
+                }
+                if len <= 0.0 {
+                    return None;
+                }
+                (c / len, area_normal(&mut group_tris(g)), None)
+            }
+            Placement::BoundaryCenter => {
+                let loops = mm_core::topology::boundary_loops(m);
+                let lp = loops.iter().min_by(|a, b| {
+                    let d = |l: &mm_core::topology::EdgeLoop| l.vertices.iter().map(|&v| m.vertex(v).distance(hit.point)).fold(f64::MAX, f64::min);
+                    d(a).total_cmp(&d(b))
+                })?;
+                let pts = lp.positions(m);
+                let c = pts.iter().copied().sum::<DVec3>() / pts.len() as f64;
+                let mut cov = [[0.0; 3]; 3];
+                for p in &pts {
+                    mm_core::linalg::add_outer(&mut cov, *p - c, 1.0);
+                }
+                let mut n = mm_core::linalg::sym_eigen3(cov).1[0];
+                let inner: DVec3 = lp.vertices.iter().flat_map(|&v| m.vertex_triangles(v)).map(|x| m.tri_centroid(x)).sum::<DVec3>();
+                let inner = inner / (lp.vertices.iter().map(|&v| m.vertex_triangles(v).len()).sum::<usize>().max(1) as f64);
+                if (c - inner).dot(n) < 0.0 {
+                    n = -n;
+                }
+                (c, n, None)
+            }
+            _ => unreachable!(),
+        })
+    }
+
+    #[test]
+    fn cached_placements_are_the_ones_worked_out_from_scratch() {
+        // A wavy tube along x with four face groups around it and two openings.
+        let path: Vec<DVec3> = (0..=20).map(|i| DVec3::new(-10.0 + i as f64, (i as f64 * 0.7).sin(), 0.0)).collect();
+        let mut tube = primitives::tube_along(&path, &[2.0; 21], 32);
+        let ids: Vec<u32> = tube.triangle_ids().collect();
+        for t in ids {
+            let c = tube.tri_centroid(t);
+            tube.set_tri_group(t, (c.y > 0.0) as i32 + 2 * (c.x > 0.0) as i32);
+        }
+        let bvh = mm_core::Bvh::build(&tube);
+        let mut cache = PlaceCache::default();
+        let modes = [Placement::GroupCenter, Placement::GroupBorderCenter, Placement::BoundaryCenter];
+        for k in 0..60 {
+            let (x, y) = (-9.5 + 0.33 * k as f64, if k % 2 == 0 { 0.4 } else { -0.6 });
+            let (hit, ray) = hit_from_above(&tube, &bvh, x, y);
+            // The same hit twice in a row (the cache answers the second), then the next mode.
+            for mode in modes.into_iter().chain(modes).chain([modes[k % 3]]) {
+                assert_eq!(place_cached(&tube, &bvh, &hit, &ray, mode, &mut cache), place_from_scratch(&tube, &hit, mode), "{mode:?} at {x}, {y}");
+            }
+        }
+        // Another mesh (or the same one with other groups) is not answered from the cache.
+        let (hit, ray) = hit_from_above(&tube, &bvh, 3.0, 0.4);
+        let before = place_cached(&tube, &bvh, &hit, &ray, Placement::GroupCenter, &mut cache);
+        let mut regrouped = tube.clone();
+        regrouped.set_tri_group(hit.tid, 9);
+        let after = place_cached(&regrouped, &bvh, &hit, &ray, Placement::GroupCenter, &mut cache);
+        assert_ne!(before, after);
+        assert_eq!(after, place_from_scratch(&regrouped, &hit, Placement::GroupCenter));
+    }
+
+    #[test]
+    fn the_symmetry_plane_is_kept_until_something_it_depends_on_changes() {
+        with_scene(|cx, a, _| {
+            let mut tool = PivotTool::new(cx);
+            let check = |tool: &PivotTool, cx: &ToolCx| {
+                let o = cx.scene.get(a).unwrap();
+                assert_eq!(tool.plane(cx.scene), Some(symmetry_plane(o, tool.sym_axis, tool.sym_local)));
+            };
+            check(&tool, cx);
+            check(&tool, cx);
+            for (axis, local) in [(1, false), (1, true), (2, true)] {
+                tool.sym_axis = axis;
+                tool.sym_local = local;
+                check(&tool, cx);
+            }
+            cx.scene.get_mut(a).unwrap().frame = DQuat::from_rotation_z(0.4);
+            check(&tool, cx);
+            cx.scene.get_mut(a).unwrap().mesh_mut().transform(|p| p * 1.5 + DVec3::X);
+            check(&tool, cx);
+        });
     }
 
     #[test]

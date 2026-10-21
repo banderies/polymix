@@ -9,10 +9,12 @@
 //! into branches, short spurs from surface noise are pruned, and branches are smoothed.
 
 use glam::DVec3;
-use mm_core::{Mesh, INVALID};
+use mm_core::{Bvh, Mesh, INVALID};
 use std::cmp::Ordering;
 use rayon::prelude::*;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CenterlineNode {
@@ -110,7 +112,17 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// Compute the centerline tree. `sources` are the inlet vertices (e.g. a boundary loop or
 /// the vertices of an inlet cap); `inlet_radius` sets the automatic band width.
 pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &CenterlineParams) -> Centerline {
+    compute_with(mesh, sources, inlet_radius, params, None).expect("only a progress callback stops it")
+}
+
+/// [`compute`], reporting progress (0..1) to `progress` between its steps; `None` once
+/// `progress` returns false (the work then stops there).
+pub fn compute_with(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &CenterlineParams, progress: Option<&dyn Fn(f32) -> bool>) -> Option<Centerline> {
+    let going = |x: f32| progress.is_none_or(|p| p(x));
     let dist = geodesic_distance(mesh, sources);
+    if !going(0.4) {
+        return None;
+    }
     let step = if params.step > 0.0 { params.step } else { (inlet_radius * 0.5).max(mesh.average_edge_length() * 2.0) };
     let band = |v: u32| -> usize {
         let d = dist[v as usize];
@@ -139,8 +151,11 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
             }
         }
     }
-    // Components -> nodes.
-    let mut comp_of_root: HashMap<u32, usize> = HashMap::new();
+    if !going(0.6) {
+        return None;
+    }
+    // Components -> nodes (numbered in the order their first vertex comes up).
+    let mut comp_of_root = vec![u32::MAX; mesh.max_vid()];
     let mut sums: Vec<(DVec3, f64, usize)> = Vec::new();
     let mut vcomp = vec![usize::MAX; mesh.max_vid()];
     for v in mesh.vertex_ids() {
@@ -148,10 +163,11 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
             continue;
         }
         let r = find(&mut parent, v);
-        let c = *comp_of_root.entry(r).or_insert_with(|| {
+        if comp_of_root[r as usize] == u32::MAX {
+            comp_of_root[r as usize] = sums.len() as u32;
             sums.push((DVec3::ZERO, 0.0, band(v)));
-            sums.len() - 1
-        });
+        }
+        let c = comp_of_root[r as usize] as usize;
         vcomp[v as usize] = c;
         let w = area[v as usize].max(1e-30);
         sums[c].0 += mesh.vertex(v) * w;
@@ -170,6 +186,9 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
     for (n, (s, w)) in nodes.iter_mut().zip(&rsum) {
         n.radius = if *w > 0.0 { s / w } else { 0.0 };
     }
+    if !going(0.8) {
+        return None;
+    }
     // Links between rings of later bands (consecutive ones, or further apart where an edge
     // is longer than a band on a coarse mesh).
     let mut edges: Vec<(usize, usize)> = Vec::new();
@@ -186,9 +205,12 @@ pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &Centerl
     }
     edges.sort_unstable();
     edges.dedup();
+    if !going(0.9) {
+        return None;
+    }
     let mut cl = Centerline { nodes, edges, branches: Vec::new(), vertex_node: vcomp };
     build_branches(&mut cl, params);
-    cl
+    Some(cl)
 }
 
 fn build_branches(cl: &mut Centerline, params: &CenterlineParams) {
@@ -372,8 +394,142 @@ pub struct InscribedPath {
 /// its radii are the exact distances to the wall. Only voxels within a few radii of the guide
 /// are searched, so the path cannot wander into another vessel. `None` where the lumen does not
 /// connect `a` to `b` at the grid's resolution.
+///
+/// Caps a copy of the mesh and builds its tree each time: for several paths through one mesh,
+/// see [`inscribed_path_with`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: DVec3) -> Option<InscribedPath> {
-    use mm_core::{Bvh, Ray};
+    inscribed_path_with(mesh, &CappedCache::default(), guide, radii, a, b, None)
+}
+
+/// The surface with its open ends capped and a tree over it, as [`inscribed_path`] casts its
+/// rays and measures its depths against.
+struct Capped {
+    mesh: Mesh,
+    bvh: Bvh,
+}
+
+/// A single-entry cache of [`inscribed_path`]'s capped surface: the capping and its tree, the
+/// slow part of a path through a big mesh, are built once per shape of the mesh (its shape
+/// version, which no other shape shares) and kept for the next path through it, or the
+/// failure to cap it. Clones share the entry, so a background job can fill it for the tool
+/// that keeps it. It holds a copy of the mesh (hundreds of MB for millions of triangles):
+/// keep it only while paths are being traced.
+#[derive(Clone, Default)]
+pub struct CappedCache(Arc<CappedShared>);
+
+#[derive(Default)]
+struct CappedShared {
+    slot: Mutex<CappedSlot>,
+    /// Woken when a build ends (kept, cancelled or failed).
+    built: Condvar,
+}
+
+#[derive(Default)]
+struct CappedSlot {
+    entry: CappedEntry,
+    /// Builds started so far, to tell whose build the entry waits for.
+    claims: u64,
+}
+
+#[derive(Default)]
+enum CappedEntry {
+    #[default]
+    Empty,
+    /// Being built for a shape version, by the caller holding `claim`.
+    Building { version: u64, claim: u64 },
+    /// Built for a shape version (`None`: its open ends could not be capped).
+    Ready { version: u64, capped: Option<Arc<Capped>> },
+}
+
+impl CappedCache {
+    fn lock(&self) -> MutexGuard<'_, CappedSlot> {
+        self.0.slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The capped surface of `mesh` (`None` where its open ends cannot be capped, or once
+    /// `going` returns false). Built now if the entry is for another shape, outside the lock:
+    /// a caller for another shape does not wait for it (the build it replaces is not kept),
+    /// and callers for the same shape wait for this one build. `going` (0..1 of the build)
+    /// is asked between the build's steps and while waiting, so a caller no longer
+    /// interested stops early.
+    fn get(&self, mesh: &Mesh, going: &dyn Fn(f32) -> bool) -> Option<Arc<Capped>> {
+        let version = mesh.shape_version();
+        let mut slot = self.lock();
+        loop {
+            match &slot.entry {
+                CappedEntry::Ready { version: v, capped } if *v == version => return capped.clone(),
+                CappedEntry::Building { version: v, .. } if *v == version => {
+                    if !going(0.0) {
+                        return None;
+                    }
+                    slot = self.0.built.wait_timeout(slot, Duration::from_millis(20)).unwrap_or_else(PoisonError::into_inner).0;
+                }
+                _ => break,
+            }
+        }
+        slot.claims += 1;
+        let claim = slot.claims;
+        let old = std::mem::replace(&mut slot.entry, CappedEntry::Building { version, claim });
+        drop(slot);
+        // The old surface is let go before this one is built, so two are not held at once
+        // (unless another caller still holds it).
+        drop(old);
+        let unfinished = Unfinished { cache: self, claim };
+        let built = Self::build(mesh, going)?;
+        let capped = built.map(Arc::new);
+        let mut slot = self.lock();
+        if matches!(slot.entry, CappedEntry::Building { claim: c, .. } if c == claim) {
+            slot.entry = CappedEntry::Ready { version, capped: capped.clone() };
+        }
+        drop(slot);
+        drop(unfinished);
+        capped
+    }
+
+    /// `mesh` capped, with its tree (`Some(None)`: it cannot be capped); `None` once `going`
+    /// returns false.
+    fn build(mesh: &Mesh, going: &dyn Fn(f32) -> bool) -> Option<Option<Capped>> {
+        if !going(0.0) {
+            return None;
+        }
+        let mut closed = mesh.clone();
+        let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&closed).into_iter().map(|l| l.vertices).collect();
+        if !loops.is_empty() && mm_edit::cap_planar_loops(&mut closed, &loops, None, mm_edit::CutFill::Flat).is_err() {
+            return Some(None);
+        }
+        if !going(0.3) {
+            return None;
+        }
+        let bvh = Bvh::build(&closed);
+        Some(Some(Capped { mesh: closed, bvh }))
+    }
+}
+
+/// A claim on the cache's entry while its build runs: when it ends without the build kept
+/// (cancelled, or a panic), the entry is emptied if it still waits for this build, and the
+/// callers waiting for it are woken either way.
+struct Unfinished<'a> {
+    cache: &'a CappedCache,
+    claim: u64,
+}
+
+impl Drop for Unfinished<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.cache.lock();
+        if matches!(slot.entry, CappedEntry::Building { claim, .. } if claim == self.claim) {
+            slot.entry = CappedEntry::Empty;
+        }
+        drop(slot);
+        self.cache.0.built.notify_all();
+    }
+}
+
+/// [`inscribed_path`], taking the capped surface from `cache` (or filling it), and reporting
+/// progress (0..1) to `progress` between its steps: `None` once that returns false.
+pub fn inscribed_path_with(mesh: &Mesh, cache: &CappedCache, guide: &[DVec3], radii: &[f64], a: DVec3, b: DVec3, progress: Option<&dyn Fn(f32) -> bool>) -> Option<InscribedPath> {
+    use mm_core::Ray;
+    let going = |x: f32| progress.is_none_or(|p| p(x));
     if guide.len() < 2 || radii.len() != guide.len() {
         return None;
     }
@@ -413,12 +569,12 @@ pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: 
     }
     // Inside the lumen, by the parity of crossings along x from outside the mesh (its open
     // ends capped, so rays cannot slip out through them).
-    let mut closed = mesh.clone();
-    let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&closed).into_iter().map(|l| l.vertices).collect();
-    if !loops.is_empty() && mm_edit::cap_planar_loops(&mut closed, &loops, None, mm_edit::CutFill::Flat).is_err() {
+    // (Building the capped surface, when it is not kept yet, takes most of the time.)
+    let capped = cache.get(mesh, &|x| going(0.5 * x))?;
+    let (closed, bvh) = (&capped.mesh, &capped.bvh);
+    if !going(0.5) {
         return None;
     }
-    let bvh = Bvh::build(&closed);
     let start_x = closed.bounds().min.x - 1.0;
     let rows: Vec<(usize, usize)> = (0..nz).flat_map(|k| (0..ny).map(move |j| (j, k))).filter(|&(j, k)| (0..nx).any(|i| tube[index(i, j, k)])).collect();
     let inside_rows: Vec<Vec<(f64, f64)>> = rows
@@ -427,7 +583,7 @@ pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: 
             // Nudged off the grid, so a ray does not run exactly along an edge.
             let c = at(0, j, k) + DVec3::new(0.0, 0.000_37 * v, 0.000_61 * v);
             let mut hits = Vec::new();
-            bvh.raycast_all(&closed, &Ray::new(DVec3::new(start_x, c.y, c.z), DVec3::X), &mut hits);
+            bvh.raycast_all(closed, &Ray::new(DVec3::new(start_x, c.y, c.z), DVec3::X), &mut hits);
             let mut ts: Vec<f64> = hits.iter().map(|h| start_x + h.t).collect();
             ts.sort_by(f64::total_cmp);
             ts.dedup_by(|x, y| (*x - *y).abs() < 1e-9);
@@ -446,7 +602,13 @@ pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: 
             }
         }
     }
+    if !going(0.7) {
+        return None;
+    }
     let depth: Vec<f32> = mm_segment::ops::distance_sq(dims, &outside, [v; 3]).into_iter().map(|d| d.sqrt() as f32).collect();
+    if !going(0.75) {
+        return None;
+    }
     // The deepest lumen voxel near a point.
     let deepest = |p: DVec3, r: f64| -> Option<usize> {
         let (bl, bh) = ((p - DVec3::splat(r) - lo) / v, (p + DVec3::splat(r) - lo) / v);
@@ -505,7 +667,7 @@ pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: 
             }
         }
     }
-    if prev[to] == u32::MAX && to != from {
+    if (prev[to] == u32::MAX && to != from) || !going(0.85) {
         return None;
     }
     let mut cells = vec![to];
@@ -517,7 +679,7 @@ pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: 
     let deep: Vec<f64> = cells.iter().map(|&x| depth[x] as f64).collect();
     // Smoothed over about half the local depth (the voxel path is a staircase), unless that
     // takes a point much nearer the wall.
-    let wall = |p: DVec3| bvh.nearest(&closed, p, f64::INFINITY).map_or(0.0, |h| h.dist_sq.sqrt());
+    let wall = |p: DVec3| bvh.nearest(closed, p, f64::INFINITY).map_or(0.0, |h| h.dist_sq.sqrt());
     let m = raw.len();
     let mut pts = raw.clone();
     for _ in 0..3 {
@@ -530,7 +692,7 @@ pub fn inscribed_path(mesh: &Mesh, guide: &[DVec3], radii: &[f64], a: DVec3, b: 
     let pts: Vec<DVec3> = (0..m).into_par_iter().map(|i| if wall(pts[i]) < 0.6 * deep[i] { raw[i] } else { pts[i] }).collect();
     // Each point then climbs, within its cross-section, to where the wall is farthest (steps
     // halving from a voxel), so the centring is finer than the grid.
-    let nearest = |p: DVec3| bvh.nearest(&closed, p, f64::INFINITY).map(|h| h.point);
+    let nearest = |p: DVec3| bvh.nearest(closed, p, f64::INFINITY).map(|h| h.point);
     let points: Vec<DVec3> = (0..m)
         .into_par_iter()
         .map(|i| {
@@ -591,6 +753,95 @@ mod tests {
         }
         let narrowest = path.radii.iter().copied().fold(f64::INFINITY, f64::min);
         assert!((narrowest - 0.8).abs() < 0.1, "narrowest {narrowest:.2}");
+    }
+
+    #[test]
+    fn a_kept_capping_gives_the_same_path() {
+        let bump = |z: f64| (-((z - 30.0) / 4.0).powi(2)).exp();
+        let centre = move |z: f64| DVec3::new(2.5 * bump(z), 0.0, z);
+        let zs: Vec<f64> = (0..=240).map(|k| 0.25 * k as f64).collect();
+        let m = mm_core::primitives::tube_along(&zs.iter().map(|&z| centre(z)).collect::<Vec<_>>(), &zs.iter().map(|&z| 3.0 - 2.2 * bump(z)).collect::<Vec<_>>(), 48);
+        let guide: Vec<DVec3> = (8..=52).map(|z| DVec3::new(0.0, 0.0, z as f64)).collect();
+        let radii = vec![3.0; guide.len()];
+        let bits = |p: &InscribedPath| (p.points.iter().map(|q| q.to_array().map(f64::to_bits)).collect::<Vec<_>>(), p.radii.iter().map(|r| r.to_bits()).collect::<Vec<_>>());
+        let cache = CappedCache::default();
+        // Filled by the first path, used by the next (other ends too); each the uncached path.
+        for (a, b) in [(16.0, 44.0), (20.0, 40.0), (16.0, 44.0)] {
+            let kept = inscribed_path_with(&m, &cache, &guide, &radii, centre(a), centre(b), None).unwrap();
+            assert_eq!(bits(&kept), bits(&inscribed_path(&m, &guide, &radii, centre(a), centre(b)).unwrap()));
+        }
+        let always = |_: f32| true;
+        let first = cache.get(&m, &always).unwrap();
+        assert!(Arc::ptr_eq(&first, &cache.get(&m, &always).unwrap()), "kept, not built again");
+        // Another shape takes the entry's place.
+        let mut moved = m.clone();
+        moved.transform(|p| p + DVec3::X);
+        let shifted: Vec<DVec3> = guide.iter().map(|&p| p + DVec3::X).collect();
+        let kept = inscribed_path_with(&moved, &cache, &shifted, &radii, centre(16.0) + DVec3::X, centre(44.0) + DVec3::X, None).unwrap();
+        assert_eq!(bits(&kept), bits(&inscribed_path(&moved, &shifted, &radii, centre(16.0) + DVec3::X, centre(44.0) + DVec3::X).unwrap()));
+        assert!(!Arc::ptr_eq(&first, &cache.get(&moved, &always).unwrap()));
+        // A path no longer wanted stops (at each step, building or not) and keeps nothing.
+        // (The capped surface is built over 0..0.15, and kept once built.)
+        for stop_at in [0.0, 0.1, 0.4, 0.6, 0.72, 0.8] {
+            let fresh = CappedCache::default();
+            let going = |x: f32| x < stop_at;
+            assert!(inscribed_path_with(&m, &fresh, &guide, &radii, centre(16.0), centre(44.0), Some(&going)).is_none(), "stopped at {stop_at}");
+            let entry = &fresh.lock().entry;
+            assert!(if stop_at < 0.15 { matches!(entry, CappedEntry::Empty) } else { matches!(entry, CappedEntry::Ready { capped: Some(_), .. }) });
+        }
+    }
+
+    #[test]
+    fn the_capped_cache_is_built_outside_its_lock_once_per_shape() {
+        let m = primitives::tube_along(&[DVec3::ZERO, DVec3::Z * 10.0], &[2.0, 2.0], 24);
+        let mut moved = m.clone();
+        moved.transform(|p| p + DVec3::X);
+        let always = |_: f32| true;
+        let cache = CappedCache::default();
+        let kept = |mesh: &Mesh| matches!(&cache.lock().entry, CappedEntry::Ready { version, .. } if *version == mesh.shape_version());
+        type Held<'s> = (std::thread::ScopedJoinHandle<'s, Option<Arc<Capped>>>, std::sync::mpsc::Sender<()>);
+        // A build of `mesh` held part way, on a thread of its own: released by sending on the
+        // channel returned.
+        fn held<'s>(s: &'s std::thread::Scope<'s, '_>, cache: &CappedCache, mesh: &Mesh) -> Held<'s> {
+            let (at_tx, at_rx) = std::sync::mpsc::channel::<()>();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let mesh = mesh.clone();
+            let cache = cache.clone();
+            let h = s.spawn(move || {
+                let hold = |x: f32| {
+                    if x > 0.0 {
+                        let _ = at_tx.send(());
+                        let _ = go_rx.recv();
+                    }
+                    true
+                };
+                cache.get(&mesh, &hold)
+            });
+            at_rx.recv().unwrap();
+            (h, go_tx)
+        }
+        std::thread::scope(|s| {
+            // A caller for the same shape waits for the build under way and gets what it built.
+            let (a, go) = held(s, &cache, &m);
+            let waiter = s.spawn(|| cache.get(&m, &always));
+            std::thread::sleep(Duration::from_millis(50));
+            go.send(()).unwrap();
+            let built = a.join().unwrap().unwrap();
+            assert!(Arc::ptr_eq(&built, &waiter.join().unwrap().unwrap()));
+            assert!(kept(&m));
+            // A caller for another shape does not wait for a build under way (held until after
+            // it), and the build it replaced is not kept.
+            let (b, go) = held(s, &cache, &moved);
+            let other = cache.get(&m, &always).unwrap();
+            assert!(!Arc::ptr_eq(&other, &built));
+            go.send(()).unwrap();
+            assert!(b.join().unwrap().is_some());
+            assert!(kept(&m) && Arc::ptr_eq(&other, &cache.get(&m, &always).unwrap()));
+        });
+        // A cancelled build leaves the entry empty; the next caller builds it.
+        assert!(cache.get(&moved, &|x: f32| x < 0.2).is_none());
+        assert!(matches!(cache.lock().entry, CappedEntry::Empty));
+        assert!(cache.get(&moved, &always).is_some() && kept(&moved));
     }
 
     #[test]

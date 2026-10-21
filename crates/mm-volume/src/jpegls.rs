@@ -196,16 +196,30 @@ impl<'a> Bits<'a> {
         ((self.cache >> self.count) & ((1u64 << n) - 1)) as i32
     }
 
-    /// Zeros before the next 1 (which is consumed).
+    /// Zeros before the next 1 (which is consumed). The zeros are counted a cache at a time
+    /// rather than bit by bit; more than 64 of them is corrupt data, as before.
     fn unary(&mut self) -> Result<u32> {
         let mut q = 0;
-        while !self.bit() {
-            q += 1;
+        loop {
+            if self.count == 0 {
+                self.fill();
+            }
+            // The unread bits, first one at the top (`count` is 1 to 64 here).
+            let lz = (self.cache << (64 - self.count)).leading_zeros();
+            if lz < self.count {
+                self.count -= lz + 1;
+                q += lz;
+                if q > 64 {
+                    bail!("corrupt JPEG-LS data");
+                }
+                return Ok(q);
+            }
+            q += self.count;
+            self.count = 0;
             if q > 64 {
                 bail!("corrupt JPEG-LS data");
             }
         }
-        Ok(q)
     }
 
     /// A Golomb-coded value with the length limit of T.87 A.5.3.
@@ -536,7 +550,8 @@ pub fn decode(data: &[u8]) -> Result<Image> {
                     _ => bail!("unknown JPEG-LS interleave mode {ilv}"),
                 }
                 let nc = planes.len();
-                let samples = (0..w * h).flat_map(|i| planes.iter().map(move |p| p[i] as u16)).collect::<Vec<_>>();
+                // One component needs no interleaving.
+                let samples = if nc == 1 { planes[0].iter().map(|&p| p as u16).collect() } else { (0..w * h).flat_map(|i| planes.iter().map(move |p| p[i] as u16)).collect::<Vec<_>>() };
                 out = Some(Image { width: w, height: h, components: nc, bits, samples });
             }
             0xd8 | 0x01 | 0xd0..=0xd7 => {}
@@ -574,5 +589,54 @@ mod tests {
         }
         assert!(decode(b"\xff\xd8\xff\xd9").is_err());
         assert!(decode(b"junk").is_err());
+    }
+
+    /// The bit-by-bit count of zeros the decoder used before.
+    fn unary_by_bits(b: &mut Bits) -> Result<u32> {
+        let mut q = 0;
+        while !b.bit() {
+            q += 1;
+            if q > 64 {
+                bail!("corrupt JPEG-LS data");
+            }
+        }
+        Ok(q)
+    }
+
+    #[test]
+    fn unary_codes_match_bit_by_bit_reading() {
+        // Random streams heavy in zero bytes (long runs), 0xFF bytes (stuffed bits) and markers,
+        // read as unary codes and plain values in turn, both ways: the codes, the errors and
+        // everything left to read must agree.
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for round in 0..3000 {
+            let len = 1 + (rnd() % 160) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| match rnd() % 10 {
+                    0..=4 => 0,
+                    5 => 0xff,
+                    6 => 0x80 | rnd() as u8,
+                    _ => rnd() as u8,
+                })
+                .collect();
+            let (mut a, mut b) = (Bits::new(&data), Bits::new(&data));
+            for _ in 0..300 {
+                match (a.unary(), unary_by_bits(&mut b)) {
+                    (Ok(x), Ok(y)) => assert_eq!(x, y, "round {round}"),
+                    (Err(_), Err(_)) => break,
+                    (x, y) => panic!("round {round}: {x:?} / {y:?}"),
+                }
+                let unread = |b: &Bits| (b.count, b.pos, b.data.len(), b.prev_ff, if b.count == 0 { 0 } else { b.cache << (64 - b.count) });
+                assert_eq!(unread(&a), unread(&b), "round {round}");
+                let n = (rnd() % 17) as u32;
+                assert_eq!(a.value(n), b.value(n));
+            }
+        }
     }
 }

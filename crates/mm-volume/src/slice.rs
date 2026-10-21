@@ -47,6 +47,21 @@ pub fn load_raw(v: &Volume, max_voxels: usize) -> Result<VolumeData> {
 /// Load 3D volume `t` of a raw-format volume: the `t`-th component when components are
 /// interleaved per voxel, else the `t`-th block of a 4D file.
 pub fn load_raw_at(v: &Volume, t: usize, max_voxels: usize) -> Result<VolumeData> {
+    load_raw_into(v, t, max_voxels, &|_| true)
+}
+
+/// About how many bytes [`load_raw_into`] reads and decodes at a time.
+const RAW_STEP: usize = 4 << 20;
+
+/// [`load_raw_at`], reading and decoding about 4 MB at a time (so only the values are held
+/// whole, not the file's bytes as well). `progress` gets 0.1 to 1 as the data come in;
+/// returning `false` cancels.
+pub(crate) fn load_raw_into(v: &Volume, t: usize, max_voxels: usize, progress: &(dyn Fn(f32) -> bool + Sync)) -> Result<VolumeData> {
+    load_raw_stepped(v, t, max_voxels, progress, RAW_STEP)
+}
+
+/// [`load_raw_into`] with about `step` bytes per step.
+fn load_raw_stepped(v: &Volume, t: usize, max_voxels: usize, progress: &(dyn Fn(f32) -> bool + Sync), step: usize) -> Result<VolumeData> {
     let Voxels::Raw { file, file_offset, gzip, skip, interleave, dtype, big_endian, slope, intercept } = &v.voxels else { bail!("not a raw-format volume") };
     let g = v.geometry.as_ref().context("no geometry")?;
     let dims = [g.dims[0], g.dims[1], g.dims[2]];
@@ -77,35 +92,78 @@ pub fn load_raw_at(v: &Volume, t: usize, max_voxels: usize) -> Result<VolumeData
     if to_skip > 0 {
         std::io::copy(&mut reader.by_ref().take(to_skip), &mut std::io::sink())?;
     }
-    // Interleaved: read whole voxels from component t on (the last voxel may stop short).
-    let mut bytes = vec![0u8; n * stride * size];
-    let want = if stride > 1 { n * stride * size - before } else { n * size };
-    reader.read_exact(&mut bytes[..want]).context("the file ends before its data does")?;
-    let mut values = decode(&bytes, *dtype, *big_endian, stride);
-    if *slope != 1.0 || *intercept != 0.0 {
-        for x in &mut values {
-            *x = (*x as f64 * slope + intercept) as f32;
+    let rescale = |values: &mut [f32]| {
+        if *slope != 1.0 || *intercept != 0.0 {
+            for x in values {
+                *x = (*x as f64 * slope + intercept) as f32;
+            }
+        }
+    };
+    let short = "the file ends before its data does";
+    let mut values: Vec<f32>;
+    if *dtype == DataType::F32 && !*big_endian && stride == 1 && cfg!(target_endian = "little") {
+        // Little-endian floats on a little-endian machine: the file's bytes are the values.
+        values = vec![0.0f32; n];
+        let mut done = 0;
+        while done < n {
+            let m = (step / 4).max(1).min(n - done);
+            let part = &mut values[done..done + m];
+            // SAFETY: the bytes of `m` initialised f32s, every bit pattern of which is a valid f32.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(part.as_mut_ptr().cast::<u8>(), m * 4) };
+            reader.read_exact(bytes).context(short)?;
+            rescale(part);
+            done += m;
+            if !progress(0.1 + 0.9 * done as f32 / n as f32) {
+                bail!("cancelled");
+            }
+        }
+    } else {
+        // Whole records of `stride` values, so a step never splits a voxel. Interleaved data are
+        // read from component t on, so the last record stops `before` bytes short (left zero).
+        let record = stride * size;
+        let want = if stride > 1 { n * record - before } else { n * size };
+        let per_step = (step / record).max(1);
+        let mut buf = vec![0u8; per_step.min(n) * record];
+        values = Vec::with_capacity(n);
+        let mut done = 0;
+        while done < n {
+            let m = per_step.min(n - done);
+            let chunk = &mut buf[..m * record];
+            let read = (want - done * record).min(m * record);
+            reader.read_exact(&mut chunk[..read]).context(short)?;
+            chunk[read..].fill(0);
+            let from = values.len();
+            decode_into(chunk, *dtype, *big_endian, stride, &mut values);
+            rescale(&mut values[from..]);
+            done += m;
+            if !progress(0.1 + 0.9 * done as f32 / n as f32) {
+                bail!("cancelled");
+            }
         }
     }
     Ok(VolumeData { dims, values })
 }
 
-/// Values of component 0 of every `stride`-th voxel.
-fn decode(bytes: &[u8], t: DataType, big: bool, stride: usize) -> Vec<f32> {
+/// Append the values of component 0 of every `stride`-th voxel in `bytes` to `out`.
+fn decode_into(bytes: &[u8], t: DataType, big: bool, stride: usize, out: &mut Vec<f32>) {
     let size = t.size();
-    let voxel = |k: usize| &bytes[k * stride * size..k * stride * size + size];
-    let n = bytes.len() / (size * stride);
+    let records = bytes.chunks_exact(size * stride);
+    // Values one after the other (no interleave) are read in fixed-size pieces, which the
+    // compiler turns into much faster code.
     macro_rules! num {
-        ($ty:ty) => {
-            (0..n).map(|k| {
-                let b: [u8; std::mem::size_of::<$ty>()] = voxel(k).try_into().unwrap();
-                (if big { <$ty>::from_be_bytes(b) } else { <$ty>::from_le_bytes(b) }) as f32
-            }).collect()
-        };
+        ($ty:ty) => {{
+            const S: usize = std::mem::size_of::<$ty>();
+            let value = |b: [u8; S]| (if big { <$ty>::from_be_bytes(b) } else { <$ty>::from_le_bytes(b) }) as f32;
+            if stride == 1 {
+                out.extend(bytes.chunks_exact(S).map(|r| value(r.try_into().unwrap())))
+            } else {
+                out.extend(records.map(|r| value(r[..S].try_into().unwrap())))
+            }
+        }};
     }
     match t {
-        DataType::U8 => (0..n).map(|k| voxel(k)[0] as f32).collect(),
-        DataType::I8 => (0..n).map(|k| voxel(k)[0] as i8 as f32).collect(),
+        DataType::U8 => out.extend(records.map(|r| r[0] as f32)),
+        DataType::I8 => out.extend(records.map(|r| r[0] as i8 as f32)),
         DataType::U16 => num!(u16),
         DataType::I16 => num!(i16),
         DataType::U32 => num!(u32),
@@ -114,20 +172,15 @@ fn decode(bytes: &[u8], t: DataType, big: bool, stride: usize) -> Vec<f32> {
         DataType::I64 => num!(i64),
         DataType::F32 => num!(f32),
         DataType::F64 => num!(f64),
-        DataType::Rgb24 | DataType::Rgba32 => (0..n).map(|k| {
-            let p = voxel(k);
-            0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32
-        }).collect(),
-        DataType::Complex64 => (0..n).map(|k| {
-            let p = voxel(k);
+        DataType::Rgb24 | DataType::Rgba32 => out.extend(records.map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)),
+        DataType::Complex64 => out.extend(records.map(|p| {
             let f = |o: usize| { let b: [u8; 4] = p[o..o + 4].try_into().unwrap(); if big { f32::from_be_bytes(b) } else { f32::from_le_bytes(b) } };
             f(0).hypot(f(4))
-        }).collect(),
-        DataType::Complex128 => (0..n).map(|k| {
-            let p = voxel(k);
+        })),
+        DataType::Complex128 => out.extend(records.map(|p| {
             let f = |o: usize| { let b: [u8; 8] = p[o..o + 8].try_into().unwrap(); if big { f64::from_be_bytes(b) } else { f64::from_le_bytes(b) } };
             f(0).hypot(f(8)) as f32
-        }).collect(),
+        })),
     }
 }
 
@@ -245,10 +298,21 @@ pub fn auto_window(values: &[f32]) -> (f64, f64) {
     if zeros * 2 > v.len() && zeros < v.len() {
         v.retain(|&x| x != 0.0);
     }
-    v.sort_by(f32::total_cmp);
-    let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize] as f64;
-    let (lo, hi) = (q(0.01), q(0.99));
-    let (lo, hi) = if hi > lo { (lo, hi) } else { (v[0] as f64, *v.last().unwrap() as f64 + 1.0) };
+    // The two percentiles by selection rather than a full sort. total_cmp orders every value,
+    // so the value selected at a rank is the one sorting would put there.
+    let rank = |p: f64| ((v.len() - 1) as f64 * p).round() as usize;
+    let (r_lo, r_hi) = (rank(0.01), rank(0.99));
+    let hi = *v.select_nth_unstable_by(r_hi, f32::total_cmp).1;
+    // Everything before rank r_hi is now at most `hi`, so rank r_lo is found among those.
+    let lo = if r_lo < r_hi { *v[..r_hi].select_nth_unstable_by(r_lo, f32::total_cmp).1 } else { hi };
+    let (lo, hi) = (lo as f64, hi as f64);
+    let (lo, hi) = if hi > lo {
+        (lo, hi)
+    } else {
+        let min = v.iter().copied().min_by(f32::total_cmp).unwrap();
+        let max = v.iter().copied().max_by(f32::total_cmp).unwrap();
+        (min as f64, max as f64 + 1.0)
+    };
     ((lo + hi) * 0.5, hi - lo)
 }
 
@@ -268,12 +332,20 @@ pub fn raw_slice(v: &Volume, data: &VolumeData, k: usize) -> Result<SliceImage> 
 
 /// Decode slice `k` of a DICOM volume.
 pub fn dicom_slice(v: &Volume, k: usize) -> Result<SliceImage> {
+    let Voxels::Dicom { slices } = &v.voxels else { bail!("not a DICOM volume") };
+    let (path, _) = slices.get(k).context("slice out of range")?;
+    let obj = dicom_object::open_file(path).with_context(|| format!("cannot read {}", path.display()))?;
+    dicom_slice_from(&obj, v, k)
+}
+
+/// Decode slice `k` of a DICOM volume from its file, already open (so a multi-frame file can
+/// stay open while its slices are shown one after another).
+pub fn dicom_slice_from(obj: &dicom_object::DefaultDicomObject, v: &Volume, k: usize) -> Result<SliceImage> {
     use dicom_pixeldata::PixelDecoder;
     let Voxels::Dicom { slices } = &v.voxels else { bail!("not a DICOM volume") };
-    let (path, frame) = slices.get(k).context("slice out of range")?;
-    let obj = dicom_object::open_file(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let (_, frame) = slices.get(k).context("slice out of range")?;
     let (nx, ny, grey) = if crate::dicom::is_jpegls(obj.meta().transfer_syntax()) {
-        crate::dicom::jpegls_frame(&obj, *frame)?
+        crate::dicom::jpegls_frame(obj, *frame)?
     } else {
         let px = obj.decode_pixel_data_frame(*frame).map_err(|e| anyhow::anyhow!("cannot decode the pixels: {e}"))?;
         let (nx, ny) = (px.columns() as usize, px.rows() as usize);
@@ -437,5 +509,209 @@ mod tests {
         let g = to_grey8(&s, (50.0, 100.0));
         assert_eq!((g[0], g[2]), (255, 0));
         assert!((127..=128).contains(&g[1]));
+    }
+
+    /// The window as it was computed before, by sorting.
+    fn sorted_window(values: &[f32]) -> (f64, f64) {
+        let mut v: Vec<f32> = values.iter().copied().filter(|x| x.is_finite()).collect();
+        if v.is_empty() {
+            return (0.5, 1.0);
+        }
+        let zeros = v.iter().filter(|&&x| x == 0.0).count();
+        if zeros * 2 > v.len() && zeros < v.len() {
+            v.retain(|&x| x != 0.0);
+        }
+        v.sort_by(f32::total_cmp);
+        let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize] as f64;
+        let (lo, hi) = (q(0.01), q(0.99));
+        let (lo, hi) = if hi > lo { (lo, hi) } else { (v[0] as f64, *v.last().unwrap() as f64 + 1.0) };
+        ((lo + hi) * 0.5, hi - lo)
+    }
+
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed | 1;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        }
+    }
+
+    #[test]
+    fn windows_by_selection_match_sorting() {
+        let mut r = rng(17);
+        let mut cases: Vec<Vec<f32>> = vec![vec![], vec![3.0], vec![2.0, 1.0], vec![0.0, -0.0, 0.0], vec![-0.0, 0.0, 5.0], vec![f32::NAN, 3.0, f32::INFINITY], vec![7.0; 100], vec![-0.0; 9]];
+        for n in [2usize, 3, 7, 50, 99, 100, 101, 1000, 4321] {
+            for kind in 0..6 {
+                cases.push((0..n).map(|k| match kind {
+                    0 => (r() % 4096) as f32,
+                    1 => if k % 3 == 0 { 0.0 } else { (r() % 900) as f32 + 300.0 },
+                    2 => match r() % 5 { 0 => 0.0, 1 => -0.0, 2 => (r() % 3) as f32, _ => (r() >> 40) as f32 * 1e-3 - 5.0 },
+                    3 => f32::from_bits(r() as u32),
+                    4 => ((r() % 7) as f32 - 3.0) * 0.5,
+                    _ => if r().is_multiple_of(50) { (r() % 100) as f32 } else { 0.0 },
+                }).collect());
+            }
+        }
+        for v in &cases {
+            let (a, b) = (sorted_window(v), auto_window(v));
+            assert!(a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits(), "{} values: {a:?} / {b:?}", v.len());
+        }
+    }
+
+    /// How values were decoded before.
+    fn old_decode(bytes: &[u8], t: DataType, big: bool, stride: usize) -> Vec<f32> {
+        let size = t.size();
+        let voxel = |k: usize| &bytes[k * stride * size..k * stride * size + size];
+        let n = bytes.len() / (size * stride);
+        macro_rules! num {
+            ($ty:ty) => {
+                (0..n).map(|k| {
+                    let b: [u8; std::mem::size_of::<$ty>()] = voxel(k).try_into().unwrap();
+                    (if big { <$ty>::from_be_bytes(b) } else { <$ty>::from_le_bytes(b) }) as f32
+                }).collect()
+            };
+        }
+        match t {
+            DataType::U8 => (0..n).map(|k| voxel(k)[0] as f32).collect(),
+            DataType::I8 => (0..n).map(|k| voxel(k)[0] as i8 as f32).collect(),
+            DataType::U16 => num!(u16),
+            DataType::I16 => num!(i16),
+            DataType::U32 => num!(u32),
+            DataType::I32 => num!(i32),
+            DataType::U64 => num!(u64),
+            DataType::I64 => num!(i64),
+            DataType::F32 => num!(f32),
+            DataType::F64 => num!(f64),
+            DataType::Rgb24 | DataType::Rgba32 => (0..n).map(|k| {
+                let p = voxel(k);
+                0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32
+            }).collect(),
+            DataType::Complex64 => (0..n).map(|k| {
+                let p = voxel(k);
+                let f = |o: usize| { let b: [u8; 4] = p[o..o + 4].try_into().unwrap(); if big { f32::from_be_bytes(b) } else { f32::from_le_bytes(b) } };
+                f(0).hypot(f(4))
+            }).collect(),
+            DataType::Complex128 => (0..n).map(|k| {
+                let p = voxel(k);
+                let f = |o: usize| { let b: [u8; 8] = p[o..o + 8].try_into().unwrap(); if big { f64::from_be_bytes(b) } else { f64::from_le_bytes(b) } };
+                f(0).hypot(f(8)) as f32
+            }).collect(),
+        }
+    }
+
+    /// Volume `t` read as before: the whole data into one buffer, then decoded.
+    fn whole_read(v: &Volume, t: usize) -> Result<VolumeData> {
+        let Voxels::Raw { file, file_offset, gzip, skip, interleave, dtype, big_endian, slope, intercept } = &v.voxels else { bail!("not raw") };
+        let g = v.geometry.as_ref().unwrap();
+        let dims = [g.dims[0], g.dims[1], g.dims[2]];
+        let n = dims.iter().product::<usize>();
+        let (stride, size) = ((*interleave).max(1), dtype.size());
+        let before = if stride > 1 { t.min(stride - 1) * size } else { t * n * size };
+        let mut f = std::fs::File::open(file)?;
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(*file_offset))?;
+        let mut buffered = std::io::BufReader::new(f);
+        let mut reader: Box<dyn Read> = if !*gzip {
+            Box::new(buffered)
+        } else if std::io::BufRead::fill_buf(&mut buffered)?.starts_with(&[0x1f, 0x8b]) {
+            Box::new(flate2::read::MultiGzDecoder::new(buffered))
+        } else {
+            Box::new(flate2::read::ZlibDecoder::new(buffered))
+        };
+        std::io::copy(&mut reader.by_ref().take(*skip + before as u64), &mut std::io::sink())?;
+        let mut bytes = vec![0u8; n * stride * size];
+        let want = if stride > 1 { n * stride * size - before } else { n * size };
+        reader.read_exact(&mut bytes[..want]).context("the file ends before its data does")?;
+        let mut values = old_decode(&bytes, *dtype, *big_endian, stride);
+        if *slope != 1.0 || *intercept != 0.0 {
+            for x in &mut values {
+                *x = (*x as f64 * slope + intercept) as f32;
+            }
+        }
+        Ok(VolumeData { dims, values })
+    }
+
+    #[test]
+    fn raw_volumes_read_in_steps_match_one_whole_read() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("mmv-steps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = rng(5);
+        let dims = [37usize, 23, 5];
+        let n = dims.iter().product::<usize>();
+        let types = [DataType::U8, DataType::I8, DataType::U16, DataType::I16, DataType::U32, DataType::I32, DataType::U64, DataType::I64, DataType::F32, DataType::F64, DataType::Rgb24, DataType::Rgba32, DataType::Complex64, DataType::Complex128];
+        let mut checked = 0;
+        for (case, dtype) in types.iter().copied().cycle().take(14 * 6).enumerate() {
+            let big = case % 2 == 1;
+            let (stride, volumes) = if case % 3 == 0 { (3, 3) } else { (1, 1 + case % 3) };
+            let (skip, offset) = ((case % 4) as u64 * 7, (case % 5) as u64 * 13);
+            let (slope, intercept) = if case % 4 == 1 { (0.37, -12.5) } else { (1.0, 0.0) };
+            // Random bytes (large integers, NaNs and all), cut short now and then.
+            let len = skip as usize + n * dtype.size() * if stride > 1 { stride } else { volumes };
+            let mut data: Vec<u8> = (0..len).map(|_| r() as u8).collect();
+            if case % 7 == 6 {
+                data.truncate(data.len() - 1 - (r() % 50) as usize);
+            }
+            let compress = case % 3;
+            let body = match compress {
+                0 => data,
+                1 => {
+                    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&data).unwrap();
+                    e.finish().unwrap()
+                }
+                _ => {
+                    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    e.write_all(&data).unwrap();
+                    e.finish().unwrap()
+                }
+            };
+            let p = dir.join(format!("v{case}.raw"));
+            std::fs::write(&p, [vec![0xa5u8; offset as usize], body].concat()).unwrap();
+            let mut v = volume_with([DVec3::X, DVec3::Y, DVec3::Z], Voxels::Raw { file: p, file_offset: offset, gzip: compress > 0, skip, interleave: stride, dtype, big_endian: big, slope, intercept });
+            v.geometry = Some(Geometry::from_axes([dims[0], dims[1], dims[2], volumes], [1.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO));
+            for t in 0..volumes {
+                let old = whole_read(&v, t);
+                for step in [RAW_STEP, 1000, 77, 1] {
+                    let new = load_raw_stepped(&v, t, usize::MAX, &|_| true, step);
+                    match (&old, &new) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(a.dims, b.dims);
+                            assert!(a.values.iter().zip(&b.values).all(|(x, y)| x.to_bits() == y.to_bits()) && a.values.len() == b.values.len(), "case {case} {dtype:?} t {t} step {step}");
+                        }
+                        (Err(a), Err(b)) => assert_eq!(format!("{a:#}"), format!("{b:#}"), "case {case}"),
+                        _ => panic!("case {case} {dtype:?} t {t} step {step}: {:?} / {:?}", old.as_ref().err(), new.as_ref().err()),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 300);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_loads_report_progress_and_cancel() {
+        let dir = std::env::temp_dir().join(format!("mmv-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("v.raw");
+        std::fs::write(&p, (0..12i32).flat_map(|v| (v * 100_000).to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        for dtype in [DataType::I32, DataType::F32] {
+            let v = volume_with([DVec3::X, DVec3::Y, DVec3::Z], Voxels::Raw { file: p.clone(), file_offset: 0, gzip: false, skip: 0, interleave: 1, dtype, big_endian: false, slope: 1.0, intercept: 0.0 });
+            let seen = std::sync::Mutex::new(Vec::new());
+            load_raw_stepped(&v, 0, 100, &|f| {
+                seen.lock().unwrap().push(f);
+                true
+            }, 8).unwrap();
+            let seen = seen.into_inner().unwrap();
+            assert_eq!(seen.len(), 6, "{dtype:?}");
+            assert!(seen.windows(2).all(|w| w[0] < w[1]) && (seen.last().unwrap() - 1.0).abs() < 1e-6);
+            let e = load_raw_stepped(&v, 0, 100, &|f| f < 0.5, 8).unwrap_err();
+            assert_eq!(e.to_string(), "cancelled");
+        }
+        assert_eq!(load_raw(&volume_with([DVec3::X, DVec3::Y, DVec3::Z], Voxels::Raw { file: p, file_offset: 0, gzip: false, skip: 0, interleave: 1, dtype: DataType::I32, big_endian: false, slope: 1.0, intercept: 0.0 }), 100).unwrap().values[11], 1_100_000.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

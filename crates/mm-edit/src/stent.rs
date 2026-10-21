@@ -40,9 +40,11 @@ use crate::cut::{local_plane_cut_with, CutFill, KeepSide, LocalCutResult, PlaneC
 use crate::loft::{blend_join, EndContinuity};
 use crate::util::smoothstep;
 use crate::{EditError, EditResult};
-use mm_core::{Bvh, DQuat, DVec3, Mesh, Plane, Ray};
+use mm_core::hash::{FastMap, FastSet};
+use mm_core::{Aabb, Bvh, DQuat, DVec3, Mesh, Plane, Ray};
+use std::cell::Cell;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 use rayon::prelude::*;
 use std::f64::consts::TAU;
 
@@ -592,7 +594,7 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
 pub(crate) fn relax(mesh: &Mesh, moves: &mut [(u32, DVec3)]) {
     const MOST: f64 = 1.0;
     let n = moves.len();
-    let index: HashMap<u32, usize> = moves.iter().enumerate().map(|(i, m)| (m.0, i)).collect();
+    let index: FastMap<u32, usize> = moves.iter().enumerate().map(|(i, m)| (m.0, i)).collect();
     // Each moved vertex's neighbours: moved ones by index, unmoved ones as fixed points.
     let neighbours: Vec<Vec<(Option<usize>, u32)>> = moves.iter().map(|&(v, _)| mesh.vertex_neighbors(v).map(|u| (index.get(&u).copied(), u)).collect()).collect();
     let mut shift: Vec<DVec3> = moves.iter().map(|&(v, p)| p - mesh.vertex(v)).collect();
@@ -770,28 +772,46 @@ fn percentile(v: &mut [f64], q: f64) -> Option<f64> {
 /// the wall is pushed out instead. The mesh is rebuilt where the tube joins it, so vertex
 /// and triangle ids change there.
 pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Option<&[bool]>) -> EditResult<StentReport> {
+    apply_stent_with(mesh, pl, params, owner, None)
+}
+
+/// [`apply_stent`], reporting progress (0..1) to `progress`, which returns `false` to cancel:
+/// the work then stops at the next step (between the reshaping, the union, the remesh and the
+/// checks, and within the remesh) with the error "cancelled", leaving `mesh` in a valid state
+/// but part way (a superseded preview's mesh is dropped anyway).
+pub fn apply_stent_with(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Option<&[bool]>, progress: Option<&dyn Fn(f32) -> bool>) -> EditResult<StentReport> {
     check(params)?;
+    // Reported never lower than before: the fallback below goes over the same share again.
+    let last = Cell::new(0f32);
+    let report_up = |x: f32| {
+        last.set(last.get().max(x));
+        progress.is_none_or(|f| f(last.get()))
+    };
+    let all = Progress { f: progress.map(|_| &report_up as &dyn Fn(f32) -> bool), from: 0.0, to: 1.0 };
+    all.check(0.0)?;
     if params.stiffness <= 0.0 && !params.covered {
-        return reshape(mesh, pl, params, owner, true, None);
+        return reshape(mesh, pl, params, owner, true, None, all);
     }
     if params.covered {
         // The tube's rings from the native lumen, measured on the straightened vessel.
         let mut carried = mesh.clone();
-        reshape(&mut carried, pl, &StentParams { covered: false, remesh: false, ..*params }, owner, false, None)?;
+        reshape(&mut carried, pl, &StentParams { covered: false, remesh: false, ..*params }, owner, false, None, all.part(0.0, 0.2))?;
         let h = params.edge_length.unwrap_or_else(|| carried.average_edge_length());
         let frames = pl.frames(((pl.length / h).round() as usize).max(3));
         let rings = stent_rings(&carried, &frames, pl.radius, params.stiffness, h);
+        drop(carried);
+        all.check(0.25)?;
         let s = (0..frames.len()).map(|j| pl.length * j as f64 / (frames.len() - 1) as f64).collect();
         let profile = Profile { s, frames, rings };
-        let mut report = reshape(mesh, pl, params, owner, true, Some(&profile))?;
+        let mut report = reshape(mesh, pl, params, owner, true, Some(&profile), all.part(0.25, 1.0))?;
         // The lumen along a covered stent is its tube (the 10th percentile around each ring).
         report.narrowest[1] = profile.rings.iter().filter_map(|ring| percentile(&mut ring.radii.clone(), 0.1)).fold(f64::INFINITY, f64::min);
         return Ok(report);
     }
     // Straightened only, then opened by the stent's tube.
     let mut carried = mesh.clone();
-    let mut report = reshape(&mut carried, pl, params, owner, false, None)?;
-    match open_with_tube(&mut carried, pl, params) {
+    let mut report = reshape(&mut carried, pl, params, owner, false, None, all.part(0.0, 0.25))?;
+    match open_with_tube(&mut carried, pl, params, all.part(0.25, 1.0)) {
         Ok(None) => {
             *mesh = carried;
             Ok(report)
@@ -802,7 +822,7 @@ pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, o
             let pad = DVec3::splat(opened.reach);
             let (lo, hi) = opened.centre.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &p| (a.min(p - pad), b.max(p + pad)));
             let near = |p: DVec3| p.cmpge(lo).all() && p.cmple(hi).all() && opened.centre.windows(2).any(|w| point_segment_distance(p, w[0], w[1]) < opened.reach);
-            report.source_triangles.extend(mesh.triangle_ids().filter(|&t| mesh.tri_positions(t).iter().any(|&p| near(p))));
+            report.source_triangles.extend(live_triangles_where(mesh, |t| mesh.tri_positions(t).iter().any(|&p| near(p))));
             report.source_triangles.sort_unstable();
             report.source_triangles.dedup();
             *mesh = carried;
@@ -812,12 +832,69 @@ pub fn apply_stent(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, o
             report.triangles = opened.triangles;
             Ok(report)
         }
+        // A cancelled union is not a failed one: nothing is pushed out instead.
+        Err(e) if is_cancelled(&e) || !all.at(0.5) => Err(cancelled()),
         Err(e) => {
-            let mut report = reshape(mesh, pl, params, owner, true, None)?;
+            drop(carried);
+            let mut report = reshape(mesh, pl, params, owner, true, None, all.part(0.25, 1.0))?;
             report.pushed = Some(e.to_string());
             Ok(report)
         }
     }
+}
+
+/// The caller's progress callback over a share (`from`..`to`) of the work, as a check for
+/// cancellation between steps.
+#[derive(Clone, Copy)]
+struct Progress<'a> {
+    f: Option<&'a dyn Fn(f32) -> bool>,
+    from: f32,
+    to: f32,
+}
+
+impl Progress<'_> {
+    /// Report `x` (0..1) of this share; `false` once the work is cancelled.
+    fn at(&self, x: f32) -> bool {
+        self.f.is_none_or(|f| f(self.from + (self.to - self.from) * x.clamp(0.0, 1.0)))
+    }
+
+    /// [`Progress::at`] as a result: the "cancelled" error once cancelled.
+    fn check(&self, x: f32) -> EditResult<()> {
+        if self.at(x) {
+            Ok(())
+        } else {
+            Err(cancelled())
+        }
+    }
+
+    /// The share `a`..`b` of this one.
+    fn part(&self, a: f32, b: f32) -> Self {
+        let at = |x: f32| self.from + (self.to - self.from) * x;
+        Progress { f: self.f, from: at(a), to: at(b) }
+    }
+}
+
+fn cancelled() -> EditError {
+    EditError::Failed("cancelled".into())
+}
+
+fn is_cancelled(e: &EditError) -> bool {
+    matches!(e, EditError::Failed(s) if s == "cancelled")
+}
+
+/// Remesh with the progress reported over `p`'s share; `None` where it was cancelled.
+fn remesh_within(mesh: &mut Mesh, params: &mm_remesh::RemeshParams, p: Progress) -> Option<Result<mm_remesh::RemeshReport, mm_remesh::RemeshError>> {
+    let sub = |x: f32| p.at(x);
+    let r = mm_remesh::remesh(mesh, params, p.f.map(|_| &sub as &dyn Fn(f32) -> bool));
+    match r {
+        Ok(rep) if rep.cancelled => None,
+        r => Some(r),
+    }
+}
+
+/// The live triangles for which `keep` holds, in id order (found in parallel).
+fn live_triangles_where(m: &Mesh, keep: impl Fn(u32) -> bool + Sync) -> Vec<u32> {
+    (0..m.max_tid() as u32).into_par_iter().filter(|&t| m.is_triangle(t) && keep(t)).collect()
 }
 
 fn point_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
@@ -863,7 +940,7 @@ fn stent_rings(mesh: &Mesh, frames: &[[DVec3; 4]], r: f64, st: f64, h: f64) -> V
     let near: Vec<u32> = {
         let pad = DVec3::splat(2.0 * r);
         let (lo, hi) = frames.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), f| (a.min(f[0] - pad), b.max(f[0] + pad)));
-        mesh.triangle_ids().filter(|&t| mesh.tri_positions(t).iter().any(|p| p.cmpge(lo).all() && p.cmple(hi).all())).collect()
+        live_triangles_where(mesh, |t| mesh.tri_positions(t).iter().any(|p| p.cmpge(lo).all() && p.cmple(hi).all()))
     };
     let bvh = Bvh::build_subset(mesh, &near);
     let walls: Vec<Vec<f64>> = frames
@@ -949,8 +1026,10 @@ struct TubeOpening {
 ///
 /// The mesh's open ends are capped for the union and opened again after. `None`: the tube
 /// lies inside the lumen everywhere (nothing to open). Errors where the union fails or the
-/// tube reaches an open end.
-fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) -> EditResult<Option<TubeOpening>> {
+/// tube reaches an open end. Cancelled through `p` between its steps.
+fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, p: Progress) -> EditResult<Option<TubeOpening>> {
+    // (Checked between the steps over the whole mesh, a few tens of ms each on a big one.)
+    p.check(0.0)?;
     let (r, length, st) = (pl.radius, pl.length, params.stiffness);
     // The tube eases into the wall over the end blend and ends there: nothing beyond changes.
     let blend = params.end_blend;
@@ -964,7 +1043,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     let (bmin, bmax) = pl.axis[lo..hi].iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &p| (a.min(p), b.max(p)));
     let (bmin, bmax) = (bmin - pad, bmax + pad);
     let in_box = |m: &Mesh, t: u32| m.tri_positions(t).iter().any(|p| p.cmpge(bmin).all() && p.cmple(bmax).all());
-    let boxed: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t)).collect();
+    let boxed: Vec<u32> = live_triangles_where(mesh, |t| in_box(mesh, t));
     if boxed.is_empty() {
         return Ok(None);
     }
@@ -1001,14 +1080,14 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     };
     let near_tube = |m: &Mesh, off: &[f64], t: u32| m.triangle(t).iter().any(|&v| off.get(v as usize).is_some_and(|&d| d < reach));
     let off = off_all(mesh, &boxed);
+    p.check(0.01)?;
     // Zero-area and microscopic triangles near the stent fixed first (a union cannot place
     // them, and their coincident corners could not be told apart after it).
     let tiny = 1e-6 * r;
     for _ in 0..4 {
         let mut fixed = false;
-        let short: Vec<(u32, u32)> = mesh
-            .triangle_ids()
-            .filter(|&t| in_box(mesh, t) && near_tube(mesh, &off, t))
+        let short: Vec<(u32, u32)> = live_triangles_where(mesh, |t| in_box(mesh, t) && near_tube(mesh, &off, t))
+            .into_iter()
             .flat_map(|t| {
                 let tv = mesh.triangle(t);
                 [(tv[0], tv[1]), (tv[1], tv[2]), (tv[2], tv[0])]
@@ -1024,7 +1103,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
                 }
             }
         }
-        let degenerate: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t) && near_tube(mesh, &off, t) && mm_repair::ops::is_degenerate_triangle(mesh, t, 1e-12)).collect();
+        let degenerate: Vec<u32> = live_triangles_where(mesh, |t| in_box(mesh, t) && near_tube(mesh, &off, t) && mm_repair::ops::is_degenerate_triangle(mesh, t, 1e-12));
         for t in degenerate {
             fixed |= mm_repair::ops::fix_degenerate_triangle(mesh, t);
         }
@@ -1032,13 +1111,15 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
             break;
         }
     }
+    p.check(0.02)?;
     // (Again after the fixes, which may have added vertices.)
-    let boxed: Vec<u32> = mesh.triangle_ids().filter(|&t| in_box(mesh, t)).collect();
+    let boxed: Vec<u32> = live_triangles_where(mesh, |t| in_box(mesh, t));
     let off = off_all(mesh, &boxed);
     let local: Vec<u32> = boxed.iter().copied().filter(|&t| near_tube(mesh, &off, t)).collect();
     if local.is_empty() {
         return Ok(None);
     }
+    p.check(0.03)?;
     // Rotation-minimising frames along it, and the stent's rings there.
     let mut frames: Vec<[DVec3; 4]> = Vec::with_capacity(rings + 1);
     for (i, &c) in centre.iter().enumerate() {
@@ -1118,6 +1199,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
         tris.push([c1, last + j, last + jn]);
     }
     let (tube, _) = Mesh::from_triangles(&pos, &tris, None);
+    p.check(0.04)?;
     // The vessel closed at its open ends for the union.
     let mut closed = mesh.clone();
     let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&closed).into_iter().map(|l| l.vertices).collect();
@@ -1125,8 +1207,11 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     if !caps.failed_loops.is_empty() || !closed.is_closed() {
         return Err(EditError::Failed("could not close the vessel's open ends for the union".into()));
     }
-    let cap_groups: HashSet<i32> = caps.groups.iter().copied().collect();
+    let cap_groups: FastSet<i32> = caps.groups.iter().copied().collect();
+    p.check(0.05)?;
     let joined = crate::boolean::mesh_boolean(&closed, &tube, crate::boolean::BooleanOp::Union)?;
+    drop(closed);
+    p.check(0.45)?;
     let mut out = joined.mesh;
     let tube_group = joined.group_offset;
     // The tube must not reach a cap (an open end), which is opened again now.
@@ -1134,11 +1219,11 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     if on_cap {
         return Err(EditError::Failed("the stent's tube reaches an open end of the mesh".into()));
     }
-    let caps_out: Vec<u32> = out.triangle_ids().filter(|&t| cap_groups.contains(&out.tri_group(t))).collect();
+    let caps_out: Vec<u32> = live_triangles_where(&out, |t| cap_groups.contains(&out.tri_group(t)));
     out.remove_triangles(caps_out);
-    // The tube's triangles take the group of the wall they join.
+    // The tube's triangles take the group of the wall they join (on a tie, the lowest).
     let from_tube = |m: &Mesh, t: u32| m.tri_group(t) >= tube_group && !cap_groups.contains(&m.tri_group(t));
-    let mut votes: HashMap<i32, usize> = HashMap::new();
+    let mut votes: FastMap<i32, usize> = FastMap::default();
     for &v in &joined.seam_vertices {
         for t in out.vertex_triangles(v) {
             if !from_tube(&out, t) {
@@ -1146,21 +1231,22 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
             }
         }
     }
-    let group = votes.into_iter().max_by_key(|x| x.1).map_or(0, |x| x.0);
+    let group = votes.into_iter().max_by_key(|&(g, n)| (n, Reverse(g))).map_or(0, |x| x.0);
     // Back onto the straightened mesh, keeping the ids of everything the union left as it
     // was (it copies untouched triangles exactly): its triangles the union replaced go, and
     // the union's new ones come in. Only near the tube can anything have changed.
     let inside_box = |p: DVec3| p.cmpge(bmin).all() && p.cmple(bmax).all();
     let key = |p: DVec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
-    let mut old_ids: HashMap<[u64; 3], u32> = HashMap::new();
+    let mut old_ids: FastMap<[u64; 3], u32> = FastMap::default();
     for v in local.iter().flat_map(|&t| mesh.triangle(t)) {
         if old_ids.insert(key(mesh.vertex(v)), v).is_some_and(|o| o != v) {
             return Err(EditError::Failed("the wall near the stent has vertices on top of one another".into()));
         }
     }
-    let mut kept: HashSet<u32> = HashSet::new();
+    p.check(0.47)?;
+    let mut kept: FastSet<u32> = FastSet::default();
     let mut fresh: Vec<([u32; 3], i32)> = Vec::new();
-    let out_boxed: Vec<u32> = out.triangle_ids().filter(|&t| out.tri_positions(t).iter().any(|&p| inside_box(p))).collect();
+    let out_boxed: Vec<u32> = live_triangles_where(&out, |t| out.tri_positions(t).iter().any(|&p| inside_box(p)));
     let out_off = off_all(&out, &out_boxed);
     for &t in &out_boxed {
         let tv = out.triangle(t);
@@ -1182,22 +1268,26 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     let gone: Vec<u32> = local.iter().copied().filter(|t| !kept.contains(t)).collect();
     mesh.remove_triangles(gone);
     // Each corner: the old vertex there if it is still in use, else a new one; all decided
-    // before any is added, since added vertices can take the ids of removed ones.
-    let mut corner: HashMap<u32, Option<u32>> = HashMap::new();
+    // before any is added, since added vertices can take the ids of removed ones. New ones are
+    // added in the order the corners first come up, so the ids do not depend on a map's order.
+    let mut seen: FastSet<u32> = FastSet::default();
+    let mut corner: Vec<(u32, Option<u32>)> = Vec::new();
     for (tv, _) in &fresh {
         for &v in tv {
-            corner.entry(v).or_insert_with(|| old_ids.get(&key(out.vertex(v))).copied().filter(|&o| mesh.is_vertex(o)));
+            if seen.insert(v) {
+                corner.push((v, old_ids.get(&key(out.vertex(v))).copied().filter(|&o| mesh.is_vertex(o))));
+            }
         }
     }
-    let ids: HashMap<u32, u32> = corner.into_iter().map(|(v, old)| (v, old.unwrap_or_else(|| mesh.append_vertex(out.vertex(v))))).collect();
+    let ids: FastMap<u32, u32> = corner.into_iter().map(|(v, old)| (v, old.unwrap_or_else(|| mesh.append_vertex(out.vertex(v))))).collect();
     let mut added = Vec::with_capacity(fresh.len());
     for (tv, g) in fresh {
         added.push(mesh.append_triangle(tv.map(|v| ids[&v]), g).map_err(|e| EditError::Failed(format!("joining the stent's tube: {e:?}")))?);
     }
     mesh.remove_isolated_vertices();
     // The joined region: the new triangles and two rings around them.
-    let mut region: HashSet<u32> = added.iter().copied().collect();
-    let mut may: HashMap<u32, bool> = HashMap::new();
+    let mut region: FastSet<u32> = added.iter().copied().collect();
+    let mut may: FastMap<u32, bool> = FastMap::default();
     for _ in 0..2 {
         let mut more: Vec<u32> = region.iter().flat_map(|&t| mesh.triangle(t)).flat_map(|v| mesh.vertex_triangles(v)).filter(|t| !region.contains(t)).collect();
         more.sort_unstable();
@@ -1213,14 +1303,18 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
     region.sort_unstable();
     // A join that runs into the wall (where it lies close, e.g. at a branch's mouth) is not
     // used: the wall is pushed out instead.
+    p.check(0.5)?;
     if runs_into_wall(mesh, &region) {
         return Err(EditError::Failed("the stent's tube, joined to the wall, ran into it".into()));
     }
     if params.remesh {
+        p.check(0.55)?;
         let rp = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(region.clone()), ..mm_remesh::RemeshParams::with_target(h) };
         // A remesh that makes the wall run into itself is undone.
         let unremeshed = mesh.clone();
-        if let Ok(Some(tris)) = mm_remesh::remesh(mesh, &rp, None).map(|x| x.region_triangles) {
+        let remeshed = remesh_within(mesh, &rp, p.part(0.55, 0.9)).ok_or_else(cancelled)?;
+        if let Ok(Some(tris)) = remeshed.map(|x| x.region_triangles) {
+            p.check(0.92)?;
             if runs_into_wall(mesh, &tris) {
                 *mesh = unremeshed;
             } else {
@@ -1233,12 +1327,15 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams) ->
 }
 
 /// Straighten the vessel with the stent and (`push_wall`) push the wall out to it; covered,
-/// replace the stented stretch with the stent's tube, `rings` giving its shape.
-fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Option<&[bool]>, push_wall: bool, rings: Option<&Profile>) -> EditResult<StentReport> {
+/// replace the stented stretch with the stent's tube, `rings` giving its shape. Cancelled
+/// through `p` between its steps.
+#[allow(clippy::too_many_arguments)]
+fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Option<&[bool]>, push_wall: bool, rings: Option<&Profile>, p: Progress) -> EditResult<StentReport> {
     let k = pl.s.len();
     if k < 3 {
         return Err(EditError::InvalidParameter("the stent placement has too few samples".into()));
     }
+    p.check(0.0)?;
     let (r, length) = (pl.radius, pl.length);
     let ds = pl.s[1] - pl.s[0];
     let (tp, tc) = (tangents(&pl.axis), tangents(&pl.vessel));
@@ -1273,7 +1370,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
     // A slice carries wall at most this far from the centerline: wall further off lies near
     // the samples without belonging to them (the vessel passing by again, another vessel).
     let bound = |x: f64| 3.0 * lerp_f(&pl.vessel_radius, x).max(r);
-    let near: Vec<u32> = mesh.vertex_ids().filter(|&v| !(mesh.vertex(v).cmplt(lo).any() || mesh.vertex(v).cmpgt(hi).any())).collect();
+    let near: Vec<u32> = (0..mesh.max_vid() as u32).into_par_iter().filter(|&v| mesh.is_vertex(v) && !(mesh.vertex(v).cmplt(lo).any() || mesh.vertex(v).cmpgt(hi).any())).collect();
     let candidates: Vec<(u32, f64, DVec3)> = near
         .par_iter()
         .filter_map(|&v| {
@@ -1291,7 +1388,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         .collect();
     // The stented vessel's own wall: the candidates joined, through candidates, to wall close
     // around the stent's stretch of centerline.
-    let index: HashMap<u32, usize> = candidates.iter().enumerate().map(|(i, c)| (c.0, i)).collect();
+    let index: FastMap<u32, usize> = candidates.iter().enumerate().map(|(i, c)| (c.0, i)).collect();
     let mut reached = vec![false; candidates.len()];
     let mut stack: Vec<usize> = (0..candidates.len())
         .filter(|&i| {
@@ -1325,7 +1422,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
     // Side branches and anything else joined to the vessel near the stent follow it less
     // with distance along the surface.
     let reach = 1.5 * wide;
-    let mut dist: HashMap<u32, f64> = core.iter().map(|&(v, _, _)| (v, 0.0)).collect();
+    let mut dist: FastMap<u32, f64> = core.iter().map(|&(v, _, _)| (v, 0.0)).collect();
     let mut heap: BinaryHeap<Reverse<(u64, u32)>> = core.iter().map(|&(v, _, _)| Reverse((0u64, v))).collect();
     while let Some(Reverse((bits, u))) = heap.pop() {
         let d = f64::from_bits(bits);
@@ -1342,7 +1439,10 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         }
     }
     let mut verts: Vec<(u32, f64, DVec3, f64)> = core.iter().map(|&(v, x, o)| (v, x, o, 1.0)).collect();
-    for (&v, &d) in &dist {
+    // (In vertex order, not the map's.)
+    let mut nearby: Vec<(u32, f64)> = dist.into_iter().collect();
+    nearby.sort_unstable_by_key(|x| x.0);
+    for (v, d) in nearby {
         if !is_core[v as usize] {
             let p = mesh.vertex(v);
             let (x, c) = project(p);
@@ -1457,10 +1557,11 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         m.1 += push;
     }
     let narrow_after = (first..=last).filter_map(|i| percentile(&mut after[i], 0.1)).fold(f64::INFINITY, f64::min);
+    p.check(0.3)?;
     // Moves under 1 % of an edge or 0.6 % of the radius (the soft corner's nudge to wall
     // touching the stent) neither need a remesh nor can make new crossings.
     let tiny = (0.01 * mesh.average_edge_length()).max(0.006 * r);
-    let mut moved_verts: HashSet<u32> = HashSet::new();
+    let mut moved_verts: FastSet<u32> = FastSet::default();
     let mut max_shift: f64 = 0.0;
     for &(v, p) in &moves {
         let d = p.distance(mesh.vertex(v));
@@ -1478,13 +1579,17 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
     });
     let before: Vec<[f64; 3]> = region.iter().map(|&t| mesh.tri_edges(t).map(|e| mesh.edge_length(e))).collect();
     let moved_openings = mm_core::topology::boundary_loops(mesh).iter().filter(|l| l.vertices.iter().any(|v| moved_verts.contains(v))).count();
-    for &(v, p) in &moves {
-        mesh.set_vertex(v, p);
+    p.check(0.33)?;
+    // (Written all at once, with one new shape version.)
+    let pos = mesh.positions_mut();
+    for &(v, x) in &moves {
+        pos[v as usize] = x;
     }
+    mesh.bump_shape_version();
     let mut report = StentReport { moved: moved_verts.len(), max_shift, narrowest: [narrow_before, narrow_after], outside, moved_openings, source_triangles: region.clone(), ..Default::default() };
     // Remeshed: where the wall was stretched or squeezed (not where slices were only carried
     // along), and two rings of triangles around that.
-    let mut distorted: HashSet<u32> = region
+    let mut distorted: FastSet<u32> = region
         .iter()
         .zip(&before)
         .filter(|(t, old)| mesh.tri_edges(**t).iter().zip(old.iter()).any(|(&e, &l)| (mesh.edge_length(e) / l.max(1e-300) - 1.0).abs() > 0.1))
@@ -1495,9 +1600,10 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         distorted.extend(ring);
     }
     // Only wall within the stent and its end blend is remeshed (a region's border stays put).
-    let within: HashSet<u32> = moves.iter().map(|m| m.0).collect();
+    let within: FastSet<u32> = moves.iter().map(|m| m.0).collect();
     distorted.retain(|&t| mesh.triangle(t).iter().all(|v| within.contains(v)));
     if params.covered {
+        p.check(0.35)?;
         let (tube, sealed, removed, landing) = cover(mesh, pl, h, params.end_blend, rings.ok_or_else(|| EditError::Failed("a covered stent needs its rings".into()))?)?;
         region.retain(|&t| mesh.is_triangle(t));
         distorted.retain(|&t| mesh.is_triangle(t));
@@ -1506,7 +1612,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         let mut verts: Vec<u32> = distorted.iter().flat_map(|&t| mesh.triangle(t)).collect();
         verts.sort_unstable();
         verts.dedup();
-        let past: HashSet<u32> = verts.par_iter().copied().filter(|&v| past_end(pl, params.end_blend, mesh.vertex(v))).collect();
+        let past: FastSet<u32> = verts.par_iter().copied().filter(|&v| past_end(pl, params.end_blend, mesh.vertex(v))).collect();
         distorted.retain(|&t| !mesh.triangle(t).iter().any(|v| past.contains(v)));
         region.extend(tube);
         report.sealed_openings = sealed;
@@ -1517,6 +1623,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
     region.sort_unstable();
     region.dedup();
     if params.remesh && !distorted.is_empty() {
+        p.check(0.5)?;
         let mut part: Vec<u32> = distorted.iter().copied().collect();
         part.sort_unstable();
         let rp = mm_remesh::RemeshParams { target_edge_length: h, iterations: 8, region: Some(part.clone()), ..mm_remesh::RemeshParams::with_target(h) };
@@ -1524,7 +1631,10 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
         // close, e.g. a branch's mouth near the stent's end) is undone.
         let unremeshed = mesh.clone();
         let crossed_before = runs_into_wall(mesh, &part);
-        if let Ok(Some(tris)) = mm_remesh::remesh(mesh, &rp, None).map(|x| x.region_triangles) {
+        p.check(0.55)?;
+        let remeshed = remesh_within(mesh, &rp, p.part(0.55, 0.9)).ok_or_else(cancelled)?;
+        if let Ok(Some(tris)) = remeshed.map(|x| x.region_triangles) {
+            p.check(0.92)?;
             if !crossed_before && runs_into_wall(mesh, &tris) {
                 *mesh = unremeshed;
                 report.remesh_undone = true;
@@ -1540,14 +1650,33 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
 }
 
 /// Whether any of `tris` crosses another triangle of `m` (one it shares no corner with).
+///
+/// Only triangles whose boxes come within a hair of the box around `tris` can, so the tree is
+/// built over those alone rather than the whole mesh (which cost most of the check on a big
+/// mesh). The hair is far wider than the tolerance within which two triangles count as
+/// touching, and a pair is tested only where their boxes come within it of one another, so
+/// the answer does not depend on how the tree groups the triangles.
 fn runs_into_wall(m: &Mesh, tris: &[u32]) -> bool {
-    let bvh = mm_core::bvh::Bvh::build(m);
-    tris.par_iter().filter(|&&t| m.is_triangle(t)).any(|&t| {
+    let live: Vec<u32> = tris.iter().copied().filter(|&t| m.is_triangle(t)).collect();
+    if live.is_empty() {
+        return false;
+    }
+    let bounds = live.par_iter().map(|&t| Aabb::from_points(m.tri_positions(t))).reduce(|| Aabb::EMPTY, |a, b| a.union(&b));
+    let size = bounds.min.abs().max(bounds.max.abs()).max_element().max(1.0);
+    let hair = 1e-9 * bounds.diagonal() + 1e-6 * size;
+    let zone = bounds.expanded(hair);
+    let near = live_triangles_where(m, |t| Aabb::from_points(m.tri_positions(t)).intersects(&zone));
+    let bvh = Bvh::build_subset(m, &near);
+    live.par_iter().any(|&t| {
         let (tv, tp) = (m.triangle(t), m.tri_positions(t));
+        let reach = Aabb::from_points(tp).expanded(hair);
         let mut hit = false;
-        bvh.query_aabb(&mm_core::Aabb::from_points(tp), |o| {
-            if !hit && o != t && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
-                hit = true;
+        bvh.query_aabb(&reach, |o| {
+            if !hit && o != t {
+                let op = m.tri_positions(o);
+                if Aabb::from_points(op).intersects(&reach) && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, op) {
+                    hit = true;
+                }
             }
         });
         hit
@@ -1591,7 +1720,7 @@ fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, end_blend: f64, rings: &P
     }
     // The excluded stretch: everything joined to the inside of the cuts.
     let seeds: Vec<u32> = inner_a.iter().flat_map(|&v| mesh.vertex_triangles(v)).collect();
-    let middle: HashSet<u32> = mm_core::topology::flood_fill_triangles(mesh, &seeds, |_| true).into_iter().collect();
+    let middle: FastSet<u32> = mm_core::topology::flood_fill_triangles(mesh, &seeds, |_| true).into_iter().collect();
     let touches = |lp: &[u32]| lp.iter().any(|&v| mesh.vertex_triangles(v).iter().any(|t| middle.contains(t)));
     if touches(&outer_a) || touches(&outer_b) || !touches(&inner_b) {
         return Err(EditError::Failed("the covered stretch is joined to the rest of the vessel another way round, so it cannot be sealed off".into()));
@@ -1602,7 +1731,11 @@ fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, end_blend: f64, rings: &P
         .count();
     let removed = middle.len();
     let group = mesh.vertex_triangles(outer_a[0]).first().map_or(0, |&t| mesh.tri_group(t));
-    mesh.remove_triangles(middle.iter().copied());
+    // Removed in id order: the ids they free are taken again by the tube, so the order of a
+    // set's walk would show in the result.
+    let mut middle: Vec<u32> = middle.into_iter().collect();
+    middle.sort_unstable();
+    mesh.remove_triangles(middle);
     mesh.remove_isolated_vertices();
 
     // The stent's tube between the cuts, its rows going round the way the first cut's
@@ -1716,4 +1849,129 @@ fn polar(poly: &[(f64, f64)], a: f64) -> Option<f64> {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+    use std::cell::RefCell;
+
+    /// A straight vessel of radius 2 along z (0..60), narrowed to 1 at z = 30.
+    fn stenosed() -> (Mesh, VesselPath) {
+        let points: Vec<DVec3> = (0..=240).map(|k| DVec3::new(0.0, 0.0, 0.25 * k as f64)).collect();
+        let radii: Vec<f64> = points.iter().map(|p| 2.0 - (-((p.z - 30.0) / 3.0).powi(2)).exp()).collect();
+        (primitives::tube_along(&points, &radii, 48), VesselPath { points, radii })
+    }
+
+    fn sections(path: &VesselPath) -> [StentSection; 2] {
+        [80, 160].map(|i| StentSection { center: path.points[i], normal: DVec3::Z })
+    }
+
+    /// Everything the result is: ids, positions, triangles and groups, and the report.
+    fn same(a: &(Mesh, StentReport), b: &(Mesh, StentReport)) -> bool {
+        let (ma, mb) = (&a.0, &b.0);
+        ma.max_vid() == mb.max_vid()
+            && ma.max_tid() == mb.max_tid()
+            && ma.vertex_ids().eq(mb.vertex_ids())
+            && ma.vertex_ids().all(|v| ma.vertex(v).to_array().map(f64::to_bits) == mb.vertex(v).to_array().map(f64::to_bits))
+            && ma.triangle_ids().eq(mb.triangle_ids())
+            && ma.triangle_ids().all(|t| ma.triangle(t) == mb.triangle(t) && ma.tri_group(t) == mb.tri_group(t))
+            && format!("{:?}", a.1) == format!("{:?}", b.1)
+    }
+
+    fn run(m: &Mesh, path: &VesselPath, params: &StentParams, progress: Option<&dyn Fn(f32) -> bool>) -> EditResult<(Mesh, StentReport)> {
+        let pl = place_stent(path, sections(path), params)?;
+        let mut out = m.clone();
+        let rep = apply_stent_with(&mut out, &pl, params, None, progress)?;
+        Ok((out, rep))
+    }
+
+    #[test]
+    fn progress_changes_nothing_and_runs_give_the_same_mesh() {
+        // Bare and covered, stiffness from none to full, remeshed: a callback that never
+        // cancels changes nothing, and the result is the same every time (no map's order shows).
+        let (m, path) = stenosed();
+        for covered in [false, true] {
+            for stiffness in [0.0, 0.5, 1.0] {
+                let params = StentParams { diameter: 4.0, length: 24.0, straightness: 0.0, stiffness, covered, remesh: true, ..Default::default() };
+                let seen = RefCell::new(Vec::new());
+                let report = |x: f32| {
+                    seen.borrow_mut().push(x);
+                    true
+                };
+                let plain = run(&m, &path, &params, None).unwrap();
+                let watched = run(&m, &path, &params, Some(&report)).unwrap();
+                let again = run(&m, &path, &params, None).unwrap();
+                assert!(same(&plain, &watched), "covered {covered}, stiffness {stiffness}: the progress callback changed the result");
+                assert!(same(&plain, &again), "covered {covered}, stiffness {stiffness}: two runs differ");
+                let seen = seen.into_inner();
+                assert!(!seen.is_empty() && seen.windows(2).all(|w| w[0] <= w[1]) && seen.iter().all(|x| (0.0..=1.0).contains(x)), "{seen:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_stops_at_the_next_step_without_pushing_the_wall() {
+        let (m, path) = stenosed();
+        for covered in [false, true] {
+            let params = StentParams { diameter: 4.0, length: 24.0, straightness: 0.0, stiffness: 1.0, covered, remesh: true, ..Default::default() };
+            // Cancelled at the first report, and after a few (inside the union or the remesh).
+            for after in [0, 3, 6] {
+                let calls = Cell::new(0);
+                let stop = |_: f32| {
+                    calls.set(calls.get() + 1);
+                    calls.get() <= after
+                };
+                match run(&m, &path, &params, Some(&stop)) {
+                    Err(e) => assert!(is_cancelled(&e), "{e}"),
+                    Ok((_, rep)) => panic!("covered {covered}: not cancelled after {after} reports (pushed {:?})", rep.pushed),
+                }
+                // Not asked again once it said stop.
+                assert_eq!(calls.get(), after + 1, "covered {covered}");
+            }
+        }
+    }
+
+    /// The wall check as it was: a tree over the whole mesh, every leaf-mate a candidate.
+    fn runs_into_wall_whole(m: &Mesh, tris: &[u32]) -> bool {
+        let bvh = Bvh::build(m);
+        tris.iter().filter(|&&t| m.is_triangle(t)).any(|&t| {
+            let (tv, tp) = (m.triangle(t), m.tri_positions(t));
+            let mut hit = false;
+            bvh.query_aabb(&Aabb::from_points(tp), |o| {
+                if !hit && o != t && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
+                    hit = true;
+                }
+            });
+            hit
+        })
+    }
+
+    #[test]
+    fn the_wall_check_on_nearby_triangles_answers_as_on_the_whole_mesh() {
+        // Two spheres overlapping (crossings where they meet) and a tube apart from them; parts
+        // of each as the region checked, crossing and clear, big and small.
+        let mut m = primitives::icosphere(1.0, 4);
+        let mut b = primitives::icosphere(0.8, 4);
+        b.transform(|p| p + DVec3::new(1.5, 0.1, 0.05));
+        m.append_mesh(&b, 1);
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(5.0, 0.0, 0.1 * i as f64)).collect();
+        m.append_mesh(&primitives::tube_along(&path, &vec![0.5; path.len()], 24), 2);
+        let all: Vec<u32> = m.triangle_ids().collect();
+        for (k, step) in [(0usize, 1usize), (3, 7), (1, 50), (0, 997)] {
+            for part in [m.tri_group(0), 1, 2] {
+                let tris: Vec<u32> = all.iter().copied().filter(|&t| m.tri_group(t) == part).skip(k).step_by(step).collect();
+                assert_eq!(runs_into_wall(&m, &tris), runs_into_wall_whole(&m, &tris), "group {part}, every {step}th from {k}");
+            }
+            // Near where the spheres meet only.
+            let tris: Vec<u32> = all.iter().copied().filter(|&t| (m.tri_centroid(t).x - 0.9).abs() < 0.2).skip(k).step_by(step).collect();
+            let crossing = runs_into_wall(&m, &tris);
+            assert_eq!(crossing, runs_into_wall_whole(&m, &tris));
+            assert!(crossing || step > 50, "the meeting spheres cross");
+        }
+        // Nothing live to check.
+        assert!(!runs_into_wall(&m, &[]));
+        assert!(!runs_into_wall(&m, &[m.max_tid() as u32 + 5]));
+    }
 }

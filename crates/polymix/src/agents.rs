@@ -548,7 +548,7 @@ impl AgentAccess {
                         self.claude_job = Some(Job::spawn("Adding to Claude Code", ctx.clone(), move |_| add_to_claude(&url, token.as_deref())));
                     }
                     if busy {
-                        ui.spinner();
+                        polymix_workspace::spinner(ui);
                     } else if stale {
                         ui.colored_label(egui::Color32::from_rgb(240, 150, 80), "Claude Code has an older port or token");
                     } else if self.claude_setup.is_some() && self.claude_message.is_none() {

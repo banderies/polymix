@@ -12,6 +12,7 @@ use glam::DVec3;
 use mm_core::{geom::Ray, measure, Aabb, Bvh, Mesh};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Output style of [`make_solid`] (Meshmixer's "Solid Type").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -127,13 +128,27 @@ pub fn cell_size_for_resolution(bounds: &Aabb, cells: u32) -> f64 {
 
 /// Drop triangles with non-finite vertices and validate what remains.
 fn prepare(mesh: &Mesh) -> Result<(Cow<'_, Mesh>, Aabb)> {
+    let m: Cow<Mesh> = match finite_part(mesh) {
+        None => Cow::Borrowed(mesh),
+        Some(m) => Cow::Owned(m),
+    };
+    let b = check_prepared(&m)?;
+    Ok((m, b))
+}
+
+/// `mesh` without its triangles that have a non-finite corner, or `None` when there are none.
+fn finite_part(mesh: &Mesh) -> Option<Mesh> {
     let finite = |t: u32| mesh.tri_positions(t).iter().all(|p| p.is_finite());
-    let m: Cow<Mesh> = if mesh.triangle_ids().all(finite) {
-        Cow::Borrowed(mesh)
+    if mesh.triangle_ids().all(finite) {
+        None
     } else {
         let keep: Vec<u32> = mesh.triangle_ids().filter(|&t| finite(t)).collect();
-        Cow::Owned(mesh.submesh(&keep).0)
-    };
+        Some(mesh.submesh(&keep).0)
+    }
+}
+
+/// The bounds of a prepared mesh, which must enclose something.
+fn check_prepared(m: &Mesh) -> Result<Aabb> {
     if m.triangle_count() == 0 {
         return Err(SolidError::EmptyInput);
     }
@@ -141,7 +156,7 @@ fn prepare(mesh: &Mesh) -> Result<(Cow<'_, Mesh>, Aabb)> {
     if b.is_empty() || b.diagonal() <= 0.0 {
         return Err(SolidError::EmptyInput);
     }
-    Ok((m, b))
+    Ok(b)
 }
 
 fn check_cell(h: f64) -> Result<f64> {
@@ -175,6 +190,204 @@ pub(crate) fn extract_and_clean(field: &SparseField, blocky: bool, min_edge: f64
     Ok(m)
 }
 
+/// The search trees the field needs: the BVH and the winding number (with [`FIELD_BETA`]),
+/// built side by side.
+fn build_trees(mesh: &Mesh) -> (Bvh, WindingNumber) {
+    rayon::join(|| Bvh::build(mesh), || WindingNumber::with_beta(mesh, FIELD_BETA))
+}
+
+/// Make Solid's input made ready once ([`prepare_input`]): the mesh without the triangles
+/// that have a non-finite corner, its bounds and its search trees. Make Solid runs on the
+/// same mesh with different settings (a preview being adjusted) can share it through
+/// [`make_solid_with_prepared`] and, while the field's own settings stay the same,
+/// [`build_solid_field`] and [`make_solid_from_field`].
+pub struct Prepared {
+    mesh: Arc<Mesh>,
+    is_source: bool,
+    bounds: Aabb,
+    bvh: Bvh,
+    wn: WindingNumber,
+}
+
+impl Prepared {
+    /// The mesh the solid is made from.
+    pub fn mesh(&self) -> &Mesh {
+        &self.mesh
+    }
+    /// The mesh as shared.
+    pub fn mesh_arc(&self) -> &Arc<Mesh> {
+        &self.mesh
+    }
+    /// True when no triangle had to be dropped, so the mesh is the caller's own and the
+    /// trees also serve it (for instance to transfer groups or colours after a remesh).
+    pub fn is_source(&self) -> bool {
+        self.is_source
+    }
+    pub fn bounds(&self) -> Aabb {
+        self.bounds
+    }
+    /// BVH over the mesh's triangles.
+    pub fn bvh(&self) -> &Bvh {
+        &self.bvh
+    }
+    /// Winding number of the mesh, with the field's accuracy ([`FIELD_BETA`]).
+    pub fn winding(&self) -> &WindingNumber {
+        &self.wn
+    }
+    /// The grid spacing `params` asks for on this mesh (resolving `cell_size <= 0`).
+    pub fn cell_size_for(&self, params: &MakeSolidParams) -> f64 {
+        if params.cell_size > 0.0 {
+            params.cell_size
+        } else {
+            cell_size_for_resolution(&self.bounds, 128)
+        }
+    }
+}
+
+/// Prepare `mesh` for [`make_solid_with_prepared`]: drop the triangles with a non-finite
+/// corner (keeping the shared mesh itself when there are none), and build its bounds and
+/// search trees. `progress` may cancel; a cancelled build returns
+/// [`SolidError::Cancelled`] and should not be kept.
+pub fn prepare_input(mesh: Arc<Mesh>, progress: Progress) -> Result<Prepared> {
+    let prog = Prog::new(progress);
+    let (mesh, is_source) = match finite_part(&mesh) {
+        None => (mesh, true),
+        Some(m) => (Arc::new(m), false),
+    };
+    let bounds = check_prepared(&mesh)?;
+    prog.report(0.1)?;
+    let (bvh, wn) = build_trees(&mesh);
+    prog.report(1.0)?;
+    Ok(Prepared { mesh, is_source, bounds, bvh, wn })
+}
+
+/// The distance field Make Solid extracts its surface from ([`build_solid_field`]). It
+/// depends on the prepared mesh, the grid spacing, the offset, the winding threshold and
+/// the minimum thickness only, so the steps after it ([`make_solid_from_field`]) can run
+/// again with other output settings (mode, edge collapse, flips, small shells, holes,
+/// transfers) without rebuilding it.
+pub struct SolidField {
+    mesh: Arc<Mesh>,
+    field: SparseField,
+    /// Triangles the minimum thickness thickened, by id.
+    thickened: Option<Vec<bool>>,
+    flip_input: bool,
+    /// Bits of the grid spacing, offset, winding threshold and minimum thickness.
+    key: [u64; 4],
+}
+
+impl SolidField {
+    /// The sampled field.
+    pub fn field(&self) -> &SparseField {
+        &self.field
+    }
+    /// The grid spacing it was sampled with.
+    pub fn cell_size(&self) -> f64 {
+        f64::from_bits(self.key[0])
+    }
+    /// Whether this field is the one `params` would build on `prepared`.
+    pub fn matches(&self, prepared: &Prepared, params: &MakeSolidParams) -> bool {
+        Arc::ptr_eq(&self.mesh, &prepared.mesh) && self.key == field_key(prepared.cell_size_for(params), params)
+    }
+}
+
+/// What the field depends on besides the mesh, as bits.
+fn field_key(h: f64, params: &MakeSolidParams) -> [u64; 4] {
+    let thick = params.min_thickness.filter(|&t| t > 0.0).map_or(0, f64::to_bits);
+    [h.to_bits(), params.offset.to_bits(), params.winding_threshold.to_bits(), thick]
+}
+
+/// Check the parameters the field depends on; the grid spacing.
+fn check_field_params(params: &MakeSolidParams, bounds: &Aabb) -> Result<f64> {
+    let h = if params.cell_size > 0.0 { params.cell_size } else { cell_size_for_resolution(bounds, 128) };
+    let h = check_cell(h)?;
+    let tau = params.winding_threshold;
+    if !(tau > 0.0) || !tau.is_finite() {
+        return Err(SolidError::InvalidParameter(format!("winding threshold {tau}")));
+    }
+    if !params.offset.is_finite() {
+        return Err(SolidError::InvalidParameter("offset must be finite".into()));
+    }
+    Ok(h)
+}
+
+/// The field with what the steps after extraction need from its build.
+struct FieldParts {
+    field: SparseField,
+    thickened: Option<Vec<bool>>,
+    flip_input: bool,
+}
+
+/// Sample the field of `mesh` (steps up to the grid; `prog` from 0.05 to 0.75).
+fn solid_field(mesh: &Mesh, bounds: &Aabb, bvh: &Bvh, wn: &WindingNumber, params: &MakeSolidParams, h: f64, prog: &Prog) -> Result<FieldParts> {
+    let band = params.offset.abs() + DEFAULT_BAND_CELLS * h;
+    let mut sdf = MeshSdf::from_refs(mesh, bvh, wn, params.offset, params.winding_threshold, band);
+    let mut thickened: Option<Vec<bool>> = None;
+    if let Some(t) = params.min_thickness.filter(|&t| t > 0.0) {
+        let (tris, radii) = thin_triangles(&sdf, t, h);
+        let mut flags = vec![false; mesh.max_tid()];
+        for &t in &tris {
+            flags[t as usize] = true;
+        }
+        thickened = Some(flags);
+        sdf.set_thin_shell(&tris, radii);
+    }
+    prog.report(0.05)?;
+    let grid = GridSpec::covering(bounds, h, sdf.band() + 2.0 * h)?;
+    let field = build_field_with(&sdf, grid, &prog.sub(0.05, 0.75))?;
+    let flip_input = measure::volume(mesh) < 0.0;
+    Ok(FieldParts { field, thickened, flip_input })
+}
+
+/// The surface of the field, cleaned (`prog` from 0.75 to 0.92).
+fn extract_solid(field: &SparseField, params: &MakeSolidParams, h: f64, prog: &Prog) -> Result<Mesh> {
+    let blocky = params.mode == SolidMode::Blocky;
+    let min_edge = params.min_edge_length.unwrap_or(0.3 * h);
+    let shell_vol = params.min_shell_volume.unwrap_or(8.0 * h * h * h);
+    extract_and_clean(field, blocky, min_edge, params.improve_quality, shell_vol, &prog.sub(0.75, 0.92))
+}
+
+/// The steps after extraction: projection and sharpening, hole caps, transfers (`prog`
+/// from 0.92 to 1).
+#[allow(clippy::too_many_arguments)]
+fn finish_solid(mut out: Mesh, mesh: &Mesh, bvh: &Bvh, thickened: Option<&[bool]>, flip_input: bool, params: &MakeSolidParams, h: f64, prog: &Prog) -> Result<Mesh> {
+    let min_edge = params.min_edge_length.unwrap_or(0.3 * h);
+    if matches!(params.mode, SolidMode::Accurate | SolidMode::SharpEdges) {
+        cleanup::project_to_input(&mut out, mesh, bvh, h, params.offset, flip_input, thickened);
+        if params.mode == SolidMode::SharpEdges {
+            cleanup::sharpen_features(&mut out, mesh, bvh, h, params.offset, flip_input, thickened, params.sharp_angle_deg);
+        }
+        cleanup::collapse_short_edges(&mut out, 0.5 * min_edge);
+        if params.improve_quality {
+            cleanup::flip_to_improve(&mut out, 2);
+        }
+    }
+    prog.report(0.96)?;
+    if !params.close_holes {
+        let extra = params.min_thickness.filter(|&t| t > 0.0).map_or(0.0, |t| 0.5 * t);
+        remove_hole_caps(&mut out, mesh, bvh, h, params.offset, extra);
+    }
+    if params.transfer_groups {
+        transfer_face_groups_with(&mut out, mesh, bvh);
+    }
+    let mut out = compact(out);
+    if params.transfer_colors && mesh.has_vertex_colors() {
+        transfer_vertex_colors_with(&mut out, mesh, bvh);
+    }
+    prog.report(1.0)?;
+    Ok(out)
+}
+
+/// The field, the surface and the steps after it, for a prepared mesh and its trees.
+#[allow(clippy::too_many_arguments)]
+fn solid_pipeline(mesh: &Mesh, bounds: &Aabb, bvh: &Bvh, wn: &WindingNumber, params: &MakeSolidParams, h: f64, prog: &Prog) -> Result<Mesh> {
+    let FieldParts { field, thickened, flip_input } = solid_field(mesh, bounds, bvh, wn, params, h, prog)?;
+    let out = extract_solid(&field, params, h, prog)?;
+    // The field is no longer needed: free it before the steps that copy the mesh.
+    drop(field);
+    finish_solid(out, mesh, bvh, thickened.as_deref(), flip_input, params, h, prog)
+}
+
 /// Turn an arbitrary triangle mesh (holes, self-intersections, overlapping shells,
 /// inconsistent orientation) into a closed, 2-manifold, outward-oriented solid.
 ///
@@ -187,67 +400,65 @@ pub(crate) fn extract_and_clean(field: &SparseField, blocky: bool, min_edge: f64
 /// The result may be empty when nothing encloses volume (e.g. a single open sheet without
 /// `min_thickness`). Inputs are first stripped of triangles with non-finite vertices.
 pub fn make_solid(mesh: &Mesh, params: &MakeSolidParams, progress: Progress) -> Result<Mesh> {
+    make_solid_with(mesh, params, None, progress)
+}
+
+/// [`make_solid`] with the search trees of `mesh` built beforehand: its BVH and its winding
+/// number with the field's accuracy ([`FIELD_BETA`]), both over all its triangles (as
+/// `Bvh::build` and `WindingNumber::with_beta` build them). The result is the same. The
+/// trees are used only when every triangle is kept (a mesh with non-finite corners is
+/// stripped of them first, and the trees are then built for what remains) and when the
+/// winding number's β is the field's.
+pub fn make_solid_with(mesh: &Mesh, params: &MakeSolidParams, trees: Option<(&Bvh, &WindingNumber)>, progress: Progress) -> Result<Mesh> {
     let prog = Prog::new(progress);
     let (mesh, bounds) = prepare(mesh)?;
+    let given = trees.filter(|(_, wn)| matches!(mesh, Cow::Borrowed(_)) && wn.beta() == FIELD_BETA);
     let mesh: &Mesh = &mesh;
-    let h = if params.cell_size > 0.0 { params.cell_size } else { cell_size_for_resolution(&bounds, 128) };
-    let h = check_cell(h)?;
-    let tau = params.winding_threshold;
-    if !(tau > 0.0) || !tau.is_finite() {
-        return Err(SolidError::InvalidParameter(format!("winding threshold {tau}")));
-    }
-    if !params.offset.is_finite() {
-        return Err(SolidError::InvalidParameter("offset must be finite".into()));
-    }
-    let band = params.offset.abs() + DEFAULT_BAND_CELLS * h;
-    let bvh = Bvh::build(mesh);
-    let wn = WindingNumber::with_beta(mesh, FIELD_BETA);
+    let h = check_field_params(params, &bounds)?;
+    let built;
+    let (bvh, wn) = match given {
+        Some(t) => t,
+        None => {
+            built = build_trees(mesh);
+            (&built.0, &built.1)
+        }
+    };
     prog.report(0.03)?;
-    let mut sdf = MeshSdf::from_parts(mesh, bvh, wn, params.offset, tau, band);
-    let mut thickened: Option<Vec<bool>> = None;
-    if let Some(t) = params.min_thickness.filter(|&t| t > 0.0) {
-        let (tris, radii) = thin_triangles(&sdf, t, h);
-        let mut flags = vec![false; mesh.max_tid()];
-        for &t in &tris {
-            flags[t as usize] = true;
-        }
-        thickened = Some(flags);
-        sdf.set_thin_shell(&tris, radii);
+    solid_pipeline(mesh, &bounds, bvh, wn, params, h, &prog)
+}
+
+/// [`make_solid`] of a prepared mesh: the same result, without stripping the mesh or
+/// building its trees again.
+pub fn make_solid_with_prepared(prepared: &Prepared, params: &MakeSolidParams, progress: Progress) -> Result<Mesh> {
+    let prog = Prog::new(progress);
+    let h = check_field_params(params, &prepared.bounds)?;
+    prog.report(0.03)?;
+    solid_pipeline(&prepared.mesh, &prepared.bounds, &prepared.bvh, &prepared.wn, params, h, &prog)
+}
+
+/// The distance field [`make_solid_with_prepared`] would extract its surface from, to keep
+/// for [`make_solid_from_field`].
+pub fn build_solid_field(prepared: &Prepared, params: &MakeSolidParams, progress: Progress) -> Result<SolidField> {
+    let h = check_field_params(params, &prepared.bounds)?;
+    // The field's part of the whole run (0.05 to 0.75) spread over the full range.
+    let prog = Prog::new(progress).sub(-0.05 / 0.7, 0.95 / 0.7);
+    let FieldParts { field, thickened, flip_input } = solid_field(&prepared.mesh, &prepared.bounds, &prepared.bvh, &prepared.wn, params, h, &prog)?;
+    Ok(SolidField { mesh: prepared.mesh.clone(), field, thickened, flip_input, key: field_key(h, params) })
+}
+
+/// The steps of Make Solid after the field (extraction, cleanup, projection, sharpening,
+/// hole caps, transfers) on a field built by [`build_solid_field`] for the same prepared
+/// mesh and the same grid spacing, offset, winding threshold and minimum thickness
+/// ([`SolidField::matches`]): the same result as [`make_solid_with_prepared`] with `params`.
+pub fn make_solid_from_field(prepared: &Prepared, field: &SolidField, params: &MakeSolidParams, progress: Progress) -> Result<Mesh> {
+    if !field.matches(prepared, params) {
+        return Err(SolidError::InvalidParameter("the field was built for another mesh or other field settings".into()));
     }
-    prog.report(0.05)?;
-    let grid = GridSpec::covering(&bounds, h, sdf.band() + 2.0 * h)?;
-    let field = build_field_with(&sdf, grid, &prog.sub(0.05, 0.75))?;
-    let blocky = params.mode == SolidMode::Blocky;
-    let min_edge = params.min_edge_length.unwrap_or(0.3 * h);
-    let shell_vol = params.min_shell_volume.unwrap_or(8.0 * h * h * h);
-    let mut out = extract_and_clean(&field, blocky, min_edge, params.improve_quality, shell_vol, &prog.sub(0.75, 0.92))?;
-    drop(field);
-    let flip_input = measure::volume(mesh) < 0.0;
-    if matches!(params.mode, SolidMode::Accurate | SolidMode::SharpEdges) {
-        cleanup::project_to_input(&mut out, mesh, sdf.bvh(), h, params.offset, flip_input, thickened.as_deref());
-        if params.mode == SolidMode::SharpEdges {
-            let exclude = thickened.as_deref();
-            cleanup::sharpen_features(&mut out, mesh, sdf.bvh(), h, params.offset, flip_input, exclude, params.sharp_angle_deg);
-        }
-        cleanup::collapse_short_edges(&mut out, 0.5 * min_edge);
-        if params.improve_quality {
-            cleanup::flip_to_improve(&mut out, 2);
-        }
-    }
-    prog.report(0.96)?;
-    if !params.close_holes {
-        let extra = params.min_thickness.filter(|&t| t > 0.0).map_or(0.0, |t| 0.5 * t);
-        remove_hole_caps(&mut out, mesh, sdf.bvh(), h, params.offset, extra);
-    }
-    if params.transfer_groups {
-        transfer_face_groups_with(&mut out, mesh, sdf.bvh());
-    }
-    let mut out = compact(out);
-    if params.transfer_colors && mesh.has_vertex_colors() {
-        transfer_vertex_colors_with(&mut out, mesh, sdf.bvh());
-    }
-    prog.report(1.0)?;
-    Ok(out)
+    let h = field.cell_size();
+    // The steps after the field (0.75 to 1 of the whole run) spread over the full range.
+    let prog = Prog::new(progress).sub(-3.0, 1.0);
+    let out = extract_solid(&field.field, params, h, &prog)?;
+    finish_solid(out, &prepared.mesh, &prepared.bvh, field.thickened.as_deref(), field.flip_input, params, h, &prog)
 }
 
 /// Give each vertex of `out` the colour of `input` at its nearest point (interpolated from
@@ -258,7 +469,10 @@ pub fn transfer_vertex_colors(out: &mut Mesh, input: &Mesh) {
     }
 }
 
-fn transfer_vertex_colors_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
+/// [`transfer_vertex_colors`] with the BVH of `input` built beforehand (it must be current).
+/// When the input has no colours it still walks every vertex, so check
+/// [`Mesh::has_vertex_colors`] first.
+pub fn transfer_vertex_colors_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
     let ids: Vec<u32> = out.vertex_ids().collect();
     let snapshot: &Mesh = out;
     let cols: Vec<Option<[f32; 3]>> = ids
@@ -278,7 +492,8 @@ pub fn transfer_face_groups(out: &mut Mesh, input: &Mesh) {
     transfer_face_groups_with(out, input, &Bvh::build(input));
 }
 
-fn transfer_face_groups_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
+/// [`transfer_face_groups`] with the BVH of `input` built beforehand (it must be current).
+pub fn transfer_face_groups_with(out: &mut Mesh, input: &Mesh, bvh: &Bvh) {
     let ids: Vec<u32> = out.triangle_ids().collect();
     let snapshot: &Mesh = out;
     let groups: Vec<Option<i32>> = ids
@@ -510,4 +725,84 @@ fn vertex_fans(m: &Mesh, v: u32) -> Vec<Vec<u32>> {
         fans.push(fan);
     }
     fans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    fn same(a: &Mesh, b: &Mesh) -> bool {
+        a.max_vid() == b.max_vid()
+            && a.max_tid() == b.max_tid()
+            && a.vertex_ids().eq(b.vertex_ids())
+            && a.vertex_ids().all(|v| a.vertex(v).to_array().map(f64::to_bits) == b.vertex(v).to_array().map(f64::to_bits) && a.vertex_color(v) == b.vertex_color(v))
+            && a.triangle_ids().eq(b.triangle_ids())
+            && a.triangle_ids().all(|t| a.triangle(t) == b.triangle(t) && a.tri_group(t) == b.tri_group(t))
+    }
+
+    /// A bent open tube with coloured vertices and two face groups.
+    fn tube() -> Mesh {
+        let path: Vec<DVec3> = (0..=60).map(|i| DVec3::new((i as f64 * 0.1).sin() * 2.0, i as f64 * 0.15, 0.0)).collect();
+        let mut m = primitives::tube_along(&path, &vec![0.8; path.len()], 24);
+        for v in m.vertex_ids().collect::<Vec<_>>() {
+            let p = m.vertex(v);
+            m.set_vertex_color(v, [p.x as f32 * 0.1, p.y as f32 * 0.05, 0.5]);
+        }
+        for t in m.triangle_ids().collect::<Vec<_>>() {
+            if m.tri_centroid(t).y > 4.0 {
+                m.set_tri_group(t, 3);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn every_route_gives_make_solids_result() {
+        let mut nan = primitives::icosphere(2.0, 3);
+        let v = nan.vertex_ids().nth(5).unwrap();
+        nan.set_vertex(v, DVec3::NAN);
+        let base = MakeSolidParams { cell_size: 0.12, ..Default::default() };
+        let variants = [
+            base.clone(),
+            MakeSolidParams { mode: SolidMode::Accurate, transfer_groups: true, ..base.clone() },
+            MakeSolidParams { mode: SolidMode::SharpEdges, offset: 0.2, ..base.clone() },
+            MakeSolidParams { mode: SolidMode::Blocky, ..base.clone() },
+            MakeSolidParams { close_holes: false, min_thickness: Some(0.5), ..base.clone() },
+            MakeSolidParams { offset: -0.25, min_edge_length: Some(0.05), improve_quality: false, ..base.clone() },
+        ];
+        for (name, m) in [("tube", tube()), ("sphere with a NaN vertex", nan), ("sphere", primitives::icosphere(2.0, 3))] {
+            let shared = Arc::new(m.clone());
+            let prepared = prepare_input(shared.clone(), None).unwrap();
+            assert_eq!(prepared.is_source(), Arc::ptr_eq(prepared.mesh_arc(), &shared), "{name}");
+            let (bvh, wn) = build_trees(&m);
+            let other_beta = WindingNumber::new(&m);
+            for p in &variants {
+                let want = make_solid(&m, p, None).unwrap();
+                assert!(same(&want, &make_solid_with(&m, p, Some((&bvh, &wn)), None).unwrap()), "{name} {p:?}: given trees");
+                assert!(same(&want, &make_solid_with(&m, p, Some((&bvh, &other_beta)), None).unwrap()), "{name} {p:?}: another beta");
+                assert!(same(&want, &make_solid_with_prepared(&prepared, p, None).unwrap()), "{name} {p:?}: prepared");
+                let field = build_solid_field(&prepared, p, None).unwrap();
+                assert!(field.matches(&prepared, p));
+                assert!(same(&want, &make_solid_from_field(&prepared, &field, p, None).unwrap()), "{name} {p:?}: from the field");
+            }
+            // A field serves every setting it does not depend on.
+            let field = build_solid_field(&prepared, &base, None).unwrap();
+            for p in [&variants[1], &variants[3]] {
+                assert!(same(&make_solid(&m, p, None).unwrap(), &make_solid_from_field(&prepared, &field, p, None).unwrap()), "{name} {p:?}: shared field");
+            }
+            assert!(!field.matches(&prepared, &variants[2]));
+            assert!(make_solid_from_field(&prepared, &field, &variants[2], None).is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_input_cancels() {
+        let m = Arc::new(primitives::icosphere(1.0, 3));
+        assert_eq!(prepare_input(m.clone(), Some(&|_| false)).err(), Some(SolidError::Cancelled));
+        let prepared = prepare_input(m, None).unwrap();
+        let p = MakeSolidParams { cell_size: 0.1, ..Default::default() };
+        assert_eq!(make_solid_with_prepared(&prepared, &p, Some(&|_| false)).err(), Some(SolidError::Cancelled));
+        assert_eq!(build_solid_field(&prepared, &p, Some(&|_| false)).err(), Some(SolidError::Cancelled));
+    }
 }

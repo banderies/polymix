@@ -19,6 +19,7 @@ use crate::stamp::{stamp_polygon, StampFrame, Stencil};
 use crate::{EditError, EditResult};
 use glam::DVec2;
 use mm_core::Mesh;
+use mm_core::hash::{FastMap, FastSet};
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::TAU;
 
@@ -536,7 +537,8 @@ pub fn stamp_loops(mesh: &mut Mesh, seed: u32, frame: &StampFrame, loops: &[Vec<
             }
             // The insides are worked out at the end: later loops may have split triangles
             // (and, where two loops came within snapping distance, edges) of earlier ones.
-            let mut count: HashMap<u32, u32> = HashMap::new();
+            // The tally's order is lost in the sort below.
+            let mut count: FastMap<u32, u32> = FastMap::default();
             for o in &outlines {
                 for t in loop_inside(mesh, o, frame, reach)? {
                     *count.entry(t).or_default() += 1;
@@ -575,7 +577,8 @@ fn edge_path(mesh: &Mesh, a: u32, b: u32) -> Option<Vec<u32>> {
 /// Triangles on the left of a (counter-clockwise) outline.
 fn loop_inside(mesh: &Mesh, outline: &[u32], frame: &StampFrame, reach: f64) -> EditResult<Vec<u32>> {
     let lost = || EditError::Failed("a stamp outline was cut by another of its loops".into());
-    let mut wall = HashSet::new();
+    // Only asked, never walked in order (the caller only counts the triangles).
+    let mut wall = FastSet::default();
     let mut first = None;
     for i in 0..outline.len() {
         let path = edge_path(mesh, outline[i], outline[(i + 1) % outline.len()]).ok_or_else(lost)?;
@@ -594,7 +597,8 @@ fn loop_inside(mesh: &Mesh, outline: &[u32], frame: &StampFrame, reach: f64) -> 
     });
     let Some(start) = start else { return Err(EditError::Failed("stamp outline has no inside".into())) };
     let limit = reach * 1.5 + 1e-9;
-    let mut seen = HashSet::from([start]);
+    let mut seen: FastSet<u32> = FastSet::default();
+    seen.insert(start);
     let mut stack = vec![start];
     while let Some(t) = stack.pop() {
         if frame.project(mesh.tri_centroid(t)).length() > limit {

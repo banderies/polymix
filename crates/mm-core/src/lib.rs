@@ -6,9 +6,11 @@
 //! * [`selection::TriSelection`] — triangle selections and region operations.
 //! * [`primitives`] — procedural shapes.
 //! * [`shading`] — display normals that keep sharp edges crisp.
+//! * [`hash`] — a fast deterministic hasher for maps and sets keyed by integers.
 
 pub mod bvh;
 pub mod geom;
+pub mod hash;
 pub mod intersect;
 pub mod linalg;
 pub mod measure;

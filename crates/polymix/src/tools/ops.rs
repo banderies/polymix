@@ -4,14 +4,21 @@
 
 use super::*;
 use crate::jobs::{Job, ProgressFn};
+use crate::scene::SceneObject;
 use crate::ui_util;
-use std::sync::Arc;
+use std::any::Any;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Result of running an operation on a copy of the mesh.
 #[derive(Default)]
 pub struct OpOutput {
+    /// The object's new mesh (empty when `keeps_source` is set).
     pub mesh: Mesh,
+    /// The op leaves the object's mesh as it is (e.g. Extract, which only adds an object):
+    /// `mesh` is left empty rather than a copy of it, and accepting keeps the object's own
+    /// mesh, so the undo history holds it once and nothing is uploaded again.
+    pub keeps_source: bool,
     /// Triangles to select afterwards (e.g. the remeshed region).
     pub selection: Option<Vec<u32>>,
     pub message: String,
@@ -53,6 +60,13 @@ pub struct SourceLook {
     pub texture: Arc<crate::scene::TextureImage>,
 }
 
+impl SourceLook {
+    /// The object's texture, if it has one and UVs that still fit its mesh.
+    fn of(o: &SceneObject) -> Option<Self> {
+        o.uvs.clone().filter(|u| u.topo == o.mesh.topology_version()).zip(o.texture.clone()).map(|(uvs, texture)| SourceLook { uvs, texture })
+    }
+}
+
 /// Context shown to operation panels.
 pub struct OpInfo<'a> {
     pub mesh: &'a Mesh,
@@ -61,6 +75,62 @@ pub struct OpInfo<'a> {
     pub bbox_diag: f64,
     /// The scene's target surface, if one is set (and is not this object).
     pub target: Option<&'a TargetSurface>,
+}
+
+impl<'a> OpInfo<'a> {
+    /// The context for `mesh` and `selection`, with its sizes measured and no target.
+    pub fn new(mesh: &'a Mesh, selection: Option<&'a [u32]>) -> Self {
+        let (avg_edge, bbox_diag) = source_sizes(mesh);
+        Self { mesh, selection, avg_edge, bbox_diag, target: None }
+    }
+}
+
+/// The mean edge length and the bounding box diagonal of a source: what panels scale their
+/// sliders and defaults by.
+fn source_sizes(mesh: &Mesh) -> (f64, f64) {
+    (mesh.average_edge_length(), mesh.bounds().diagonal())
+}
+
+/// What an operation keeps about its source mesh: facts its panel shows every frame that
+/// take a while to work out on a large mesh (Thicken's open ends), and work one run leaves
+/// for the next (Fit Primitive's fits, Hollow's shell). A tool starts a new memo whenever
+/// its source changes, so nothing kept here can be stale; a job holds on to the memo it
+/// started with.
+#[derive(Default)]
+pub struct SourceMemo {
+    facts: Mutex<Option<Box<dyn Any + Send>>>,
+    kept: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
+impl SourceMemo {
+    /// Read facts about the source, worked out by `make` the first time they are asked for
+    /// and kept from then on (an op keeps one kind of facts).
+    pub fn facts<T: Any + Send, R>(&self, make: impl FnOnce() -> T, read: impl FnOnce(&T) -> R) -> R {
+        // Facts are only made and kept whole, so a panic elsewhere cannot leave them half done.
+        let mut slot = self.facts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(t) = slot.as_ref().and_then(|f| f.downcast_ref::<T>()) {
+            return read(t);
+        }
+        let t = make();
+        let r = read(&t);
+        *slot = Some(Box::new(t));
+        r
+    }
+
+    /// Work earlier runs kept for later ones (a `T::default()` the first time), to look up
+    /// or to store in. Runs of superseded previews may still be going and share it, so
+    /// `use_it` should only look up and store, and the work itself happen outside.
+    pub fn kept<T: Any + Send + Default, R>(&self, use_it: impl FnOnce(&mut T) -> R) -> R {
+        // Entries are stored whole, so a panic elsewhere cannot leave a wrong one behind.
+        let mut slot = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if !slot.as_ref().is_some_and(|k| k.is::<T>()) {
+            *slot = Some(Box::new(T::default()));
+        }
+        match slot.as_mut().and_then(|k| k.downcast_mut::<T>()) {
+            Some(t) => use_it(t),
+            None => use_it(&mut T::default()),
+        }
+    }
 }
 
 pub trait OpSpec: Send + 'static {
@@ -76,6 +146,12 @@ pub trait OpSpec: Send + 'static {
     const SHOWS_GROUPS: bool = false;
     fn defaults(info: &OpInfo) -> Self::Params;
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo);
+    /// [`OpSpec::ui`] with the source's memo, for panels that show facts about the source
+    /// which take a while to work out on a large mesh: they are worked out once, not every
+    /// frame.
+    fn ui_memo(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo, _memo: &SourceMemo) {
+        Self::ui(ui, p, info)
+    }
     fn run(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput>;
     /// [`OpSpec::run`] with the scene's target surface, for ops that use one.
     fn run_with(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, _target: Option<&TargetSurface>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -84,6 +160,12 @@ pub trait OpSpec: Send + 'static {
     /// [`OpSpec::run_with`] with the object's texture, for ops that use it.
     fn run_look(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, target: Option<&TargetSurface>, _look: Option<&SourceLook>, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         Self::run_with(mesh, selection, p, target, progress)
+    }
+    /// [`OpSpec::run_look`] with the source's memo, for ops whose runs can start from work an
+    /// earlier run (with other settings) kept there. The result must be the same as
+    /// without it.
+    fn run_memo(mesh: &Mesh, selection: Option<&[u32]>, p: &Self::Params, target: Option<&TargetSurface>, look: Option<&SourceLook>, _memo: &SourceMemo, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_look(mesh, selection, p, target, look, progress)
     }
     /// In-tool hotkeys (Meshmixer: D/F density ±10, T adaptive, G groups). Return true if
     /// the parameters changed.
@@ -134,6 +216,8 @@ pub struct OpTool<S: OpSpec> {
     drag: Option<(usize, Handle, DVec3)>,
     /// The object's texture, if it has one with UVs.
     look: Option<SourceLook>,
+    /// Facts about the source and work kept between runs; a new one with each new source.
+    memo: Arc<SourceMemo>,
 }
 
 impl<S: OpSpec> OpTool<S> {
@@ -144,11 +228,9 @@ impl<S: OpSpec> OpTool<S> {
         };
         let selection = if S::USES_SELECTION && !o.selection.is_empty() { Some(Arc::new(o.selection.to_vec())) } else { None };
         let source = o.mesh.clone();
-        let avg_edge = source.average_edge_length();
-        let bbox_diag = source.bounds().diagonal();
-        let info = OpInfo { mesh: &source, selection: selection.as_deref().map(|v| v.as_slice()), avg_edge, bbox_diag, target: target.as_ref() };
+        let info = OpInfo { target: target.as_ref(), ..OpInfo::new(&source, selection.as_deref().map(|v| v.as_slice())) };
         let params = S::defaults(&info);
-        let look = o.uvs.clone().filter(|u| u.topo == source.topology_version()).zip(o.texture.clone()).map(|(uvs, texture)| SourceLook { uvs, texture });
+        let (avg_edge, bbox_diag) = (info.avg_edge, info.bbox_diag);
         Self {
             object: o.id,
             source,
@@ -165,7 +247,26 @@ impl<S: OpSpec> OpTool<S> {
             pending_accept: false,
             invalid: false,
             drag: None,
-            look,
+            look: SourceLook::of(o),
+            memo: Arc::default(),
+        }
+    }
+
+    /// Take `o`'s mesh as the source: what is known and kept about the old one goes, and the
+    /// sizes the panel scales its sliders by and the texture are taken afresh.
+    fn set_source(&mut self, o: &SceneObject) {
+        self.source = o.mesh.clone();
+        (self.avg_edge, self.bbox_diag) = source_sizes(&self.source);
+        self.look = SourceLook::of(o);
+        self.memo = Arc::default();
+    }
+
+    /// The mesh `out` leaves the object with.
+    fn result_mesh<'a>(&'a self, out: &'a OpOutput) -> &'a Mesh {
+        if out.keeps_source {
+            &self.source
+        } else {
+            &out.mesh
         }
     }
 
@@ -189,6 +290,7 @@ impl<S: OpSpec> OpTool<S> {
             invalid: true,
             drag: None,
             look: None,
+            memo: Arc::default(),
         }
     }
 
@@ -201,8 +303,9 @@ impl<S: OpSpec> OpTool<S> {
         let sel = self.selection.clone();
         let target = self.target.clone();
         let look = self.look.clone();
+        let memo = self.memo.clone();
         let p2 = p.clone();
-        let job = Job::spawn(S::NAME, ctx.clone(), move |progress| S::run_look(&src, sel.as_deref().map(|v| v.as_slice()), &p2, target.as_ref(), look.as_ref(), progress));
+        let job = Job::spawn(S::NAME, ctx.clone(), move |progress| S::run_memo(&src, sel.as_deref().map(|v| v.as_slice()), &p2, target.as_ref(), look.as_ref(), &memo, progress));
         self.job = Some((p, job));
         self.error = None;
     }
@@ -234,7 +337,7 @@ impl<S: OpSpec> OpTool<S> {
         match cx.scene.get(self.object) {
             None => return true,
             Some(o) if !Arc::ptr_eq(&o.mesh, &self.source) => {
-                self.source = o.mesh.clone();
+                self.set_source(o);
                 self.result = None;
                 self.error = Some("The object changed; recomputing the preview.".into());
                 self.start(cx.egui);
@@ -246,7 +349,14 @@ impl<S: OpSpec> OpTool<S> {
         cx.history.push(S::NAME, cx.scene);
         let Some(o) = cx.scene.get_mut(self.object) else { return true };
         let base_name = o.name.clone();
-        o.set_mesh(out.mesh);
+        if out.keeps_source {
+            // The object keeps the very mesh it has (checked above to be the source); its
+            // selection starts afresh, as with a new mesh.
+            o.selection = mm_core::TriSelection::new(&o.mesh);
+            o.touch_selection();
+        } else {
+            o.set_mesh(out.mesh);
+        }
         if let Some(sel) = out.selection {
             let m = o.mesh.clone();
             for t in sel {
@@ -384,7 +494,7 @@ impl<S: OpSpec> Tool for OpTool<S> {
                 bbox_diag: self.bbox_diag,
                 target: self.target.as_ref(),
             };
-            S::ui(ui, &mut self.params, &info);
+            S::ui_memo(ui, &mut self.params, &info, &self.memo);
         }
         if self.params != before {
             self.changed_at = Some(Instant::now());
@@ -410,13 +520,13 @@ impl<S: OpSpec> Tool for OpTool<S> {
         if let Some((p, j)) = &self.job {
             let _ = p;
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.add(egui::ProgressBar::new(j.progress()).show_percentage());
             });
             cx.egui.request_repaint_after(Duration::from_millis(50));
         } else if let Some((_, out)) = &self.result {
             ui.label(&out.message);
-            ui.label(format!("Result: {} triangles", ui_util::format_count(out.mesh.triangle_count())));
+            ui.label(format!("Result: {} triangles", ui_util::format_count(self.result_mesh(out).triangle_count())));
         }
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(240, 110, 90), e);
@@ -459,7 +569,7 @@ impl<S: OpSpec> Tool for OpTool<S> {
     }
 
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {
-        self.result.as_ref().map(|(_, out)| (self.object, out.preview.as_ref().unwrap_or(&out.mesh)))
+        self.result.as_ref().map(|(_, out)| (self.object, out.preview.as_ref().unwrap_or_else(|| self.result_mesh(out))))
     }
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
@@ -543,7 +653,7 @@ impl<S: OpSpec> Tool for OpTool<S> {
         serde_json::json!({
             "computing": self.job.as_ref().map(|(_, j)| j.progress()),
             "acting_on_selected_triangles": self.selection.as_ref().map(|s| s.len()),
-            "result": self.result.as_ref().map(|(p, out)| serde_json::json!({"message": out.message, "triangles": out.mesh.triangle_count(), "for_current_settings": *p == self.params})),
+            "result": self.result.as_ref().map(|(p, out)| serde_json::json!({"message": out.message, "triangles": self.result_mesh(out).triangle_count(), "for_current_settings": *p == self.params})),
             "error": self.error,
             "updates": if S::LIVE { "live (recomputed after every change)" } else { "on accept" },
         })
@@ -730,11 +840,8 @@ impl OpSpec for ExtrudeSpec {
                     let (mut copy, _) = mesh.submesh(tris);
                     let all: Vec<u32> = copy.triangle_ids().collect();
                     let n = mm_edit::offset_selection_exact(&mut copy, &all, p.distance, 0.0, false, iterations)?;
-                    let before: std::collections::HashSet<u32> = m.triangle_ids().collect();
                     let g = m.max_group_id() + 1 - copy.triangle_ids().map(|t| copy.tri_group(t)).min().unwrap_or(0);
-                    m.append_mesh(&copy, g);
-                    let new: Vec<u32> = m.triangle_ids().filter(|t| !before.contains(t)).collect();
-                    (new, n)
+                    (append_listing_new(&mut m, &copy, g), n)
                 };
                 let tris = &tris[..];
                 if !p.offset_groups && p.connected {
@@ -763,7 +870,7 @@ impl OpSpec for ExtrudeSpec {
                 preview.append_mesh(&solid, preview.max_group_id() + 1);
                 let n = solid.triangle_count();
                 Ok(OpOutput {
-                    mesh: mesh.clone(),
+                    keeps_source: true,
                     selection: Some(tris.to_vec()),
                     message: format!("extracted a solid of {n} triangles"),
                     new_objects: vec![("extract".into(), solid)],
@@ -773,6 +880,15 @@ impl OpSpec for ExtrudeSpec {
             }
         }
     }
+}
+
+/// Append `copy` to `m` (its groups moved up by `group_offset`) and list the triangles it
+/// added, in id order. Ids freed earlier are taken again first, so a triangle is new when
+/// its id was not in use before, not when it is past the old ones.
+fn append_listing_new(m: &mut Mesh, copy: &Mesh, group_offset: i32) -> Vec<u32> {
+    let was_live: Vec<bool> = (0..m.max_tid() as u32).map(|t| m.is_triangle(t)).collect();
+    m.append_mesh(copy, group_offset);
+    m.triangle_ids().filter(|&t| !was_live.get(t as usize).copied().unwrap_or(false)).collect()
 }
 
 pub struct ExtrudeTool;
@@ -1234,6 +1350,9 @@ pub struct CloseCracksUi {
     pub tolerance_exp: f64,
 }
 
+/// How many open edges the source has (Close Cracks' panel).
+struct OpenEdges(usize);
+
 pub struct CloseCracksSpec;
 impl OpSpec for CloseCracksSpec {
     type Params = CloseCracksUi;
@@ -1243,9 +1362,14 @@ impl OpSpec for CloseCracksSpec {
         CloseCracksUi { tolerance_exp: -5.0 }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        Self::ui_memo(ui, p, info, &SourceMemo::default());
+    }
+    fn ui_memo(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo, memo: &SourceMemo) {
         ui.add(egui::Slider::new(&mut p.tolerance_exp, -7.0..=-2.0).text("Tolerance").custom_formatter(|v, _| format!("{:.2e}", 10f64.powf(v) * info.bbox_diag)))
             .on_hover_text("Open edges closer than this are zipped together");
-        ui.small(format!("Open edges now: {}", info.mesh.boundary_edge_ids().count()));
+        // A walk over every edge: once per source, not every frame.
+        let open = memo.facts(|| OpenEdges(info.mesh.boundary_edge_ids().count()), |n| n.0);
+        ui.small(format!("Open edges now: {open}"));
         ui.small("Zips cracks: open boundaries lying on top of each other (e.g. CAD surfaces exported without shared vertices), including T-junctions.");
     }
     fn run(mesh: &Mesh, _sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -1860,26 +1984,99 @@ impl OpSpec for OffsetSolidSpec {
         }
         ui.small("Robust volumetric offset: the result is always a closed, manifold solid. Negative distances shrink.");
     }
-    fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_memo(mesh, sel, p, None, None, &SourceMemo::default(), progress)
+    }
+    fn run_memo(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, _target: Option<&TargetSurface>, _look: Option<&SourceLook>, memo: &SourceMemo, progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let cells = (64.0 * 16f64.powf(p.accuracy)).round() as u32;
         let h = mm_solid::cell_size_for_resolution(&mesh.bounds().expanded(p.distance.abs()), cells);
-        let mut out = if p.hollow {
-            mm_solid::hollow(mesh, p.distance, h, Some(&|f| progress(f * 0.8)))
-        } else {
-            mm_solid::offset_solid(mesh, p.distance, h, Some(&|f| progress(f)))
+        if !p.hollow {
+            let out = mm_solid::offset_solid(mesh, p.distance, h, Some(&|f| progress(f))).map_err(|e| anyhow::anyhow!("{e}"))?;
+            return Ok(OpOutput { message: format!("{} triangles", out.triangle_count()), mesh: out, selection: None, ..Default::default() });
         }
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut made = 0;
-        if p.hollow {
-            for hole in &p.holes {
-                let (at, n) = (DVec3::new(hole[0], hole[1], hole[2]), DVec3::new(hole[3], hole[4], hole[5]));
-                let drill = escape_hole(at, n, p.hole_radius, p.hole_taper, p.distance.abs(), out.average_edge_length());
-                out = mm_edit::mesh_boolean(&out, &drill, mm_edit::BooleanOp::Difference).map_err(|e| anyhow::anyhow!("escape hole: {e}"))?.mesh;
-                made += 1;
+        // Each click adds a hole and runs the op again: start from the shell, or from the shell
+        // with the first holes drilled, as an earlier run left it.
+        let shell_key = (mesh.shape_version(), p.distance.to_bits(), p.accuracy.to_bits());
+        let drill_key = DrillKey { shell: shell_key, radius: p.hole_radius.to_bits(), taper: p.hole_taper.to_bits(), holes: p.holes.iter().map(|h| h.map(f64::to_bits)).collect() };
+        let (kept_holes, kept) = memo.kept(|k: &mut KeptHollow| k.start_for(&drill_key));
+        let mut done = kept_holes;
+        let mut out = match kept {
+            Some(m) => Mesh::clone(&m),
+            None => {
+                let shell = mm_solid::hollow(mesh, p.distance, h, Some(&|f| progress(f * 0.8))).map_err(|e| anyhow::anyhow!("{e}"))?;
+                memo.kept(|k: &mut KeptHollow| k.keep_shell(shell_key, Arc::new(shell.clone())));
+                shell
             }
+        };
+        let n = p.holes.len();
+        for (i, hole) in p.holes.iter().enumerate().skip(done) {
+            if !progress(0.8 + 0.2 * i as f32 / n as f32) {
+                anyhow::bail!("cancelled");
+            }
+            let (at, normal) = (DVec3::new(hole[0], hole[1], hole[2]), DVec3::new(hole[3], hole[4], hole[5]));
+            let drill = escape_hole(at, normal, p.hole_radius, p.hole_taper, p.distance.abs(), out.average_edge_length());
+            out = mm_edit::mesh_boolean(&out, &drill, mm_edit::BooleanOp::Difference).map_err(|e| anyhow::anyhow!("escape hole: {e}"))?.mesh;
+            done = i + 1;
         }
-        let holes = if made > 0 { format!(", {made} escape hole{}", if made == 1 { "" } else { "s" }) } else { String::new() };
+        if done > kept_holes {
+            memo.kept(|k: &mut KeptHollow| k.keep_drilled(drill_key, Arc::new(out.clone())));
+        }
+        let holes = if done > 0 { format!(", {done} escape hole{}", if done == 1 { "" } else { "s" }) } else { String::new() };
         Ok(OpOutput { message: format!("{} triangles{holes}", out.triangle_count()), mesh: out, selection: None, ..Default::default() })
+    }
+}
+
+/// The source's shape version and the wall thickness and accuracy (as bits) a hollow
+/// shell was made with.
+type ShellKey = (u64, u64, u64);
+
+/// A shell with escape holes drilled: the shell, the hole radius and taper, and the holes in
+/// order (all as bits, so only the very same settings match).
+#[derive(Clone, PartialEq)]
+struct DrillKey {
+    shell: ShellKey,
+    radius: u64,
+    taper: u64,
+    holes: Vec<[u64; 6]>,
+}
+
+/// Hollow's latest shell, and the latest shells with holes drilled into it, kept for the
+/// next run.
+#[derive(Default)]
+struct KeptHollow {
+    shell: Option<(ShellKey, Arc<Mesh>)>,
+    /// The latest last: two cover adding a hole and taking the last one off again.
+    drilled: Vec<(DrillKey, Arc<Mesh>)>,
+}
+
+impl KeptHollow {
+    const DRILLED: usize = 2;
+
+    /// Where a run for `want` can start: the kept shell with the most of its first holes
+    /// already drilled (and how many), or nothing when the shell itself is not kept.
+    fn start_for(&self, want: &DrillKey) -> (usize, Option<Arc<Mesh>>) {
+        let drilled = self
+            .drilled
+            .iter()
+            .filter(|(k, _)| k.shell == want.shell && k.radius == want.radius && k.taper == want.taper && want.holes.starts_with(&k.holes))
+            .max_by_key(|(k, _)| k.holes.len());
+        match (drilled, &self.shell) {
+            (Some((k, m)), _) => (k.holes.len(), Some(m.clone())),
+            (None, Some((k, m))) if *k == want.shell => (0, Some(m.clone())),
+            _ => (0, None),
+        }
+    }
+
+    fn keep_shell(&mut self, key: ShellKey, shell: Arc<Mesh>) {
+        self.drilled.retain(|(k, _)| k.shell == key);
+        self.shell = Some((key, shell));
+    }
+
+    fn keep_drilled(&mut self, key: DrillKey, mesh: Arc<Mesh>) {
+        self.drilled.retain(|(k, _)| *k != key);
+        self.drilled.push((key, mesh));
+        let extra = self.drilled.len().saturating_sub(Self::DRILLED);
+        self.drilled.drain(..extra);
     }
 }
 
@@ -1940,6 +2137,21 @@ pub struct ThickenUi {
     pub remesh: bool,
 }
 
+/// What Thicken's panel says about the source's open ends: how many, and the numbers
+/// (from 1) of those that are not flat.
+struct OpenEnds {
+    count: usize,
+    rough: Vec<String>,
+}
+
+impl OpenEnds {
+    fn of(mesh: &Mesh) -> Self {
+        let ends = mm_edit::thicken::openings(mesh);
+        let rough = ends.iter().enumerate().filter(|(_, (_, o))| o.flatness > mm_edit::thicken::FLAT_ENOUGH).map(|(i, _)| (i + 1).to_string()).collect();
+        Self { count: ends.len(), rough }
+    }
+}
+
 pub struct ThickenSpec;
 impl OpSpec for ThickenSpec {
     type Params = ThickenUi;
@@ -1949,6 +2161,9 @@ impl OpSpec for ThickenSpec {
         ThickenUi { thickness: 2.0, side: ThickenWay::Outward, accuracy: 0.33, remesh: true }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
+        Self::ui_memo(ui, p, info, &SourceMemo::default());
+    }
+    fn ui_memo(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo, memo: &SourceMemo) {
         ui.add(egui::Slider::new(&mut p.thickness, 0.1..=20.0).logarithmic(true).suffix(" mm").text("Wall thickness"));
         ui.horizontal(|ui| {
             ui.selectable_value(&mut p.side, ThickenWay::Outward, "Outward").on_hover_text("The wall grows outside the surface: the lumen keeps its shape (a flow model)");
@@ -1957,16 +2172,21 @@ impl OpSpec for ThickenSpec {
         });
         ui.add(egui::Slider::new(&mut p.accuracy, 0.0..=1.0).text("Accuracy")).on_hover_text("How closely the new side follows the surface; finer is slower");
         ui.checkbox(&mut p.remesh, "Remesh the new wall").on_hover_text("Even triangles of the surface's own size on the new side and the rims");
-        let ends = mm_edit::thicken::openings(info.mesh);
-        let rough: Vec<String> = ends.iter().enumerate().filter(|(_, (_, o))| o.flatness > mm_edit::thicken::FLAT_ENOUGH).map(|(i, _)| (i + 1).to_string()).collect();
-        ui.small(match ends.len() {
-            0 => "No open ends: the wall encloses a sealed cavity.".to_string(),
-            1 => "1 open end, kept open with a flat rim.".to_string(),
-            n => format!("{n} open ends, kept open with flat rims."),
-        });
-        if !rough.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(240, 180, 60), format!("Open end{} {} {} not flat: cut {} square first (Vessel → Trim branch, or Plane Cut) for a clean rim.", if rough.len() == 1 { "" } else { "s" }, rough.join(", "), if rough.len() == 1 { "is" } else { "are" }, if rough.len() == 1 { "it" } else { "them" }));
-        }
+        // The open ends are found by a walk over every edge: once per source, not every frame.
+        memo.facts(
+            || OpenEnds::of(info.mesh),
+            |ends| {
+                ui.small(match ends.count {
+                    0 => "No open ends: the wall encloses a sealed cavity.".to_string(),
+                    1 => "1 open end, kept open with a flat rim.".to_string(),
+                    n => format!("{n} open ends, kept open with flat rims."),
+                });
+                let rough = &ends.rough;
+                if !rough.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(240, 180, 60), format!("Open end{} {} {} not flat: cut {} square first (Vessel → Trim branch, or Plane Cut) for a clean rim.", if rough.len() == 1 { "" } else { "s" }, rough.join(", "), if rough.len() == 1 { "is" } else { "are" }, if rough.len() == 1 { "it" } else { "them" }));
+                }
+            },
+        );
         ui.small("The new side lies the thickness from the surface everywhere (it never folds into itself, unlike moving the surface along its normals), so the result is a closed wall ready to print.");
     }
     fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -2943,6 +3163,45 @@ fn selection_pieces(m: &Mesh, tris: &[u32]) -> Vec<Vec<u32>> {
     out
 }
 
+/// What a set of fits was made from: the source (its shape version), the selection, and
+/// the settings that change the fit itself (not its adjustment).
+struct FitKey {
+    shape: u64,
+    selection: Vec<u32>,
+    kind: mm_edit::PrimitiveType,
+    density: usize,
+    single: bool,
+}
+
+impl FitKey {
+    fn new(mesh: &Mesh, tris: &[u32], p: &FitPrimitiveUi) -> Self {
+        Self { shape: mesh.shape_version(), selection: tris.to_vec(), kind: p.kind, density: p.density, single: p.single }
+    }
+
+    /// Whether these are what fitting `tris` of `mesh` with `p` starts from.
+    fn is_for(&self, mesh: &Mesh, tris: &[u32], p: &FitPrimitiveUi) -> bool {
+        self.shape == mesh.shape_version() && self.kind == p.kind && self.density == p.density && self.single == p.single && self.selection == tris
+    }
+}
+
+/// The latest fits, before adjusting, kept for the next run: dragging a handle runs the op
+/// at every step with only the adjustment changed.
+#[derive(Default)]
+struct KeptFits(Option<(FitKey, Arc<Vec<mm_edit::FitResult>>)>);
+
+/// The primitives fitted to the selection (one per piece, or one for all of it), not yet
+/// adjusted: those kept in `memo` if they were fitted to the same, else fitted now (and
+/// kept).
+fn fits_before_adjusting(mesh: &Mesh, tris: &[u32], p: &FitPrimitiveUi, memo: &SourceMemo) -> anyhow::Result<Arc<Vec<mm_edit::FitResult>>> {
+    if let Some(fits) = memo.kept(|k: &mut KeptFits| k.0.as_ref().filter(|(key, _)| key.is_for(mesh, tris, p)).map(|(_, fits)| fits.clone())) {
+        return Ok(fits);
+    }
+    let pieces = if p.single { vec![tris.to_vec()] } else { selection_pieces(mesh, tris) };
+    let fits = Arc::new(pieces.iter().map(|piece| mm_edit::fit_primitive(mesh, piece, p.kind, p.density)).collect::<Result<Vec<_>, _>>()?);
+    memo.kept(|k: &mut KeptFits| k.0 = Some((FitKey::new(mesh, tris, p), fits.clone())));
+    Ok(fits)
+}
+
 pub struct FitPrimitiveSpec;
 impl OpSpec for FitPrimitiveSpec {
     type Params = FitPrimitiveUi;
@@ -3012,21 +3271,23 @@ impl OpSpec for FitPrimitiveSpec {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select the faces to fit first.");
         }
     }
-    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
+    fn run(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
+        Self::run_memo(mesh, sel, p, None, None, &SourceMemo::default(), progress)
+    }
+    fn run_memo(mesh: &Mesh, sel: Option<&[u32]>, p: &Self::Params, _target: Option<&TargetSurface>, _look: Option<&SourceLook>, memo: &SourceMemo, _progress: ProgressFn) -> anyhow::Result<OpOutput> {
         let tris = sel.ok_or_else(|| anyhow::anyhow!("select the faces to fit first"))?;
-        let pieces = if p.single { vec![tris.to_vec()] } else { selection_pieces(mesh, tris) };
+        let fitted = fits_before_adjusting(mesh, tris, p, memo)?;
         let mut fits = Vec::new();
         let mut frames = Vec::new();
         let a = &p.adjust;
-        for piece in &pieces {
-            let mut f = mm_edit::fit_primitive(mesh, piece, p.kind, p.density)?;
+        for f in fitted.iter() {
+            let mut f = f.clone();
             if let Some(fr) = f.frame {
                 frames.push(fr.adjust(&mut f.mesh, DVec3::from(a.offset), DVec3::from(a.scale), a.turn_deg.to_radians()));
             }
             fits.push(f);
         }
         let message = fits.iter().map(|f| f.description.clone()).collect::<Vec<_>>().join("; ");
-        let mut out = mesh.clone();
         if p.create_new_objects {
             let mut preview = mesh.clone();
             for f in &fits {
@@ -3034,7 +3295,7 @@ impl OpSpec for FitPrimitiveSpec {
             }
             let name = p.kind.label().to_lowercase();
             return Ok(OpOutput {
-                mesh: out,
+                keeps_source: true,
                 selection: Some(tris.to_vec()),
                 message,
                 new_objects: fits.into_iter().map(|f| (name.clone(), f.mesh)).collect(),
@@ -3043,6 +3304,7 @@ impl OpSpec for FitPrimitiveSpec {
                 ..Default::default()
             });
         }
+        let mut out = mesh.clone();
         for f in &fits {
             let g = out.max_group_id() + 1;
             out.append_mesh(&f.mesh, g);
@@ -3111,7 +3373,7 @@ mod tests {
         m.append_mesh(&t2, 1);
         let ring = |z: f64| -> Vec<u32> { m.triangle_ids().filter(|&t| m.triangle(t).iter().any(|&v| (m.vertex(v).z - z).abs() < 1e-9)).collect() };
         let rings: Vec<u32> = ring(2.0).into_iter().chain(ring(3.5)).collect();
-        let info = |sel| OpInfo { mesh: &m, selection: Some(sel), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = |sel| OpInfo::new(&m, Some(sel));
         let p = EraseFillSpec::defaults(&info(&rings));
         assert_eq!(p.kind, FillKind::Loft, "two hole rings are lofted");
         assert_eq!(EraseFillSpec::defaults(&info(&ring(2.0))).kind, FillKind::SmoothMvc, "one hole is filled");
@@ -3170,7 +3432,7 @@ mod tests {
         let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_normal(t).z > 0.0 && m.triangle(t).iter().any(|&v| m.vertex(v).distance(base) < 0.5 || v == tip)).collect();
         let far_side = m.vertex_triangles(tip).iter().filter(|t| !sel.contains(t)).count();
         assert!(far_side > 0, "part of the spike is left unselected");
-        let p = EraseFillSpec::defaults(&OpInfo { mesh: &m, selection: Some(&sel), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None });
+        let p = EraseFillSpec::defaults(&OpInfo::new(&m, Some(&sel)));
         let out = EraseFillSpec::run(&m, Some(&sel), &p, &|_| true).unwrap();
         assert_eq!(mm_core::topology::connected_components(&out.mesh).len(), 1, "no floating fragments");
         assert!(out.mesh.is_closed());
@@ -3198,7 +3460,7 @@ mod tests {
     fn erase_fill_parameters() {
         let m = mm_core::primitives::icosphere(1.0, 4);
         let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.6).collect();
-        let info = OpInfo { mesh: &m, selection: Some(&cap), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, Some(&cap));
         let base = EraseFillSpec::defaults(&info);
         let run = |p: EraseFillUi| EraseFillSpec::run(&m, Some(&cap), &p, &|_| true).unwrap();
         // Height of the patch's highest point above the hole plane (the cap border sits at z ≈ 0.6).
@@ -3255,7 +3517,7 @@ mod tests {
         b.transform(|p| p + DVec3::new(3.0, 0.0, 0.0));
         m.append_mesh(&b, 0);
         let caps: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t) - DVec3::new(1.5, 0.0, 0.0)).length() < 0.9).collect();
-        let info = OpInfo { mesh: &m, selection: Some(&caps), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, Some(&caps));
         let bridge = RegionBridgeSpec::defaults(&info);
         assert_eq!(bridge.loft.shape, mm_edit::LoftShape::Straight, "Cmd+B bridges straight");
         let mut g2 = RegionBridgeUi::tube_handle();
@@ -3357,7 +3619,7 @@ mod tests {
         use mm_core::primitives;
         let m = primitives::icosphere(1.0, 4);
         let info = |sel: Option<&'static [u32]>| -> RemeshUi {
-            let i = OpInfo { mesh: &m, selection: sel, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+            let i = OpInfo::new(&m, sel);
             RemeshSpec::defaults(&i)
         };
         let base = info(None);
@@ -3374,7 +3636,7 @@ mod tests {
         // flatter middle, more so with a higher threshold.
         let mut e = primitives::icosphere(1.0, 4);
         e.transform(|p| DVec3::new(p.x * 3.0, p.y, p.z));
-        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal(), target: None };
+        let ei = OpInfo::new(&e, None);
         let eb = RemeshSpec::defaults(&ei);
         let tip_over_middle = |t: f64| {
             let o = RemeshSpec::run(&e, None, &RemeshUi { mode: RemeshMode::AdaptiveDensity, threshold: t, ..eb }, &|_| true).unwrap();
@@ -3402,7 +3664,7 @@ mod tests {
         // Uniform reduction evens out edge lengths more than shape-preserving reduction.
         let mut e = primitives::icosphere(1.0, 4);
         e.transform(|p| DVec3::new(p.x * 3.0, p.y, p.z));
-        let ei = OpInfo { mesh: &e, selection: None, avg_edge: e.average_edge_length(), bbox_diag: e.bounds().diagonal(), target: None };
+        let ei = OpInfo::new(&e, None);
         let rb = ReduceSpec::defaults(&ei);
         let cv = |uniform: bool| {
             let o = ReduceSpec::run(&e, None, &ReduceUi { uniform, ..rb }, &|_| true).unwrap();
@@ -3426,7 +3688,7 @@ mod tests {
             }
         }
         let rough = |mm: &Mesh| mm.vertex_ids().map(|v| (mm.vertex(v).length() - 1.0).abs()).sum::<f64>();
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let base = SmoothSpec::defaults(&info);
         let group_border: Vec<u32> = m.vertex_ids().filter(|&v| {
             let ts = m.vertex_triangles(v);
@@ -3478,7 +3740,7 @@ mod tests {
     #[test]
     fn remesh_and_reduce_hotkeys() {
         let m = mm_core::primitives::icosphere(1.0, 2);
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let mut p = RemeshSpec::defaults(&info);
         let d0 = p.density;
         assert!(RemeshSpec::keys(&mut p, &key_input(egui::Key::D)));
@@ -3498,7 +3760,7 @@ mod tests {
     }
 
     fn run_spec<S: OpSpec>(mesh: &Mesh, sel: Option<&[u32]>) -> anyhow::Result<OpOutput> {
-        let info = OpInfo { mesh, selection: sel, avg_edge: mesh.average_edge_length(), bbox_diag: mesh.bounds().diagonal(), target: None };
+        let info = OpInfo::new(mesh, sel);
         let p = S::defaults(&info);
         let r = S::run(mesh, sel, &p, &|_| true);
         if let Ok(out) = &r {
@@ -3552,7 +3814,7 @@ mod tests {
             m.set_tri_group(t, (2 * axis + (n[axis] > 0.0) as usize) as i32);
         }
         m.transform(|p| q * p);
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let base = MakeSolidUi { accuracy: 0.0, ..MakeSolidSpec::defaults(&info) };
         let run = |p: MakeSolidUi| MakeSolidSpec::run(&m, None, &p, &|_| true).unwrap().mesh;
         // Sharp Edge Preserve keeps the cube's edges through the remesh, with its groups.
@@ -3588,7 +3850,7 @@ mod offset_tool_tests {
     fn offset_connected_or_as_a_copy() {
         let m = mm_core::primitives::icosphere(5.0, 3);
         let top: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 3.0).collect();
-        let info = OpInfo { mesh: &m, selection: Some(&top), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, Some(&top));
         let mut p = ExtrudeSpec::defaults(&info);
         p.mode = ExtrudeMode::Offset;
         p.distance = 1.0;
@@ -3618,7 +3880,7 @@ mod hollow_tool_tests {
     #[test]
     fn escape_holes_open_the_cavity() {
         let m = mm_core::primitives::icosphere(10.0, 4);
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let mut p = OffsetSolidSpec::defaults(&info);
         p.hollow = true;
         p.distance = 2.0;
@@ -3649,7 +3911,7 @@ mod thicken_tool_tests {
         // An open tube of radius 3: a 2 mm wall outward, its two ends kept open.
         let pts: Vec<DVec3> = (0..=80).map(|k| DVec3::new(0.0, 0.0, 0.25 * k as f64)).collect();
         let m = mm_core::primitives::tube_along(&pts, &vec![3.0; pts.len()], 48);
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let p = ThickenSpec::defaults(&info);
         assert_eq!((p.thickness, p.side), (2.0, ThickenWay::Outward));
         let out = ThickenSpec::run(&m, None, &p, &|_| true).unwrap();
@@ -3715,7 +3977,7 @@ mod thicken_tool_tests {
         let ends = mm_edit::thicken::openings(&m);
         eprintln!("{} triangles, {} open ends (flatness {:?})", m.triangle_count(), ends.len(), ends.iter().map(|e| (e.1.flatness * 1000.0).round() / 1000.0).collect::<Vec<_>>());
         for (side, remesh) in [(ThickenWay::Outward, true), (ThickenWay::Outward, false), (ThickenWay::Inward, true)] {
-            let p = ThickenUi { side, remesh, ..ThickenSpec::defaults(&OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None }) };
+            let p = ThickenUi { side, remesh, ..ThickenSpec::defaults(&OpInfo::new(&m, None)) };
             let t0 = std::time::Instant::now();
             match ThickenSpec::run(&m, None, &p, &|_| true) {
                 Ok(out) => {
@@ -3764,7 +4026,7 @@ mod target_tests {
     }
 
     fn info<'a>(m: &'a Mesh, sel: Option<&'a [u32]>, t: Option<&'a TargetSurface>) -> OpInfo<'a> {
-        OpInfo { mesh: m, selection: sel, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: t }
+        OpInfo { target: t, ..OpInfo::new(m, sel) }
     }
 
     #[test]
@@ -3820,7 +4082,7 @@ mod fit_primitive_tests {
         assert_eq!(mm_core::topology::connected_components(&single.mesh).len(), 2);
         let objects = FitPrimitiveSpec::run(&m, Some(&sel), &FitPrimitiveUi { create_new_objects: true, ..p }, &|_| true).unwrap();
         assert_eq!(objects.new_objects.len(), 2);
-        assert_eq!(objects.mesh.triangle_count(), m.triangle_count());
+        assert!(objects.keeps_source, "the object itself is left as it is");
     }
 
     #[test]
@@ -3862,7 +4124,7 @@ mod color_transfer_tests {
         let mid = texture.sample([0.5, 0.5]);
         assert!((mid[0] - 0.5).abs() < 1e-6 && (mid[2] - 0.5).abs() < 1e-6, "bilinear between the two");
         let look = SourceLook { uvs: Arc::new(crate::scene::UvSet::new(&m, corners)), texture: Arc::new(texture) };
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let p = MakeSolidUi { color_transfer: ColorTransfer::MaterialToVertex, accuracy: 0.2, remesh_result: false, ..MakeSolidSpec::defaults(&info) };
         let out = MakeSolidSpec::run_look(&m, None, &p, None, Some(&look), &|_| true).unwrap().mesh;
         let (mut red, mut blue) = (0, 0);
@@ -3890,7 +4152,7 @@ mod color_transfer_tests {
             let z = m.vertex(v).z as f32;
             m.set_vertex_color(v, [(z + 1.0) / 2.0, 0.2, 0.2]);
         }
-        let info = OpInfo { mesh: &m, selection: None, avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&m, None);
         let base = MakeSolidUi { accuracy: 0.0, ..MakeSolidSpec::defaults(&info) };
         for remesh in [false, true] {
             let out = MakeSolidSpec::run(&m, None, &MakeSolidUi { remesh_result: remesh, ..base }, &|_| true).unwrap().mesh;
@@ -3905,3 +4167,252 @@ mod color_transfer_tests {
     }
 }
 
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use mm_core::primitives;
+    use std::cell::Cell;
+
+    /// The very same mesh: ids, positions (to the bit), triangles and groups.
+    fn same_mesh(a: &Mesh, b: &Mesh) -> bool {
+        let bits = |p: DVec3| p.to_array().map(f64::to_bits);
+        a.max_vid() == b.max_vid()
+            && a.max_tid() == b.max_tid()
+            && (0..a.max_vid() as u32).all(|v| a.is_vertex(v) == b.is_vertex(v) && (!a.is_vertex(v) || bits(a.vertex(v)) == bits(b.vertex(v))))
+            && (0..a.max_tid() as u32).all(|t| a.is_triangle(t) == b.is_triangle(t) && (!a.is_triangle(t) || (a.triangle(t) == b.triangle(t) && a.tri_group(t) == b.tri_group(t))))
+    }
+
+    fn same_output(a: &OpOutput, b: &OpOutput) {
+        assert!(same_mesh(&a.mesh, &b.mesh));
+        assert_eq!(a.keeps_source, b.keeps_source);
+        assert_eq!(a.selection, b.selection);
+        assert_eq!(a.message, b.message);
+        assert_eq!(a.frames, b.frames);
+        assert_eq!(a.new_objects.len(), b.new_objects.len());
+        for ((na, ma), (nb, mb)) in a.new_objects.iter().zip(&b.new_objects) {
+            assert_eq!(na, nb);
+            assert!(same_mesh(ma, mb));
+        }
+        assert_eq!(a.preview.is_some(), b.preview.is_some());
+        if let (Some(x), Some(y)) = (&a.preview, &b.preview) {
+            assert!(same_mesh(x, y));
+        }
+    }
+
+    /// Draw `S`'s panel once, headless.
+    fn draw<S: OpSpec>(p: &mut S::Params, info: &OpInfo, memo: &SourceMemo) {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| S::ui_memo(ui, p, info, memo));
+    }
+
+    /// What a tool needs around it: a scene, its history, a camera and the UI.
+    struct Around {
+        scene: Scene,
+        history: crate::scene::History,
+        camera: crate::camera::Camera,
+        status: String,
+        ctx: egui::Context,
+    }
+
+    impl Around {
+        fn new(scene: Scene) -> Self {
+            Self { scene, history: Default::default(), camera: Default::default(), status: String::new(), ctx: egui::Context::default() }
+        }
+        fn cx(&mut self) -> ToolCx<'_> {
+            let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+            ToolCx { scene: &mut self.scene, history: &mut self.history, camera: &mut self.camera, status: &mut self.status, egui: &self.ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift }
+        }
+    }
+
+    /// Accept `tool` (computing its result first) and wait until it has committed.
+    fn accept<T: Tool>(tool: &mut T, cx: &mut ToolCx) {
+        let t0 = Instant::now();
+        while !tool.accept(cx) {
+            assert!(t0.elapsed() < Duration::from_secs(60), "the op never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_memo_makes_facts_once_and_keeps_work() {
+        let memo = SourceMemo::default();
+        let made = Cell::new(0);
+        for _ in 0..3 {
+            let n = memo.facts(
+                || {
+                    made.set(made.get() + 1);
+                    OpenEdges(7)
+                },
+                |n| n.0,
+            );
+            assert_eq!(n, 7);
+        }
+        assert_eq!(made.get(), 1, "worked out once");
+        assert_eq!(memo.kept(|k: &mut Vec<u32>| k.len()), 0, "nothing kept at first");
+        memo.kept(|k: &mut Vec<u32>| k.push(1));
+        assert_eq!(memo.kept(|k: &mut Vec<u32>| k.clone()), vec![1]);
+    }
+
+    #[test]
+    fn panels_work_out_facts_about_the_source_once() {
+        // An open tube: two flat open ends.
+        let pts: Vec<DVec3> = (0..=20).map(|k| DVec3::new(0.0, 0.0, k as f64)).collect();
+        let m = primitives::tube_along(&pts, &vec![3.0; pts.len()], 24);
+        let info = OpInfo::new(&m, None);
+        let memo = SourceMemo::default();
+        let mut p = ThickenSpec::defaults(&info);
+        draw::<ThickenSpec>(&mut p, &info, &memo);
+        draw::<ThickenSpec>(&mut p, &info, &memo);
+        let (count, rough) = memo.facts(|| -> OpenEnds { panic!("worked out again") }, |e| (e.count, e.rough.clone()));
+        assert_eq!(count, mm_edit::thicken::openings(&m).len());
+        assert_eq!((count, rough.len()), (2, 0));
+        // A ragged end is reported by its number, as the panel always did.
+        let ragged: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 19.0 && m.tri_centroid(t).x > 1.0).collect();
+        let mut r = m.clone();
+        r.remove_triangles(ragged);
+        let want: Vec<String> = mm_edit::thicken::openings(&r).iter().enumerate().filter(|(_, (_, o))| o.flatness > mm_edit::thicken::FLAT_ENOUGH).map(|(i, _)| (i + 1).to_string()).collect();
+        assert!(!want.is_empty());
+        assert_eq!(OpenEnds::of(&r).rough, want);
+
+        let memo = SourceMemo::default();
+        let mut c = CloseCracksSpec::defaults(&info);
+        draw::<CloseCracksSpec>(&mut c, &info, &memo);
+        assert_eq!(memo.facts(|| -> OpenEdges { panic!("worked out again") }, |n| n.0), m.boundary_edge_ids().count());
+    }
+
+    #[test]
+    fn a_new_source_brings_new_sizes_and_a_new_memo() {
+        let mut scene = Scene::default();
+        let id = scene.add("ball", primitives::icosphere(5.0, 2));
+        let mut around = Around::new(scene);
+        let mut cx = around.cx();
+        let mut tool = CloseCracksTool::new(&mut cx);
+        let (memo, avg) = (tool.memo.clone(), tool.avg_edge);
+        assert_eq!(tool.bbox_diag, cx.scene.get(id).unwrap().mesh.bounds().diagonal());
+        // The object changes under the tool: accepting takes its new mesh as the source.
+        cx.scene.get_mut(id).unwrap().set_mesh(primitives::icosphere(20.0, 3));
+        assert!(!tool.commit(&mut cx));
+        let now = cx.scene.get(id).unwrap().mesh.clone();
+        assert!(Arc::ptr_eq(&tool.source, &now));
+        assert_eq!((tool.avg_edge, tool.bbox_diag), (now.average_edge_length(), now.bounds().diagonal()));
+        assert!(tool.avg_edge != avg && !Arc::ptr_eq(&tool.memo, &memo));
+        tool.cancel(&mut cx);
+    }
+
+    #[test]
+    fn fit_primitive_reuses_its_fits_with_the_same_result() {
+        let m = primitives::cylinder(2.0, 10.0, 48, 10, false);
+        let all: Vec<u32> = m.triangle_ids().collect();
+        let p = FitPrimitiveUi { kind: mm_edit::PrimitiveType::Cylinder, density: 16, single: true, create_new_objects: true, adjust: FitAdjust::default() };
+        let memo = SourceMemo::default();
+        let run = |p: &FitPrimitiveUi, memo: &SourceMemo| FitPrimitiveSpec::run_memo(&m, Some(&all), p, None, None, memo, &|_| true).unwrap();
+        same_output(&run(&p, &memo), &run(&p, &SourceMemo::default()));
+        // A handle dragged, or the numbers typed: the kept fit adjusted is a fresh fit adjusted.
+        for adjust in [FitAdjust { offset: [1.0, -2.0, 0.5], scale: [1.5, 1.0, 0.8], turn_deg: 30.0 }, FitAdjust::default()] {
+            for create_new_objects in [true, false] {
+                let q = FitPrimitiveUi { adjust, create_new_objects, ..p };
+                same_output(&run(&q, &memo), &run(&q, &SourceMemo::default()));
+            }
+        }
+        // The kept fits are what is used: mark them and see the mark.
+        memo.kept(|k: &mut KeptFits| {
+            if let Some((_, fits)) = &mut k.0 {
+                Arc::make_mut(fits)[0].description = "kept".into();
+            }
+        });
+        assert_eq!(run(&p, &memo).message, "kept");
+        // Another fit (density, pieces, kind or selection): fitted again.
+        for q in [FitPrimitiveUi { density: 8, ..p }, FitPrimitiveUi { single: false, ..p }, FitPrimitiveUi { kind: mm_edit::PrimitiveType::SphereBestFit, ..p }] {
+            let out = run(&q, &memo);
+            assert_ne!(out.message, "kept");
+            same_output(&out, &run(&q, &SourceMemo::default()));
+        }
+        let half: Vec<u32> = all.iter().copied().filter(|&t| m.tri_centroid(t).z > 0.0).collect();
+        let fresh = FitPrimitiveSpec::run_memo(&m, Some(&half), &p, None, None, &SourceMemo::default(), &|_| true).unwrap();
+        same_output(&FitPrimitiveSpec::run_memo(&m, Some(&half), &p, None, None, &memo, &|_| true).unwrap(), &fresh);
+    }
+
+    #[test]
+    fn hollow_drills_only_the_new_holes_with_the_same_result() {
+        let m = primitives::icosphere(10.0, 3);
+        let mut p = OffsetSolidSpec::defaults(&OpInfo::new(&m, None));
+        p.hollow = true;
+        p.distance = 2.0;
+        p.accuracy = 0.2;
+        let holes = [[0.0, 0.0, 10.0, 0.0, 0.0, 1.0], [10.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
+        let memo = SourceMemo::default();
+        let run = |p: &OffsetUi, memo: &SourceMemo| OffsetSolidSpec::run_memo(&m, None, p, None, None, memo, &|_| true).unwrap();
+        // Holes clicked one at a time, the last taken off again, then a narrower drill.
+        for (holes, radius) in [(&holes[..1], 1.5), (&holes[..2], 1.5), (&holes[..1], 1.5), (&holes[..1], 1.0)] {
+            let q = OffsetUi { holes: holes.to_vec(), hole_radius: radius, ..p.clone() };
+            let (kept, fresh) = (run(&q, &memo), run(&q, &SourceMemo::default()));
+            same_output(&kept, &fresh);
+            assert!(kept.message.contains(&format!("{} escape hole", holes.len())), "{}", kept.message);
+        }
+        // The kept shell is what is used: swap it and see.
+        let cube = primitives::cube(1.0, 1);
+        memo.kept(|k: &mut KeptHollow| {
+            if let Some((_, shell)) = &mut k.shell {
+                *shell = Arc::new(cube.clone());
+            }
+        });
+        assert!(same_mesh(&run(&OffsetUi { holes: Vec::new(), ..p.clone() }, &memo).mesh, &cube));
+        // Another wall thickness: hollowed again.
+        let q = OffsetUi { distance: 1.5, ..p.clone() };
+        same_output(&run(&q, &memo), &run(&q, &SourceMemo::default()));
+    }
+
+    #[test]
+    fn appended_triangles_are_listed_even_in_reused_ids() {
+        let mut m = primitives::icosphere(5.0, 2);
+        // Removed triangles leave ids that appending takes again first.
+        let cap: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 3.0).collect();
+        m.remove_triangles(cap);
+        let copy = primitives::cube(1.0, 2);
+        let mut a = m.clone();
+        let before: std::collections::HashSet<u32> = a.triangle_ids().collect();
+        a.append_mesh(&copy, 5);
+        let want: Vec<u32> = a.triangle_ids().filter(|t| !before.contains(t)).collect();
+        let mut b = m.clone();
+        assert_eq!(append_listing_new(&mut b, &copy, 5), want);
+        assert!(same_mesh(&a, &b));
+        assert_eq!(want.len(), copy.triangle_count());
+        assert!(want.iter().any(|&t| (t as usize) < m.max_tid()), "ids were reused");
+    }
+
+    #[test]
+    fn extract_and_new_primitives_keep_the_object_mesh_itself() {
+        let ball = primitives::icosphere(5.0, 3);
+        let top: Vec<u32> = ball.triangle_ids().filter(|&t| ball.tri_centroid(t).z > 3.0).collect();
+        let mut scene = Scene::default();
+        let id = scene.add("ball", ball);
+        if let Some(o) = scene.get_mut(id) {
+            for &t in &top {
+                o.selection.insert(t);
+            }
+        }
+        let mut around = Around::new(scene);
+        let mut cx = around.cx();
+        let mesh = cx.scene.get(id).unwrap().mesh.clone();
+        let mut tool = ExtrudeTool::new(&mut cx, ExtrudeMode::Extract);
+        accept(&mut tool, &mut cx);
+        let o = cx.scene.get(id).unwrap();
+        assert!(Arc::ptr_eq(&o.mesh, &mesh), "not a copy");
+        assert_eq!(o.selection.to_vec(), top);
+        assert_eq!(cx.scene.objects.len(), 2);
+        assert!(cx.status.starts_with("Extrude / Offset: extracted"), "{}", cx.status);
+        // Undone: the one object with its selection and the same mesh.
+        assert!(cx.history.undo(cx.scene).is_some());
+        assert_eq!(cx.scene.objects.len(), 1);
+        assert!(Arc::ptr_eq(&cx.scene.get(id).unwrap().mesh, &mesh));
+        assert_eq!(cx.scene.get(id).unwrap().selection.to_vec(), top);
+        // Fit Primitive making new objects: the same.
+        let mut tool = FitPrimitiveTool::new(&mut cx);
+        tool.params.create_new_objects = true;
+        accept(&mut tool, &mut cx);
+        assert!(Arc::ptr_eq(&cx.scene.get(id).unwrap().mesh, &mesh));
+        assert_eq!(cx.scene.get(id).unwrap().selection.to_vec(), top);
+        assert_eq!(cx.scene.objects.len(), 2);
+    }
+}

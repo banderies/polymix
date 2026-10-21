@@ -18,6 +18,7 @@
 use crate::cap::cap_oriented_loops;
 use crate::util::*;
 use crate::{EditError, EditResult};
+use mm_core::hash::{FastMap, FastSet};
 use mm_core::{Aabb, Bvh, DVec2, DVec3, Mesh, Plane, INVALID};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
@@ -234,8 +235,15 @@ pub(crate) fn point_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
 
 pub(crate) struct CutContext {
     pub plane: Plane,
-    /// Signed distance by vertex id; exactly 0.0 for vertices treated as on the plane.
+    /// Signed distance by vertex id; exactly 0.0 for vertices treated as on the plane (and for
+    /// those a context made for a few triangles did not set). Empty for a context made
+    /// [`CutContext::for_triangles_local`], which keeps them in `local`.
     pub sd: Vec<f64>,
+    /// The signed distances of a few triangles' vertices (unset ones read as 0.0), so a
+    /// context near a click costs as much as the triangles there, not the whole mesh.
+    local: Option<FastMap<u32, f64>>,
+    /// The entries of `sd` set by [`CutContext::for_triangles_in`], to clear after.
+    touched: Vec<u32>,
 }
 
 impl CutContext {
@@ -245,33 +253,108 @@ impl CutContext {
             let d = plane.signed_distance(mesh.vertex(v));
             sd[v as usize] = if d.abs() <= eps { 0.0 } else { d };
         }
-        Self { plane, sd }
+        Self { plane, sd, local: None, touched: Vec::new() }
     }
 
-    /// Context valid only for `tris` and their edge neighbours (enough for
-    /// [`compute_curves`] restricted to `tris`); `sd` is a reusable buffer.
-    pub fn for_triangles(mesh: &Mesh, plane: Plane, eps: f64, tris: &[u32], mut sd: Vec<f64>) -> Self {
-        sd.clear();
-        sd.resize(mesh.max_vid(), 0.0);
-        let mut set = |v: u32| {
-            let d = plane.signed_distance(mesh.vertex(v));
-            sd[v as usize] = if d.abs() <= eps { 0.0 } else { d };
-        };
+    /// Every vertex of `tris` and of their edge neighbours (enough for [`compute_curves`]
+    /// restricted to `tris`), with repeats.
+    fn each_vertex_near(mesh: &Mesh, tris: &[u32], mut f: impl FnMut(u32)) {
         for &t in tris {
             for e in mesh.tri_edges(t) {
                 for o in mesh.edge_triangles(e) {
                     if o != INVALID {
-                        mesh.triangle(o).into_iter().for_each(&mut set);
+                        mesh.triangle(o).into_iter().for_each(&mut f);
                     }
                 }
             }
         }
-        Self { plane, sd }
+    }
+
+    /// Context valid only for `tris` and their edge neighbours (enough for
+    /// [`compute_curves`] restricted to `tris`); `sd` is a reusable buffer (of any contents: it
+    /// is cleared first; see [`CutContext::for_triangles_in`] for one kept all zeros).
+    // (Kept for callers that clear their buffer here; the crate's own now keep it zeroed.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn for_triangles(mesh: &Mesh, plane: Plane, eps: f64, tris: &[u32], mut sd: Vec<f64>) -> Self {
+        sd.clear();
+        sd.resize(mesh.max_vid(), 0.0);
+        Self::for_triangles_in(mesh, plane, eps, tris, sd)
+    }
+
+    /// [`CutContext::for_triangles`] with its distances in a small map rather than a buffer as
+    /// long as the mesh: for a few triangles.
+    pub fn for_triangles_local(mesh: &Mesh, plane: Plane, eps: f64, tris: &[u32]) -> Self {
+        let mut local: FastMap<u32, f64> = FastMap::default();
+        Self::each_vertex_near(mesh, tris, |v| {
+            local.entry(v).or_insert_with(|| {
+                let d = plane.signed_distance(mesh.vertex(v));
+                if d.abs() <= eps { 0.0 } else { d }
+            });
+        });
+        Self { plane, sd: Vec::new(), local: Some(local), touched: Vec::new() }
+    }
+
+    /// [`CutContext::for_triangles`] with `sd` a buffer of zeros (of any length: it grows to
+    /// the mesh's vertices), so many triangles are looked up as fast as in a whole-mesh
+    /// context without clearing a buffer as long as the mesh each time; only their entries
+    /// are set, and [`CutContext::into_buffer`] clears just those, for the buffer's next use.
+    pub fn for_triangles_in(mesh: &Mesh, plane: Plane, eps: f64, tris: &[u32], mut sd: Vec<f64>) -> Self {
+        if sd.len() < mesh.max_vid() {
+            sd.resize(mesh.max_vid(), 0.0);
+        }
+        // Entries are 0.0 until set, and set ones are 0.0 only on the plane: a vertex met again
+        // with its distance set is skipped (each is met many times, through every triangle
+        // around it), and one met at 0.0 is worked out (again) and noted for clearing (so the
+        // list holds each once, bar a few on-plane vertices met again).
+        let mut touched = Vec::new();
+        Self::each_vertex_near(mesh, tris, |v| {
+            let slot = &mut sd[v as usize];
+            if *slot != 0.0 {
+                return;
+            }
+            touched.push(v);
+            let d = plane.signed_distance(mesh.vertex(v));
+            *slot = if d.abs() <= eps { 0.0 } else { d };
+        });
+        Self { plane, sd, local: None, touched }
+    }
+
+    /// The buffer of a context made [`CutContext::for_triangles`] or
+    /// [`CutContext::for_triangles_in`], all zeros again.
+    pub fn into_buffer(mut self) -> Vec<f64> {
+        for &v in &self.touched {
+            self.sd[v as usize] = 0.0;
+        }
+        self.sd
+    }
+
+    /// Signed distance of `v` (0.0 where it is on the plane, or unknown to this context).
+    #[inline]
+    fn dist(&self, v: u32) -> f64 {
+        match &self.local {
+            Some(m) => m.get(&v).copied().unwrap_or(0.0),
+            None => self.sd.get(v as usize).copied().unwrap_or(0.0),
+        }
+    }
+
+    /// Put `v` on the plane in this context.
+    fn set_on_plane(&mut self, v: u32) {
+        match &mut self.local {
+            Some(m) => {
+                m.insert(v, 0.0);
+            }
+            None => {
+                if self.sd.len() <= v as usize {
+                    self.sd.resize(v as usize + 1, 0.0);
+                }
+                self.sd[v as usize] = 0.0;
+            }
+        }
     }
 
     #[inline]
     pub fn sign(&self, v: u32) -> i8 {
-        let d = self.sd.get(v as usize).copied().unwrap_or(0.0);
+        let d = self.dist(v);
         if d > 0.0 {
             1
         } else if d < 0.0 {
@@ -291,7 +374,7 @@ impl CutContext {
     #[inline]
     pub fn param(&self, mesh: &Mesh, e: u32) -> f64 {
         let [a, b] = mesh.edge_vertices(e);
-        let (da, db) = (self.sd[a as usize], self.sd[b as usize]);
+        let (da, db) = (self.dist(a), self.dist(b));
         (da / (da - db)).clamp(0.0, 1.0)
     }
 
@@ -304,7 +387,7 @@ impl CutContext {
     pub fn snap(&mut self, mesh: &mut Mesh, v: u32) {
         let p = self.plane.project(mesh.vertex(v));
         mesh.set_vertex(v, p);
-        self.sd[v as usize] = 0.0;
+        self.set_on_plane(v);
     }
 
     /// Split crossing edge `e` at the plane; returns the new (on-plane) vertex.
@@ -314,10 +397,7 @@ impl CutContext {
         let v = info.v_new;
         let p = self.plane.project(mesh.vertex(v));
         mesh.set_vertex(v, p);
-        if self.sd.len() <= v as usize {
-            self.sd.resize(v as usize + 1, 0.0);
-        }
-        self.sd[v as usize] = 0.0;
+        self.set_on_plane(v);
         Ok(v)
     }
 
@@ -340,6 +420,23 @@ impl CutContext {
 
 fn snap_eps(mesh: &Mesh) -> f64 {
     1e-9 * mesh.bounds().diagonal()
+}
+
+/// The distance within which the cuts and intersection curves count a vertex as on the plane:
+/// 1e-9 of the mesh's bounding-box diagonal. Ask once for many curves through one mesh (see
+/// [`local_intersection_curves_with`]).
+pub fn snap_distance(mesh: &Mesh) -> f64 {
+    snap_eps(mesh)
+}
+
+/// [`snap_distance`], from `bvh`'s box when it holds every triangle of `mesh` (current) and the
+/// mesh's own box is not cached: the same box (the same coordinates, so the same diagonal),
+/// without a walk over the mesh.
+pub(crate) fn snap_eps_with(mesh: &Mesh, bvh: Option<&Bvh>) -> f64 {
+    match bvh {
+        Some(b) if b.tris.len() == mesh.triangle_count() && b.is_current(mesh) && mesh.cached_bounds().is_none() => 1e-9 * b.bounds().diagonal(),
+        _ => snap_eps(mesh),
+    }
 }
 
 // ----------------------------------------------------------------------------------------
@@ -367,12 +464,12 @@ fn uf_find(p: &mut [usize], mut x: usize) -> usize {
 /// of triangles). Does not modify the mesh.
 pub(crate) fn compute_curves(mesh: &Mesh, ctx: &CutContext, subset: Option<&[u32]>) -> Vec<Curve> {
     let n = ctx.plane.normal;
-    let mut index: HashMap<u64, usize> = HashMap::new();
+    let mut index: FastMap<u64, usize> = FastMap::default();
     let mut keys: Vec<u64> = Vec::new();
     let mut segs: Vec<(usize, usize, [DVec3; 2])> = Vec::new();
-    let mut inplane: HashSet<u32> = HashSet::new();
+    let mut inplane: FastSet<u32> = FastSet::default();
 
-    let elem = |k: u64, index: &mut HashMap<u64, usize>, keys: &mut Vec<u64>| -> usize {
+    let elem = |k: u64, index: &mut FastMap<u64, usize>, keys: &mut Vec<u64>| -> usize {
         *index.entry(k).or_insert_with(|| {
             keys.push(k);
             keys.len() - 1
@@ -450,14 +547,15 @@ pub(crate) fn compute_curves(mesh: &Mesh, ctx: &CutContext, subset: Option<&[u32
             parent[ra] = rb;
         }
     }
-    let mut comp_of_root: HashMap<usize, usize> = HashMap::new();
+    let mut comp_of_root: Vec<usize> = vec![usize::MAX; ne];
     let mut curves: Vec<Curve> = Vec::new();
     for i in 0..ne {
         let r = uf_find(&mut parent, i);
-        let ci = *comp_of_root.entry(r).or_insert_with(|| {
+        if comp_of_root[r] == usize::MAX {
+            comp_of_root[r] = curves.len();
             curves.push(Curve { crossing_edges: Vec::new(), plane_vertices: Vec::new(), segments: Vec::new(), closed: true });
-            curves.len() - 1
-        });
+        }
+        let ci = comp_of_root[r];
         let k = keys[i];
         if k & VKEY != 0 {
             curves[ci].plane_vertices.push((k & 0xffff_ffff) as u32);
@@ -470,7 +568,7 @@ pub(crate) fn compute_curves(mesh: &Mesh, ctx: &CutContext, subset: Option<&[u32
     }
     for &(a, _, s) in &segs {
         let r = uf_find(&mut parent, a);
-        let ci = comp_of_root[&r];
+        let ci = comp_of_root[r];
         curves[ci].segments.push(s);
     }
     curves.retain(|c| !c.segments.is_empty());
@@ -518,6 +616,16 @@ pub fn plane_intersection_curves(mesh: &Mesh, plane: Plane) -> Vec<IntersectionC
 /// triangles within `reach` of it (cheap on a big mesh; a curve the reach cuts short is open).
 /// `bvh` must be current for `mesh`, or built from a subset of it holding those triangles.
 pub fn local_intersection_curves(mesh: &Mesh, bvh: &Bvh, plane: Plane, point: DVec3, reach: f64) -> Vec<IntersectionCurve> {
+    local_curves(mesh, bvh, plane, point, reach, None)
+}
+
+/// [`local_intersection_curves`] with the on-plane distance given (`snap`, from
+/// [`snap_distance`]), for many curves through one mesh.
+pub fn local_intersection_curves_with(mesh: &Mesh, bvh: &Bvh, plane: Plane, point: DVec3, reach: f64, snap: f64) -> Vec<IntersectionCurve> {
+    local_curves(mesh, bvh, plane, point, reach, Some(snap))
+}
+
+fn local_curves(mesh: &Mesh, bvh: &Bvh, plane: Plane, point: DVec3, reach: f64, snap: Option<f64>) -> Vec<IntersectionCurve> {
     let Ok(plane) = normalize_plane(plane) else { return Vec::new() };
     let mut tris = Vec::new();
     bvh.query_aabb(&Aabb::from_points([point - DVec3::splat(reach), point + DVec3::splat(reach)]), |t| {
@@ -529,7 +637,8 @@ pub fn local_intersection_curves(mesh: &Mesh, bvh: &Bvh, plane: Plane, point: DV
     if tris.is_empty() {
         return Vec::new();
     }
-    let ctx = CutContext::for_triangles(mesh, plane, snap_eps(mesh), &tris, Vec::new());
+    let eps = snap.unwrap_or_else(|| snap_eps_with(mesh, Some(bvh)));
+    let ctx = CutContext::for_triangles_local(mesh, plane, eps, &tris);
     compute_curves(mesh, &ctx, Some(&tris)).iter().map(|c| curve_summary(c, plane.normal)).collect()
 }
 
@@ -950,4 +1059,68 @@ pub fn local_plane_cut_with(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    fn same_curves(a: &[Curve], b: &[Curve]) -> bool {
+        let bits = |s: &[[DVec3; 2]]| s.iter().map(|x| x.map(|p| p.to_array().map(f64::to_bits))).collect::<Vec<_>>();
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| x.crossing_edges == y.crossing_edges && x.plane_vertices == y.plane_vertices && x.closed == y.closed && bits(&x.segments) == bits(&y.segments))
+    }
+
+    /// Two wavy tubes side by side, with planes through vertices (on-plane corners) and between.
+    fn tubes() -> Mesh {
+        let mut m = Mesh::new();
+        for k in 0..2 {
+            let path: Vec<DVec3> = (0..=60).map(|i| DVec3::new(4.0 * k as f64 + 0.5 * (0.2 * i as f64).sin(), 0.0, 0.25 * i as f64)).collect();
+            m.append_mesh(&primitives::tube_along(&path, &vec![1.0 + 0.2 * k as f64; path.len()], 24), 0);
+        }
+        m
+    }
+
+    #[test]
+    fn contexts_for_a_few_triangles_give_the_whole_contexts_curves() {
+        let m = tubes();
+        let eps = snap_eps(&m);
+        let all: Vec<u32> = m.triangle_ids().collect();
+        let mut buffer = Vec::new();
+        for plane in [Plane::from_point_normal(m.vertex(100), DVec3::Z), Plane::from_point_normal(DVec3::new(0.3, 0.0, 7.1), DVec3::new(0.2, 0.1, 1.0)), Plane::from_point_normal(m.vertex(500), DVec3::X)] {
+            let full = CutContext::new(&m, plane, eps);
+            assert!(same_curves(&compute_curves(&m, &full, None), &compute_curves(&m, &full, Some(&all))));
+            // A few triangles: a context for them alone, in a map or in a reused buffer (kept
+            // all zeros, or of any contents), gives what the whole one gives, and the buffer
+            // is all zeros again after.
+            let near: Vec<u32> = all.iter().copied().filter(|&t| m.tri_centroid(t).distance(DVec3::new(0.0, 0.0, 7.0)) < 3.0).collect();
+            let want = compute_curves(&m, &full, Some(&near));
+            let local = CutContext::for_triangles_local(&m, plane, eps, &near);
+            assert!(same_curves(&compute_curves(&m, &local, Some(&near)), &want));
+            let reused = CutContext::for_triangles_in(&m, plane, eps, &near, std::mem::take(&mut buffer));
+            assert!(same_curves(&compute_curves(&m, &reused, Some(&near)), &want));
+            buffer = reused.into_buffer();
+            assert!(buffer.len() == m.max_vid() && buffer.iter().all(|&x| x.to_bits() == 0));
+            let cleared = CutContext::for_triangles(&m, plane, eps, &near, vec![1.0; 7]);
+            assert!(same_curves(&compute_curves(&m, &cleared, Some(&near)), &want));
+            assert!(cleared.into_buffer().iter().all(|&x| x.to_bits() == 0));
+        }
+    }
+
+    #[test]
+    fn a_full_tree_gives_the_snap_distance() {
+        let mut m = tubes();
+        let bvh = Bvh::build(&m);
+        // Not cached yet: from the tree's box; then from the mesh's own.
+        m.bump_shape_version();
+        let bvh2 = Bvh::build(&m);
+        assert!(m.cached_bounds().is_none());
+        assert_eq!(snap_eps_with(&m, Some(&bvh2)).to_bits(), (1e-9 * m.bounds().diagonal()).to_bits());
+        assert_eq!(snap_eps_with(&m, Some(&bvh2)).to_bits(), snap_distance(&m).to_bits());
+        // A stale tree, or one over some triangles, is not used.
+        assert_eq!(snap_eps_with(&m, Some(&bvh)).to_bits(), snap_distance(&m).to_bits());
+        let some: Vec<u32> = m.triangle_ids().take(10).collect();
+        assert_eq!(snap_eps_with(&m, Some(&Bvh::build_subset(&m, &some))).to_bits(), snap_distance(&m).to_bits());
+    }
 }

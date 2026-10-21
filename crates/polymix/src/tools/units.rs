@@ -5,6 +5,8 @@
 
 use super::*;
 use crate::ui_util;
+use rayon::prelude::*;
+use std::sync::Arc;
 
 /// Display units; model units are taken to be millimetres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,26 @@ pub struct UnitsTool {
     measures: Vec<Measure>,
     selected: Option<usize>,
     pressed: Option<(egui::Pos2, DVec3)>,
+    /// The dimension being dragged or typed, if any.
+    gesture: Option<Gesture>,
+    /// Where the X, Y and Z fields were drawn last (tests work them).
+    #[cfg(test)]
+    dim_rects: [egui::Rect; 3],
+}
+
+/// A dimension being dragged (or typed, until Enter): its first change pushed the undo step,
+/// and every change scales the object as it was before the gesture, not as the last frame
+/// left it. A drag is then one undo step, and no frame copies the mesh or snapshots the scene.
+struct Gesture {
+    object: ObjectId,
+    /// The mesh before the gesture (the undo step holds the same one).
+    base: Arc<Mesh>,
+    center: DVec3,
+    extents: DVec3,
+    /// The measurements' ends before the gesture.
+    measures: Vec<(DVec3, DVec3)>,
+    /// The shape version the last change left: any other edit of the mesh ends the gesture.
+    shape: u64,
 }
 
 /// Least-squares scale `s` minimising Σ (s·Lᵢ − Tᵢ)², with the average and maximum
@@ -72,10 +94,21 @@ fn fit_scale(pairs: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
 
 impl UnitsTool {
     pub fn new(cx: &mut ToolCx) -> Self {
-        Self { object: cx.scene.active, unit: Unit::Mm, measures: Vec::new(), selected: None, pressed: None }
+        Self {
+            object: cx.scene.active,
+            unit: Unit::Mm,
+            measures: Vec::new(),
+            selected: None,
+            pressed: None,
+            gesture: None,
+            #[cfg(test)]
+            dim_rects: [egui::Rect::NOTHING; 3],
+        }
     }
 
     fn scale_by(&mut self, cx: &mut ToolCx, s: f64, label: &str) {
+        // A step of its own: a dimension dragged afterwards starts a new one.
+        self.gesture = None;
         let Some(id) = self.object.filter(|id| cx.scene.get(*id).is_some()) else { return };
         if !(s > 0.0 && s.is_finite()) || s == 1.0 {
             return;
@@ -89,6 +122,52 @@ impl UnitsTool {
             m.b = c + (m.b - c) * s;
         }
         *cx.status = format!("{label}: scaled by {s}");
+    }
+
+    /// Give dimension `axis` the length `size` (model units) by scaling the object uniformly
+    /// about its centre, as one change of a dimension gesture (see [`Gesture`]).
+    fn set_dimension_live(&mut self, cx: &mut ToolCx, axis: usize, size: f64) {
+        let Some(id) = self.object.filter(|id| cx.scene.get(*id).is_some()) else { return };
+        let n = self.measures.len();
+        let going = self.gesture.as_ref().is_some_and(|g| g.object == id && g.measures.len() == n && cx.scene.get(id).is_some_and(|o| o.mesh.shape_version() == g.shape));
+        if going {
+            let s = self.gesture.as_ref().map_or(0.0, |g| size / g.extents[axis]);
+            if !(s > 0.0 && s.is_finite()) {
+                return;
+            }
+            cx.history.touch();
+        } else {
+            let Some(o) = cx.scene.get(id) else { return };
+            let b = o.bounds();
+            let s = size / b.extents()[axis];
+            if !(s > 0.0 && s.is_finite()) || s == 1.0 {
+                return;
+            }
+            cx.history.push("Set dimensions", cx.scene);
+            let measures = self.measures.iter().map(|m| (m.a, m.b)).collect();
+            self.gesture = Some(Gesture { object: id, base: o.mesh.clone(), center: b.center(), extents: b.extents(), measures, shape: 0 });
+        }
+        let (Some(g), Some(o)) = (self.gesture.as_mut(), cx.scene.get_mut(id)) else { return };
+        let (c, s) = (g.center, size / g.extents[axis]);
+        let base = &*g.base;
+        // The same positions Mesh::transform gives the live vertices; the mesh is copied from
+        // the undo step once, on the first change.
+        let mesh = o.mesh_mut();
+        const CHUNK: usize = 1 << 15;
+        mesh.positions_mut().par_chunks_mut(CHUNK).zip(base.positions().par_chunks(CHUNK)).enumerate().for_each(|(k, (ps, qs))| {
+            for (i, (p, q)) in ps.iter_mut().zip(qs).enumerate() {
+                if base.is_vertex((k * CHUNK + i) as u32) {
+                    *p = c + (*q - c) * s;
+                }
+            }
+        });
+        mesh.bump_shape_version();
+        g.shape = mesh.shape_version();
+        for (m, (a, b)) in self.measures.iter_mut().zip(&g.measures) {
+            m.a = c + (*a - c) * s;
+            m.b = c + (*b - c) * s;
+        }
+        *cx.status = format!("Set dimensions: scaled by {s}");
     }
 }
 
@@ -151,6 +230,8 @@ impl Tool for UnitsTool {
         let a = Args(args);
         let k = self.unit.mm();
         let index = |len: usize| -> Result<usize, String> { a.usize("measurement")?.checked_sub(1).filter(|i| *i < len).ok_or_else(|| "there is no such measurement".to_string()) };
+        // Agents' changes are steps of their own.
+        self.gesture = None;
         match action {
             "set_dimension" => {
                 let o = self.object.and_then(|id| cx.scene.get(id)).ok_or("no active object")?;
@@ -227,19 +308,31 @@ impl Tool for UnitsTool {
             });
         });
         let k = self.unit.mm();
-        let mut scale = None;
+        let mut size = None;
+        // A dimension is being dragged, or typed in (a typed value applies on Enter or when
+        // the field loses focus, not at every keystroke).
+        let mut held = false;
         egui::Grid::new("dims").num_columns(2).show(ui, |ui| {
             for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
                 ui.label(*n);
                 let mut v = e[i] / k;
-                if ui.add(egui::DragValue::new(&mut v).speed(e[i] / k * 0.005).max_decimals(4).suffix(format!(" {}", self.unit.label()))).changed() && e[i] > 0.0 && v > 0.0 {
-                    scale = Some(v * k / e[i]);
+                let r = ui.add(egui::DragValue::new(&mut v).speed(e[i] / k * 0.005).max_decimals(4).suffix(format!(" {}", self.unit.label())).update_while_editing(false));
+                held |= r.dragged() || r.has_focus();
+                if r.changed() && e[i] > 0.0 && v > 0.0 {
+                    size = Some((i, v * k));
+                }
+                #[cfg(test)]
+                {
+                    self.dim_rects[i] = r.rect;
                 }
                 ui.end_row();
             }
         });
-        if let Some(s) = scale {
-            self.scale_by(cx, s, "Set dimensions");
+        if let Some((axis, size)) = size {
+            self.set_dimension_live(cx, axis, size);
+        }
+        if !held {
+            self.gesture = None;
         }
         ui.small("Typing a dimension scales the object uniformly. Mesh files carry no units; medical exports are usually millimetres.");
         ui_util::section(ui, "Convert units");
@@ -271,6 +364,7 @@ impl Tool for UnitsTool {
         if let Some(i) = remove {
             self.measures.remove(i);
             self.selected = None;
+            self.gesture = None;
         }
         let pairs: Vec<(f64, f64)> = self.measures.iter().filter(|m| m.target > 0.0).map(|m| (m.length(), m.target)).collect();
         if let Some((s, avg, max)) = fit_scale(&pairs) {
@@ -300,6 +394,7 @@ impl Tool for UnitsTool {
                     let m = Measure { a, b: h.point, target: a.distance(h.point) };
                     self.measures.push(m);
                     self.selected = Some(self.measures.len() - 1);
+                    self.gesture = None;
                 }
             }
         }
@@ -363,5 +458,85 @@ mod tests {
         let (s, avg, max) = fit_scale(&[(1.0, 2.0), (1.0, 3.0)]).unwrap();
         assert!((s - 2.5).abs() < 1e-12 && (avg - 0.5).abs() < 1e-12 && (max - 0.5).abs() < 1e-12);
         assert!(fit_scale(&[]).is_none());
+    }
+
+    /// Every live vertex of `m` is `base`'s scaled by `s` about `c`, to rounding.
+    fn scaled_from(m: &Mesh, base: &Mesh, c: DVec3, s: f64) -> bool {
+        base.vertex_ids().all(|v| (m.vertex(v) - (c + (base.vertex(v) - c) * s)).length() < 1e-9 * (1.0 + s))
+    }
+
+    #[test]
+    fn a_dimension_drag_or_typed_value_is_one_undo_step() {
+        let mut scene = Scene::default();
+        let mut m = mm_core::primitives::cube(1.0, 3);
+        m.transform(|p| DVec3::new(p.x * 80.0 + 5.0, p.y * 40.0 - 3.0, p.z * 20.0 + 1.0));
+        let id = scene.add("box", m);
+        scene.active = Some(id);
+        let (mut history, mut camera, mut status, ctx) = (History::default(), crate::camera::Camera::default(), String::new(), egui::Context::default());
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = UnitsTool::new(&mut cx);
+        // A measurement scales with the object.
+        tool.act("measure", &serde_json::json!({"a": [5.0, -3.0, 1.0], "b": [45.0, -3.0, 1.0]}), &mut cx).unwrap();
+        let frame = |tool: &mut UnitsTool, cx: &mut ToolCx, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), events, ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| {
+                let _ = tool.panel(ui, cx);
+            });
+        };
+        let press = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        let base = cx.scene.get(id).unwrap().mesh.clone();
+        let b0 = base.bounds();
+        assert!((b0.extents().x - 80.0).abs() < 1e-9);
+        frame(&mut tool, &mut cx, vec![]);
+        frame(&mut tool, &mut cx, vec![]);
+
+        // Drag X to the right over several frames: every frame rescales the box, all of it one
+        // undo step.
+        let p = tool.dim_rects[0].center();
+        frame(&mut tool, &mut cx, vec![egui::Event::PointerMoved(p), press(p, true)]);
+        let mut versions = vec![];
+        for k in 1..=5 {
+            frame(&mut tool, &mut cx, vec![egui::Event::PointerMoved(p + egui::vec2(20.0 * k as f32, 0.0))]);
+            versions.push(cx.scene.get(id).unwrap().mesh.shape_version());
+        }
+        frame(&mut tool, &mut cx, vec![press(p + egui::vec2(100.0, 0.0), false)]);
+        frame(&mut tool, &mut cx, vec![]);
+        versions.dedup();
+        assert!(versions.len() >= 4, "the box follows the drag: {versions:?}");
+        assert_eq!(cx.history.labels().0, vec!["Set dimensions"]);
+        let e = cx.scene.get(id).unwrap().bounds().extents();
+        let s = e.x / 80.0;
+        assert!(s > 1.2, "{e:?}");
+        assert!(scaled_from(&cx.scene.get(id).unwrap().mesh, &base, b0.center(), s));
+        assert!((e.y - 40.0 * s).abs() < 1e-9 && (e.z - 20.0 * s).abs() < 1e-9, "{e:?}");
+        assert!((tool.measures[0].length() - 40.0 * s).abs() < 1e-9);
+
+        // Type 120 over the X value: nothing happens until Enter, then one step scales it.
+        frame(&mut tool, &mut cx, vec![egui::Event::PointerMoved(p), press(p, true)]);
+        frame(&mut tool, &mut cx, vec![press(p, false)]);
+        frame(&mut tool, &mut cx, vec![]);
+        let before = cx.scene.get(id).unwrap().mesh.shape_version();
+        for c in ["1", "2", "0"] {
+            frame(&mut tool, &mut cx, vec![egui::Event::Text(c.into())]);
+            assert_eq!(cx.scene.get(id).unwrap().mesh.shape_version(), before, "typing does not scale");
+        }
+        assert_eq!(cx.history.labels().0.len(), 1);
+        frame(&mut tool, &mut cx, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        frame(&mut tool, &mut cx, vec![]);
+        frame(&mut tool, &mut cx, vec![]);
+        assert_eq!(cx.history.labels().0, vec!["Set dimensions", "Set dimensions"]);
+        let e = cx.scene.get(id).unwrap().bounds().extents();
+        assert!((e.x - 120.0).abs() < 1e-9 && (e.y - 60.0).abs() < 1e-9, "{e:?}");
+        assert!(scaled_from(&cx.scene.get(id).unwrap().mesh, &base, b0.center(), 1.5));
+        assert!((tool.measures[0].length() - 60.0).abs() < 1e-9);
+
+        // Undo goes back to the drag's result, then to the very mesh before it.
+        let gen = cx.history.generation();
+        cx.history.undo(cx.scene);
+        assert!((cx.scene.get(id).unwrap().bounds().extents().x - 80.0 * s).abs() < 1e-9);
+        cx.history.undo(cx.scene);
+        assert!(Arc::ptr_eq(&cx.scene.get(id).unwrap().mesh, &base));
+        assert!(cx.history.generation() > gen);
     }
 }

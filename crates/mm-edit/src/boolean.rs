@@ -21,10 +21,13 @@
 
 use crate::triangulate::triangulate;
 use crate::{EditError, EditResult};
-use mm_core::{Aabb, Bvh, DVec2, DVec3, Mesh};
+use mm_core::hash::{FastMap, FastSet};
+use mm_core::{Aabb, Bvh, DVec2, DVec3, Mesh, INVALID};
+use mm_solid::WindingNumber;
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 
 /// Boolean operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +150,13 @@ fn edge_plane_point(p: DVec3, q: DVec3, t: [DVec3; 3]) -> (DVec3, f64) {
     (p + (q - p) * s, s)
 }
 
+/// An unordered pair of vertex ids as one key.
+#[inline]
+fn pair_key(a: u32, b: u32) -> u64 {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    (lo as u64) << 32 | hi as u64
+}
+
 /// One input mesh as seen by the boolean.
 struct Operand<'a> {
     mesh: &'a Mesh,
@@ -160,9 +170,14 @@ impl Operand<'_> {
     fn tri_pos(&self, t: u32) -> [DVec3; 3] {
         self.mesh.triangle(t).map(|v| self.pos[v as usize])
     }
+    /// Edge `j` of triangle `t` runs from corner j to corner j+1.
     fn tri_edges(&self, t: u32) -> [u32; 3] {
-        let tv = self.mesh.triangle(t);
-        [0, 1, 2].map(|j| self.mesh.find_edge(tv[j], tv[(j + 1) % 3]).expect("triangle edge"))
+        let te = self.mesh.tri_edges(t);
+        debug_assert!({
+            let tv = self.mesh.triangle(t);
+            (0..3).all(|j| self.mesh.find_edge(tv[j], tv[(j + 1) % 3]) == Some(te[j]))
+        });
+        te
     }
 }
 
@@ -177,9 +192,11 @@ struct TriCut {
 /// Triangulate triangle `t` of `op` cut along `cut`. Output triangles use global ids and
 /// keep the triangle's orientation.
 fn split_triangle(op: &Operand, t: u32, cut: &mut TriCut, pos: &[DVec3]) -> Result<Vec<[u32; 3]>, Degenerate> {
+    // (The maps and sets here are only looked up, or their keys sorted, so their order
+    // does not matter.)
     let corners = op.mesh.triangle(t).map(|v| v + op.base);
     let mut cycle: Vec<u32> = Vec::new();
-    let mut on_edge: HashSet<u32> = HashSet::new();
+    let mut on_edge: FastSet<u32> = FastSet::default();
     for (corner, pts) in corners.iter().zip(cut.edge_pts.iter_mut()) {
         cycle.push(*corner);
         pts.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -188,7 +205,7 @@ fn split_triangle(op: &Operand, t: u32, cut: &mut TriCut, pos: &[DVec3]) -> Resu
             on_edge.insert(p);
         }
     }
-    let mut adj: HashMap<u32, SmallVec<[u32; 2]>> = HashMap::new();
+    let mut adj: FastMap<u32, SmallVec<[u32; 2]>> = FastMap::default();
     for &[p, q] in &cut.segs {
         adj.entry(p).or_default().push(q);
         adj.entry(q).or_default().push(p);
@@ -199,9 +216,9 @@ fn split_triangle(op: &Operand, t: u32, cut: &mut TriCut, pos: &[DVec3]) -> Resu
         }
     }
     // Chains from edge to edge, then closed loops inside the triangle.
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: FastSet<u32> = FastSet::default();
     let mut chains: Vec<Vec<u32>> = Vec::new();
-    let walk = |start: u32, seen: &mut HashSet<u32>| -> Vec<u32> {
+    let walk = |start: u32, seen: &mut FastSet<u32>| -> Vec<u32> {
         let mut path = vec![start];
         seen.insert(start);
         let mut prev = u32::MAX;
@@ -312,7 +329,7 @@ fn split_triangle(op: &Operand, t: u32, cut: &mut TriCut, pos: &[DVec3]) -> Resu
     }
     // Triangulate each piece; diagonals may not repeat an edge already used in this triangle.
     let mut ids: Vec<u32> = Vec::new();
-    let mut local: HashMap<u32, usize> = HashMap::new();
+    let mut local: FastMap<u32, usize> = FastMap::default();
     let mut idx = |v: u32, ids: &mut Vec<u32>| {
         *local.entry(v).or_insert_with(|| {
             ids.push(v);
@@ -320,7 +337,7 @@ fn split_triangle(op: &Operand, t: u32, cut: &mut TriCut, pos: &[DVec3]) -> Resu
         })
     };
     let key = |a: u32, b: u32| (a.min(b), a.max(b));
-    let mut used: HashSet<(u32, u32)> = HashSet::new();
+    let mut used: FastSet<(u32, u32)> = FastSet::default();
     let mut rings: Vec<(Vec<usize>, Vec<Vec<usize>>)> = Vec::new();
     for pc in &pieces {
         for ring in std::iter::once(&pc.outer).chain(pc.holes.iter()) {
@@ -352,22 +369,30 @@ fn split_triangle(op: &Operand, t: u32, cut: &mut TriCut, pos: &[DVec3]) -> Resu
 }
 
 /// The cut-up surface of one operand: every triangle (global ids) with its source group.
+/// The uncut input triangles come first, in input order.
 struct Pieces {
     tris: Vec<[u32; 3]>,
     groups: Vec<i32>,
+    /// Input ids of the leading uncut triangles.
+    uncut: Vec<u32>,
 }
 
-fn cut_operand(op: &Operand, cuts: HashMap<u32, TriCut>, pos: &[DVec3], group_offset: i32) -> Result<Pieces, Degenerate> {
+fn cut_operand(op: &Operand, cuts: FastMap<u32, TriCut>, pos: &[DVec3], group_offset: i32) -> Result<Pieces, Degenerate> {
     let mut cuts: Vec<(u32, TriCut)> = cuts.into_iter().collect();
     cuts.sort_unstable_by_key(|c| c.0);
     let split: Vec<Result<Vec<[u32; 3]>, Degenerate>> = cuts.par_iter_mut().map(|(t, c)| split_triangle(op, *t, c, pos)).collect();
-    let cut_set: HashSet<u32> = cuts.iter().map(|c| c.0).collect();
+    let mut is_cut = vec![false; op.mesh.max_tid()];
+    for c in &cuts {
+        is_cut[c.0 as usize] = true;
+    }
     let mut tris = Vec::with_capacity(op.mesh.triangle_count() + 4 * cuts.len());
     let mut groups = Vec::with_capacity(tris.capacity());
+    let mut uncut = Vec::with_capacity(op.mesh.triangle_count());
     for t in op.mesh.triangle_ids() {
-        if !cut_set.contains(&t) {
+        if !is_cut[t as usize] {
             tris.push(op.mesh.triangle(t).map(|v| v + op.base));
             groups.push(op.mesh.tri_group(t) + group_offset);
+            uncut.push(t);
         }
     }
     for ((t, _), r) in cuts.iter().zip(split) {
@@ -377,12 +402,13 @@ fn cut_operand(op: &Operand, cuts: HashMap<u32, TriCut>, pos: &[DVec3], group_of
             groups.push(g);
         }
     }
-    Ok(Pieces { tris, groups })
+    Ok(Pieces { tris, groups, uncut })
 }
 
-/// Inside flag per triangle of `side`: patches between seam edges are classified as a whole
-/// by the other mesh's winding number at the centroids of their largest triangles.
-fn classify(side: &Pieces, seam: &HashSet<(u32, u32)>, pos: &[DVec3], other: &mm_solid::WindingNumber) -> Vec<bool> {
+/// Inside flag per triangle of `side` (cut from `mesh`, whose vertex ids start at `base`):
+/// patches between seam edges are classified as a whole by the other mesh's winding number
+/// at the centroids of their largest triangles.
+fn classify(side: &Pieces, mesh: &Mesh, base: u32, seam: &FastSet<u64>, pos: &[DVec3], other: &WindingNumber) -> Vec<bool> {
     let n = side.tris.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -392,23 +418,45 @@ fn classify(side: &Pieces, seam: &HashSet<(u32, u32)>, pos: &[DVec3], other: &mm
         }
         x
     }
-    let mut first: HashMap<(u32, u32), u32> = HashMap::with_capacity(n * 3 / 2);
-    for (i, t) in side.tris.iter().enumerate() {
+    fn join(p: &mut [u32], a: u32, b: u32) {
+        let (ra, rb) = (find(p, a), find(p, b));
+        if ra != rb {
+            p[ra as usize] = rb;
+        }
+    }
+    // Triangles sharing an edge (a pair of vertex ids) that is not on the seam form a patch.
+    // Two uncut triangles share one exactly when they are neighbours in the input mesh, so
+    // they are joined through its adjacency; only the edges an uncut triangle shares with
+    // the cut pieces, and the cut pieces' own, are hashed.
+    let mut slot = vec![u32::MAX; mesh.max_tid()];
+    for (i, &t) in side.uncut.iter().enumerate() {
+        slot[t as usize] = i as u32;
+    }
+    let mut first: FastMap<u64, u32> = FastMap::default();
+    for (i, &t) in side.uncut.iter().enumerate() {
+        for e in mesh.tri_edges(t) {
+            let o = mesh.edge_other_triangle(e, t);
+            if o != INVALID && slot[o as usize] != u32::MAX {
+                if o > t {
+                    join(&mut parent, i as u32, slot[o as usize]);
+                }
+            } else {
+                let [a, b] = mesh.edge_vertices(e);
+                first.insert(pair_key(a + base, b + base), i as u32);
+            }
+        }
+    }
+    for i in side.uncut.len()..n {
+        let t = side.tris[i];
         for j in 0..3 {
-            let (a, b) = (t[j], t[(j + 1) % 3]);
-            let k = (a.min(b), a.max(b));
+            let k = pair_key(t[j], t[(j + 1) % 3]);
             if seam.contains(&k) {
                 continue;
             }
-            match first.get(&k) {
-                Some(&o) => {
-                    let (ra, rb) = (find(&mut parent, i as u32), find(&mut parent, o));
-                    if ra != rb {
-                        parent[ra as usize] = rb;
-                    }
-                }
-                None => {
-                    first.insert(k, i as u32);
+            match first.entry(k) {
+                Entry::Occupied(o) => join(&mut parent, i as u32, *o.get()),
+                Entry::Vacant(v) => {
+                    v.insert(i as u32);
                 }
             }
         }
@@ -417,35 +465,55 @@ fn classify(side: &Pieces, seam: &HashSet<(u32, u32)>, pos: &[DVec3], other: &mm
         let [a, b, c] = t.map(|v| pos[v as usize]);
         (b - a).cross(c - a).length()
     };
-    // Up to three largest triangles per patch vote.
-    let mut best: HashMap<u32, SmallVec<[(f64, usize); 3]>> = HashMap::new();
-    for i in 0..n {
-        let r = find(&mut parent, i as u32);
-        let e = best.entry(r).or_default();
-        let a = area(&side.tris[i]);
+    let areas: Vec<f64> = side.tris.par_iter().map(area).collect();
+    // Up to three largest triangles per patch vote. Patches are numbered in order of their
+    // first triangle.
+    let mut patch_of_root = vec![u32::MAX; n];
+    let mut patch = Vec::with_capacity(n);
+    let mut best: Vec<SmallVec<[(f64, usize); 3]>> = Vec::new();
+    for (i, &a) in areas.iter().enumerate() {
+        let r = find(&mut parent, i as u32) as usize;
+        if patch_of_root[r] == u32::MAX {
+            patch_of_root[r] = best.len() as u32;
+            best.push(SmallVec::new());
+        }
+        let p = patch_of_root[r];
+        patch.push(p);
+        let e = &mut best[p as usize];
         if e.len() < 3 {
             e.push((a, i));
         } else if let Some(m) = e.iter_mut().min_by(|x, y| x.0.total_cmp(&y.0)).filter(|m| m.0 < a) {
             *m = (a, i);
         }
     }
-    let verdict: HashMap<u32, bool> = best
-        .into_par_iter()
-        .map(|(r, votes)| {
+    let verdict: Vec<bool> = best
+        .par_iter()
+        .map(|votes| {
             let ins = votes
                 .iter()
                 .filter(|&&(_, i)| {
                     let c = side.tris[i].iter().map(|&v| pos[v as usize]).sum::<DVec3>() / 3.0;
-                    other.eval(c).abs() > 0.5
+                    other.eval_with_beta(c, WindingNumber::DEFAULT_BETA).abs() > 0.5
                 })
                 .count();
-            (r, 2 * ins > votes.len())
+            2 * ins > votes.len()
         })
         .collect();
-    (0..n).map(|i| verdict[&find(&mut parent, i as u32)]).collect()
+    patch.into_iter().map(|p| verdict[p as usize]).collect()
 }
 
-fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanResult, Degenerate> {
+/// Search structures shared by every attempt of one boolean.
+struct Trees<'a> {
+    /// BVH over at least the larger operand's triangles that the smaller one may reach, at
+    /// their own (not nudged) positions.
+    large: Cow<'a, Bvh>,
+    /// Winding numbers of the operands (evaluated with the default β whatever they were
+    /// built with).
+    wa: Cow<'a, WindingNumber>,
+    wb: Cow<'a, WindingNumber>,
+}
+
+fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3, trees: &Trees, group_offset: i32) -> Result<BooleanResult, Degenerate> {
     let na = a.max_vid() as u32;
     let oa = Operand { mesh: a, pos: (0..a.max_vid() as u32).map(|v| if a.is_vertex(v) { a.vertex(v) } else { DVec3::ZERO }).collect(), base: 0 };
     let ob = Operand {
@@ -455,7 +523,7 @@ fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanRes
     };
     // Pairs: walk the smaller mesh's triangles against the larger mesh's BVH.
     let (small, large, small_is_a) = if a.triangle_count() <= b.triangle_count() { (&oa, &ob, true) } else { (&ob, &oa, false) };
-    let large_bvh = Bvh::build(large.mesh);
+    let large_bvh: &Bvh = &trees.large;
     let large_shift = if small_is_a { shift } else { DVec3::ZERO };
     let pad = 1e-9 * (a.bounds().union(&b.bounds()).diagonal() + shift.length());
     let small_tris: Vec<u32> = small.mesh.triangle_ids().collect();
@@ -469,6 +537,11 @@ fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanRes
             bb.max += DVec3::splat(pad);
             let mut out = Vec::new();
             large_bvh.query_aabb(&bb, |tl| {
+                // A leaf holds several triangles: each one's own box is tested too, so the
+                // candidates are the same whatever the tree.
+                if !Aabb::from_points(large.mesh.tri_positions(tl)).intersects(&bb) {
+                    return;
+                }
                 let pl = large.tri_pos(tl);
                 let el = large.tri_edges(tl);
                 let r = if small_is_a { pair(ps, es, ts, pl, el, tl) } else { pair(pl, el, tl, ps, es, ts) };
@@ -490,12 +563,12 @@ fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanRes
         pos[(na + v) as usize] = ob.pos[v as usize];
     }
     let first_point = pos.len() as u32;
-    let mut point_id: HashMap<PointKey, u32> = HashMap::new();
-    let mut cuts_a: HashMap<u32, TriCut> = HashMap::new();
-    let mut cuts_b: HashMap<u32, TriCut> = HashMap::new();
-    let mut a_edge_pts: HashMap<u32, Vec<(f64, u32)>> = HashMap::new();
-    let mut b_edge_pts: HashMap<u32, Vec<(f64, u32)>> = HashMap::new();
-    let mut seam: HashSet<(u32, u32)> = HashSet::new();
+    let mut point_id: FastMap<PointKey, u32> = FastMap::default();
+    let mut cuts_a: FastMap<u32, TriCut> = FastMap::default();
+    let mut cuts_b: FastMap<u32, TriCut> = FastMap::default();
+    let mut a_edge_pts: FastMap<u32, Vec<(f64, u32)>> = FastMap::default();
+    let mut b_edge_pts: FastMap<u32, Vec<(f64, u32)>> = FastMap::default();
+    let mut seam: FastSet<u64> = FastSet::default();
     let mut hits: Vec<(u32, u32, [PointKey; 2])> = found
         .into_iter()
         .filter_map(|p| match p {
@@ -528,11 +601,11 @@ fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanRes
         }
         cuts_a.entry(ta).or_default().segs.push(ids);
         cuts_b.entry(tb).or_default().segs.push(ids);
-        seam.insert((ids[0].min(ids[1]), ids[0].max(ids[1])));
+        seam.insert(pair_key(ids[0], ids[1]));
     }
     let seam_points: Vec<u32> = (first_point..pos.len() as u32).collect();
     // Edge points per crossed triangle, measured from each triangle edge's first corner.
-    let fill_edges = |opd: &Operand, cuts: &mut HashMap<u32, TriCut>, edge_pts: &HashMap<u32, Vec<(f64, u32)>>| {
+    let fill_edges = |opd: &Operand, cuts: &mut FastMap<u32, TriCut>, edge_pts: &FastMap<u32, Vec<(f64, u32)>>| {
         for (&t, c) in cuts.iter_mut() {
             let tv = opd.mesh.triangle(t);
             for (j, e) in opd.tri_edges(t).into_iter().enumerate() {
@@ -545,13 +618,9 @@ fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanRes
     };
     fill_edges(&oa, &mut cuts_a, &a_edge_pts);
     fill_edges(&ob, &mut cuts_b, &b_edge_pts);
-    let group_offset = a.max_group_id() + 1 - b.triangle_ids().map(|t| b.tri_group(t)).min().unwrap_or(0);
     let pieces_a = cut_operand(&oa, cuts_a, &pos, 0)?;
     let pieces_b = cut_operand(&ob, cuts_b, &pos, group_offset)?;
-    let wa = mm_solid::WindingNumber::new(a);
-    let wb = mm_solid::WindingNumber::new(b);
-    let in_b = classify(&pieces_a, &seam, &pos, &wb);
-    let in_a = classify(&pieces_b, &seam, &pos, &wa);
+    let (in_b, in_a) = rayon::join(|| classify(&pieces_a, a, 0, &seam, &pos, &trees.wb), || classify(&pieces_b, b, na, &seam, &pos, &trees.wa));
     let (keep_a_inside, keep_b_inside, flip_b) = match op {
         BooleanOp::Union => (false, false, false),
         BooleanOp::Intersection => (true, true, false),
@@ -596,18 +665,152 @@ fn attempt(a: &Mesh, b: &Mesh, op: BooleanOp, shift: DVec3) -> Result<BooleanRes
 /// first's. Fails when an input is open, or when the meshes self-intersect in a way the
 /// curve cannot be traced through (the volumetric boolean handles such input).
 pub fn mesh_boolean(a: &Mesh, b: &Mesh, op: BooleanOp) -> EditResult<BooleanResult> {
+    mesh_boolean_with_trees(a, b, op, None, None)
+}
+
+/// [`mesh_boolean`] with the second mesh's search trees built beforehand: its BVH (as
+/// `Bvh::build(b)` builds it, current for `b`) and its winding number (as
+/// `WindingNumber::with_beta(b, β)` builds it, for any β). The result is the same.
+pub fn mesh_boolean_with(a: &Mesh, b: &Mesh, op: BooleanOp, b_trees: Option<(&Bvh, &WindingNumber)>) -> EditResult<BooleanResult> {
+    mesh_boolean_with_trees(a, b, op, None, b_trees)
+}
+
+/// [`mesh_boolean_with`] with trees for either mesh. A BVH is used only for the mesh with
+/// more triangles (the other's triangles are walked against it).
+pub fn mesh_boolean_with_trees(
+    a: &Mesh,
+    b: &Mesh,
+    op: BooleanOp,
+    a_trees: Option<(&Bvh, &WindingNumber)>,
+    b_trees: Option<(&Bvh, &WindingNumber)>,
+) -> EditResult<BooleanResult> {
     for (m, which) in [(a, "first"), (b, "second")] {
         if !m.is_closed() {
             return Err(EditError::Failed(format!("the {which} mesh has open boundaries; the precise boolean needs closed meshes")));
         }
     }
-    let size = a.bounds().union(&b.bounds()).diagonal().max(1e-300);
+    debug_assert!(a_trees.is_none_or(|(bvh, _)| bvh.is_current(a)) && b_trees.is_none_or(|(bvh, _)| bvh.is_current(b)));
+    let bounds = a.bounds().union(&b.bounds());
+    let size = bounds.diagonal().max(1e-300);
     // A direction unlikely to line up with any modelled feature.
     let dir = DVec3::new(0.5773, 0.6181, 0.5331).normalize();
-    for scale in [0.0, 1e-9, 1e-8, 1e-7, 1e-6] {
-        if let Ok(r) = attempt(a, b, op, dir * scale * size) {
+    let scales = [0.0, 1e-9, 1e-8, 1e-7, 1e-6];
+    // The trees do not depend on the nudge, so every attempt shares them.
+    let small_is_a = a.triangle_count() <= b.triangle_count();
+    let (small, large, large_given) = if small_is_a { (a, b, b_trees.map(|t| t.0)) } else { (b, a, a_trees.map(|t| t.0)) };
+    let large_tree = || -> Cow<Bvh> {
+        if let Some(bvh) = large_given {
+            return Cow::Borrowed(bvh);
+        }
+        // Only the larger mesh's triangles whose boxes meet the smaller mesh's box can pair
+        // with it. The box is grown to cover every attempt's nudge and padding (with room
+        // for rounding), so the per-candidate box test in `attempt` sees the same triangles
+        // as with a tree over the whole mesh.
+        let reach = bounds.min.abs().max(bounds.max.abs()).max_element();
+        let zone = small.bounds().expanded(4.0 * scales[scales.len() - 1] * size + 16.0 * f64::EPSILON * reach);
+        let all: Vec<u32> = large.triangle_ids().collect();
+        let near: Vec<u32> = all.into_par_iter().filter(|&t| Aabb::from_points(large.tri_positions(t)).intersects(&zone)).collect();
+        Cow::Owned(Bvh::build_subset(large, &near))
+    };
+    fn winding<'t>(m: &Mesh, given: Option<(&'t Bvh, &'t WindingNumber)>) -> Cow<'t, WindingNumber> {
+        match given {
+            Some((_, wn)) => Cow::Borrowed(wn),
+            None => Cow::Owned(WindingNumber::new(m)),
+        }
+    }
+    let (large_bvh, (wa, wb)) = rayon::join(large_tree, || rayon::join(|| winding(a, a_trees), || winding(b, b_trees)));
+    let trees = Trees { large: large_bvh, wa, wb };
+    let group_offset = a.max_group_id() + 1 - b.triangle_ids().map(|t| b.tri_group(t)).min().unwrap_or(0);
+    for scale in scales {
+        if let Ok(r) = attempt(a, b, op, dir * scale * size, &trees, group_offset) {
             return Ok(r);
         }
     }
     Err(EditError::Failed("the meshes intersect in a way the precise boolean cannot resolve (self-intersections?); try Fast Approximate".into()))
+}
+
+#[cfg(test)]
+#[path = "boolean_reference.rs"]
+mod reference;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    fn moved(mut m: Mesh, d: DVec3) -> Mesh {
+        m.transform(|p| p + d);
+        m
+    }
+
+    fn same(x: &BooleanResult, y: &BooleanResult) -> bool {
+        let (a, b) = (&x.mesh, &y.mesh);
+        a.max_vid() == b.max_vid()
+            && a.max_tid() == b.max_tid()
+            && a.triangle_ids().eq(b.triangle_ids())
+            && a.triangle_ids().all(|t| a.triangle(t) == b.triangle(t) && a.tri_group(t) == b.tri_group(t))
+            && a.vertex_ids().eq(b.vertex_ids())
+            && a.vertex_ids().all(|v| a.vertex(v).to_array().map(f64::to_bits) == b.vertex(v).to_array().map(f64::to_bits))
+            && x.seam_vertices == y.seam_vertices
+            && x.group_offset == y.group_offset
+            && x.perturbed == y.perturbed
+    }
+
+    /// Every operation both ways, against the reference implementation (a tree over the
+    /// whole larger mesh, hashed patch edges, trees rebuilt per attempt).
+    fn check(a: &Mesh, b: &Mesh) {
+        for (x, y) in [(a, b), (b, a)] {
+            for op in [BooleanOp::Union, BooleanOp::Difference, BooleanOp::Intersection] {
+                let new = mesh_boolean(x, y, op);
+                let old = reference::mesh_boolean(x, y, op);
+                match (new, old) {
+                    (Ok(n), Ok(o)) => assert!(same(&n, &o), "{op:?}: results differ"),
+                    (Err(_), Err(_)) => {}
+                    (n, o) => panic!("{op:?}: new {:?} vs reference {:?}", n.map(|r| r.perturbed), o.map(|r| r.perturbed)),
+                }
+                // Prebuilt trees (of either mesh, with any β) give the same result.
+                let (bvh_x, wn_x) = (Bvh::build(x), WindingNumber::new(x));
+                let (bvh_y, wn_y) = (Bvh::build(y), WindingNumber::with_beta(y, 1.5));
+                let plain = mesh_boolean(x, y, op);
+                for with in [mesh_boolean_with(x, y, op, Some((&bvh_y, &wn_y))), mesh_boolean_with_trees(x, y, op, Some((&bvh_x, &wn_x)), Some((&bvh_y, &wn_y)))] {
+                    match (with, &plain) {
+                        (Ok(w), Ok(p)) => assert!(same(&w, p), "{op:?}: prebuilt trees change the result"),
+                        (Err(_), Err(_)) => {}
+                        _ => panic!("{op:?}: prebuilt trees change success"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_as_reference_on_varied_configurations() {
+        let big = primitives::icosphere(2.0, 5);
+        let path: Vec<DVec3> = (0..=20).map(|i| DVec3::new(0.3, 0.1, 1.4 + 1.2 * i as f64 / 20.0)).collect();
+        let tube = crate::tube::tube_mesh(&path, 0.2, 0.2, 24);
+        check(&big, &tube);
+        check(&primitives::icosphere(1.0, 3), &moved(primitives::icosphere(1.0, 3), DVec3::new(1.0, 0.13, 0.07)));
+        // Coplanar faces: the nudged attempts.
+        check(&primitives::cube(1.0, 3), &moved(primitives::cube(1.0, 3), DVec3::new(0.5, 0.0, 0.0)));
+        check(&primitives::cube(1.0, 2), &primitives::cube(1.0, 2));
+        check(&primitives::cube(1.0, 2), &moved(primitives::cylinder(0.3, 1.0, 24, 4, true), DVec3::new(0.1, 0.0, 0.5)));
+        check(&primitives::cube(4.0, 1), &moved(primitives::icosphere(0.3, 3), DVec3::new(0.7, 0.4, 2.0)));
+        check(&primitives::icosphere(1.0, 2), &moved(primitives::icosphere(0.5, 2), DVec3::new(5.0, 0.0, 0.0)));
+        check(&primitives::icosphere(1.0, 2), &primitives::icosphere(0.5, 2));
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let shapes = [primitives::icosphere(1.0, 2), primitives::cube(1.6, 2), primitives::icosphere(0.6, 3)];
+        for k in 0..24 {
+            let q = mm_core::DQuat::from_euler(glam::EulerRot::XYZ, rnd() * 6.3, rnd() * 6.3, rnd() * 6.3);
+            let d = DVec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5) * 2.0;
+            let mut b = shapes[(k / 3) % 3].clone();
+            b.transform(|p| q * p + d);
+            check(&shapes[k % 3], &b);
+        }
+    }
 }

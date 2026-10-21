@@ -19,6 +19,7 @@ mod renderer;
 mod scene;
 mod shell;
 mod spacemouse;
+mod test_screen;
 mod tools;
 mod ui_access;
 mod ui_util;
@@ -34,25 +35,36 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let files: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
-    let scripted = std::env::var_os("POLYMIX_SCRIPT").is_some();
+    // Test runs: a script, or their own data folder (agents' instances).
+    let test_run = std::env::var_os("POLYMIX_SCRIPT").is_some() || std::env::var_os("POLYMIX_DATA_DIR").is_some();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Polymix")
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([800.0, 500.0])
+        .with_drag_and_drop(true)
+        .with_icon(app_icon())
+        .with_active(!test_run);
+    // ... open on the screen set aside for them (see test_screen), staggered.
+    if let Some(r) = test_run.then(test_screen::rect).flatten() {
+        let size = egui::vec2(1440f32.min(r.width() - 40.0), 900f32.min(r.height() - 60.0)).max(egui::vec2(800.0, 500.0));
+        let step = test_screen::slot() as f32 * egui::vec2(60.0, 50.0);
+        let at = (r.min + egui::vec2(20.0, 20.0) + step).min(r.max - size - egui::vec2(0.0, 30.0)).max(r.min);
+        viewport = viewport.with_position(at).with_inner_size(size);
+    }
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Polymix")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([800.0, 500.0])
-            .with_drag_and_drop(true)
-            .with_icon(app_icon())
-            .with_active(!scripted),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
         // Test runs with their own data folder keep the window state there too.
         persistence_path: std::env::var_os("POLYMIX_DATA_DIR").map(|d| std::path::PathBuf::from(d).join("app.ron")),
+        // ... but not its place: that is the test screen's.
+        persist_window: !test_run,
         ..Default::default()
     };
-    // Scripted test runs must not steal focus (or keystrokes) from whatever the user is doing.
+    // Test runs must not steal focus (or keystrokes) from whatever the user is doing.
     #[cfg(target_os = "macos")]
-    if scripted {
+    if test_run {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
             b.with_activate_ignoring_other_apps(false).with_activation_policy(ActivationPolicy::Accessory);

@@ -186,24 +186,56 @@ fn evaluate(ctrl: &[f64], n: [usize; 3], ax: &[Axis; 3]) -> Vec<f64> {
 
 /// A smooth B-spline approximation of `r` where `m` is set (one level of multilevel B-spline
 /// approximation, Lee, Wolberg & Shin 1997), evaluated on the whole grid.
+#[cfg(test)]
 fn fit(r: &[f64], m: &[f64], n: [usize; 3], ax: &[Axis; 3]) -> Vec<f64> {
     let rm: Vec<f64> = r.iter().zip(m).map(|(a, b)| a * b).collect();
-    let num = contract(&rm, n, ax, |w| {
+    fit_weighted(&rm, &fit_denominator(m, n, ax), n, ax)
+}
+
+/// The denominator of [`fit`]'s control values: it depends only on the mask and the mesh, so
+/// a level makes it once for all its iterations.
+fn fit_denominator(m: &[f64], n: [usize; 3], ax: &[Axis; 3]) -> Vec<f64> {
+    contract(m, n, ax, |w| w.map(|x| x * x))
+}
+
+/// [`fit`] from `rm` (the residual times the mask) and the denominator.
+fn fit_weighted(rm: &[f64], den: &[f64], n: [usize; 3], ax: &[Axis; 3]) -> Vec<f64> {
+    let num = contract(rm, n, ax, |w| {
         let s: f64 = w.iter().map(|x| x * x).sum();
         w.map(|x| x * x * x / s)
     });
-    let den = contract(m, n, ax, |w| w.map(|x| x * x));
-    let ctrl: Vec<f64> = num.iter().zip(&den).map(|(&a, &b)| if b > 1e-12 { a / b } else { 0.0 }).collect();
+    let ctrl: Vec<f64> = num.iter().zip(den).map(|(&a, &b)| if b > 1e-12 { a / b } else { 0.0 }).collect();
     evaluate(&ctrl, n, ax)
 }
 
-/// Sharpen the histogram of `u` (values where `m` is set): each value moves to its expected
-/// value under the deconvolved histogram.
-fn sharpen(u: &[f64], m: &[f64], p: &N4Params) -> Vec<f64> {
-    let (lo, hi) = u.iter().zip(m).filter(|(_, &w)| w > 0.0).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), (&x, _)| (a.min(x), b.max(x)));
+/// The values a sharpened histogram moves its values to: linear between the expected true
+/// values of its bins (no bins: values stay).
+struct Sharpening {
+    lo: f64,
+    slope: f64,
+    expect: Vec<f64>,
+}
+
+impl Sharpening {
+    fn at(&self, x: f64) -> f64 {
+        let bins = self.expect.len();
+        if bins == 0 {
+            return x;
+        }
+        let c = ((x - self.lo) / self.slope).clamp(0.0, (bins - 1) as f64);
+        let i = (c.floor() as usize).min(bins - 2);
+        let f = c - i as f64;
+        self.expect[i] * (1.0 - f) + self.expect[i + 1] * f
+    }
+}
+
+/// Sharpen the histogram of `u` (values where `m` is set, from `lo` to `hi`): each value
+/// moves to its expected value under the deconvolved histogram. The histogram is summed in
+/// voxel order.
+fn sharpen(u: &[f64], m: &[f64], (lo, hi): (f64, f64), p: &N4Params) -> Sharpening {
     let bins = p.bins.max(2);
     if hi - lo <= 1e-9 {
-        return u.to_vec();
+        return Sharpening { lo, slope: 1.0, expect: Vec::new() };
     }
     let slope = (hi - lo) / (bins - 1) as f64;
     let mut hist = vec![0.0; bins];
@@ -262,33 +294,21 @@ fn sharpen(u: &[f64], m: &[f64], p: &N4Params) -> Vec<f64> {
         let (n, d) = (num[b + offset], den[b + offset]);
         if d.abs() > 1e-12 { n / d } else { lo + b as f64 * slope }
     }).collect();
-    u.iter()
-        .zip(m)
-        .map(|(&x, &w)| {
-            if w <= 0.0 {
-                return x;
-            }
-            let c = ((x - lo) / slope).clamp(0.0, (bins - 1) as f64);
-            let i = (c.floor() as usize).min(bins - 2);
-            let f = c - i as f64;
-            expect[i] * (1.0 - f) + expect[i + 1] * f
-        })
-        .collect()
+    Sharpening { lo, slope, expect }
 }
 
 /// Correct `vol` for intensity shading. `mask`: the voxels to fit to (`None`: [`auto_mask`]).
 /// `progress` gets the fraction done; returning `false` cancels.
 pub fn n4(vol: &LoadedVolume, mask: Option<&[u8]>, p: &N4Params, progress: &(dyn Fn(f32) -> bool + Sync)) -> Result<N4Output> {
     let dims = vol.dims;
-    let auto;
-    let mask = match mask {
-        Some(m) if m.len() == vol.values.len() => m,
+    // The automatic mask, made here, goes into the output as it is.
+    let auto = match mask {
+        Some(m) if m.len() == vol.values.len() => None,
         Some(_) => bail!("the mask does not match the image"),
-        None => {
-            auto = auto_mask(vol);
-            &auto
-        }
+        None => Some(auto_mask(vol)),
     };
+    let given = mask;
+    let mask: &[u8] = auto.as_deref().or(given).unwrap_or_default();
     let s = p.shrink.max(1);
     let sd = dims.map(|d| d.div_ceil(s));
     let n = sd[0] * sd[1] * sd[2];
@@ -328,22 +348,40 @@ pub fn n4(vol: &LoadedVolume, mask: Option<&[u8]>, p: &N4Params, progress: &(dyn
     let mut done = 0usize;
     let mut log_bias = vec![0.0f64; n];
     let mut runs = Vec::new();
+    // Per iteration: the corrected log image, the residual of its sharpening times the mask,
+    // and the field's change as a factor (where the mask is set).
+    let (mut u, mut rm, mut change) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f64; n]);
     for (level, &iters) in p.iterations.iter().enumerate() {
         let spans = spans0.map(|x| x << level);
         let ax = [Axis::new(sd[0], spans[0]), Axis::new(sd[1], spans[1]), Axis::new(sd[2], spans[2])];
+        let den = if iters > 0 { fit_denominator(&m, sd, &ax) } else { Vec::new() };
         let mut run = 0;
         for _ in 0..iters {
-            let u: Vec<f64> = v.iter().zip(&log_bias).map(|(a, b)| a - b).collect();
-            let sharp = sharpen(&u, &m, p);
-            let residual: Vec<f64> = u.iter().zip(&sharp).zip(&m).map(|((a, b), &w)| if w > 0.0 { a - b } else { 0.0 }).collect();
-            let delta = fit(&residual, &m, sd, &ax);
-            // Coefficient of variation of the field's change over the mask.
-            let changes: Vec<f64> = delta.iter().zip(&m).filter(|(_, &w)| w > 0.0).map(|(d, _)| d.exp()).collect();
-            let mean = changes.iter().sum::<f64>() / changes.len() as f64;
-            let var = changes.iter().map(|c| (c - mean) * (c - mean)).sum::<f64>() / changes.len() as f64;
-            for (b, d) in log_bias.iter_mut().zip(&delta) {
+            // The corrected log image and its range over the mask (minimum and maximum are
+            // exact, so the order they are found in does not matter).
+            let range = u
+                .par_iter_mut()
+                .zip(&v)
+                .zip(&log_bias)
+                .zip(&m)
+                .map(|(((o, a), b), &w)| {
+                    *o = a - b;
+                    if w > 0.0 { (*o, *o) } else { (f64::INFINITY, f64::NEG_INFINITY) }
+                })
+                .reduce(|| (f64::INFINITY, f64::NEG_INFINITY), |(a, b), (c, d)| (a.min(c), b.max(d)));
+            let sharp = sharpen(&u, &m, range, p);
+            rm.par_iter_mut().zip(&u).zip(&m).for_each(|((o, &a), &w)| *o = (if w > 0.0 { a - sharp.at(a) } else { 0.0 }) * w);
+            let delta = fit_weighted(&rm, &den, sd, &ax);
+            change.par_iter_mut().zip(&mut log_bias).zip(&delta).zip(&m).for_each(|(((c, b), &d), &w)| {
+                if w > 0.0 {
+                    *c = d.exp();
+                }
                 *b += d;
-            }
+            });
+            // Coefficient of variation of the field's change over the mask (summed in order).
+            let masked = || change.iter().zip(&m).filter(|(_, &w)| w > 0.0).map(|(c, _)| c);
+            let mean = masked().sum::<f64>() / fitted as f64;
+            let var = masked().map(|c| (c - mean) * (c - mean)).sum::<f64>() / fitted as f64;
             run += 1;
             done += 1;
             if !progress(0.9 * done as f32 / total as f32) {
@@ -363,8 +401,16 @@ pub fn n4(vol: &LoadedVolume, mask: Option<&[u8]>, p: &N4Params, progress: &(dyn
     let half = (s as f64 - 1.0) * 0.5;
     let coord = |i: usize, a: usize| ((i as f64 - half) / s as f64).clamp(0.0, (sd[a] - 1) as f64);
     let at = |x: usize, y: usize, z: usize| log_bias[(z * sd[1] + y) * sd[0] + x];
+    // The x samples and weight of every column, the same for every row.
+    let columns: Vec<(usize, usize, f64)> = (0..dims[0])
+        .map(|i| {
+            let tx = coord(i, 0);
+            let x0 = (tx.floor() as usize).min(sd[0].saturating_sub(2));
+            (x0, (x0 + 1).min(sd[0] - 1), tx - x0 as f64)
+        })
+        .collect();
     let mut bias = vec![0.0f32; vol.values.len()];
-    bias.par_chunks_mut(dims[0] * dims[1]).enumerate().for_each(|(k, plane)| {
+    bias.par_chunks_mut((dims[0] * dims[1]).max(1)).enumerate().for_each(|(k, plane)| {
         let tz = coord(k, 2);
         let z0 = (tz.floor() as usize).min(sd[2].saturating_sub(2));
         let z1 = (z0 + 1).min(sd[2] - 1);
@@ -374,11 +420,7 @@ pub fn n4(vol: &LoadedVolume, mask: Option<&[u8]>, p: &N4Params, progress: &(dyn
             let y0 = (ty.floor() as usize).min(sd[1].saturating_sub(2));
             let y1 = (y0 + 1).min(sd[1] - 1);
             let fy = ty - y0 as f64;
-            for i in 0..dims[0] {
-                let tx = coord(i, 0);
-                let x0 = (tx.floor() as usize).min(sd[0].saturating_sub(2));
-                let x1 = (x0 + 1).min(sd[0] - 1);
-                let fx = tx - x0 as f64;
+            for (i, &(x0, x1, fx)) in columns.iter().enumerate() {
                 let l = |a: f64, b: f64, t: f64| a + (b - a) * t;
                 let c00 = l(at(x0, y0, z0), at(x1, y0, z0), fx);
                 let c10 = l(at(x0, y1, z0), at(x1, y1, z0), fx);
@@ -390,7 +432,11 @@ pub fn n4(vol: &LoadedVolume, mask: Option<&[u8]>, p: &N4Params, progress: &(dyn
     });
     progress(0.97);
     let corrected = vol.values.par_iter().zip(&bias).map(|(&x, &b)| x / b).collect();
-    Ok(N4Output { corrected, bias, mask: mask.to_vec(), iterations: runs })
+    let mask = match auto {
+        Some(m) => m,
+        None => given.unwrap_or_default().to_vec(),
+    };
+    Ok(N4Output { corrected, bias, mask, iterations: runs })
 }
 
 #[cfg(test)]
@@ -456,6 +502,18 @@ mod tests {
         assert!(out.iterations.iter().all(|&i| i >= 1));
         // Cancelling stops it.
         assert!(n4(&vol, None, &p, &|_| false).is_err());
+    }
+
+    #[test]
+    fn the_result_does_not_depend_on_the_threads() {
+        let (vol, _, _) = phantom();
+        let p = N4Params { shrink: 2, iterations: vec![20, 20], spline_distance_mm: 120.0, convergence: 0.0, ..Default::default() };
+        let many = n4(&vol, None, &p, &|_| true).unwrap();
+        let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| n4(&vol, None, &p, &|_| true).unwrap());
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&many.corrected), bits(&one.corrected));
+        assert_eq!(bits(&many.bias), bits(&one.bias));
+        assert_eq!((many.mask, many.iterations), (one.mask, one.iterations));
     }
 
     #[test]

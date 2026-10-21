@@ -213,15 +213,59 @@ impl Fusion {
     /// `colour_map` at half opacity.
     pub fn new(name: impl Into<String>, values: Vec<f32>, colour_map: ColourMap) -> Self {
         let (range, auto_window) = value_window(&values);
-        Self { name: name.into(), values: Arc::new(values), range, auto_window, window: auto_window, colour_map, opacity: 0.5, compare: Compare::Blend, wipe: 0.5, showing: false }
+        Self::from_shared(name, Arc::new(values), range, auto_window, colour_map)
+    }
+
+    /// As [`Self::new`], for values already shared (with their range and automatic window,
+    /// as `new` finds them).
+    pub fn from_shared(name: impl Into<String>, values: Arc<Vec<f32>>, range: (f32, f32), auto_window: (f64, f64), colour_map: ColourMap) -> Self {
+        Self { name: name.into(), values, range, auto_window, window: auto_window, colour_map, opacity: 0.5, compare: Compare::Blend, wipe: 0.5, showing: false }
+    }
+
+    /// The image `load` gives (once, here) on `vol`'s voxel grid, as [`Self::new`] shows it.
+    /// Images put on the same grid before, under the same `key`, share their values while any
+    /// of them is still shown, and are not loaded again. So the key has to tell apart every
+    /// load whose values can differ: the source and how it was loaded, and what its files
+    /// hold now ([`file_stamps`]), or a series written again in place would show its old
+    /// values while they are still shown elsewhere.
+    pub fn shared<K, L, E>(name: impl Into<String>, vol: &LoadedVolume, key: K, colour_map: ColourMap, load: impl FnOnce() -> Result<L, E>) -> Result<Self, E>
+    where
+        K: PartialEq + Send + Sync + 'static,
+        L: Into<Arc<LoadedVolume>>,
+    {
+        let grid = (vol.dims, vol.geometry.matrix().to_cols_array().map(f64::to_bits));
+        let found = |fused: &[FusedValues]| fused.iter().find(|f| f.grid == grid && f.key.downcast_ref::<K>() == Some(&key)).and_then(|f| Some((f.values.upgrade()?, f.range, f.auto_window)));
+        if let Some((values, range, auto_window)) = found(&fused_values()) {
+            return Ok(Self::from_shared(name, values, range, auto_window, colour_map));
+        }
+        let values = Self::resampled_owned(vol, load()?);
+        let (range, auto_window) = value_window(&values);
+        let mut fused = fused_values();
+        // Another job may have made the same meanwhile: one copy is kept.
+        if let Some((values, range, auto_window)) = found(&fused) {
+            return Ok(Self::from_shared(name, values, range, auto_window, colour_map));
+        }
+        let values = Arc::new(values);
+        fused.retain(|f| f.values.strong_count() > 0);
+        fused.push(FusedValues { grid, key: Box::new(key), values: Arc::downgrade(&values), range, auto_window });
+        Ok(Self::from_shared(name, values, range, auto_window, colour_map))
+    }
+
+    /// As [`Self::resampled`], taking `other`: when the grids match its values are moved
+    /// rather than copied (copied only if `other` is shared elsewhere).
+    pub fn resampled_owned(vol: &LoadedVolume, other: impl Into<Arc<LoadedVolume>>) -> Vec<f32> {
+        let other = other.into();
+        if same_grid(vol, &other) {
+            return Arc::try_unwrap(other).map_or_else(|o| o.values.clone(), |o| o.values);
+        }
+        Self::resampled(vol, &other)
     }
 
     /// `other` on `vol`'s voxel grid, by position: copied when the grids match, otherwise
     /// sampled (trilinear) where each voxel of `vol` lies in `other` (0 outside it).
     pub fn resampled(vol: &LoadedVolume, other: &LoadedVolume) -> Vec<f32> {
         use rayon::prelude::*;
-        let same = vol.dims == other.dims && (vol.geometry.matrix() - other.geometry.matrix()).to_cols_array().iter().all(|x| x.abs() < 1e-4);
-        if same {
+        if same_grid(vol, other) {
             return other.values.clone();
         }
         let to_other = other.geometry.matrix().inverse() * vol.geometry.matrix();
@@ -248,6 +292,34 @@ impl Fusion {
             })
             .collect()
     }
+}
+
+/// Each file's length and modification time (`None` for a file that cannot be read), for the
+/// keys of [`Fusion::shared`]: writing a file again changes them.
+pub fn file_stamps<P: AsRef<std::path::Path>>(files: &[P]) -> Vec<Option<(u64, Option<std::time::SystemTime>)>> {
+    files.iter().map(|f| std::fs::metadata(f).ok().map(|m| (m.len(), m.modified().ok()))).collect()
+}
+
+/// The second image's voxels lie on the first's (to a tenth of a micrometre).
+fn same_grid(vol: &LoadedVolume, other: &LoadedVolume) -> bool {
+    vol.dims == other.dims && (vol.geometry.matrix() - other.geometry.matrix()).to_cols_array().iter().all(|x| x.abs() < 1e-4)
+}
+
+/// Second images put on a first image's grid ([`Fusion::shared`]), while a view shows them.
+struct FusedValues {
+    /// The first image's dims and voxel → RAS matrix (as bits).
+    grid: ([usize; 3], [u64; 16]),
+    /// What tells the second image's loads apart.
+    key: Box<dyn std::any::Any + Send + Sync>,
+    values: std::sync::Weak<Vec<f32>>,
+    range: (f32, f32),
+    auto_window: (f64, f64),
+}
+
+fn fused_values() -> std::sync::MutexGuard<'static, Vec<FusedValues>> {
+    static FUSED: std::sync::Mutex<Vec<FusedValues>> = std::sync::Mutex::new(Vec::new());
+    // Nothing is left half-changed by a panic while it is held.
+    FUSED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The range of the (finite) values, and a window over their 1st to 99th percentile.
@@ -460,6 +532,67 @@ mod tests {
         assert_eq!(r[2], 5.0);
         assert_eq!(r[3], 10.0);
         assert_eq!(r[0], 0.0, "voxel 0 lies half a voxel of b outside it: clamped");
+    }
+
+    #[test]
+    fn second_images_are_moved_and_shared() {
+        let g = Geometry::from_axes([4, 4, 4, 1], [1.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        let a = LoadedVolume::from_values("a", [4, 4, 4], (0..64).map(|n| n as f32).collect(), g.clone());
+        // The same grid: the values moved, as they would have been copied.
+        let b = LoadedVolume::from_values("b", [4, 4, 4], (0..64).map(|n| (n * 3 % 17) as f32).collect(), g.clone());
+        let (at, copied) = (b.values.as_ptr(), Fusion::resampled(&a, &b));
+        let moved = Fusion::resampled_owned(&a, b.clone());
+        assert_eq!(moved, copied);
+        let moved = Fusion::resampled_owned(&a, b);
+        assert_eq!((moved.as_ptr(), &moved), (at, &copied), "not copied");
+        // Shared elsewhere: copied.
+        let shared = Arc::new(LoadedVolume::from_values("b", [4, 4, 4], copied.clone(), g.clone()));
+        assert_eq!(Fusion::resampled_owned(&a, shared.clone()), shared.values);
+        // Another grid: sampled as before.
+        let g2 = Geometry::from_axes([2, 2, 2, 1], [2.0; 3], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::splat(1.0));
+        let c = LoadedVolume::from_values("c", [2, 2, 2], vec![0.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0], g2.clone());
+        assert_eq!(Fusion::resampled_owned(&a, c.clone()), Fusion::resampled(&a, &c));
+
+        // Shared fused values: loaded once per (grid, key) while shown.
+        let loads = std::sync::atomic::AtomicUsize::new(0);
+        let load = |v: &LoadedVolume| {
+            loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, String>(v.clone())
+        };
+        let key = |n: u32| ("layers::tests::shared", n);
+        let first = Fusion::shared("first", &a, key(1), ColourMap::Hot, || load(&c)).unwrap();
+        let again = Fusion::shared("again", &a, key(1), ColourMap::Green, || load(&c)).unwrap();
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&first.values, &again.values));
+        // As Fusion::new makes it.
+        let new = Fusion::new("again", Fusion::resampled(&a, &c), ColourMap::Green);
+        assert_eq!((&again.name, &*again.values, again.range, again.auto_window, again.window), (&new.name, &*new.values, new.range, new.auto_window, new.window));
+        assert_eq!((again.colour_map, again.opacity, again.compare, again.wipe, again.showing), (new.colour_map, new.opacity, new.compare, new.wipe, new.showing));
+        // Another key, or another first grid: loaded.
+        let other_key = Fusion::shared("k", &a, key(2), ColourMap::Hot, || load(&c)).unwrap();
+        let small = LoadedVolume::from_values("s", [2, 2, 2], vec![0.0; 8], g2);
+        let other_grid = Fusion::shared("g", &small, key(1), ColourMap::Hot, || load(&c)).unwrap();
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(*other_grid.values, c.values);
+        // A failed load passes its error on.
+        assert_eq!(Fusion::shared("e", &a, key(3), ColourMap::Hot, || Err::<LoadedVolume, _>("unreadable".to_string())).err(), Some("unreadable".to_string()));
+        // Once nothing shows them, they are loaded again.
+        drop((first, again, other_key, other_grid));
+        let _later = Fusion::shared("later", &a, key(1), ColourMap::Hot, || load(&c)).unwrap();
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn file_stamps_change_when_a_file_is_written_again() {
+        let path = std::env::temp_dir().join(format!("polymix-imaging-stamps-{}.raw", std::process::id()));
+        std::fs::write(&path, [1u8; 64]).unwrap();
+        let (missing, first) = (path.with_extension("missing"), file_stamps(&[&path]));
+        assert!(first[0].is_some_and(|(len, _)| len == 64));
+        assert_eq!(file_stamps(&[&path]), first);
+        std::fs::write(&path, [2u8; 96]).unwrap();
+        let again = file_stamps(&[path.clone(), missing]);
+        std::fs::remove_file(&path).unwrap();
+        assert!(again[0] != first[0] && again[1].is_none());
     }
 
     #[test]

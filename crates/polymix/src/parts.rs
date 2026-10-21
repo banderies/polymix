@@ -11,6 +11,7 @@ use mm_edit::{Part, PartKind, StencilShape};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct LibPart {
@@ -20,7 +21,30 @@ pub struct LibPart {
     /// The parts folder it comes from (index into [`Library::folders`]).
     pub folder: Option<usize>,
     /// Shaded drawing in a unit square, see [`thumbnail`].
-    pub thumb: egui::Mesh,
+    pub thumb: Arc<egui::Mesh>,
+    /// The name as its tile shows it (cut short).
+    label: String,
+    /// The thumbnail placed in the tile's picture, for the rectangle it was placed in.
+    placed: Option<(egui::Rect, Arc<egui::Mesh>)>,
+}
+
+impl LibPart {
+    fn new(part: Arc<Part>, file: Option<PathBuf>, folder: Option<usize>, thumb: Arc<egui::Mesh>) -> Self {
+        Self { label: elide(&part.name, 12), part, file, folder, thumb, placed: None }
+    }
+}
+
+/// Bumped whenever the library's files change (a part saved, a parts folder added or
+/// removed), so that a library loaded before is known to be out of date.
+static CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times the library's files have changed (see [`CHANGES`]).
+pub fn library_changes() -> u64 {
+    CHANGES.load(Ordering::Relaxed)
+}
+
+fn library_changed() {
+    CHANGES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A folder of mesh files in the library.
@@ -59,14 +83,26 @@ fn folders_file() -> Option<PathBuf> {
 
 impl Library {
     /// Built-in parts, the user's saved parts and the parts in the user's parts folders.
+    /// Parts already loaded from files that have not changed since are taken as they were.
     pub fn load() -> Self {
-        let mut parts: Vec<LibPart> = mm_edit::builtin_parts().into_iter().map(|p| LibPart { thumb: thumbnail(&p.mesh, p.kind), part: Arc::new(p), file: None, folder: None }).collect();
+        // Built-ins never change: made once per session.
+        static BUILTIN: OnceLock<Vec<(Arc<Part>, Arc<egui::Mesh>)>> = OnceLock::new();
+        let builtin = BUILTIN.get_or_init(|| {
+            mm_edit::builtin_parts()
+                .into_iter()
+                .map(|p| {
+                    let thumb = Arc::new(thumbnail(&p.mesh, p.kind));
+                    (Arc::new(p), thumb)
+                })
+                .collect()
+        });
+        let mut parts: Vec<LibPart> = builtin.iter().map(|(p, t)| LibPart::new(p.clone(), None, None, t.clone())).collect();
         let mut files: Vec<PathBuf> = parts_dir().and_then(|d| std::fs::read_dir(d).ok()).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pmx")).collect();
         files.sort();
         for f in files {
-            match load_part(&f) {
-                Ok(p) => parts.push(LibPart { thumb: thumbnail(&p.mesh, p.kind), part: Arc::new(p), file: Some(f), folder: None }),
-                Err(e) => log::warn!("skipping part {}: {e:#}", f.display()),
+            match user_part(&f) {
+                Ok((p, thumb)) => parts.push(LibPart::new(p, Some(f), None, thumb)),
+                Err(e) => log::warn!("skipping part {}: {e}", f.display()),
             }
         }
         let mut lib = Self { parts, folders: Vec::new() };
@@ -90,7 +126,7 @@ impl Library {
                 part = Arc::new(Part { name, ..(*part).clone() });
             }
             taken.insert(part.name.clone());
-            self.parts.push(LibPart { part, file: Some(fp.file), folder: Some(index), thumb: fp.thumb });
+            self.parts.push(LibPart::new(part, Some(fp.file), Some(index), fp.thumb));
         }
         self.folders.push(PartsFolder { path: dir.to_path_buf(), skipped: scan.skipped, error: scan.error });
     }
@@ -111,6 +147,38 @@ fn load_part(path: &Path) -> Result<Part> {
     })
 }
 
+/// A part file loaded with its thumbnail (or why it could not be).
+type Loaded = std::result::Result<(Arc<Part>, Arc<egui::Mesh>), String>;
+/// Loaded part files by path, with the modification time and size they were loaded at.
+type PartCache = Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, u64, Loaded)>>;
+
+/// `load` of the file at `path` (`Err` with the message to show), reusing the last load from
+/// `cache` while the file's modification time and size are unchanged.
+fn cached_load(cache: &PartCache, path: &Path, load: impl FnOnce() -> Loaded) -> Loaded {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let stamp = (meta.modified().ok(), meta.len());
+    if let Some((m, l, r)) = cache.lock().ok().and_then(|c| c.get(path).cloned()) {
+        if (m, l) == stamp {
+            return r;
+        }
+    }
+    let loaded = load();
+    if let Ok(mut c) = cache.lock() {
+        c.insert(path.to_path_buf(), (stamp.0, stamp.1, loaded.clone()));
+    }
+    loaded
+}
+
+/// A user part (`.pmx`) with its thumbnail, loaded again only when its file changed.
+fn user_part(path: &Path) -> Loaded {
+    static CACHE: OnceLock<PartCache> = OnceLock::new();
+    cached_load(CACHE.get_or_init(Default::default), path, || {
+        let p = load_part(path).map_err(|e| format!("{e:#}"))?;
+        let thumb = Arc::new(thumbnail(&p.mesh, p.kind));
+        Ok((Arc::new(p), thumb))
+    })
+}
+
 /// The first of "<prefix> 1", "<prefix> 2", … not `taken`.
 fn free_name(prefix: &str, taken: impl Fn(&str) -> bool) -> String {
     (1..).map(|i| format!("{prefix} {i}")).find(|n| !taken(n)).unwrap()
@@ -124,6 +192,7 @@ pub fn save_part(part_mesh: Mesh, kind: PartKind) -> Result<String> {
     let name = free_name("My part", |n| dir.join(format!("{n}.open.pmx")).exists() || dir.join(format!("{n}.solid.pmx")).exists());
     let part = if kind == PartKind::Open { Part::open(&name, part_mesh)? } else { Part::solid(&name, part_mesh)? };
     std::fs::write(dir.join(format!("{name}.{label}.pmx")), crate::project::mesh_to_bytes(&part.mesh))?;
+    library_changed();
     Ok(name)
 }
 
@@ -150,7 +219,7 @@ pub fn classify_part(mesh: &Mesh) -> std::result::Result<PartKind, String> {
 pub struct FolderPart {
     pub file: PathBuf,
     pub part: Arc<Part>,
-    pub thumb: egui::Mesh,
+    pub thumb: Arc<egui::Mesh>,
 }
 
 /// What [`scan_parts_folder`] found.
@@ -165,22 +234,10 @@ pub struct FolderScan {
 /// Meshes larger than this are drawn reduced in their thumbnails.
 const THUMB_TRIANGLES: usize = 6000;
 
-type Loaded = std::result::Result<(Arc<Part>, Arc<egui::Mesh>), String>;
-/// Loaded folder parts by file, with the modification time and size they were loaded at.
-type PartCache = Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, u64, Loaded)>>;
-
 /// Load a mesh file as a part, reusing the last load while the file is unchanged.
 fn folder_part(path: &Path) -> Loaded {
     static CACHE: OnceLock<PartCache> = OnceLock::new();
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let stamp = (meta.modified().ok(), meta.len());
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some((m, l, r)) = cache.lock().ok().and_then(|c| c.get(path).cloned()) {
-        if (m, l) == stamp {
-            return r;
-        }
-    }
-    let loaded: Loaded = (|| {
+    cached_load(CACHE.get_or_init(Default::default), path, || {
         let imported = mm_io::read_mesh(path).map_err(|e| format!("{e:#}"))?;
         let kind = classify_part(&imported.mesh)?;
         let name = path.file_stem().map_or_else(|| "part".to_string(), |s| s.to_string_lossy().into_owned());
@@ -198,11 +255,7 @@ fn folder_part(path: &Path) -> Loaded {
             thumbnail(&part.mesh, kind)
         };
         Ok((Arc::new(part), Arc::new(thumb)))
-    })();
-    if let Ok(mut c) = cache.lock() {
-        c.insert(path.to_path_buf(), (stamp.0, stamp.1, loaded.clone()));
-    }
-    loaded
+    })
 }
 
 /// The mesh files of a folder (not its subfolders) as parts: closed meshes are solid parts,
@@ -218,7 +271,7 @@ pub fn scan_parts_folder(dir: &Path) -> FolderScan {
     let mut scan = FolderScan::default();
     for (file, r) in files.into_iter().zip(loaded) {
         match r {
-            Ok((part, thumb)) => scan.parts.push(FolderPart { file, part, thumb: (*thumb).clone() }),
+            Ok((part, thumb)) => scan.parts.push(FolderPart { file, part, thumb }),
             Err(e) => scan.skipped.push((file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), e)),
         }
     }
@@ -254,6 +307,7 @@ fn add_folder_to(list: &Path, dir: &Path) -> Result<String> {
     }
     dirs.push(dir.clone());
     write_list(list, &dirs)?;
+    library_changed();
     let scan = scan_parts_folder(&dir);
     let solid = scan.parts.iter().filter(|p| p.part.kind == PartKind::Solid).count();
     let mut msg = format!("Added parts folder \"{name}\" to Meshmix: {} ({solid} solid, {} open)", count(scan.parts.len(), "part"), scan.parts.len() - solid);
@@ -271,7 +325,9 @@ fn count(n: usize, noun: &str) -> String {
 fn remove_folder_from(list: &Path, dir: &Path) -> Result<()> {
     let mut dirs = read_list(list);
     dirs.retain(|d| d != dir);
-    write_list(list, &dirs)
+    write_list(list, &dirs)?;
+    library_changed();
+    Ok(())
 }
 
 /// Add a folder of mesh files to the parts library (remembered across sessions); returns a
@@ -304,23 +360,35 @@ fn elide(s: &str, max: usize) -> String {
 }
 
 /// One part's tile; returns whether it was clicked.
-fn part_tile(ui: &mut egui::Ui, p: &LibPart) -> bool {
+fn part_tile(ui: &mut egui::Ui, p: &mut LibPart) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(72.0, 86.0), egui::Sense::click());
     let v = ui.visuals();
     let bg = if resp.hovered() { v.widgets.hovered.bg_fill } else { v.widgets.inactive.bg_fill };
     ui.painter().rect_filled(rect, 4.0, bg);
     let img = egui::Rect::from_min_size(rect.min + egui::vec2(6.0, 4.0), egui::vec2(60.0, 60.0));
-    paint_thumbnail(ui.painter(), img, &p.thumb);
-    ui.painter().text(rect.center_bottom() - egui::vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, elide(&p.part.name, 12), egui::FontId::proportional(11.0), v.text_color());
-    let kind = if p.part.kind == PartKind::Open { "open part: welded into the surface" } else { "solid part" };
-    let mut hover = format!("{} ({kind})", p.part.name);
-    if let Some(f) = &p.file {
-        hover += &format!("\n{}", f.display());
-    }
-    resp.on_hover_text(hover).clicked()
+    // Placed once for where the tile is, not copied and moved every frame.
+    let placed = match &p.placed {
+        Some((r, m)) if *r == img => m.clone(),
+        _ => {
+            let m = Arc::new(placed_thumbnail(img, &p.thumb));
+            p.placed = Some((img, m.clone()));
+            m
+        }
+    };
+    ui.painter().add(egui::Shape::mesh(placed));
+    ui.painter().text(rect.center_bottom() - egui::vec2(0.0, 6.0), egui::Align2::CENTER_BOTTOM, &p.label, egui::FontId::proportional(11.0), v.text_color());
+    crate::app::hover_text_with(resp, || {
+        let kind = if p.part.kind == PartKind::Open { "open part: welded into the surface" } else { "solid part" };
+        let mut hover = format!("{} ({kind})", p.part.name);
+        if let Some(f) = &p.file {
+            hover += &format!("\n{}", f.display());
+        }
+        hover
+    })
+    .clicked()
 }
 
-fn part_grid<'a>(ui: &mut egui::Ui, items: impl Iterator<Item = &'a LibPart>, has_obj: bool, drop: &mut Option<String>) {
+fn part_grid<'a>(ui: &mut egui::Ui, items: impl Iterator<Item = &'a mut LibPart>, has_obj: bool, drop: &mut Option<String>) {
     ui.horizontal_wrapped(|ui| {
         for p in items {
             if part_tile(ui, p) && has_obj {
@@ -330,21 +398,35 @@ fn part_grid<'a>(ui: &mut egui::Ui, items: impl Iterator<Item = &'a LibPart>, ha
     });
 }
 
+/// What was done in the Meshmix panel.
+#[derive(Default)]
+pub struct PanelResponse {
+    /// The name of the part clicked (to open Drop Part with).
+    pub drop: Option<String>,
+    /// The library's files changed or a reload was asked for: load it again.
+    pub reload: bool,
+}
+
 /// The Meshmix category panel: built-in parts, My parts, one section per parts folder (with
-/// its Remove button), and Add parts folder. Returns the name of the part clicked (to open
-/// Drop Part with); messages go to `status`.
-pub fn library_panel(ui: &mut egui::Ui, lib: &mut Option<Library>, has_obj: bool, status: &mut String) -> Option<String> {
-    let l = lib.get_or_insert_with(Library::load);
+/// its Remove button), and Add parts folder; while there is no library yet (`None`, being
+/// loaded), a spinner. Messages go to `status`.
+pub fn library_panel(ui: &mut egui::Ui, lib: Option<&mut Library>, has_obj: bool, status: &mut String) -> PanelResponse {
+    let Some(l) = lib else {
+        ui.horizontal(|ui| {
+            polymix_workspace::spinner(ui);
+            ui.label("Loading parts…");
+        });
+        return PanelResponse::default();
+    };
     let mut drop = None;
     let mut reload = false;
     for (title, kind) in [("Solid parts", PartKind::Solid), ("Open parts", PartKind::Open)] {
         crate::ui_util::section(ui, title);
-        part_grid(ui, l.parts.iter().filter(|p| p.file.is_none() && p.part.kind == kind), has_obj, &mut drop);
+        part_grid(ui, l.parts.iter_mut().filter(|p| p.file.is_none() && p.part.kind == kind), has_obj, &mut drop);
     }
-    let mine: Vec<&LibPart> = l.parts.iter().filter(|p| p.file.is_some() && p.folder.is_none()).collect();
-    if !mine.is_empty() {
+    if l.parts.iter().any(|p| p.file.is_some() && p.folder.is_none()) {
         crate::ui_util::section(ui, "My parts");
-        part_grid(ui, mine.into_iter(), has_obj, &mut drop);
+        part_grid(ui, l.parts.iter_mut().filter(|p| p.file.is_some() && p.folder.is_none()), has_obj, &mut drop);
     }
     for (i, f) in l.folders.iter().enumerate() {
         ui.add_space(4.0);
@@ -364,11 +446,10 @@ pub fn library_panel(ui: &mut egui::Ui, lib: &mut Option<Library>, has_obj: bool
         if let Some(e) = &f.error {
             ui.colored_label(ui.visuals().warn_fg_color, e);
         }
-        let items: Vec<&LibPart> = l.parts.iter().filter(|p| p.folder == Some(i)).collect();
-        if items.is_empty() && f.error.is_none() {
+        if f.error.is_none() && !l.parts.iter().any(|p| p.folder == Some(i)) {
             ui.weak("No usable mesh files in this folder.");
         }
-        part_grid(ui, items.into_iter(), has_obj, &mut drop);
+        part_grid(ui, l.parts.iter_mut().filter(|p| p.folder == Some(i)), has_obj, &mut drop);
         if !f.skipped.is_empty() {
             let list: String = f.skipped.iter().map(|(n, why)| format!("{n}: {why}\n")).collect();
             ui.small(format!("{} skipped (hover for why)", count(f.skipped.len(), "file"))).on_hover_text(list.trim_end());
@@ -387,10 +468,7 @@ pub fn library_panel(ui: &mut egui::Ui, lib: &mut Option<Library>, has_obj: bool
         }
     });
     ui.small("Click a part, then press on the model where it goes and drag to size it. Make your own with Select > Convert To, or add a folder of mesh files.");
-    if reload {
-        *lib = None;
-    }
-    drop
+    PanelResponse { drop, reload }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -580,13 +658,13 @@ pub fn thumbnail(mesh: &Mesh, kind: PartKind) -> egui::Mesh {
     out
 }
 
-/// Draw a thumbnail into `rect`.
-pub fn paint_thumbnail(painter: &egui::Painter, rect: egui::Rect, thumb: &egui::Mesh) {
+/// A thumbnail placed in `rect`, to draw with `egui::Shape::mesh`.
+pub fn placed_thumbnail(rect: egui::Rect, thumb: &egui::Mesh) -> egui::Mesh {
     let mut m = thumb.clone();
     for v in &mut m.vertices {
         v.pos = rect.min + v.pos.to_vec2() * rect.width();
     }
-    painter.add(egui::Shape::mesh(m));
+    m
 }
 
 #[cfg(test)]
@@ -714,6 +792,69 @@ mod tests {
         assert_eq!(names, ["Sphere".to_string(), format!("Sphere ({label})")]);
         assert_eq!(lib.parts[1].folder, Some(1));
         assert!(lib.find(&format!("Sphere ({label})")).is_some());
+    }
+
+    #[test]
+    fn user_parts_are_read_again_only_when_their_file_changes() {
+        let dir = TempDir::new("pmx");
+        let f = dir.0.join("Knob.solid.pmx");
+        std::fs::write(&f, crate::project::mesh_to_bytes(&primitives::icosphere(1.0, 2))).unwrap();
+        let (a, b) = (user_part(&f).unwrap(), user_part(&f).unwrap());
+        assert!(Arc::ptr_eq(&a.0, &b.0) && Arc::ptr_eq(&a.1, &b.1), "unchanged: the same part");
+        assert_eq!(a.0.name, "Knob");
+        let fresh = load_part(&f).unwrap();
+        assert_eq!(a.0.mesh.to_arrays(), fresh.mesh.to_arrays());
+        let t = thumbnail(&fresh.mesh, fresh.kind);
+        assert_eq!((&a.1.vertices, &a.1.indices), (&t.vertices, &t.indices));
+        // Another mesh in the file (another size): read again.
+        std::fs::write(&f, crate::project::mesh_to_bytes(&primitives::icosphere(1.0, 3))).unwrap();
+        let c = user_part(&f).unwrap();
+        assert!(!Arc::ptr_eq(&a.0, &c.0));
+        assert_eq!(c.0.mesh.triangle_count(), primitives::icosphere(1.0, 3).triangle_count());
+        // A broken file says why, every time.
+        std::fs::write(&f, b"junk, not a mesh at all").unwrap();
+        assert!(user_part(&f).err().expect("broken").contains("not a Polymix mesh"));
+        assert!(user_part(&dir.0.join("gone.solid.pmx")).is_err());
+    }
+
+    #[test]
+    fn changes_to_the_library_files_are_counted() {
+        let dir = TempDir::new("changes");
+        let list = dir.0.join("list").join("parts_folders.txt");
+        let before = library_changes();
+        add_folder_to(&list, &dir.0).unwrap();
+        let added = library_changes();
+        assert!(added > before);
+        // Already listed: nothing changed.
+        add_folder_to(&list, &dir.0).unwrap();
+        remove_folder_from(&list, &dir.0.canonicalize().unwrap()).unwrap();
+        assert!(library_changes() > added);
+    }
+
+    #[test]
+    fn tiles_draw_their_thumbnail_placed_once() {
+        let p = mm_edit::builtin_parts().into_iter().next().unwrap();
+        let thumb = Arc::new(thumbnail(&p.mesh, p.kind));
+        let mut part = LibPart::new(Arc::new(p), None, None, thumb.clone());
+        assert_eq!(part.label, elide(&part.part.name, 12));
+        let ctx = egui::Context::default();
+        let mut placed = Vec::new();
+        for x in [0.0, 0.0, 30.0] {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))), ..Default::default() };
+            let out = ctx.run_ui(input, |ui| {
+                ui.add_space(x);
+                part_tile(ui, &mut part);
+            });
+            let (img, m) = part.placed.clone().expect("placed");
+            // The vertices where the old drawing put them: thumbnail scaled into the picture.
+            assert!(m.vertices.iter().zip(&thumb.vertices).all(|(a, b)| a.pos == img.min + b.pos.to_vec2() * img.width() && a.color == b.color));
+            assert_eq!(m.indices, thumb.indices);
+            let meshes = out.shapes.iter().filter(|s| matches!(s.shape, egui::Shape::Mesh(_))).count();
+            assert_eq!(meshes, 1);
+            placed.push((img, m));
+        }
+        assert!(Arc::ptr_eq(&placed[0].1, &placed[1].1), "the same place: drawn from the cache");
+        assert!(!Arc::ptr_eq(&placed[1].1, &placed[2].1) && placed[1].0 != placed[2].0, "moved: placed again");
     }
 
     #[test]

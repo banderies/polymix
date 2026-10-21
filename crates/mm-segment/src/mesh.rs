@@ -6,6 +6,7 @@
 
 use crate::mask::Mask;
 use crate::ops::distance_sq;
+use crate::smooth::convolve;
 use anyhow::{bail, Context, Result};
 use glam::DVec3;
 use mm_core::{Aabb, Mesh};
@@ -65,45 +66,18 @@ impl Crop {
 
 /// Separable Gaussian blur with per-axis standard deviation in voxels.
 fn gaussian(values: &mut [f32], dims: [usize; 3], sigma: [f64; 3]) {
-    let [nx, ny, nz] = dims;
-    let plane = nx * ny;
+    let mut src = vec![0f32; values.len()];
     for axis in 0..3 {
         let s = sigma[axis];
-        let len = dims[axis];
-        if s < 0.2 || len < 2 {
+        if s < 0.2 || dims[axis] < 2 {
             continue;
         }
         let r = (3.0 * s).ceil() as i64;
         let w: Vec<f32> = (-r..=r).map(|x| (-(x * x) as f64 / (2.0 * s * s)).exp() as f32).collect();
         let total: f32 = w.iter().sum();
-        let src = values.to_vec();
-        let (stride, lines): (usize, Vec<usize>) = match axis {
-            0 => (1, (0..ny * nz).map(|l| l * nx).collect()),
-            1 => (nx, (0..nx * nz).map(|l| (l / nx) * plane + l % nx).collect()),
-            _ => (plane, (0..plane).collect()),
-        };
-        let out: Vec<(usize, Vec<f32>)> = lines
-            .par_iter()
-            .map(|&start| {
-                let line: Vec<f32> = (0..len)
-                    .map(|x| {
-                        let mut acc = 0.0;
-                        for (t, &wt) in w.iter().enumerate() {
-                            // Clamp at the ends (the crop has a margin, so these are far).
-                            let y = (x as i64 + t as i64 - r).clamp(0, len as i64 - 1) as usize;
-                            acc += wt * src[start + y * stride];
-                        }
-                        acc / total
-                    })
-                    .collect();
-                (start, line)
-            })
-            .collect();
-        for (start, line) in out {
-            for (x, v) in line.into_iter().enumerate() {
-                values[start + x * stride] = v;
-            }
-        }
+        // Each sum from +0, then over the weights' total; the ends of lines repeat (the crop has
+        // a margin, so they are far).
+        convolve(values, &mut src, dims, axis, &w, 0.0, |a| a / total);
     }
 }
 
@@ -184,6 +158,21 @@ pub fn mask_to_mesh(mask: &Mask, geometry: &Geometry, params: &MeshParams, progr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaussian_is_the_old_one_to_the_bit() {
+        use crate::reference::{mesh_gaussian, unit, DIMS};
+        for &dims in &DIMS {
+            let n = dims.iter().product::<usize>();
+            let v: Vec<f32> = (0..n).map(|q| (unit(q as u64 + 77) * 20.0 - 10.0) as f32).collect();
+            for sigma in [[0.0, 0.0, 0.0], [0.2, 0.5, 1.3], [2.0, 0.19, 0.7], [f64::NAN, 1.0, 9.0], [0.6, 0.6, 0.6]] {
+                let (mut a, mut b) = (v.clone(), v.clone());
+                mesh_gaussian(&mut a, dims, sigma);
+                gaussian(&mut b, dims, sigma);
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{dims:?} {sigma:?}");
+            }
+        }
+    }
 
     #[test]
     fn a_ball_meshes_closed_with_the_right_size() {

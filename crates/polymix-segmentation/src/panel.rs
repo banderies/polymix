@@ -46,7 +46,7 @@ impl SegmentationWorkspace {
         let mut cancel = false;
         if let Some(r) = &self.running {
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.label(format!("{}…", r.what));
                 cancel = ui.small_button("Cancel").clicked();
             });
@@ -80,7 +80,9 @@ impl SegmentationWorkspace {
         });
         let ml_per_voxel = vol.geometry.spacing.iter().product::<f64>() / 1000.0;
         let counts = seg.counts().to_vec();
-        let mut redraw = false;
+        // Showing or hiding a segment changes what edits may do and what the 3D view shows; a
+        // colour, status or name changes only how the segments look.
+        let (mut redraw, mut restyle) = (false, false);
         // Filter by name and status, when there are enough segments to need it.
         if seg.segments.len() > 4 || !self.filter.0.is_empty() || self.filter.1.is_some() {
             ui.horizontal(|ui| {
@@ -107,12 +109,12 @@ impl SegmentationWorkspace {
                 let flag = ui.add(egui::Button::new(RichText::new("●").color(s.status.colour())).frame(false).small()).on_hover_text(format!("{} (click for the next state)", s.status.label()));
                 if flag.clicked() {
                     s.status = s.status.next();
-                    redraw = true;
+                    restyle = true;
                 }
                 let mut c = [s.colour.r(), s.colour.g(), s.colour.b()];
                 if ui.color_edit_button_srgb(&mut c).changed() {
                     s.colour = Color32::from_rgb(c[0], c[1], c[2]);
-                    redraw = true;
+                    restyle = true;
                 }
                 match &mut self.renaming {
                     Some((r, name, focused)) if *r == k => {
@@ -126,7 +128,7 @@ impl SegmentationWorkspace {
                         } else if !ui.memory(|m| m.has_focus(edit.id)) {
                             if !name.trim().is_empty() && !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 s.name = name.trim().to_string();
-                                redraw = true;
+                                restyle = true;
                             }
                             self.renaming = None;
                         }
@@ -151,6 +153,9 @@ impl SegmentationWorkspace {
         }
         if redraw {
             seg.changed(true);
+        }
+        if restyle {
+            seg.restyled();
         }
     }
 

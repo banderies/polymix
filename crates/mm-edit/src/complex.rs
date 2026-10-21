@@ -28,6 +28,8 @@ use crate::{convex_hull, mesh_boolean, BooleanOp, EditError, EditResult};
 use glam::DVec3;
 use mm_core::{measure::volume, topology, Bvh, Mesh, Plane};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Most inputs of a complex (its cells are the non-empty ones of 2ⁿ − 1 combinations).
 pub const MAX_COMPLEX_INPUTS: usize = 6;
@@ -49,69 +51,231 @@ pub fn generate_complex(solids: &[Mesh]) -> EditResult<Vec<Mesh>> {
 
 /// Cells of up to six overlapping closed solids, largest first. Empty cells are left out.
 pub fn generate_complex_cells(solids: &[Mesh]) -> EditResult<Vec<ComplexCell>> {
+    let solids: Vec<&Mesh> = solids.iter().collect();
+    generate_complex_cells_with(&solids, None)
+}
+
+/// [`generate_complex_cells`] of borrowed solids, reporting progress: `progress` gets 0..1 as
+/// the booleans finish and may return `false` to stop between them (an error then).
+pub fn generate_complex_cells_with(solids: &[&Mesh], progress: mm_solid::Progress) -> EditResult<Vec<ComplexCell>> {
     if !(2..=MAX_COMPLEX_INPUTS).contains(&solids.len()) {
         return Err(EditError::InvalidParameter("Generate Complex needs 2 to 6 closed objects".into()));
     }
-    match cells_of(solids, false)? {
-        (cells, false) => Ok(cells),
+    // The bar never goes back. The first pass fills it, or only its first half once a boolean
+    // has had to nudge (the second pass then follows and fills the rest).
+    let shown = std::cell::Cell::new(0.0f32);
+    let report = |at: f32| {
+        shown.set(shown.get().max(at));
+        progress.is_none_or(|p| p(shown.get()))
+    };
+    match cells_of(solids, false, &|f, nudged| report(if nudged { 0.5 * f } else { f }))? {
+        Pass { cells, nudged: false, .. } => Ok(cells),
         // Touching inputs (coplanar faces, a vertex on another surface) make each boolean
         // nudge its second operand its own way, so the cells would overlap or leave gaps of
         // that size. Then every input but the first is moved once instead, by a different
         // 10⁻⁷ of the size, so all booleans see the same inputs in general position and the
         // cells tile exactly (where faces were coplanar, a cell gets a sheet that thin).
-        (_, true) => Ok(cells_of(solids, true)?.0),
+        _ => Ok(cells_of(solids, true, &|f, _| report(0.5 + 0.5 * f))?.cells),
     }
 }
 
-/// The cells, largest first, and whether any boolean had to nudge its operand.
-fn cells_of(solids: &[Mesh], spread: bool) -> EditResult<(Vec<ComplexCell>, bool)> {
+/// Masks of a complex worked on side by side, at most: each boolean is parallel inside, so a
+/// few at once keep the cores busy through their serial parts.
+const CONCURRENT_BOOLEANS: usize = 4;
+
+/// Memory a boolean takes while it runs, per triangle of its two operands (measured: about 400
+/// bytes, from 20k to 330k triangles each; four times the operands themselves).
+const BOOLEAN_BYTES_PER_TRIANGLE: usize = 400;
+
+/// Memory the booleans run side by side may take together (a single one takes what it needs):
+/// large inputs run fewer at once, four up to about 670k triangles each, one above 1.3M.
+const SIDE_BY_SIDE_BYTES: usize = 2 << 30;
+
+/// The intersection of the inputs of a mask, shared by the mask's cell and the masks that add
+/// a later input.
+#[derive(Clone)]
+enum Inside<'a> {
+    /// A single input.
+    Input(&'a Mesh),
+    Made(Arc<Made<'a>>),
+}
+
+impl std::ops::Deref for Inside<'_> {
+    type Target = Mesh;
+    fn deref(&self) -> &Mesh {
+        match self {
+            Inside::Input(m) => m,
+            Inside::Made(m) => &m.mesh,
+        }
+    }
+}
+
+impl Inside<'_> {
+    /// The mesh itself, without a copy when nothing else holds it.
+    fn into_mesh(self) -> Mesh {
+        match self {
+            Inside::Input(m) => m.clone(),
+            Inside::Made(m) => Arc::try_unwrap(m).map_or_else(|m| m.mesh.clone(), |mut m| std::mem::take(&mut m.mesh)),
+        }
+    }
+}
+
+/// An intersection [`cells_of`] made, counted in `held` while it lives.
+struct Made<'a> {
+    mesh: Mesh,
+    held: &'a Held,
+}
+
+impl<'a> Made<'a> {
+    fn new(mesh: Mesh, held: &'a Held) -> Self {
+        let now = held.now.fetch_add(1, Ordering::Relaxed) + 1;
+        held.most.fetch_max(now, Ordering::Relaxed);
+        held.made.fetch_add(1, Ordering::Relaxed);
+        Made { mesh, held }
+    }
+}
+
+impl Drop for Made<'_> {
+    fn drop(&mut self) {
+        self.held.now.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How many intersections [`cells_of`] holds, now and at most, and has made.
+#[derive(Default)]
+struct Held {
+    now: AtomicUsize,
+    most: AtomicUsize,
+    made: AtomicUsize,
+}
+
+/// What one pass of [`cells_of`] made.
+struct Pass {
+    /// Largest first.
+    cells: Vec<ComplexCell>,
+    /// Whether any boolean had to nudge its operand.
+    nudged: bool,
+    /// The intersections made (not empty), and the most held at once.
+    #[cfg_attr(not(test), allow(dead_code))]
+    intersections: (usize, usize),
+}
+
+/// The cells, and whether any boolean had to nudge its operand. `progress` gets the fraction of
+/// masks done and whether a boolean has nudged so far; `false` stops between booleans.
+///
+/// A cell is the intersection of the inputs it is inside (taken in input order), minus each of
+/// the other inputs in turn. The intersection of the inputs of a mask is that of the mask
+/// without its last input (its parent), intersected with that input: so each intersection is
+/// computed once and serves its own cell and every mask that adds a later input (its
+/// children), rather than being computed again for every cell it starts. That tree of masks is
+/// walked depth first, a few masks at a time, and an intersection is dropped once its cell and
+/// its children's intersections are made, so only a few are held at once (9 at most for six
+/// inputs that all overlap) rather than all 57. The booleans and their operands are those each
+/// cell would make on its own, so the cells, the nudge flag and the first error in mask order
+/// are too. After a mask fails, larger masks are not made: they cannot fail first, and smaller
+/// ones need only smaller ones.
+fn cells_of(solids: &[&Mesh], spread: bool, progress: &dyn Fn(f32, bool) -> bool) -> EditResult<Pass> {
     let n = solids.len();
     let size = solids.iter().fold(mm_core::Aabb::EMPTY, |b, m| b.union(&m.bounds())).diagonal().max(1e-300);
     let dirs = [DVec3::new(0.5773, 0.6181, 0.5331), DVec3::new(-0.4422, 0.7193, 0.5318), DVec3::new(0.6338, -0.3271, 0.7008)];
-    let moved: Vec<Mesh> = solids
+    // Only the inputs that move are copied.
+    let shifted: Vec<Option<Mesh>> = solids
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let mut m = m.clone();
-            if spread && i > 0 {
+            (spread && i > 0).then(|| {
+                let mut m = (*m).clone();
                 let d = dirs[(i - 1) % 3].normalize() * (1e-7 * size * i as f64);
                 m.transform(|p| p + d);
-            }
-            m
+                m
+            })
         })
         .collect();
-    let mut nudged = false;
-    let mut boolean = |a: &Mesh, b: &Mesh, op| -> EditResult<Mesh> {
+    let moved: Vec<&Mesh> = shifted.iter().zip(solids).map(|(s, m)| s.as_ref().unwrap_or(m)).collect();
+    let all = (1u32 << n) - 1;
+    let last_input = |mask: u32| 31 - mask.leading_zeros() as usize;
+    let nudged = AtomicBool::new(false);
+    let boolean = |a: &Mesh, b: &Mesh, op| -> EditResult<Mesh> {
         let r = mesh_boolean(a, b, op)?;
-        nudged |= r.perturbed;
+        if r.perturbed {
+            nudged.store(true, Ordering::Relaxed);
+        }
         Ok(r.mesh)
     };
-    let mut cells = Vec::new();
-    for mask in 1u32..(1 << n) {
-        let inside: Vec<usize> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
-        let mut cell = moved[inside[0]].clone();
-        let mut empty = false;
-        for &i in &inside[1..] {
-            cell = boolean(&cell, &moved[i], BooleanOp::Intersection)?;
-            if cell.triangle_count() == 0 {
-                empty = true;
-                break;
-            }
-        }
-        if !empty {
-            for j in (0..n).filter(|j| mask & (1 << j) == 0) {
-                cell = boolean(&cell, &moved[j], BooleanOp::Difference)?;
-                if cell.triangle_count() == 0 {
-                    break;
+    let held = Held::default();
+    let largest = moved.iter().map(|m| m.triangle_count()).max().unwrap_or(0);
+    let side_by_side = (SIDE_BY_SIDE_BYTES / (2 * BOOLEAN_BYTES_PER_TRIANGLE * largest).max(1)).clamp(1, CONCURRENT_BOOLEANS);
+
+    // Masks to do, each with its parent's intersection (none for a single input); the last is
+    // next.
+    let mut todo: Vec<(u32, Option<Inside>)> = (0..n).rev().map(|i| (1 << i, None)).collect();
+    // Each mask's cell, when made.
+    let mut made: Vec<Option<EditResult<Option<ComplexCell>>>> = (0..=all).map(|_| None).collect();
+    let mut first_failed = u32::MAX;
+    // Masks done or never to be made (inside an empty intersection), for progress.
+    let mut done = 0u32;
+    while !todo.is_empty() {
+        let batch: Vec<(u32, Option<Inside>)> = (0..side_by_side).map_while(|_| todo.pop()).collect();
+        let results: Vec<(u32, EditResult<Option<ComplexCell>>, Option<Inside>)> = batch
+            .into_par_iter()
+            .map(|(mask, parent)| {
+                let last = last_input(mask);
+                let own = match parent {
+                    None => Inside::Input(moved[last]),
+                    // The parent is let go before the differences.
+                    Some(parent) => match boolean(&parent, moved[last], BooleanOp::Intersection) {
+                        Err(e) => return (mask, Err(e), None),
+                        Ok(m) if m.triangle_count() == 0 => return (mask, Ok(None), None),
+                        Ok(m) => Inside::Made(Arc::new(Made::new(m, &held))),
+                    },
+                };
+                // The cell: the intersection minus the inputs it is outside, in input order.
+                let mut cell: Option<Mesh> = None;
+                for j in (0..n).filter(|j| mask & (1 << j) == 0) {
+                    let next = match boolean(cell.as_ref().unwrap_or(&own), moved[j], BooleanOp::Difference) {
+                        Ok(m) => m,
+                        Err(e) => return (mask, Err(e), None),
+                    };
+                    let empty = next.triangle_count() == 0;
+                    cell = Some(next);
+                    if empty {
+                        break;
+                    }
                 }
+                // Only the mask of every input has no difference to take, and no children.
+                let (cell, own) = match cell {
+                    Some(cell) => (cell, (last + 1 < n).then_some(own)),
+                    None => (own.into_mesh(), None),
+                };
+                let cell = (cell.triangle_count() > 0 && volume(&cell) > 0.0).then_some(ComplexCell { mask, mesh: cell });
+                (mask, Ok(cell), own)
+            })
+            .collect();
+        for (mask, cell, own) in results {
+            let last = last_input(mask);
+            match own {
+                Some(own) => todo.extend((last + 1..n).map(|j| (mask | (1 << j), Some(own.clone())))),
+                // Its children are inside an empty intersection, or come after a failure.
+                None => done += (1 << (n - 1 - last)) - 1,
             }
+            if cell.is_err() {
+                first_failed = first_failed.min(mask);
+            }
+            made[mask as usize] = Some(cell);
+            done += 1;
         }
-        if cell.triangle_count() > 0 && volume(&cell) > 0.0 {
-            cells.push(ComplexCell { mask, mesh: cell });
+        todo.retain(|&(mask, _)| mask < first_failed);
+        if !progress(done as f32 / all as f32, nudged.load(Ordering::Relaxed)) {
+            return Err(EditError::Failed("cancelled".into()));
         }
     }
+    if let Some(Some(Err(e))) = made.get_mut(first_failed as usize).map(Option::take) {
+        return Err(e);
+    }
+    let mut cells: Vec<ComplexCell> = made.into_iter().flatten().filter_map(|c| c.ok().flatten()).collect();
     cells.sort_by(|a, b| volume(&b.mesh).total_cmp(&volume(&a.mesh)));
-    Ok((cells, nudged))
+    let intersections = (held.made.load(Ordering::Relaxed), held.most.load(Ordering::Relaxed));
+    Ok(Pass { cells, nudged: nudged.into_inner(), intersections })
 }
 
 /// Letter of input `i` in cell labels and filter expressions (A, B, …).
@@ -829,8 +993,9 @@ fn halves(m: &Mesh, plane: Plane) -> Option<Vec<Mesh>> {
     (parts.len() >= 2).then_some(parts)
 }
 
-/// Best split of a piece, as its new pieces.
-fn split(p: &Piece) -> Option<Vec<Piece>> {
+/// Best split of a piece, as its new pieces. `go_on` is asked before each trial cut; when it
+/// says no, the search stops with an error.
+fn split(p: &Piece, go_on: &dyn Fn() -> bool) -> EditResult<Option<Vec<Piece>>> {
     let m = &p.mesh;
     let pts: Vec<DVec3> = m.vertex_ids().map(|v| m.vertex(v)).collect();
     let c = pts.iter().copied().sum::<DVec3>() / pts.len() as f64;
@@ -850,6 +1015,9 @@ fn split(p: &Piece) -> Option<Vec<Piece>> {
         let inner: Vec<f64> = d.into_iter().filter(|&x| x > lo + (hi - lo) * 0.05 && x < hi - (hi - lo) * 0.05).collect();
         let step = inner.len().div_ceil(12).max(1);
         for off in inner.into_iter().step_by(step) {
+            if !go_on() {
+                return Err(EditError::Failed("cancelled".into()));
+            }
             let Some(parts) = halves(m, Plane::from_point_normal(c + n * off, n)) else { continue };
             let pieces: Vec<Piece> = parts.into_iter().filter_map(piece).collect();
             let score: f64 = pieces.iter().map(|q| q.concavity).sum();
@@ -858,11 +1026,18 @@ fn split(p: &Piece) -> Option<Vec<Piece>> {
             }
         }
     }
-    best.map(|b| b.1)
+    Ok(best.map(|b| b.1))
 }
 
 /// Convex hulls of the pieces of `mesh` (see the module docs).
 pub fn convex_decomposition(mesh: &Mesh, p: &ConvexParams) -> EditResult<Vec<Mesh>> {
+    convex_decomposition_with(mesh, p, None)
+}
+
+/// [`convex_decomposition`], reporting progress: `progress` gets the pieces made so far against
+/// [`ConvexParams::max_pieces`] before each trial cut, and may return `false` to stop there (an
+/// error then). The pieces are the same.
+pub fn convex_decomposition_with(mesh: &Mesh, p: &ConvexParams, progress: mm_solid::Progress) -> EditResult<Vec<Mesh>> {
     if !mesh.is_closed() || mesh.triangle_count() == 0 {
         return Err(EditError::InvalidParameter("Convex Decomposition needs a closed object (Make Solid first)".into()));
     }
@@ -870,12 +1045,14 @@ pub fn convex_decomposition(mesh: &Mesh, p: &ConvexParams) -> EditResult<Vec<Mes
     let total = volume(&first.hull).max(1e-300);
     let mut pieces = vec![first];
     let mut stuck = vec![false];
-    while pieces.len() < p.max_pieces.max(1) {
+    let most = p.max_pieces.max(1);
+    while pieces.len() < most {
         let Some(i) = (0..pieces.len()).filter(|&i| !stuck[i]).max_by(|&a, &b| pieces[a].concavity.total_cmp(&pieces[b].concavity)) else { break };
         if pieces[i].concavity / total <= p.concavity {
             break;
         }
-        match split(&pieces[i]) {
+        let made = pieces.len() as f32 / most as f32;
+        match split(&pieces[i], &|| progress.is_none_or(|f| f(made)))? {
             Some(new) => {
                 pieces.swap_remove(i);
                 stuck.swap_remove(i);
@@ -1106,5 +1283,173 @@ mod tests {
         // A convex object stays one piece.
         let ball = primitives::icosphere(1.0, 3);
         assert_eq!(convex_decomposition(&ball, &ConvexParams::default()).unwrap().len(), 1);
+        // With progress: the same pieces, and it stops when asked to.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let p = ConvexParams { max_pieces: 8, concavity: 0.01 };
+        let with = convex_decomposition_with(&l, &p, Some(&|f| {
+            assert!((0.0..=1.0).contains(&f));
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }))
+        .unwrap();
+        assert!(calls.into_inner() > 0);
+        assert_eq!(with.len(), hulls.len());
+        for (a, b) in with.iter().zip(&hulls) {
+            assert_eq!(a.to_arrays().0, b.to_arrays().0);
+            assert_eq!(a.to_arrays().1, b.to_arrays().1);
+        }
+        assert!(convex_decomposition_with(&l, &p, Some(&|_| false)).is_err());
+    }
+
+    /// The cells as they were made before the intersections were shared between cells (kept
+    /// to check the new way against): every cell's booleans in turn.
+    fn old_cells_of(solids: &[Mesh], spread: bool) -> EditResult<(Vec<ComplexCell>, bool)> {
+        let n = solids.len();
+        let size = solids.iter().fold(mm_core::Aabb::EMPTY, |b, m| b.union(&m.bounds())).diagonal().max(1e-300);
+        let dirs = [DVec3::new(0.5773, 0.6181, 0.5331), DVec3::new(-0.4422, 0.7193, 0.5318), DVec3::new(0.6338, -0.3271, 0.7008)];
+        let moved: Vec<Mesh> = solids
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mut m = m.clone();
+                if spread && i > 0 {
+                    let d = dirs[(i - 1) % 3].normalize() * (1e-7 * size * i as f64);
+                    m.transform(|p| p + d);
+                }
+                m
+            })
+            .collect();
+        let mut nudged = false;
+        let mut boolean = |a: &Mesh, b: &Mesh, op| -> EditResult<Mesh> {
+            let r = mesh_boolean(a, b, op)?;
+            nudged |= r.perturbed;
+            Ok(r.mesh)
+        };
+        let mut cells = Vec::new();
+        for mask in 1u32..(1 << n) {
+            let inside: Vec<usize> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
+            let mut cell = moved[inside[0]].clone();
+            let mut empty = false;
+            for &i in &inside[1..] {
+                cell = boolean(&cell, &moved[i], BooleanOp::Intersection)?;
+                if cell.triangle_count() == 0 {
+                    empty = true;
+                    break;
+                }
+            }
+            if !empty {
+                for j in (0..n).filter(|j| mask & (1 << j) == 0) {
+                    cell = boolean(&cell, &moved[j], BooleanOp::Difference)?;
+                    if cell.triangle_count() == 0 {
+                        break;
+                    }
+                }
+            }
+            if cell.triangle_count() > 0 && volume(&cell) > 0.0 {
+                cells.push(ComplexCell { mask, mesh: cell });
+            }
+        }
+        cells.sort_by(|a, b| volume(&b.mesh).total_cmp(&volume(&a.mesh)));
+        Ok((cells, nudged))
+    }
+
+    fn old_generate(solids: &[Mesh]) -> EditResult<Vec<ComplexCell>> {
+        match old_cells_of(solids, false)? {
+            (cells, false) => Ok(cells),
+            (_, true) => Ok(old_cells_of(solids, true)?.0),
+        }
+    }
+
+    /// Bit for bit the same mesh, ids included.
+    fn same_mesh(a: &Mesh, b: &Mesh) -> bool {
+        (a.max_vid(), a.max_tid(), a.edge_count()) == (b.max_vid(), b.max_tid(), b.edge_count())
+            && a.vertex_ids().eq(b.vertex_ids())
+            && a.vertex_ids().all(|v| a.vertex(v).to_array().map(f64::to_bits) == b.vertex(v).to_array().map(f64::to_bits))
+            && a.triangle_ids().eq(b.triangle_ids())
+            && a.triangle_ids().all(|t| a.triangle(t) == b.triangle(t) && a.tri_group(t) == b.tri_group(t))
+    }
+
+    #[test]
+    fn shared_intersections_make_the_same_cells() {
+        let cube = |s: f64, at: DVec3| {
+            let mut c = primitives::cube(s, 2);
+            c.transform(|p| p + at);
+            c
+        };
+        let ball = |r: f64, at: DVec3, k: usize| {
+            let mut b = primitives::icosphere(r, k);
+            b.transform(|p| p + at);
+            b
+        };
+        let cases: Vec<Vec<Mesh>> = vec![
+            vec![cube(2.0, DVec3::ZERO), cube(2.0, DVec3::new(1.0, 0.3, 0.2))],
+            // Touching (coplanar) inputs: the nudged second pass.
+            vec![cube(2.0, DVec3::ZERO), cube(2.0, DVec3::X)],
+            vec![ball(1.0, DVec3::ZERO, 2), ball(1.0, DVec3::new(0.93, 0.07, 0.11), 3), ball(1.0, DVec3::new(0.41, 0.77, 0.19), 2)],
+            // Four inputs, one apart from the rest: many empty intersections.
+            vec![ball(1.0, DVec3::ZERO, 2), ball(0.8, DVec3::new(0.9, 0.1, 0.0), 2), ball(0.7, DVec3::new(0.3, 0.8, 0.1), 2), ball(0.5, DVec3::new(5.0, 0.0, 0.0), 1)],
+            // Six nearly coincident inputs (overlapping segmentations of one vessel): every
+            // intersection is there.
+            (0..6)
+                .map(|i| {
+                    let a = i as f64 * 1.3;
+                    ball(1.0 + 0.013 * i as f64, DVec3::new(0.021 * a.cos(), 0.017 * a.sin(), 0.011 * i as f64), 1)
+                })
+                .collect(),
+        ];
+        for (i, solids) in cases.iter().enumerate() {
+            let old = old_generate(solids).unwrap();
+            let new = generate_complex_cells(solids).unwrap();
+            assert_eq!(old.iter().map(|c| c.mask).collect::<Vec<_>>(), new.iter().map(|c| c.mask).collect::<Vec<_>>(), "case {i}");
+            for (a, b) in old.iter().zip(&new) {
+                assert!(same_mesh(&a.mesh, &b.mesh), "case {i}, cell {}", a.mask);
+            }
+        }
+        // An intersection is let go once its cell and its children's are made: of the 57 that
+        // six inputs make, a few are held at once.
+        let refs: Vec<&Mesh> = cases[4].iter().collect();
+        let pass = cells_of(&refs, false, &|_, _| true).unwrap();
+        assert_eq!(pass.intersections.0, 57);
+        assert!((1..=9).contains(&pass.intersections.1), "held {}", pass.intersections.1);
+
+        // The first error in mask order is the same (an open input fails its booleans).
+        let open = || {
+            let mut open = primitives::icosphere(1.0, 2);
+            let t = open.triangle_ids().next().unwrap();
+            open.remove_triangles([t]);
+            open
+        };
+        let solids = [ball(1.0, DVec3::ZERO, 2), open(), ball(1.0, DVec3::X, 2)];
+        assert_eq!(generate_complex_cells(&solids).unwrap_err(), old_generate(&solids).unwrap_err());
+        // A failure stops the walk: here every single input fails its last difference, the
+        // first round, and nothing after that is made.
+        let solids = [ball(1.0, DVec3::ZERO, 2), ball(0.9, DVec3::new(0.5, 0.1, 0.0), 2), ball(0.8, DVec3::new(0.2, 0.6, 0.0), 2), ball(0.7, DVec3::new(0.3, 0.2, 0.5), 2), open()];
+        let rounds = std::sync::atomic::AtomicUsize::new(0);
+        let refs: Vec<&Mesh> = solids.iter().collect();
+        let err = generate_complex_cells_with(&refs, Some(&|_| {
+            rounds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }))
+        .unwrap_err();
+        assert_eq!(err, old_generate(&solids).unwrap_err());
+        assert_eq!(rounds.into_inner(), 1);
+
+        // Progress runs from 0 to 1 without going back, also through the nudged second pass,
+        // and a cancel stops the booleans.
+        for case in [&cases[2], &cases[1]] {
+            let seen = std::sync::Mutex::new(Vec::new());
+            let refs: Vec<&Mesh> = case.iter().collect();
+            generate_complex_cells_with(&refs, Some(&|f| {
+                seen.lock().unwrap().push(f);
+                true
+            }))
+            .unwrap();
+            let seen = seen.into_inner().unwrap();
+            assert!(seen.windows(2).all(|w| w[0] <= w[1]) && seen[0] >= 0.0, "{seen:?}");
+            assert_eq!(seen.last(), Some(&1.0));
+        }
+        assert!(cells_of(&cases[1].iter().collect::<Vec<_>>(), false, &|_, _| true).unwrap().nudged);
+        let refs: Vec<&Mesh> = cases[2].iter().collect();
+        assert!(generate_complex_cells_with(&refs, Some(&|_| false)).is_err());
     }
 }

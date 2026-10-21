@@ -70,6 +70,9 @@ pub enum Progress {
 pub struct FileCache {
     version: u32,
     entries: HashMap<PathBuf, CachedFile>,
+    /// Changed since it was loaded or last saved by [`FileCache::save_if_changed`].
+    #[serde(skip)]
+    dirty: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,7 +89,7 @@ impl FileCache {
     /// Load a cache file (empty when missing, unreadable or from another version).
     pub fn load(path: &Path) -> Self {
         let cache: Option<FileCache> = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        cache.filter(|c| c.version == CACHE_VERSION).unwrap_or_else(|| FileCache { version: CACHE_VERSION, entries: HashMap::new() })
+        cache.filter(|c| c.version == CACHE_VERSION).unwrap_or_else(|| FileCache { version: CACHE_VERSION, entries: HashMap::new(), dirty: false })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -97,6 +100,23 @@ impl FileCache {
         std::fs::write(&tmp, serde_json::to_vec(self)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Save only when a scan changed the cache since it was loaded or last saved this way. A
+    /// change stays to be saved until a save succeeds. Returns whether the file was written.
+    pub fn save_if_changed(&mut self, path: &Path) -> Result<bool> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        self.save(path)?;
+        self.dirty = false;
+        Ok(true)
+    }
+
+    /// Whether a scan changed the cache since it was loaded or last saved with
+    /// [`FileCache::save_if_changed`].
+    pub fn is_changed(&self) -> bool {
+        self.dirty
     }
 
     pub fn len(&self) -> usize {
@@ -144,12 +164,17 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
     // 1. List the files.
     let mut listed = Vec::new();
     for root in roots {
+        // Folders skipped by name, for the summary, noted as the walk passes them.
+        let mut skipped = Vec::new();
         let walker = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
             if e.depth() == 0 || !e.file_type().is_dir() {
                 return true;
             }
             let name = e.file_name().to_string_lossy().to_lowercase();
             let skip = (opts.skip_hidden && name.starts_with('.')) || opts.skip_folders.iter().any(|s| s.eq_ignore_ascii_case(&name)) || [".app", ".framework", ".bundle"].iter().any(|x| name.ends_with(x));
+            if skip {
+                skipped.push(e.path().to_path_buf());
+            }
             !skip
         });
         for entry in walker {
@@ -181,8 +206,7 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
                 bail!("cancelled");
             }
         }
-        // Folders skipped by name, for the summary.
-        skipped_folders(root, opts, &mut catalog.skipped.folders);
+        catalog.skipped.folders.append(&mut skipped);
     }
     catalog.files_seen = listed.len();
 
@@ -219,16 +243,22 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
     if cancelled.load(Ordering::Relaxed) {
         bail!("cancelled");
     }
+    if let Some(c) = cache {
+        // Forget files no longer under these roots and keep the rest; the entries of files
+        // read just now are added or replaced (those still valid are already there).
+        let here: HashSet<&Path> = listed.iter().map(|l| l.path.as_path()).collect();
+        let before = c.entries.len();
+        c.entries.retain(|p, _| !roots.iter().any(|r| p.starts_with(r)) || here.contains(p.as_path()));
+        let changed = c.version != CACHE_VERSION || c.entries.len() != before || !results.is_empty();
+        c.version = CACHE_VERSION;
+        for (k, f) in &results {
+            let l = &listed[*k];
+            c.entries.insert(l.path.clone(), CachedFile { size: l.size, modified: l.modified, found: f.clone() });
+        }
+        c.dirty |= changed;
+    }
     for (k, f) in results {
         found[k] = Some(f);
-    }
-    if let Some(c) = cache {
-        c.version = CACHE_VERSION;
-        // Forget files no longer under these roots, keep the rest.
-        c.entries.retain(|p, _| !roots.iter().any(|r| p.starts_with(r)));
-        for (l, f) in listed.iter().zip(&found) {
-            c.entries.insert(l.path.clone(), CachedFile { size: l.size, modified: l.modified, found: f.clone().unwrap() });
-        }
     }
     if !progress(Progress::Organising) {
         bail!("cancelled");
@@ -292,23 +322,6 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
     Ok(catalog)
 }
 
-/// Folders under `root` that the walk skips by name (not descending into them).
-fn skipped_folders(root: &Path, opts: &ScanOptions, out: &mut Vec<PathBuf>) {
-    let walker = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| e.file_type().is_dir());
-    let mut it = walker.into_iter();
-    while let Some(Ok(e)) = it.next() {
-        if e.depth() == 0 {
-            continue;
-        }
-        let name = e.file_name().to_string_lossy().to_lowercase();
-        let skip = (opts.skip_hidden && name.starts_with('.')) || opts.skip_folders.iter().any(|s| s.eq_ignore_ascii_case(&name)) || [".app", ".framework", ".bundle"].iter().any(|x| name.ends_with(x));
-        if skip {
-            out.push(e.path().to_path_buf());
-            it.skip_current_dir();
-        }
-    }
-}
-
 /// Recognise one file by its first bytes and read its header.
 pub fn classify(path: &Path, size: u64) -> Found {
     if size == 0 {
@@ -324,7 +337,7 @@ pub fn classify(path: &Path, size: u64) -> Found {
 
     // DICOM (Part 10, with or without the 128-byte preamble).
     if (head.len() >= 132 && &head[128..132] == b"DICM") || head.starts_with(b"DICM") {
-        return match dicom::read(path) {
+        return match dicom::read_with_size(path, size) {
             Ok(i) if i.sop_class == "1.2.840.10008.1.3.10" => Found::DicomDir,
             Ok(i) => Found::Dicom(Box::new(i)),
             Err(e) => problem(e),
@@ -594,6 +607,74 @@ mod tests {
         assert_eq!(first, second);
         // Cancelling stops the scan.
         assert!(scan(std::slice::from_ref(&root), &ScanOptions::default(), None, &|p| !matches!(p, Progress::Reading { .. })).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The folders the second walk found before (it stopped at the first error).
+    fn skipped_by_a_second_walk(root: &Path, opts: &ScanOptions) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut it = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| e.file_type().is_dir());
+        while let Some(Ok(e)) = it.next() {
+            if e.depth() == 0 {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let skip = (opts.skip_hidden && name.starts_with('.')) || opts.skip_folders.iter().any(|s| s.eq_ignore_ascii_case(&name)) || [".app", ".framework", ".bundle"].iter().any(|x| name.ends_with(x));
+            if skip {
+                out.push(e.path().to_path_buf());
+                it.skip_current_dir();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_cache_changes_only_when_files_do() {
+        let root = messy_tree();
+        for extra in ["a/.hidden/x", "a/b/node_modules/y", "a/b/c/Thing.app/z", "z/venv/w"] {
+            let p = root.join(extra);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+        let opts = ScanOptions::default();
+        let saved = std::env::temp_dir().join(format!("mmv-cache-{}.json", std::process::id()));
+        let mut cache = FileCache::default();
+        let c = scan(std::slice::from_ref(&root), &opts, Some(&mut cache), &|_| true).unwrap();
+        assert_eq!(c.skipped.folders, skipped_by_a_second_walk(&root, &opts));
+        assert_eq!(c.skipped.folders.len(), 6);
+        assert!(cache.is_changed());
+        assert!(cache.save_if_changed(&saved).unwrap());
+        assert!(!cache.is_changed() && !cache.save_if_changed(&saved).unwrap());
+        // Loaded and rescanned with nothing changed: nothing to save.
+        let mut loaded = FileCache::load(&saved);
+        assert!(!loaded.is_changed());
+        let again = scan(std::slice::from_ref(&root), &opts, Some(&mut loaded), &|_| true).unwrap();
+        assert_eq!(again, c);
+        assert!(!loaded.is_changed());
+        // A new file, a changed one and a removed one each make a change to save; the entries
+        // end as a fresh scan's would.
+        let rescan = |cache: &mut FileCache| {
+            scan(std::slice::from_ref(&root), &opts, Some(cache), &|_| true).unwrap();
+            let changed = cache.is_changed();
+            cache.save_if_changed(&saved).unwrap();
+            let mut fresh = FileCache::default();
+            scan(std::slice::from_ref(&root), &opts, Some(&mut fresh), &|_| true).unwrap();
+            let paths = |c: &FileCache| {
+                let mut p: Vec<(PathBuf, u64)> = c.entries.iter().map(|(p, e)| (p.clone(), e.size)).collect();
+                p.sort();
+                p
+            };
+            assert_eq!(paths(cache), paths(&fresh));
+            changed
+        };
+        std::fs::write(root.join("niftis/notes.txt"), b"new").unwrap();
+        assert!(rescan(&mut loaded));
+        std::fs::write(root.join("scripts/run.py"), b"print('changed')").unwrap();
+        assert!(rescan(&mut loaded));
+        std::fs::remove_file(root.join("niftis/notes.txt")).unwrap();
+        assert!(rescan(&mut loaded));
+        assert!(!rescan(&mut loaded));
+        let _ = std::fs::remove_file(&saved);
         let _ = std::fs::remove_dir_all(&root);
     }
 

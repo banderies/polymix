@@ -152,14 +152,22 @@ pub struct DropResult {
 /// `gap` (fraction of the rim radius) wider than the rim, and bridge the rim to it. The part
 /// gets a new face group; the band takes the group of the surface it replaced.
 pub fn drop_open_part(target: &mut Mesh, seed: u32, part: &Part, at: &Placement, gap: f64) -> EditResult<DropResult> {
-    if part.kind != PartKind::Open {
-        return Err(EditError::InvalidParameter("only open parts are welded into the surface".into()));
-    }
-    if gap.is_nan() || gap <= 0.0 {
-        return Err(EditError::InvalidParameter("the gap must be positive".into()));
-    }
+    check_drop(part, gap)?;
     let bvh = Bvh::build(target);
-    let placed = place_part(part, at, Some((target, &bvh)));
+    drop_open_part_with(target, &bvh, seed, part, at, gap)
+}
+
+/// [`drop_open_part`] with a tree over all of `target` as it is now, such as the one the
+/// part was placed with for its preview, so that no tree is built per drop. The part follows
+/// the surface through the tree's nearest points; a tree of another layout (one refitted
+/// rather than built) can differ only where two triangles are exactly as near, and then only
+/// in which one's normal the part's vertex takes.
+pub fn drop_open_part_with(target: &mut Mesh, bvh: &Bvh, seed: u32, part: &Part, at: &Placement, gap: f64) -> EditResult<DropResult> {
+    check_drop(part, gap)?;
+    if !bvh.is_current(target) || bvh.tris.len() != target.triangle_count() {
+        return Err(EditError::InvalidParameter("the tree is not over the surface as it is".into()));
+    }
+    let placed = place_part(part, at, Some((target, bvh)));
     let group = target.tri_group(seed);
     let poly: Vec<DVec2> = part.rim_outline().iter().map(|q| *q * at.scale * (1.0 + gap)).collect();
     let cut = stamp_polygon(target, seed, &at.frame, &poly)?;
@@ -173,6 +181,16 @@ pub fn drop_open_part(target: &mut Mesh, seed: u32, part: &Part, at: &Placement,
         target.set_tri_group(t, group);
     }
     Ok(DropResult { part_triangles, band_triangles: band.triangles })
+}
+
+fn check_drop(part: &Part, gap: f64) -> EditResult<()> {
+    if part.kind != PartKind::Open {
+        return Err(EditError::InvalidParameter("only open parts are welded into the surface".into()));
+    }
+    if gap.is_nan() || gap <= 0.0 {
+        return Err(EditError::InvalidParameter("the gap must be positive".into()));
+    }
+    Ok(())
 }
 
 /// Surface of revolution around +z through `profile` (r, z) points; points with r = 0
@@ -320,6 +338,27 @@ mod tests {
         // The dome follows the sphere: its top is about 3 above the surface.
         let peak = target.vertex_ids().map(|v| target.vertex(v).length()).fold(0.0, f64::max);
         assert!((peak - 13.0).abs() < 0.3, "{peak}");
+    }
+
+    #[test]
+    fn dropping_with_the_objects_tree_gives_the_same_mesh() {
+        let mut target = primitives::icosphere(10.0, 4);
+        target.transform(|p| DVec3::new(p.x, p.y * 0.8, p.z));
+        let parts = builtin_parts();
+        let dome = parts.iter().find(|p| p.name == "Dome").unwrap();
+        let seed = target.triangle_ids().max_by(|&a, &b| target.tri_centroid(a).z.total_cmp(&target.tri_centroid(b).z)).unwrap();
+        let at = Placement { frame: StampFrame::new(target.tri_centroid(seed), DVec3::Z, DVec3::Y), scale: 3.0, offset: 0.0, follow: true };
+        let mut a = target.clone();
+        let ra = drop_open_part(&mut a, seed, dome, &at, 0.15).unwrap();
+        let mut b = target.clone();
+        let rb = drop_open_part_with(&mut b, &Bvh::build(&target), seed, dome, &at, 0.15).unwrap();
+        assert_eq!(a.to_arrays(), b.to_arrays());
+        assert_eq!((ra.part_triangles, ra.band_triangles), (rb.part_triangles, rb.band_triangles));
+        // A tree of another shape is turned away.
+        let mut c = target.clone();
+        let stale = Bvh::build(&primitives::icosphere(10.0, 4));
+        assert!(drop_open_part_with(&mut c, &stale, seed, dome, &at, 0.15).is_err());
+        assert_eq!(c.to_arrays(), target.to_arrays());
     }
 
     #[test]

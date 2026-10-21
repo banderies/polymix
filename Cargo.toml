@@ -26,3 +26,21 @@ opt-level = 3
 [profile.release]
 debug = 1
 lto = "thin"
+
+# The app bundle's build (scripts/make_app.sh): release, with each workspace library crate
+# (mm-*, polymix-imaging, -segmentation, -volume, -mcp and -workspace) compiled as one unit so
+# LLVM optimises across its modules: image reslicing runs about a quarter faster and STL
+# reading about 15%, the rest the same. It is cheap for the UI library crates too: one unit
+# costs them seconds, and with thin LTO an incremental build after a change to mm-core or
+# polymix-segmentation was no slower than release's. Dependencies and the polymix binary
+# crate, the largest and rebuilt on every change, keep release's 16 units. Panics still
+# unwind: the crash guard needs that.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+
+[profile.dist.package."*"]
+codegen-units = 16
+
+[profile.dist.package.polymix]
+codegen-units = 16

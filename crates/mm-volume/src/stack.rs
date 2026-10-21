@@ -45,7 +45,7 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-fn is_tiff(path: &Path) -> bool {
+pub(crate) fn is_tiff(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
 }
 
@@ -227,33 +227,11 @@ pub fn tiff_volume(path: &Path) -> Result<Option<Volume>> {
 /// Decode one image (or TIFF page) to grey values, x fastest from the top left.
 pub fn read_plane(path: &Path, page: u32) -> Result<(usize, usize, Vec<f32>)> {
     if is_tiff(path) {
-        use tiff::decoder::DecodingResult as R;
         let mut d = tiff_decoder(path)?;
         if page > 0 {
             d.seek_to_image(page as usize).map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        let (w, h) = d.dimensions().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let samples = match d.colortype().map_err(|e| anyhow::anyhow!("{e}"))? {
-            tiff::ColorType::RGB(_) => 3,
-            tiff::ColorType::RGBA(_) => 4,
-            tiff::ColorType::GrayA(_) => 2,
-            _ => 1,
-        };
-        let v: Vec<f32> = match d.read_image().map_err(|e| anyhow::anyhow!("cannot decode the TIFF page: {e}"))? {
-            R::U8(v) => v.into_iter().map(f32::from).collect(),
-            R::U16(v) => v.into_iter().map(f32::from).collect(),
-            R::U32(v) => v.into_iter().map(|x| x as f32).collect(),
-            R::U64(v) => v.into_iter().map(|x| x as f32).collect(),
-            R::F16(v) => v.into_iter().map(f32::from).collect(),
-            R::F32(v) => v,
-            R::F64(v) => v.into_iter().map(|x| x as f32).collect(),
-            R::I8(v) => v.into_iter().map(f32::from).collect(),
-            R::I16(v) => v.into_iter().map(f32::from).collect(),
-            R::I32(v) => v.into_iter().map(|x| x as f32).collect(),
-            R::I64(v) => v.into_iter().map(|x| x as f32).collect(),
-        };
-        let grey = if samples >= 3 { v.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else if samples == 2 { v.chunks(2).map(|p| p[0]).collect() } else { v };
-        return Ok((w as usize, h as usize, grey));
+        return decode_current(&mut d);
     }
     let img = image::ImageReader::open(path)?.with_guessed_format()?.decode().map_err(|e| anyhow::anyhow!("cannot decode {}: {e}", path.display()))?;
     let (w, h) = (img.width() as usize, img.height() as usize);
@@ -263,6 +241,50 @@ pub fn read_plane(path: &Path, page: u32) -> Result<(usize, usize, Vec<f32>)> {
         _ => img.to_luma8().into_raw().into_iter().map(f32::from).collect(),
     };
     Ok((w, h, v))
+}
+
+/// Decode pages `first` to `first + count - 1` of a multi-page TIFF with one decoder, walking
+/// the pages once (rather than from the first page for each), and hand each page's grey values
+/// to `put` with its place in the run. Stops at the first error, from `put` too.
+pub(crate) fn read_pages(path: &Path, first: u32, count: usize, put: &mut dyn FnMut(usize, Vec<f32>) -> Result<()>) -> Result<()> {
+    let mut d = tiff_decoder(path)?;
+    if first > 0 {
+        d.seek_to_image(first as usize).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    for i in 0..count {
+        if i > 0 {
+            d.next_image().map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        put(i, decode_current(&mut d)?.2)?;
+    }
+    Ok(())
+}
+
+/// Grey values of the TIFF page `d` is at, x fastest from the top left, with its size.
+fn decode_current(d: &mut tiff::decoder::Decoder<std::io::BufReader<std::fs::File>>) -> Result<(usize, usize, Vec<f32>)> {
+    use tiff::decoder::DecodingResult as R;
+    let (w, h) = d.dimensions().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let samples = match d.colortype().map_err(|e| anyhow::anyhow!("{e}"))? {
+        tiff::ColorType::RGB(_) => 3,
+        tiff::ColorType::RGBA(_) => 4,
+        tiff::ColorType::GrayA(_) => 2,
+        _ => 1,
+    };
+    let v: Vec<f32> = match d.read_image().map_err(|e| anyhow::anyhow!("cannot decode the TIFF page: {e}"))? {
+        R::U8(v) => v.into_iter().map(f32::from).collect(),
+        R::U16(v) => v.into_iter().map(f32::from).collect(),
+        R::U32(v) => v.into_iter().map(|x| x as f32).collect(),
+        R::U64(v) => v.into_iter().map(|x| x as f32).collect(),
+        R::F16(v) => v.into_iter().map(f32::from).collect(),
+        R::F32(v) => v,
+        R::F64(v) => v.into_iter().map(|x| x as f32).collect(),
+        R::I8(v) => v.into_iter().map(f32::from).collect(),
+        R::I16(v) => v.into_iter().map(f32::from).collect(),
+        R::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+        R::I64(v) => v.into_iter().map(|x| x as f32).collect(),
+    };
+    let grey = if samples >= 3 { v.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else if samples == 2 { v.chunks(2).map(|p| p[0]).collect() } else { v };
+    Ok((w as usize, h as usize, grey))
 }
 
 #[cfg(test)]

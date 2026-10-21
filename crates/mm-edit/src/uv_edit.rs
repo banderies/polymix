@@ -11,6 +11,7 @@
 
 use glam::{DAffine2, DVec2};
 use mm_core::Mesh;
+use rayon::prelude::*;
 
 /// UVs of one triangle's three corners (as stored with the object and written to OBJ).
 pub type Corners = [[f32; 2]; 3];
@@ -55,12 +56,45 @@ fn corner_of(tv: [u32; 3], v: u32) -> usize {
     tv.iter().position(|&x| x == v).unwrap_or(0)
 }
 
-/// The islands of the layout `uv` (corner UVs by triangle id) on `mesh`.
-pub fn uv_islands(mesh: &Mesh, uv: &[Corners]) -> UvIslands {
+/// No triangle: an edge whose UVs do not join (see [`uv_joins`]).
+const APART: u32 = u32::MAX;
+
+/// For each triangle id, the triangle across each of its edges (edge `k` runs from corner `k`
+/// to the next) where the two triangles' UVs join, i.e. agree at both ends of the edge, or
+/// [`APART`]. Triangles that do not exist or have no UVs (ids past the end of `uv`) join
+/// nothing. Each triangle is looked at on its own, so they are spread over the threads.
+fn uv_joins(mesh: &Mesh, uv: &[Corners]) -> Vec<[u32; 3]> {
+    (0..mesh.max_tid() as u32)
+        .into_par_iter()
+        .map(|t| {
+            if !mesh.is_triangle(t) || t as usize >= uv.len() {
+                return [APART; 3];
+            }
+            let tv = mesh.triangle(t);
+            mesh.tri_edges(t).map(|e| {
+                let o = mesh.edge_other_triangle(e, t);
+                if o == mm_core::INVALID || o as usize >= uv.len() {
+                    return APART;
+                }
+                let ov = mesh.triangle(o);
+                let joined = mesh.edge_vertices(e).iter().all(|&v| same(uv[t as usize][corner_of(tv, v)], uv[o as usize][corner_of(ov, v)]));
+                if joined {
+                    o
+                } else {
+                    APART
+                }
+            })
+        })
+        .collect()
+}
+
+/// The islands of `joins`: each grown from its first triangle across joined edges, in
+/// triangle-id and edge order (so the numbering and each island's order are always the same).
+fn islands_of(mesh: &Mesh, uv_len: usize, joins: &[[u32; 3]]) -> UvIslands {
     let mut of_tri = vec![u32::MAX; mesh.max_tid()];
     let mut islands = Vec::new();
     for t0 in mesh.triangle_ids() {
-        if of_tri[t0 as usize] != u32::MAX || t0 as usize >= uv.len() {
+        if of_tri[t0 as usize] != u32::MAX || t0 as usize >= uv_len {
             continue;
         }
         let id = islands.len() as u32;
@@ -70,23 +104,41 @@ pub fn uv_islands(mesh: &Mesh, uv: &[Corners]) -> UvIslands {
         while i < island.len() {
             let t = island[i];
             i += 1;
-            let tv = mesh.triangle(t);
-            for e in mesh.tri_edges(t) {
-                let o = mesh.edge_other_triangle(e, t);
-                if o == mm_core::INVALID || of_tri[o as usize] != u32::MAX || o as usize >= uv.len() {
+            for o in joins[t as usize] {
+                if o == APART || of_tri[o as usize] != u32::MAX {
                     continue;
                 }
-                let ov = mesh.triangle(o);
-                let joined = mesh.edge_vertices(e).iter().all(|&v| same(uv[t as usize][corner_of(tv, v)], uv[o as usize][corner_of(ov, v)]));
-                if joined {
-                    of_tri[o as usize] = id;
-                    island.push(o);
-                }
+                of_tri[o as usize] = id;
+                island.push(o);
             }
         }
         islands.push(island);
     }
     UvIslands { of_tri, islands }
+}
+
+/// The islands of the layout `uv` (corner UVs by triangle id) on `mesh`.
+pub fn uv_islands(mesh: &Mesh, uv: &[Corners]) -> UvIslands {
+    islands_of(mesh, uv.len(), &uv_joins(mesh, uv))
+}
+
+/// [`uv_islands`], and the edges where the UVs break: island borders and seams, open edges
+/// and edges next to triangles without UVs, as (triangle, corner) for the edge from that
+/// corner to the next, in triangle-id order, for the triangles that have UVs.
+pub fn uv_islands_and_breaks(mesh: &Mesh, uv: &[Corners]) -> (UvIslands, Vec<(u32, u8)>) {
+    let joins = uv_joins(mesh, uv);
+    // The islands grow one after another; the breaks are read meanwhile, spread over the other
+    // threads (collected in triangle order).
+    rayon::join(
+        || islands_of(mesh, uv.len(), &joins),
+        || {
+            (0..mesh.max_tid().min(uv.len()) as u32)
+                .into_par_iter()
+                .filter(|&t| mesh.is_triangle(t))
+                .flat_map_iter(|t| joins[t as usize].into_iter().enumerate().filter(|(_, o)| *o == APART).map(move |(k, _)| (t, k as u8)))
+                .collect()
+        },
+    )
 }
 
 /// UV → sheet units.
@@ -122,6 +174,20 @@ pub fn transform_islands(uv: &mut [Corners], islands: &UvIslands, which: &[usize
                 for q in c.iter_mut() {
                     *q = from_sheet(xf.transform_point2(to_sheet(*q, sheet)), sheet);
                 }
+            }
+        }
+    }
+}
+
+/// [`transform_islands`] reading the corners from `from` and writing them to `uv`: with
+/// `uv` a copy of `from` (or `from` with only these islands changed), the same result as
+/// transforming a copy of `from` in place, without copying the other corners. `which` must
+/// not list an island twice (in place, that island would be moved twice).
+pub fn transform_islands_from(uv: &mut [Corners], from: &[Corners], islands: &UvIslands, which: &[usize], xf: DAffine2, sheet: DVec2) {
+    for &i in which {
+        for &t in islands.islands.get(i).into_iter().flatten() {
+            if let (Some(c), Some(f)) = (uv.get_mut(t as usize), from.get(t as usize)) {
+                *c = f.map(|q| from_sheet(xf.transform_point2(to_sheet(q, sheet)), sheet));
             }
         }
     }
@@ -369,6 +435,116 @@ mod tests {
         assert_eq!(islands_in_box(&uv, &isl, mid - d, mid + d), Vec::<usize>::new(), "no corner inside a tiny box");
         let (lo, hi) = islands_bounds(&uv, &isl, &[1], SHEET).unwrap();
         assert_eq!(islands_in_box(&uv, &isl, lo / SHEET, hi / SHEET), vec![1]);
+    }
+
+    /// The islands as found before joins were looked at in parallel: one triangle at a time.
+    fn islands_one_by_one(mesh: &Mesh, uv: &[Corners]) -> UvIslands {
+        let mut of_tri = vec![u32::MAX; mesh.max_tid()];
+        let mut islands = Vec::new();
+        for t0 in mesh.triangle_ids() {
+            if of_tri[t0 as usize] != u32::MAX || t0 as usize >= uv.len() {
+                continue;
+            }
+            let id = islands.len() as u32;
+            of_tri[t0 as usize] = id;
+            let mut island = vec![t0];
+            let mut i = 0;
+            while i < island.len() {
+                let t = island[i];
+                i += 1;
+                let tv = mesh.triangle(t);
+                for e in mesh.tri_edges(t) {
+                    let o = mesh.edge_other_triangle(e, t);
+                    if o == mm_core::INVALID || of_tri[o as usize] != u32::MAX || o as usize >= uv.len() {
+                        continue;
+                    }
+                    let ov = mesh.triangle(o);
+                    let joined = mesh.edge_vertices(e).iter().all(|&v| same(uv[t as usize][corner_of(tv, v)], uv[o as usize][corner_of(ov, v)]));
+                    if joined {
+                        of_tri[o as usize] = id;
+                        island.push(o);
+                    }
+                }
+            }
+            islands.push(island);
+        }
+        UvIslands { of_tri, islands }
+    }
+
+    /// The breaks as the Unwrap tool found them before: edge by edge, from its two ends.
+    fn breaks_one_by_one(mesh: &Mesh, c: &[Corners]) -> Vec<(u32, u8)> {
+        let mut border = Vec::new();
+        for t in mesh.triangle_ids().filter(|&t| (t as usize) < c.len()) {
+            let tv = mesh.triangle(t);
+            for (k, e) in mesh.tri_edges(t).into_iter().enumerate() {
+                let o = mesh.edge_other_triangle(e, t);
+                let joined = o != mm_core::INVALID && (o as usize) < c.len() && {
+                    let ov = mesh.triangle(o);
+                    [tv[k], tv[(k + 1) % 3]].iter().all(|&v| same(c[t as usize][corner_of(tv, v)], c[o as usize][corner_of(ov, v)]))
+                };
+                if !joined {
+                    border.push((t, k as u8));
+                }
+            }
+        }
+        border
+    }
+
+    #[test]
+    fn islands_and_breaks_are_the_same_as_one_by_one() {
+        // Layouts with charts, seams, corners just inside and just outside the tolerance,
+        // triangles without UVs, holes (removed triangles) and every triangle on its own.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (squares, squares_uv) = layout();
+        let mut sphere = primitives::icosphere(10.0, 3);
+        let tris: Vec<u32> = sphere.triangle_ids().collect();
+        let cyl = crate::uv_project::project_uvs(&sphere, &tris, &crate::uv_project::SetUvParams { projection: crate::uv_project::Projection::Cylindrical, ..Default::default() }, None, 1.0).unwrap();
+        let mut sphere_uv: Vec<Corners> = cyl.iter().map(|q| q.map(|c| [c.x as f32, c.y as f32])).collect();
+        let mut cases = vec![(squares.clone(), squares_uv.clone()), (sphere.clone(), sphere_uv.clone())];
+        // Corners nudged by about the tolerance: some edges join, some do not.
+        for c in sphere_uv.iter_mut().step_by(5) {
+            for q in c.iter_mut() {
+                q[0] += ((rand() - 0.5) * 4.0 * SAME as f64) as f32;
+            }
+        }
+        cases.push((sphere.clone(), sphere_uv.clone()));
+        // Fewer UVs than triangles, and every triangle apart.
+        cases.push((sphere.clone(), sphere_uv[..sphere_uv.len() / 2].to_vec()));
+        cases.push((squares.clone(), (0..squares.max_tid()).map(|_| [[rand() as f32, rand() as f32]; 3]).collect()));
+        // Holes: removed triangles keep their slots.
+        sphere.remove_triangles(tris.iter().copied().filter(|t| t % 7 == 3));
+        cases.push((sphere, sphere_uv));
+        for (k, (m, uv)) in cases.iter().enumerate() {
+            let (islands, breaks) = uv_islands_and_breaks(m, uv);
+            assert_eq!(islands, islands_one_by_one(m, uv), "case {k}");
+            assert_eq!(uv_islands(m, uv), islands, "case {k}");
+            assert_eq!(breaks, breaks_one_by_one(m, uv), "case {k}");
+        }
+    }
+
+    #[test]
+    fn transforming_from_a_copy_is_transforming_in_place() {
+        let (m, uv0) = layout();
+        let isl = uv_islands(&m, &uv0);
+        let xf = about(DVec2::new(30.0, 40.0), DAffine2::from_angle(0.7) * DAffine2::from_scale(DVec2::new(1.3, -0.8)));
+        for which in [vec![1], vec![0, 2], vec![2, 0, 1], vec![]] {
+            let mut want = uv0.clone();
+            transform_islands(&mut want, &isl, &which, xf, SHEET);
+            // Over a copy, and over the corners of an earlier transform of the same islands.
+            let mut got = uv0.clone();
+            transform_islands_from(&mut got, &uv0, &isl, &which, xf, SHEET);
+            assert_eq!(got, want);
+            let mut again = uv0.clone();
+            transform_islands(&mut again, &isl, &which, DAffine2::from_translation(DVec2::new(5.0, -3.0)), SHEET);
+            transform_islands_from(&mut again, &uv0, &isl, &which, xf, SHEET);
+            assert_eq!(again, want);
+        }
     }
 
     #[test]

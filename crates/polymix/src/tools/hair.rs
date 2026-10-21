@@ -17,6 +17,18 @@ pub struct HairTool {
     show_tubes: bool,
     /// Strands for the current parameters.
     curves: Option<(HairParams, Vec<Vec<DVec3>>)>,
+    /// Show Tubes: the tubes around the strands, kept while the strands are.
+    tubes: Option<TubeOverlay>,
+}
+
+/// The triangles Show Tubes draws, made once per set of strands rather than every frame.
+struct TubeOverlay {
+    /// The parameters the strands were grown with.
+    params: HairParams,
+    tris: Vec<[DVec3; 3]>,
+    normals: Vec<DVec3>,
+    /// The triangles' colours, shaded toward the view direction they were made for.
+    shaded: Option<(DVec3, Vec<Vec4>)>,
 }
 
 impl HairTool {
@@ -34,7 +46,7 @@ impl HairTool {
         // Fill Density starts at the default count's density.
         let density = if area > 0.0 { 200.0 / area } else { 1.0 };
         let params = HairParams { length, curl_pitch: length / 3.0, base_radius: length * 0.02, tip_radius: length * 0.006, down, density, ..Default::default() };
-        Self { object, tris, area, params, show_tubes: false, curves: None }
+        Self { object, tris, area, params, show_tubes: false, curves: None, tubes: None }
     }
 
     fn refresh(&mut self, cx: &mut ToolCx) {
@@ -155,12 +167,26 @@ impl Tool for HairTool {
         let Some((p, curves)) = &self.curves else { return };
         let col = Vec4::new(0.95, 0.8, 0.45, 1.0);
         if self.show_tubes && curves.len() * p.points <= 40_000 {
-            let tubes = mm_edit::hair_mesh(curves, p.base_radius, p.tip_radius, 6);
+            if self.tubes.as_ref().is_none_or(|t| t.params != *p) {
+                let tubes = mm_edit::hair_mesh(curves, p.base_radius, p.tip_radius, 6);
+                let ids: Vec<u32> = tubes.triangle_ids().collect();
+                let tris = ids.iter().map(|&t| tubes.tri_positions(t)).collect();
+                let normals = ids.iter().map(|&t| tubes.tri_normal(t)).collect();
+                self.tubes = Some(TubeOverlay { params: *p, tris, normals, shaded: None });
+            }
+            let Some(tubes) = &mut self.tubes else { return };
+            // Flat shading toward the viewer, again only when the view turns.
             let fwd = cx.camera.forward();
-            for t in tubes.triangle_ids() {
-                let [a, b, c] = tubes.tri_positions(t);
-                let k = (0.35 + 0.65 * tubes.tri_normal(t).dot(-fwd).abs()) as f32;
-                ov.tri(a, b, c, Vec4::new(col.x * k, col.y * k, col.z * k, 1.0));
+            if tubes.shaded.as_ref().is_none_or(|(f, _)| *f != fwd) {
+                let shade = |n: &DVec3| {
+                    let k = (0.35 + 0.65 * n.dot(-fwd).abs()) as f32;
+                    Vec4::new(col.x * k, col.y * k, col.z * k, 1.0)
+                };
+                tubes.shaded = Some((fwd, tubes.normals.iter().map(shade).collect()));
+            }
+            let Some((_, colours)) = &tubes.shaded else { return };
+            for ([a, b, c], col) in tubes.tris.iter().zip(colours) {
+                ov.tri(*a, *b, *c, *col);
             }
         } else {
             for c in curves {
@@ -208,5 +234,59 @@ impl Tool for HairTool {
             Some(("tubes", t)) => self.show_tubes = t == "on",
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Show Tubes as it was drawn: the tubes made and shaded anew every frame.
+    fn tubes_every_frame(curves: &[Vec<DVec3>], p: &HairParams, fwd: DVec3) -> Vec<([f32; 3], [f32; 4])> {
+        let col = Vec4::new(0.95, 0.8, 0.45, 1.0);
+        let tubes = mm_edit::hair_mesh(curves, p.base_radius, p.tip_radius, 6);
+        let mut ov = Overlay::default();
+        for t in tubes.triangle_ids() {
+            let [a, b, c] = tubes.tri_positions(t);
+            let k = (0.35 + 0.65 * tubes.tri_normal(t).dot(-fwd).abs()) as f32;
+            ov.tri(a, b, c, Vec4::new(col.x * k, col.y * k, col.z * k, 1.0));
+        }
+        ov.tris.iter().map(|v| (v.position, v.color)).collect()
+    }
+
+    #[test]
+    fn show_tubes_draws_what_it_drew_every_frame() {
+        let mut scene = Scene::default();
+        let id = scene.add("ball", mm_core::primitives::icosphere(10.0, 3));
+        scene.active = Some(id);
+        let o = scene.get_mut(id).unwrap();
+        let top: Vec<u32> = o.mesh.triangle_ids().filter(|&t| o.mesh.tri_centroid(t).z > 7.0).collect();
+        for t in top {
+            o.selection.insert(t);
+        }
+        let (mut history, mut camera, mut status, ctx) = (History::default(), crate::camera::Camera::default(), String::new(), egui::Context::default());
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = HairTool::new(&mut cx);
+        tool.params.count = 40;
+        tool.show_tubes = true;
+        let check = |tool: &mut HairTool, cx: &mut ToolCx| {
+            tool.refresh(cx);
+            let mut ov = Overlay::default();
+            tool.overlay(&mut ov, cx);
+            let (p, curves) = tool.curves.as_ref().unwrap();
+            let drawn: Vec<([f32; 3], [f32; 4])> = ov.tris.iter().map(|v| (v.position, v.color)).collect();
+            assert!(!drawn.is_empty());
+            assert_eq!(drawn, tubes_every_frame(curves, p, cx.camera.forward()));
+        };
+        check(&mut tool, &mut cx);
+        check(&mut tool, &mut cx);
+        // Another view direction reshades them; other strands make other tubes.
+        cx.camera.look_along(DVec3::new(1.0, -0.5, -0.3).normalize());
+        check(&mut tool, &mut cx);
+        tool.params.base_radius *= 1.7;
+        check(&mut tool, &mut cx);
+        tool.params.count = 25;
+        check(&mut tool, &mut cx);
     }
 }

@@ -49,6 +49,21 @@ struct Show {
 /// An image of the catalog and its label (names masked as the browser shows them).
 pub type Choice = (Volume, String);
 
+/// What a list of [`Choice`]s was made for: a catalog (held weakly, so its address cannot be
+/// reused by a later one while the key lives, without keeping the old catalog alive), an
+/// image of it, and whether identifiers were hidden (the labels are masked then).
+struct ChoicesKey {
+    catalog: std::sync::Weak<Catalog>,
+    volume: usize,
+    hide_ids: bool,
+}
+
+impl ChoicesKey {
+    fn is(&self, catalog: &Arc<Catalog>, volume: usize, hide_ids: bool) -> bool {
+        std::ptr::eq(self.catalog.as_ptr(), Arc::as_ptr(catalog)) && self.volume == volume && self.hide_ids == hide_ids
+    }
+}
+
 pub struct VolumeWorkspace {
     /// Folders (or files) to look in.
     roots: Vec<PathBuf>,
@@ -72,8 +87,8 @@ pub struct VolumeWorkspace {
     prepare: prepare::Prepare,
     /// Three planes of the image previewed, under the browser.
     viewer: viewer::Viewer,
-    /// The images the viewer's can be compared with, for (catalog, volume).
-    viewer_choices: (Option<(usize, usize)>, Vec<Choice>),
+    /// The images the viewer's can be compared with, and what they were listed for.
+    viewer_choices: (Option<ChoicesKey>, Vec<Choice>),
 }
 
 impl VolumeWorkspace {
@@ -109,6 +124,7 @@ impl VolumeWorkspace {
         self.scan_error = None;
         if self.roots.is_empty() {
             self.catalog = None;
+            self.viewer.catalog_changed();
             self.selection = Selection::None;
             self.preview = None;
             return;
@@ -134,13 +150,29 @@ impl VolumeWorkspace {
             Ok(c) => {
                 // Keep the selected volume if it is still there.
                 let keep = match self.selection {
-                    Selection::Volume(k) => self.catalog.as_ref().and_then(|old| old.volumes.get(k)).and_then(|v| c.volumes.iter().position(|w| w.files.first() == v.files.first() && w.name == v.name)).map(Selection::Volume),
+                    Selection::Volume(k) => self.catalog.as_ref().and_then(|old| old.volumes.get(k)).and_then(|v| c.volumes.iter().position(|w| w.files.first() == v.files.first() && w.name == v.name)),
                     _ => None,
                 };
-                if keep.is_none() {
-                    self.preview = None;
-                }
-                self.selection = keep.unwrap_or(Selection::None);
+                // Where the old catalog's images are in the new one, if unchanged: the preview
+                // and the viewer hold indices, which may name other images now.
+                let old = self.catalog.take();
+                let index = |k: usize| -> Option<usize> {
+                    let v = old.as_ref()?.volumes.get(k)?;
+                    if c.volumes.get(k).is_some_and(|w| same_image(v, w)) {
+                        return Some(k);
+                    }
+                    c.volumes.iter().position(|w| same_image(v, w))
+                };
+                // The selected image's thumbnail follows it; if it changed, a new one is made
+                // (`tick`).
+                self.preview = self.preview.take().zip(keep).and_then(|(mut p, k)| {
+                    (index(p.volume) == Some(k)).then(|| {
+                        p.volume = k;
+                        p
+                    })
+                });
+                self.viewer.catalog_changed_with(&index);
+                self.selection = keep.map_or(Selection::None, Selection::Volume);
                 self.privacy = Privacy::new(self.hide_ids, Some(&c));
                 self.agent_privacy = Arc::new(Privacy::new(true, Some(&c)));
                 self.catalog = Some(Arc::new(c));
@@ -199,27 +231,33 @@ impl VolumeWorkspace {
     /// masked as the browser shows them), derived images first.
     pub fn overlay_choices(&self, current: &Volume) -> Vec<(Volume, String)> {
         let (Some(c), Some(g)) = (&self.catalog, &current.geometry) else { return Vec::new() };
+        // The world box of the voxels' corners.
         let bounds = |g: &mm_volume::geometry::Geometry| {
             let d = g.dims.map(|n| n as f64 - 0.5);
-            let pts: Vec<glam::DVec3> = (0..8).map(|c| g.world(glam::DVec3::new(if c & 1 > 0 { d[0] } else { -0.5 }, if c & 2 > 0 { d[1] } else { -0.5 }, if c & 4 > 0 { d[2] } else { -0.5 }))).collect();
-            (pts.iter().fold(glam::DVec3::INFINITY, |a, p| a.min(*p)), pts.iter().fold(glam::DVec3::NEG_INFINITY, |a, p| a.max(*p)))
+            (0..8).fold((glam::DVec3::INFINITY, glam::DVec3::NEG_INFINITY), |(lo, hi), c| {
+                let p = g.world(glam::DVec3::new(if c & 1 > 0 { d[0] } else { -0.5 }, if c & 2 > 0 { d[1] } else { -0.5 }, if c & 4 > 0 { d[2] } else { -0.5 }));
+                (lo.min(p), hi.max(p))
+            })
         };
         let vol = |b: &(glam::DVec3, glam::DVec3)| (b.1 - b.0).max(glam::DVec3::ZERO).element_product();
         let here = bounds(g);
-        let mut out: Vec<(Volume, String)> = c
+        // Looked up once, not at every comparison of the sort.
+        let derived_dir = polymix_workspace::derived_dir();
+        let derived = |v: &Volume| v.files.first().is_some_and(|f| derived_dir.as_ref().is_some_and(|d| f.starts_with(d)));
+        let mut out: Vec<(bool, Volume, String)> = c
             .volumes
             .iter()
             .filter(|v| !(v.name == current.name && v.files == current.files) && matches!(v.kind, Kind::Image | Kind::Derived | Kind::LabelMap))
             .filter_map(|v| {
                 let b = bounds(v.geometry.as_ref()?);
                 let common = (here.0.max(b.0), here.1.min(b.1));
-                (vol(&common) >= 0.5 * vol(&here).min(vol(&b))).then(|| (v.clone(), self.privacy.path(&v.name)))
+                (vol(&common) >= 0.5 * vol(&here).min(vol(&b))).then(|| (derived(v), v.clone(), self.privacy.path(&v.name)))
             })
             .take(200)
             .collect();
-        let derived = |v: &Volume| v.files.first().is_some_and(|f| polymix_workspace::derived_dir().is_some_and(|d| f.starts_with(d)));
-        out.sort_by_key(|(v, _)| !derived(v));
-        out
+        // Derived images first, each part in catalog order (the sort is stable).
+        out.sort_by_key(|(derived, _, _)| !derived);
+        out.into_iter().map(|(_, v, label)| (v, label)).collect()
     }
 
     /// Whether *Hide identifiers* is on (the shell lets agents take screenshots of the image
@@ -360,15 +398,15 @@ impl VolumeWorkspace {
                         ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(160.0).text(format!("Reading {} / {}", format_count(done), format_count(total))));
                     }
                     Some(Progress::Listing { files }) => {
-                        ui.spinner();
+                        polymix_workspace::spinner(ui);
                         ui.label(format!("Listing files… {}", format_count(files)));
                     }
                     Some(Progress::Organising) => {
-                        ui.spinner();
+                        polymix_workspace::spinner(ui);
                         ui.label("Organising…");
                     }
                     None => {
-                        ui.spinner();
+                        polymix_workspace::spinner(ui);
                         ui.label("Scanning…");
                     }
                 }
@@ -486,7 +524,7 @@ impl VolumeWorkspace {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.3);
                 if self.scan.is_some() {
-                    ui.spinner();
+                    polymix_workspace::spinner(ui);
                     ui.label("Looking for images…");
                 } else {
                     ui.heading("Volume");
@@ -655,11 +693,12 @@ impl VolumeWorkspace {
             return;
         };
         self.viewer.show(k, &c.volumes[k], &ctx);
-        let key = Some((Arc::as_ptr(&c) as usize, k));
-        if self.viewer_choices.0 != key {
-            self.viewer_choices = (key, self.overlay_choices(&c.volumes[k]));
+        if !self.viewer_choices.0.as_ref().is_some_and(|key| key.is(&c, k, self.hide_ids)) {
+            let key = ChoicesKey { catalog: Arc::downgrade(&c), volume: k, hide_ids: self.hide_ids };
+            self.viewer_choices = (Some(key), self.overlay_choices(&c.volumes[k]));
         }
-        if let Some(pick) = self.viewer.ui(ui, &label, &self.viewer_choices.1) {
+        // Its errors name files, whose paths may hold patients' names.
+        if let Some(pick) = self.viewer.ui_with(ui, &label, &self.viewer_choices.1, &|e| self.privacy.path(e)) {
             let (v, l) = self.viewer_choices.1[pick].clone();
             self.viewer.compare_with(v, l, &ctx);
         }
@@ -755,6 +794,29 @@ fn kind_label(k: Kind) -> &'static str {
     k.label()
 }
 
+/// Whether two catalog entries (of two scans) are the same image: the same name, files and
+/// size, and the same pixels on the same grid. What was loaded or decoded from one stands for
+/// the other. Real numbers (grid, value scaling) only need to agree to a billionth: the first
+/// scan that sees a file reads them from its header, later ones from the scan cache, and its
+/// JSON does not give every f64 back to the last bit.
+fn same_image(a: &Volume, b: &Volume) -> bool {
+    use mm_volume::model::Voxels;
+    let close = |x: f64, y: f64| x == y || (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0);
+    let all_close = |x: &[f64], y: &[f64]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| close(*x, *y));
+    let grid = match (&a.geometry, &b.geometry) {
+        (Some(g), Some(h)) => g.dims == h.dims && all_close(&g.spacing, &h.spacing) && all_close(g.affine.as_flattened(), h.affine.as_flattened()),
+        (g, h) => g.is_none() && h.is_none(),
+    };
+    let pixels = match (&a.voxels, &b.voxels) {
+        (
+            Voxels::Raw { file, file_offset, gzip, skip, interleave, dtype, big_endian, slope, intercept },
+            Voxels::Raw { file: file_b, file_offset: file_offset_b, gzip: gzip_b, skip: skip_b, interleave: interleave_b, dtype: dtype_b, big_endian: big_endian_b, slope: slope_b, intercept: intercept_b },
+        ) => (file, file_offset, gzip, skip, interleave, dtype, big_endian) == (file_b, file_offset_b, gzip_b, skip_b, interleave_b, dtype_b, big_endian_b) && close(*slope, *slope_b) && close(*intercept, *intercept_b),
+        (p, q) => p == q,
+    };
+    a.name == b.name && a.bytes == b.bytes && a.files == b.files && grid && pixels
+}
+
 fn field_grid(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, rows: &[(&str, String)]) {
     egui::Grid::new(id).num_columns(2).spacing([12.0, 3.0]).striped(true).show(ui, |ui| {
         for (a, b) in rows {
@@ -827,8 +889,11 @@ impl Workspace for VolumeWorkspace {
                 let found = self.catalog.as_ref().and_then(|c| c.volumes.iter().position(|v| v.files.contains(&p)));
                 if let Some(k) = found {
                     self.selection = Selection::Volume(k);
-                    self.select_volume(k, ctx);
                 }
+            }
+            // The thumbnail of the volume selected (a new one if the scan changed it).
+            if let Selection::Volume(k) = self.selection {
+                self.select_volume(k, ctx);
             }
         }
         if let (Some(p), Some(c)) = (&mut self.preview, &self.catalog) {
@@ -925,5 +990,349 @@ mod tests {
         assert_eq!(date_time("", ""), "(no date)");
         assert_eq!(relative(Path::new("/a/My MRI/7T/x.nii"), &[PathBuf::from("/a/My MRI")]), "My MRI/7T/x.nii");
         assert_eq!(bytes(23_894_278), "23.9 MB");
+    }
+
+    /// Every text drawn in `out`.
+    fn texts(out: &egui::FullOutput) -> Vec<String> {
+        fn walk(s: &egui::Shape, into: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => into.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut into = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut into));
+        into
+    }
+
+    #[test]
+    fn the_viewers_errors_hide_identifiers() {
+        use mm_volume::geometry::Geometry;
+        use mm_volume::model::{Format, Patient, PatientKey, Voxels};
+        use std::time::{Duration, Instant};
+        // A DICOM series whose file is gone: the loader's error names its path.
+        let file = PathBuf::from("/nonexistent/polymix-viewer-test/Doe_Jane/IM0001");
+        let mut c = Catalog::default();
+        c.patients.push(Patient { key: PatientKey { id: "MRN12345".into(), name: "DOE^JANE^Q".into() }, name: "DOE JANE Q".into(), id: "MRN12345".into(), birth_date: "19800101".into(), sex: "F".into(), studies: vec![], other_volumes: vec![] });
+        c.volumes.push(Volume {
+            format: Format::Dicom,
+            kind: Kind::Image,
+            name: "T1".into(),
+            files: vec![file.clone()],
+            bytes: 0,
+            geometry: Some(Geometry::from_axes([2, 2, 1, 1], [1.0; 3], [glam::DVec3::X, glam::DVec3::Y, glam::DVec3::Z], glam::DVec3::ZERO)),
+            data_type: None,
+            fields: Vec::new(),
+            warnings: Vec::new(),
+            voxels: Voxels::Dicom { slices: vec![(file, 0)] },
+            window: None,
+            photometric: None,
+            patient: None,
+        });
+        let ctx = egui::Context::default();
+        let mut ws = VolumeWorkspace::new(&ctx, None);
+        ws.catalog = Some(Arc::new(c));
+        ws.set_hide(true);
+        ws.selection = Selection::Volume(0);
+        let frame = |ws: &mut VolumeWorkspace| texts(&ctx.run_ui(egui::RawInput::default(), |ui| ws.viewer_ui(ui)));
+        frame(&mut ws);
+        let start = Instant::now();
+        while ws.viewer.busy() {
+            assert!(start.elapsed() < Duration::from_secs(20), "the load finishes");
+            std::thread::sleep(Duration::from_millis(1));
+            ws.viewer.tick();
+        }
+        let error = ws.viewer.error.clone().expect("the load failed");
+        assert!(error.contains("/Doe_Jane/IM0001"), "{error}");
+        // Drawn masked while identifiers are hidden, as it is otherwise.
+        let shown = frame(&mut ws);
+        assert!(shown.iter().any(|t| t.contains("/•••_•••/IM0001")), "{shown:?}");
+        assert!(!shown.iter().any(|t| t.to_lowercase().contains("doe") || t.to_lowercase().contains("jane")), "{shown:?}");
+        ws.set_hide(false);
+        assert!(frame(&mut ws).iter().any(|t| t.contains("/Doe_Jane/IM0001")));
+    }
+
+    use glam::DVec3;
+    use mm_volume::geometry::Geometry;
+    use mm_volume::load::LoadedVolume;
+    use mm_volume::model::{Format, Patient, PatientKey, Voxels};
+
+    /// A catalog entry (its pixels unreadable: nothing here loads files) on `geometry`.
+    fn entry(name: &str, file: PathBuf, kind: Kind, geometry: Option<Geometry>) -> Volume {
+        Volume {
+            format: Format::Nifti1,
+            kind,
+            name: name.into(),
+            files: vec![file],
+            bytes: 1000,
+            geometry,
+            data_type: None,
+            fields: Vec::new(),
+            warnings: Vec::new(),
+            voxels: Voxels::Unsupported("test".into()),
+            window: None,
+            photometric: None,
+            patient: None,
+        }
+    }
+
+    /// A grid of `dims` voxels of `mm`, turned by `turn` radians about z, at `origin`.
+    fn grid(dims: [usize; 3], mm: f64, turn: f64, origin: [f64; 3]) -> Geometry {
+        let (s, c) = turn.sin_cos();
+        Geometry::from_axes([dims[0], dims[1], dims[2], 1], [mm; 3], [DVec3::new(c, s, 0.0), DVec3::new(-s, c, 0.0), DVec3::Z], DVec3::from(origin))
+    }
+
+    /// `overlay_choices` as it was before the derived folder was looked up once and the
+    /// corners folded without a list: the reference the new one must match.
+    fn overlay_choices_before(ws: &VolumeWorkspace, current: &Volume) -> Vec<(Volume, String)> {
+        let (Some(c), Some(g)) = (&ws.catalog, &current.geometry) else { return Vec::new() };
+        let bounds = |g: &mm_volume::geometry::Geometry| {
+            let d = g.dims.map(|n| n as f64 - 0.5);
+            let pts: Vec<glam::DVec3> = (0..8).map(|c| g.world(glam::DVec3::new(if c & 1 > 0 { d[0] } else { -0.5 }, if c & 2 > 0 { d[1] } else { -0.5 }, if c & 4 > 0 { d[2] } else { -0.5 }))).collect();
+            (pts.iter().fold(glam::DVec3::INFINITY, |a, p| a.min(*p)), pts.iter().fold(glam::DVec3::NEG_INFINITY, |a, p| a.max(*p)))
+        };
+        let vol = |b: &(glam::DVec3, glam::DVec3)| (b.1 - b.0).max(glam::DVec3::ZERO).element_product();
+        let here = bounds(g);
+        let mut out: Vec<(Volume, String)> = c
+            .volumes
+            .iter()
+            .filter(|v| !(v.name == current.name && v.files == current.files) && matches!(v.kind, Kind::Image | Kind::Derived | Kind::LabelMap))
+            .filter_map(|v| {
+                let b = bounds(v.geometry.as_ref()?);
+                let common = (here.0.max(b.0), here.1.min(b.1));
+                (vol(&common) >= 0.5 * vol(&here).min(vol(&b))).then(|| (v.clone(), ws.privacy.path(&v.name)))
+            })
+            .take(200)
+            .collect();
+        let derived = |v: &Volume| v.files.first().is_some_and(|f| polymix_workspace::derived_dir().is_some_and(|d| f.starts_with(d)));
+        out.sort_by_key(|(v, _)| !derived(v));
+        out
+    }
+
+    /// A catalog of `n` images of patient Doe, some derived, some elsewhere, turned or
+    /// without a grid, of every kind (a small generator: the same each run).
+    fn mixed_catalog(n: usize) -> Catalog {
+        let derived = polymix_workspace::derived_dir().expect("a data folder");
+        let mut c = Catalog::default();
+        c.patients.push(Patient { key: PatientKey { id: "MRN12345".into(), name: "DOE^JANE".into() }, name: "DOE JANE".into(), id: "MRN12345".into(), birth_date: String::new(), sex: String::new(), studies: vec![], other_volumes: vec![] });
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        let kinds = [Kind::Image, Kind::Image, Kind::Derived, Kind::LabelMap, Kind::Segmentation, Kind::TimeSeries, Kind::Localizer];
+        for i in 0..n {
+            let file = if next(4) == 0 { derived.join(format!("doe_jane_{i} N4.nii.gz")) } else { PathBuf::from(format!("/synthetic/Doe_Jane/scan_{i}.nii.gz")) };
+            let geometry = (next(10) != 0).then(|| {
+                let shift = [next(200) as f64 - 100.0, next(200) as f64 - 100.0, next(100) as f64 - 50.0];
+                grid([64 + next(64) as usize, 64 + next(64) as usize, 20 + next(40) as usize], 0.5 + next(3) as f64 * 0.5, next(4) as f64 * 0.3, shift)
+            });
+            c.volumes.push(entry(&format!("Doe_Jane {i}"), file, kinds[next(kinds.len() as u64) as usize], geometry));
+        }
+        c
+    }
+
+    #[test]
+    fn overlay_choices_are_as_before() {
+        let ctx = egui::Context::default();
+        let mut ws = VolumeWorkspace::new(&ctx, None);
+        let (mut longest, mut reordered) = (0, 0);
+        for n in [0, 1, 7, 60, 1000] {
+            ws.catalog = Some(Arc::new(mixed_catalog(n)));
+            for hide in [false, true] {
+                ws.set_hide(hide);
+                let c = ws.catalog.clone().expect("set");
+                let everywhere = entry("everywhere", "/x.nii".into(), Kind::Image, Some(grid([400, 400, 200], 1.0, 0.0, [-200.0, -200.0, -100.0])));
+                for current in c.volumes.iter().step_by(1 + n / 100).chain([&everywhere]) {
+                    let now = ws.overlay_choices(current);
+                    assert_eq!(now, overlay_choices_before(&ws, current), "{n} volumes, hide {hide}, current {}", current.name);
+                    longest = longest.max(now.len());
+                    let at = |v: &Volume| c.volumes.iter().position(|w| w.name == v.name);
+                    reordered += usize::from(now.windows(2).any(|w| at(&w[0].0) > at(&w[1].0)));
+                }
+            }
+        }
+        // The cases compared: lists cut at 200, and lists the sort reordered.
+        assert_eq!(longest, 200);
+        assert!(reordered > 20, "{reordered}");
+    }
+
+    #[test]
+    fn the_viewers_choices_follow_hide_identifiers_and_the_catalog() {
+        let ctx = egui::Context::default();
+        let mut ws = VolumeWorkspace::new(&ctx, None);
+        let mut c = mixed_catalog(12);
+        for v in &mut c.volumes {
+            v.kind = Kind::Image;
+            v.geometry = Some(grid([10, 10, 10], 1.0, 0.0, [0.0; 3]));
+        }
+        ws.catalog = Some(Arc::new(c.clone()));
+        ws.selection = Selection::Volume(0);
+        let frame = |ws: &mut VolumeWorkspace| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| ws.viewer_ui(ui));
+        };
+        let labels = |ws: &VolumeWorkspace| ws.viewer_choices.1.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>();
+        frame(&mut ws);
+        assert_eq!(labels(&ws).len(), 11);
+        assert!(labels(&ws).iter().all(|l| l.contains("Doe_Jane")), "{:?}", labels(&ws));
+        // Hidden: listed again, masked.
+        ws.set_hide(true);
+        frame(&mut ws);
+        assert!(labels(&ws).iter().all(|l| l.contains("•••_••• ") && !l.contains("Doe")), "{:?}", labels(&ws));
+        ws.set_hide(false);
+        frame(&mut ws);
+        assert!(labels(&ws).iter().all(|l| l.contains("Doe_Jane")));
+        // A rescan with fewer images: a new list, even if the new catalog sat where the old one did.
+        c.volumes.truncate(4);
+        ws.catalog = Some(Arc::new(c));
+        frame(&mut ws);
+        assert_eq!(labels(&ws).len(), 3);
+    }
+
+    #[test]
+    fn a_rescan_keeps_thumbnail_and_viewer_on_their_images() {
+        let ctx = egui::Context::default();
+        let mut ws = VolumeWorkspace::new(&ctx, None);
+        let image = |name: &str| entry(name, PathBuf::from(format!("/synthetic/{name}.nii")), Kind::Image, Some(grid([2, 2, 2], 1.0, 0.0, [0.0; 3])));
+        let (a, b, c, d) = (image("a"), image("b"), image("c"), image("d"));
+        ws.finish_scan(Ok(Catalog { volumes: vec![a.clone(), b.clone()], ..Catalog::default() }));
+        ws.selection = Selection::Volume(1);
+        ws.select_volume(1, &ctx);
+        let shown = Arc::new(LoadedVolume::from_values("b", [2, 2, 2], vec![0.0; 8], grid([2, 2, 2], 1.0, 0.0, [0.0; 3])));
+        ws.viewer.volume = Some((1, shown.clone()));
+        // Whether the viewer starts loading catalog image `k` when it is selected; then the
+        // viewer is emptied.
+        let viewer_loads = |ws: &mut VolumeWorkspace, k: usize| {
+            let c = ws.catalog.clone().expect("a catalog");
+            ws.viewer.show(k, &c.volumes[k], &ctx);
+            let loads = ws.viewer.busy();
+            ws.viewer = viewer::Viewer::default();
+            loads
+        };
+        // Another image listed before it: both follow b to its new place.
+        ws.finish_scan(Ok(Catalog { volumes: vec![c.clone(), a.clone(), b.clone()], ..Catalog::default() }));
+        assert_eq!(ws.selection, Selection::Volume(2));
+        assert_eq!(ws.preview.as_ref().map(|p| p.volume), Some(2));
+        assert_eq!(ws.viewer.volume.as_ref().map(|(k, _)| *k), Some(2));
+        assert!(!viewer_loads(&mut ws, 2), "b is shown: not loaded again");
+        // b is gone and d took its place: the image shown is not taken for d.
+        ws.viewer.volume = Some((2, shown.clone()));
+        ws.finish_scan(Ok(Catalog { volumes: vec![c.clone(), a.clone(), d], ..Catalog::default() }));
+        assert_eq!(ws.selection, Selection::None);
+        assert!(ws.preview.is_none());
+        assert!(viewer_loads(&mut ws, 2), "d is loaded, not b shown under its name");
+        // b back, then changed (a bigger file): kept selected, with a new thumbnail and image.
+        ws.finish_scan(Ok(Catalog { volumes: vec![a.clone(), b.clone()], ..Catalog::default() }));
+        ws.selection = Selection::Volume(1);
+        ws.select_volume(1, &ctx);
+        ws.viewer.volume = Some((1, shown.clone()));
+        let mut bigger = b;
+        bigger.bytes += 1;
+        ws.finish_scan(Ok(Catalog { volumes: vec![a.clone(), bigger], ..Catalog::default() }));
+        assert_eq!(ws.selection, Selection::Volume(1));
+        assert!(ws.preview.is_none(), "made again by the next tick");
+        assert!(viewer_loads(&mut ws, 1));
+        // No folders left: no index is trusted.
+        ws.viewer.volume = Some((0, shown));
+        ws.roots.clear();
+        ws.start_scan(&ctx);
+        assert!(ws.catalog.is_none() && ws.preview.is_none());
+        ws.catalog = Some(Arc::new(Catalog { volumes: vec![a], ..Catalog::default() }));
+        assert!(viewer_loads(&mut ws, 0));
+    }
+
+    #[test]
+    fn a_rescan_from_the_scan_cache_keeps_thumbnail_and_viewer() {
+        use mm_volume::scan::{scan, FileCache, ScanOptions};
+        use mm_volume::write::{nifti, Data, Intent};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("pv-rescan-cache-{}", std::process::id()));
+        let (data, cache_path) = (dir.join("data"), dir.join("scan-cache.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&data).expect("temp folder");
+        // Grids from f32 headers that the cache's JSON does not give back to the last bit when
+        // widened to f64: an oblique one, origins with decimals, sizes like 0.4688 mm.
+        let tilt = |a: f64, b: f64| {
+            let (x, y) = (DVec3::new(a.cos(), a.sin(), 0.0), DVec3::new(-a.sin() * b.cos(), a.cos() * b.cos(), b.sin()));
+            [x, y, x.cross(y)]
+        };
+        let grids = [
+            ("axial", Geometry::from_axes([8, 8, 6, 1], [0.9375, 0.9375, 1.2], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::new(-120.0, -95.2654, 33.7))),
+            ("oblique", Geometry::from_axes([8, 8, 6, 1], [0.4688, 0.4688, 0.6], tilt(0.17, 0.11), DVec3::new(-101.3, -87.9, 12.25))),
+            ("turned", Geometry::from_axes([8, 8, 6, 1], [1.5, 1.5, 1.5], tilt(0.03, 0.0), DVec3::new(-110.25, -90.57, -40.13))),
+        ];
+        let values: Vec<f32> = (0..8 * 8 * 6).map(|i| (i % 50) as f32).collect();
+        for (name, g) in &grids {
+            nifti(&data.join(format!("{name}.nii.gz")), Data::F32(&values), [8, 8, 6], g, "test", Intent::None).expect("written");
+        }
+        let rescan = || {
+            let mut cache = FileCache::load(&cache_path);
+            let c = scan(std::slice::from_ref(&data), &ScanOptions::default(), Some(&mut cache), &|_| true).expect("scanned");
+            cache.save(&cache_path).expect("cache saved");
+            c
+        };
+        // The first scan reads the headers, the next ones the cache.
+        let (fresh, cached, cached_again) = (rescan(), rescan(), rescan());
+        assert_eq!(fresh.volumes.len(), 3);
+        let ctx = egui::Context::default();
+        for k in 0..3 {
+            let mut ws = VolumeWorkspace::new(&ctx, None);
+            ws.finish_scan(Ok(fresh.clone()));
+            ws.selection = Selection::Volume(k);
+            ws.select_volume(k, &ctx);
+            // The user's slice, to tell this thumbnail from a new one.
+            ws.preview.as_mut().expect("a thumbnail").slice = 1;
+            let c = ws.catalog.clone().expect("scanned");
+            ws.viewer.show(k, &c.volumes[k], &ctx);
+            let start = Instant::now();
+            while ws.viewer.busy() {
+                assert!(start.elapsed() < Duration::from_secs(20), "the load finishes");
+                std::thread::sleep(Duration::from_millis(1));
+                ws.viewer.tick();
+            }
+            assert_eq!(ws.viewer.shown_index(), Some(k), "{:?}", ws.viewer.error);
+            for next in [&cached, &cached_again] {
+                ws.finish_scan(Ok(next.clone()));
+                // What the next tick does after a scan.
+                ws.select_volume(k, &ctx);
+                let name = &c.volumes[k].name;
+                assert_eq!(ws.selection, Selection::Volume(k), "{name}");
+                assert_eq!(ws.preview.as_ref().map(|p| (p.volume, p.slice)), Some((k, 1)), "{name}: the same thumbnail");
+                let c = ws.catalog.clone().expect("scanned");
+                ws.viewer.show(k, &c.volumes[k], &ctx);
+                assert!(!ws.viewer.busy(), "{name}: shown, not loaded again");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_image_allows_for_the_cache_but_not_for_changes() {
+        let raw = |slope: f64, intercept: f64| Voxels::Raw { file: "/x.nii".into(), file_offset: 352, gzip: false, skip: 0, interleave: 1, dtype: mm_volume::model::DataType::I16, big_endian: false, slope, intercept };
+        let a = Volume { voxels: raw(0.1, -1024.0), ..entry("a", "/x.nii".into(), Kind::Image, Some(grid([8, 8, 6], 0.4688, 0.17, [-101.3, -87.9, 12.25]))) };
+        let with = |f: &dyn Fn(&mut Volume)| {
+            let mut b = a.clone();
+            f(&mut b);
+            same_image(&a, &b)
+        };
+        let nudge = |x: &mut f64, ulps: i64| *x = f64::from_bits((x.to_bits() as i64 + ulps) as u64);
+        assert!(with(&|_| {}));
+        // A few units in the last place, as the cache's JSON may give back.
+        assert!(with(&|v| v.geometry.as_mut().into_iter().for_each(|g| g.affine.iter_mut().flatten().for_each(|x| nudge(x, 3)))));
+        assert!(with(&|v| v.geometry.as_mut().into_iter().for_each(|g| g.spacing.iter_mut().for_each(|x| nudge(x, -2)))));
+        assert!(with(&|v| v.voxels = raw(f64::from_bits(0.1f64.to_bits() + 1), -1024.0 + 1e-12)));
+        // Changes that matter are still seen.
+        assert!(!with(&|v| v.geometry.as_mut().into_iter().for_each(|g| g.affine[0][3] += 1e-6)));
+        assert!(!with(&|v| v.geometry.as_mut().into_iter().for_each(|g| g.spacing[2] *= 1.0 + 1e-7)));
+        assert!(!with(&|v| v.geometry.as_mut().into_iter().for_each(|g| g.dims[2] += 1)));
+        assert!(!with(&|v| v.geometry = None));
+        assert!(!with(&|v| v.voxels = raw(0.1000001, -1024.0)));
+        assert!(!with(&|v| v.voxels = raw(0.1, -1023.999)));
+        assert!(!with(&|v| v.voxels = Voxels::Unsupported("test".into())));
+        assert!(!with(&|v| v.bytes += 1));
+        assert!(!with(&|v| v.name.push('2')));
     }
 }

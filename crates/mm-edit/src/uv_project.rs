@@ -24,6 +24,7 @@
 use crate::{EditError, EditResult};
 use glam::{DVec2, DVec3};
 use mm_core::Mesh;
+use rayon::prelude::*;
 use std::f64::consts::{PI, TAU};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -105,12 +106,24 @@ pub fn projection_center(mesh: &Mesh, tris: &[u32]) -> DVec3 {
     }
 }
 
-/// Distinct vertices of `tris`.
+/// Distinct vertices of `tris`, in increasing order.
 fn vertices(mesh: &Mesh, tris: &[u32]) -> Vec<u32> {
-    let mut vs: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).collect();
-    vs.sort_unstable();
-    vs.dedup();
-    vs
+    // A few triangles: sort their corners. Many (a whole object has twice as many triangles
+    // as vertices): mark them in a table instead of sorting millions of corners, which gives
+    // the same list.
+    if tris.len() * 3 < mesh.max_vid() / 8 {
+        let mut vs: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).collect();
+        vs.sort_unstable();
+        vs.dedup();
+        return vs;
+    }
+    let mut seen = vec![false; mesh.max_vid()];
+    for &t in tris {
+        for v in mesh.triangle(t) {
+            seen[v as usize] = true;
+        }
+    }
+    seen.iter().enumerate().filter(|(_, &s)| s).map(|(v, _)| v as u32).collect()
 }
 
 /// The `size` that fits the projected triangles on the sheet (see the module docs).
@@ -157,8 +170,10 @@ pub fn project_uvs(mesh: &Mesh, tris: &[u32], p: &SetUvParams, view: Option<(DVe
     let tiny = 1e-12 * size.max(mesh.bounds().diagonal());
     let finish = |q: DVec2| DVec2::new(q.x * p.scale[0] + 0.5 + p.offset[0], q.y * p.scale[1] + 0.5 + p.offset[1]);
     let flat = |d: DVec3, right: DVec3, up: DVec3| finish(DVec2::new(d.dot(right) / size, d.dot(up) / (size * aspect)));
+    // Each triangle on its own: the same UVs in any order, so the triangles are spread over
+    // the threads.
     let out = tris
-        .iter()
+        .par_iter()
         .map(|&t| {
             let ds = mesh.tri_positions(t).map(|q| q - f.center);
             match p.projection {
@@ -277,6 +292,44 @@ mod tests {
         let top = tris.iter().position(|&t| m.tri_normal(t).z > 0.9).unwrap();
         let planar = project_uvs(&m, &[tris[top]], &SetUvParams { projection: Projection::Planar, ..p }, None, 1.0).unwrap();
         assert_eq!(uv[top], planar[0]);
+    }
+
+    #[test]
+    fn vertices_are_the_sorted_distinct_corners() {
+        let m = primitives::icosphere(10.0, 4);
+        let all: Vec<u32> = m.triangle_ids().collect();
+        let reference = |tris: &[u32]| {
+            let mut vs: Vec<u32> = tris.iter().flat_map(|&t| m.triangle(t)).collect();
+            vs.sort_unstable();
+            vs.dedup();
+            vs
+        };
+        // The whole object (marked in a table), a few triangles (sorted), and a scattered,
+        // repeating, unordered set in between.
+        let scattered: Vec<u32> = all.iter().rev().step_by(3).chain(all.iter().step_by(7)).copied().collect();
+        for tris in [&all[..], &all[..5], &all[100..101], &scattered[..], &[][..]] {
+            assert_eq!(vertices(&m, tris), reference(tris));
+        }
+    }
+
+    #[test]
+    fn each_triangle_projects_as_if_alone() {
+        // With the centre and size given, a triangle's UVs do not depend on the others: the
+        // whole object projected at once (spread over threads) gives, in order, what each
+        // triangle gives on its own.
+        let mut m = primitives::icosphere(10.0, 3);
+        m.transform(|p| p + DVec3::new(1.0, -2.0, 0.5));
+        let mut tris: Vec<u32> = m.triangle_ids().collect();
+        tris.reverse();
+        for projection in [Projection::Planar, Projection::Cylindrical, Projection::Spherical, Projection::Box] {
+            let p = SetUvParams { projection, rotation: 20.0, center: Some([0.5, 0.0, 0.0]), size: Some(30.0), ..Default::default() };
+            let whole = project_uvs(&m, &tris, &p, Some((DVec3::Y, DVec3::Z)), 1.3).unwrap();
+            for (k, &t) in tris.iter().enumerate() {
+                let alone = project_uvs(&m, &[t], &p, Some((DVec3::Y, DVec3::Z)), 1.3).unwrap()[0];
+                let same = whole[k].iter().zip(&alone).all(|(a, b)| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits());
+                assert!(same, "{projection:?} {t}");
+            }
+        }
     }
 
     #[test]

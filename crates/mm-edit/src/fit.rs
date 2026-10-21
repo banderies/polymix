@@ -7,6 +7,7 @@
 //! convex hull is built incrementally with exact orientation tests.
 
 use crate::{EditError, EditResult};
+use mm_core::hash::{fast_set_with_capacity, FastSet};
 use mm_core::linalg::{add_outer, sym_eigen3};
 use mm_core::{primitives, Bvh, DMat3, DVec2, DVec3, Mesh, Ray};
 use std::collections::HashMap;
@@ -376,11 +377,15 @@ pub fn convex_hull(pts: &[DVec3]) -> Option<Mesh> {
         if !visible.contains(&true) {
             continue;
         }
-        // Horizon: directed edges of visible faces whose twin belongs to a hidden face.
-        let mut seen: HashMap<(usize, usize), bool> = HashMap::new();
-        for (f, &vis) in faces.iter().zip(&visible) {
+        debug_assert!(is_closed_manifold(&faces), "the hull is a closed surface before point {k}");
+        // Horizon: directed edges of visible faces whose twin belongs to a hidden face. The
+        // hull is closed, so every directed edge has exactly one twin, on some face: the twin
+        // is on a hidden face exactly when it is not among the visible faces' edges (only
+        // those need collecting, usually a few faces of many).
+        let mut lit: FastSet<(usize, usize)> = fast_set_with_capacity(3 * visible.iter().filter(|v| **v).count());
+        for f in faces.iter().zip(&visible).filter(|(_, v)| **v).map(|(f, _)| f) {
             for j in 0..3 {
-                seen.insert((f[j], f[(j + 1) % 3]), vis);
+                lit.insert((f[j], f[(j + 1) % 3]));
             }
         }
         let mut next: Vec<[usize; 3]> = Vec::new();
@@ -391,7 +396,7 @@ pub fn convex_hull(pts: &[DVec3]) -> Option<Mesh> {
             }
             for j in 0..3 {
                 let (a, b) = (f[j], f[(j + 1) % 3]);
-                if seen.get(&(b, a)) == Some(&false) {
+                if !lit.contains(&(b, a)) {
                     next.push([a, b, k]);
                 }
             }
@@ -402,6 +407,19 @@ pub fn convex_hull(pts: &[DVec3]) -> Option<Mesh> {
     let mut m = Mesh::from_triangles(&p, &tris, None).0;
     m = m.compacted().0;
     Some(m)
+}
+
+/// No directed edge is on two faces, and every one has its twin (debug checks of the hull).
+fn is_closed_manifold(faces: &[[usize; 3]]) -> bool {
+    let mut edges: FastSet<(usize, usize)> = fast_set_with_capacity(3 * faces.len());
+    for f in faces {
+        for j in 0..3 {
+            if !edges.insert((f[j], f[(j + 1) % 3])) {
+                return false;
+            }
+        }
+    }
+    edges.iter().all(|&(a, b)| edges.contains(&(b, a)))
 }
 
 /// A cylinder fitted to a surface region.
@@ -572,4 +590,106 @@ pub fn fit_primitive(mesh: &Mesh, tris: &[u32], kind: PrimitiveType, density: us
         }
     };
     Ok(res)
+}
+
+#[cfg(test)]
+mod hull_tests {
+    use super::*;
+
+    /// The hull as it was built before the horizon came from the visible faces only: a map of
+    /// every face's directed edges (kept to check the new one against).
+    fn old_convex_hull(pts: &[DVec3]) -> Option<Mesh> {
+        let mut p: Vec<DVec3> = pts.to_vec();
+        p.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)).then(a.z.total_cmp(&b.z)));
+        p.dedup();
+        let orient = |a: DVec3, b: DVec3, c: DVec3, d: DVec3| {
+            let c3 = |q: DVec3| robust::Coord3D { x: q.x, y: q.y, z: q.z };
+            -robust::orient3d(c3(a), c3(b), c3(c), c3(d))
+        };
+        let i0 = 0;
+        let i1 = (1..p.len()).max_by(|&a, &b| p[a].distance_squared(p[i0]).total_cmp(&p[b].distance_squared(p[i0])))?;
+        let line = p[i1] - p[i0];
+        let i2 = (0..p.len()).max_by(|&a, &b| line.cross(p[a] - p[i0]).length_squared().total_cmp(&line.cross(p[b] - p[i0]).length_squared()))?;
+        let i3 = (0..p.len()).max_by(|&a, &b| orient(p[i0], p[i1], p[i2], p[a]).abs().total_cmp(&orient(p[i0], p[i1], p[i2], p[b]).abs()))?;
+        if orient(p[i0], p[i1], p[i2], p[i3]) == 0.0 {
+            return None;
+        }
+        let mut faces: Vec<[usize; 3]> =
+            if orient(p[i0], p[i1], p[i2], p[i3]) < 0.0 { vec![[i0, i1, i2], [i0, i3, i1], [i1, i3, i2], [i2, i3, i0]] } else { vec![[i0, i2, i1], [i0, i1, i3], [i1, i2, i3], [i2, i0, i3]] };
+        for (k, &q) in p.iter().enumerate() {
+            if [i0, i1, i2, i3].contains(&k) {
+                continue;
+            }
+            let visible: Vec<bool> = faces.iter().map(|f| orient(p[f[0]], p[f[1]], p[f[2]], q) > 0.0).collect();
+            if !visible.contains(&true) {
+                continue;
+            }
+            let mut seen: HashMap<(usize, usize), bool> = HashMap::new();
+            for (f, &vis) in faces.iter().zip(&visible) {
+                for j in 0..3 {
+                    seen.insert((f[j], f[(j + 1) % 3]), vis);
+                }
+            }
+            let mut next: Vec<[usize; 3]> = Vec::new();
+            for (f, &vis) in faces.iter().zip(&visible) {
+                if !vis {
+                    next.push(*f);
+                    continue;
+                }
+                for j in 0..3 {
+                    let (a, b) = (f[j], f[(j + 1) % 3]);
+                    if seen.get(&(b, a)) == Some(&false) {
+                        next.push([a, b, k]);
+                    }
+                }
+            }
+            faces = next;
+        }
+        let tris: Vec<[u32; 3]> = faces.iter().map(|f| [f[0] as u32, f[1] as u32, f[2] as u32]).collect();
+        let mut m = Mesh::from_triangles(&p, &tris, None).0;
+        m = m.compacted().0;
+        Some(m)
+    }
+
+    /// A small deterministic generator (xorshift) for the point sets.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn same(a: &Mesh, b: &Mesh) -> bool {
+        let (pa, ta, ga) = a.to_arrays();
+        let (pb, tb, gb) = b.to_arrays();
+        pa.len() == pb.len() && pa.iter().zip(&pb).all(|(x, y)| x.to_array().map(f64::to_bits) == y.to_array().map(f64::to_bits)) && ta == tb && ga == gb
+    }
+
+    #[test]
+    fn hulls_are_the_same_as_before() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut sets: Vec<Vec<DVec3>> = Vec::new();
+        for n in [5, 20, 200, 1500] {
+            // In a ball, on a sphere (every point on the hull) and on a lattice (coplanar faces,
+            // collinear and repeated points).
+            sets.push((0..n).map(|_| DVec3::new(rng.next(), rng.next(), rng.next()) * 2.0 - 1.0).collect());
+            sets.push((0..n).map(|_| (DVec3::new(rng.next(), rng.next(), rng.next()) * 2.0 - 1.0).normalize_or(DVec3::X)).collect());
+            sets.push((0..n).map(|_| DVec3::new((rng.next() * 4.0).floor(), (rng.next() * 4.0).floor(), (rng.next() * 3.0).floor())).collect());
+        }
+        let cube = primitives::cube(1.0, 3);
+        sets.push(cube.vertex_ids().map(|v| cube.vertex(v)).collect());
+        sets.push(vec![DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::new(1.0, 1.0, 0.0)]);
+        for (i, pts) in sets.iter().enumerate() {
+            let (new, old) = (convex_hull(pts), old_convex_hull(pts));
+            assert_eq!(new.is_some(), old.is_some(), "set {i}");
+            if let (Some(new), Some(old)) = (new, old) {
+                assert!(same(&new, &old), "set {i}: {} vs {} triangles", new.triangle_count(), old.triangle_count());
+                let faces: Vec<[usize; 3]> = new.triangle_ids().map(|t| new.triangle(t).map(|v| v as usize)).collect();
+                assert!(is_closed_manifold(&faces), "set {i}");
+            }
+        }
+    }
 }

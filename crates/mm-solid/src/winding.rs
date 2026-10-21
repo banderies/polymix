@@ -315,13 +315,25 @@ impl WindingNumber {
 
     /// Fast approximate winding number at `q`.
     pub fn eval(&self, q: DVec3) -> f64 {
+        self.eval_beta2(q, self.beta2)
+    }
+
+    /// [`WindingNumber::eval`] with accuracy parameter `beta` in place of the tree's own.
+    /// The tree does not depend on β, so one tree can serve callers that want different
+    /// accuracies; the result is bit-identical to a tree built with `beta`.
+    pub fn eval_with_beta(&self, q: DVec3, beta: f64) -> f64 {
+        let beta = if beta.is_finite() && beta > 0.0 { beta } else { Self::DEFAULT_BETA };
+        self.eval_beta2(q, beta * beta)
+    }
+
+    #[inline(always)]
+    fn eval_beta2(&self, q: DVec3, beta2: f64) -> f64 {
         if self.nodes.is_empty() {
             return 0.0;
         }
         let mut stack = [0u32; 128];
         let mut sp = 1usize;
         let mut sum = 0.0;
-        let beta2 = self.beta2;
         while sp > 0 {
             sp -= 1;
             let ni = stack[sp] as usize;
@@ -533,6 +545,19 @@ mod tests {
         let batch = wn.eval_batch(&pts);
         for (p, b) in pts.iter().zip(batch) {
             assert_eq!(wn.eval(*p), b);
+        }
+    }
+
+    #[test]
+    fn eval_with_beta_matches_a_tree_built_with_it() {
+        let m = primitives::icosphere(1.0, 4);
+        let field = WindingNumber::with_beta(&m, 1.5);
+        let default = WindingNumber::new(&m);
+        let mut rng = Rng(23);
+        for _ in 0..500 {
+            let p = rng.v(1.6);
+            assert_eq!(field.eval_with_beta(p, WindingNumber::DEFAULT_BETA).to_bits(), default.eval(p).to_bits());
+            assert_eq!(default.eval_with_beta(p, 1.5).to_bits(), field.eval(p).to_bits());
         }
     }
 

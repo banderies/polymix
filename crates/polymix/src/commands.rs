@@ -171,25 +171,48 @@ pub fn separate_shells(cx: &mut CmdCx) {
 /// particular set of them), as one new object with a face group per cell. The inputs are A, B,
 /// C, … in object order; a cell's group id is its membership mask (A = 1, B = 2, A ∩ B = 3, …;
 /// see [`mm_edit::complex`]) and its group name says it with the objects' names, so Filter
-/// Complex can keep cells by membership.
+/// Complex can keep cells by membership. All at once (tests); the app computes the cells in the
+/// background instead ([`crate::tools::complex::GenerateComplexTool`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate_complex(cx: &mut CmdCx) {
-    let solids: Vec<(ObjectId, String, mm_core::Mesh)> = cx
-        .scene
-        .objects
-        .iter()
-        .filter(|o| o.visible && o.mesh.is_closed() && o.mesh.triangle_count() > 0)
-        .map(|o| (o.id, o.name.clone(), (*o.mesh).clone()))
-        .collect();
+    let solids = match complex_inputs(cx.scene) {
+        Ok(s) => s,
+        Err(e) => {
+            *cx.status = e;
+            return;
+        }
+    };
+    let cells = complex_cells(&solids, None);
+    apply_complex(cx, &solids, cells);
+}
+
+/// Generate Complex's inputs: the visible closed objects in object order (id, name, mesh), or
+/// why there are not the right number of them.
+pub fn complex_inputs(scene: &Scene) -> Result<Vec<ComplexInput>, String> {
+    let solids: Vec<ComplexInput> = scene.objects.iter().filter(|o| o.visible && o.mesh.is_closed() && o.mesh.triangle_count() > 0).map(|o| (o.id, o.name.clone(), o.mesh.clone())).collect();
     if solids.len() < 2 {
-        *cx.status = "Generate Complex needs at least two visible closed objects that overlap.".into();
-        return;
+        return Err("Generate Complex needs at least two visible closed objects that overlap.".into());
     }
     if solids.len() > mm_edit::complex::MAX_COMPLEX_INPUTS {
-        *cx.status = "Generate Complex works on up to six visible closed objects.".into();
-        return;
+        return Err("Generate Complex works on up to six visible closed objects.".into());
     }
-    let meshes: Vec<mm_core::Mesh> = solids.iter().map(|s| s.2.clone()).collect();
-    match mm_edit::generate_complex_cells(&meshes) {
+    Ok(solids)
+}
+
+/// An input of Generate Complex: its object, name and mesh.
+pub type ComplexInput = (ObjectId, String, std::sync::Arc<mm_core::Mesh>);
+
+/// The cells of the inputs (the slow part, exact booleans: it can run in the background).
+/// `progress` as for [`mm_edit::complex::generate_complex_cells_with`].
+pub fn complex_cells(solids: &[ComplexInput], progress: Option<&dyn Fn(f32) -> bool>) -> mm_edit::EditResult<Vec<mm_edit::ComplexCell>> {
+    let meshes: Vec<&mm_core::Mesh> = solids.iter().map(|s| &*s.2).collect();
+    mm_edit::complex::generate_complex_cells_with(&meshes, progress)
+}
+
+/// Put the cells of `solids` in the scene: one new object with a face group per cell, named
+/// after the inputs, which are hidden (or say why there are none).
+pub fn apply_complex(cx: &mut CmdCx, solids: &[ComplexInput], cells: mm_edit::EditResult<Vec<mm_edit::ComplexCell>>) {
+    match cells {
         Ok(cells) => {
             cx.history.push("Generate Complex", cx.scene);
             let names: Vec<String> = solids.iter().map(|s| s.1.clone()).collect();
@@ -204,7 +227,7 @@ pub fn generate_complex(cx: &mut CmdCx) {
                 }
             }
             let n = cells.len();
-            for (id, _, _) in &solids {
+            for (id, _, _) in solids {
                 if let Some(o) = cx.scene.get_mut(*id) {
                     o.visible = false;
                 }

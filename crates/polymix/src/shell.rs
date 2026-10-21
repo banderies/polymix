@@ -9,6 +9,7 @@
 
 use crate::agents::{self, AgentAccess};
 use crate::app::MeshWorkspace;
+use mm_volume::model::Catalog;
 use polymix_mcp::{Call, Reply};
 use polymix_segmentation::SegmentationWorkspace;
 use polymix_volume::VolumeWorkspace;
@@ -20,7 +21,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// Agents' work waits for drawn frames; none for this long means the window is not drawn
@@ -102,8 +103,27 @@ pub struct PolymixApp {
     brought_forward: bool,
     /// Until when work in the Mesh workspace is an agent's (after its last change).
     agent_work_until: Option<Instant>,
-    /// The catalog and volume Segmentation's overlay choices were listed for.
-    overlay_key: Option<(usize, usize)>,
+    /// What Segmentation's overlay choices were listed for.
+    overlay_key: Option<OverlayKey>,
+}
+
+/// The catalog, volume and *Hide identifiers* setting Segmentation's overlay choices were
+/// listed for. The catalog is held weakly: that keeps its address from going to a newer
+/// catalog while it is remembered, without keeping a replaced catalog's contents alive.
+struct OverlayKey {
+    catalog: Weak<Catalog>,
+    volume: usize,
+    hide: bool,
+}
+
+impl OverlayKey {
+    fn new(catalog: &Arc<Catalog>, volume: usize, hide: bool) -> Self {
+        Self { catalog: Arc::downgrade(catalog), volume, hide }
+    }
+
+    fn is(&self, catalog: &Arc<Catalog>, volume: usize, hide: bool) -> bool {
+        std::ptr::eq(self.catalog.as_ptr(), Arc::as_ptr(catalog)) && self.volume == volume && self.hide == hide
+    }
 }
 
 struct Wait {
@@ -612,19 +632,25 @@ impl eframe::App for PolymixApp {
         let active = self.active;
         // Segmentation shows the volume selected in Volume (read only while it is shown, so
         // browsing in Volume loads nothing).
-        if active == Tab::Segmentation {
-            if let Some((catalog, k, label)) = self.volume.call(|w| w.current_volume()).flatten() {
-                self.segmentation.call(|w| w.show_volume(&catalog.volumes[k], &label, ctx));
-            }
+        let shown = if active == Tab::Segmentation { self.volume.call(|w| w.current_volume()).flatten() } else { None };
+        if let Some((catalog, k, label)) = &shown {
+            self.segmentation.call(|w| w.show_volume(&catalog.volumes[*k], label, ctx));
         }
         // Images that can be shown over the one in Segmentation (its Overlay menu): listed
-        // again when another is shown or the catalog changes.
+        // again when asked, when another is shown, when the catalog changes, or when *Hide
+        // identifiers* changes how they are labelled.
         let asked = self.segmentation.call(|w| w.wants_overlay_choices()) == Some(true);
         if active == Tab::Segmentation || asked {
-            let current = self.volume.call(|w| w.current_volume()).flatten();
-            let key = current.as_ref().map(|(c, k, _)| (Arc::as_ptr(c) as usize, *k));
-            if asked || key != self.overlay_key {
-                self.overlay_key = key;
+            // Showing it in Segmentation changed nothing in Volume: no need to ask again.
+            let current = if active == Tab::Segmentation { shown } else { self.volume.call(|w| w.current_volume()).flatten() };
+            let hide = self.volume.live().is_some_and(|w| w.hides_identifiers());
+            let same = match (&current, &self.overlay_key) {
+                (Some((c, k, _)), Some(key)) => key.is(c, *k, hide),
+                (None, None) => true,
+                _ => false,
+            };
+            if asked || !same {
+                self.overlay_key = current.as_ref().map(|(c, k, _)| OverlayKey::new(c, *k, hide));
                 let choices = current.and_then(|(c, k, _)| self.volume.call(|w| w.overlay_choices(&c.volumes[k]))).unwrap_or_default();
                 self.segmentation.call(|w| w.set_overlay_choices(choices));
             }
@@ -772,4 +798,24 @@ fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> anyhow::Result<()
     let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
     w.write_image_data(&bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_key_tells_catalogs_volumes_and_masking_apart() {
+        let a = Arc::new(Catalog::default());
+        let key = OverlayKey::new(&a, 3, false);
+        assert!(key.is(&a, 3, false));
+        assert!(!key.is(&a, 4, false));
+        assert!(!key.is(&a, 3, true), "Hide identifiers relabels the choices");
+        // A rescan: equal contents, another catalog.
+        assert!(!key.is(&Arc::new(Catalog::default()), 3, false));
+        // Catalogs made after the remembered one is dropped never take its address.
+        drop(a);
+        let later: Vec<Arc<Catalog>> = (0..64).map(|_| Arc::new(Catalog::default())).collect();
+        assert!(later.iter().all(|c| !key.is(c, 3, false)));
+    }
 }

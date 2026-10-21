@@ -14,13 +14,14 @@
 //!    axis, with its normal oriented away from the mesh's vertex centroid (towards the end
 //!    of the branch, which is usually the side to trim).
 
-use crate::cut::{compute_curves, curve_summary, point_segment_distance, CutContext};
+use crate::cut::{compute_curves, curve_summary, point_segment_distance, snap_eps_with, CutContext};
 use mm_core::linalg::{add_outer, sym_eigen3};
 use crate::util::frame;
 use crate::{EditError, EditResult};
 use mm_core::bvh::RayHit;
 use mm_core::geom::{closest_point_on_triangle, ray_triangle};
-use mm_core::{Bvh, DVec2, DVec3, Mesh, Plane, Ray};
+use mm_core::{Aabb, Bvh, DVec2, DVec3, Mesh, Plane, Ray};
+use std::sync::{Mutex, PoisonError};
 
 /// Local cross-section of a vessel.
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +57,91 @@ pub fn estimate_vessel_cross_section(
     point_on_surface: DVec3,
     approx_radius: Option<f64>,
 ) -> EditResult<VesselCrossSection> {
+    let mut scratch = Scratch::take();
+    let r = estimate(mesh, bvh, point_on_surface, approx_radius, &mut scratch);
+    scratch.keep();
+    r
+}
+
+/// Marks over a mesh's vertices and triangles and a buffer of distances, kept from call to
+/// call, so each iteration of an estimate costs O(patch) rather than arrays as big as the mesh
+/// made and cleared for every click (the patch of a finely meshed vessel holds tens of
+/// thousands of vertices, too many to look up in maps quickly). A mark counts only with the
+/// current stamp, which only increases; when it would wrap, every mark is cleared.
+#[derive(Default)]
+struct Scratch {
+    stamp: u32,
+    /// Per vertex: the stamp it was last gathered with, and its place in that patch.
+    vert: Vec<(u32, u32)>,
+    /// Per triangle: the stamp it was last taken with.
+    tri: Vec<u32>,
+    /// Signed distances by vertex for the cross-sections' contexts: all zeros between uses.
+    sd: Vec<f64>,
+    /// The mean of the last mesh's vertices, for its shape version (which no other shape has).
+    centroid: Option<(u64, DVec3)>,
+}
+
+/// The scratch kept between estimates. At most two are kept (for estimates on two threads at
+/// once), whichever threads ran them, so the memory held does not grow with the number of
+/// threads that ever ran one.
+static KEPT: Mutex<Vec<Scratch>> = Mutex::new(Vec::new());
+
+impl Scratch {
+    /// A kept scratch, or a new one.
+    fn take() -> Self {
+        KEPT.lock().unwrap_or_else(PoisonError::into_inner).pop().unwrap_or_default()
+    }
+
+    /// Keep this scratch for a later estimate (unless two are kept already).
+    fn keep(self) {
+        let mut kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+        if kept.len() < 2 {
+            kept.push(self);
+        }
+    }
+
+    /// Room for every vertex and triangle of `mesh`. Scratch left far bigger by a bigger mesh
+    /// starts again at this one's size, so a big mesh's marks are not held for good after it
+    /// is closed.
+    fn fit(&mut self, mesh: &Mesh) {
+        if self.vert.len() > 4 * mesh.max_vid() + 4096 || self.tri.len() > 4 * mesh.max_tid() + 4096 {
+            *self = Scratch::default();
+        }
+        if self.vert.len() < mesh.max_vid() {
+            self.vert.resize(mesh.max_vid(), (0, 0));
+        }
+        if self.tri.len() < mesh.max_tid() {
+            self.tri.resize(mesh.max_tid(), 0);
+        }
+    }
+
+    /// A stamp no mark has yet.
+    fn next(&mut self) -> u32 {
+        if self.stamp == u32::MAX {
+            self.vert.fill((0, 0));
+            self.tri.fill(0);
+            self.stamp = 0;
+        }
+        self.stamp += 1;
+        self.stamp
+    }
+
+    /// The mean of `mesh`'s vertices: summed once per shape of the mesh, in vertex order (the
+    /// same sum every time), rather than over the whole mesh on every click.
+    fn centroid(&mut self, mesh: &Mesh) -> DVec3 {
+        match self.centroid {
+            Some((version, c)) if version == mesh.shape_version() => c,
+            _ => {
+                let nv = mesh.vertex_count().max(1) as f64;
+                let c = mesh.vertex_ids().map(|v| mesh.vertex(v)).sum::<DVec3>() / nv;
+                self.centroid = Some((mesh.shape_version(), c));
+                c
+            }
+        }
+    }
+}
+
+fn estimate(mesh: &Mesh, bvh: Option<&Bvh>, point_on_surface: DVec3, approx_radius: Option<f64>, scratch: &mut Scratch) -> EditResult<VesselCrossSection> {
     if mesh.triangle_count() == 0 {
         return Err(EditError::InvalidParameter("mesh is empty".into()));
     }
@@ -77,7 +163,8 @@ pub fn estimate_vessel_cross_section(
     }
     let edges = mesh.vertex_edges(v0);
     let h = (edges.iter().map(|&e| mesh.edge_length(e)).sum::<f64>() / edges.len().max(1) as f64).max(1e-12);
-    let diag = mesh.bounds().diagonal();
+    // 1e-9 of the bounding-box diagonal (from the tree's box when it holds every triangle).
+    let eps = snap_eps_with(mesh, bvh);
 
     let mut r = match approx_radius {
         Some(r) if r.is_finite() && r > 0.0 => r,
@@ -100,55 +187,48 @@ pub fn estimate_vessel_cross_section(
     let mut c = q - n0 * r;
     let mut axis = DVec3::ZERO;
     let mut area = None;
-    let eps = 1e-9 * diag;
-    // Stamp-based scratch so each iteration costs O(patch), not O(mesh).
-    let mut scratch = Scratch {
-        vmark: vec![0; mesh.max_vid()],
-        tmark: vec![0; mesh.max_tid()],
-        nacc: vec![DVec3::ZERO; mesh.max_vid()],
-        aacc: vec![0.0; mesh.max_vid()],
-        stamp: 0,
-    };
-    let mut sd_buf: Vec<f64> = Vec::new();
 
+    // Each iteration costs O(patch), not O(mesh): the marks and the distance buffer are
+    // kept from call to call (see [`Scratch`]).
+    scratch.fit(mesh);
+    let mut sd_buf = std::mem::take(&mut scratch.sd);
     for it in 0..16 {
         let mut rho = (2.0 * r).max(3.0 * h);
-        let mut patch = gather(mesh, v0, c, rho, &mut scratch);
+        let mut patch = gather(mesh, v0, c, rho, scratch);
         for _ in 0..4 {
             if patch.len() >= 12 {
                 break;
             }
             rho *= 1.5;
-            patch = gather(mesh, v0, c, rho, &mut scratch);
+            patch = gather(mesh, v0, c, rho, scratch);
         }
         let stamp = scratch.stamp;
         let mut tris: Vec<u32> = Vec::new();
         for &v in &patch {
-            scratch.nacc[v as usize] = DVec3::ZERO;
-            scratch.aacc[v as usize] = 0.0;
             for &e in mesh.vertex_edges(v) {
                 for t in mesh.edge_triangles(e) {
-                    if t != mm_core::INVALID && scratch.tmark[t as usize] != stamp {
-                        scratch.tmark[t as usize] = stamp;
+                    if t != mm_core::INVALID && scratch.tri[t as usize] != stamp {
+                        scratch.tri[t as usize] = stamp;
                         tris.push(t);
                     }
                 }
             }
         }
+        // Area-weighted normal and area of each patch vertex (by its place in the patch).
+        let mut nacc = vec![DVec3::ZERO; patch.len()];
+        let mut aacc = vec![0.0; patch.len()];
         for &t in &tris {
             let x = mesh.tri_cross(t);
             let a = x.length() / 6.0;
             for v in mesh.triangle(t) {
-                if scratch.vmark[v as usize] == stamp {
-                    scratch.nacc[v as usize] += x;
-                    scratch.aacc[v as usize] += a;
+                let (s, i) = scratch.vert[v as usize];
+                if s == stamp {
+                    nacc[i as usize] += x;
+                    aacc[i as usize] += a;
                 }
             }
         }
-        let nw: Vec<(DVec3, DVec3, f64)> = patch
-            .iter()
-            .map(|&v| (mesh.vertex(v), scratch.nacc[v as usize].normalize_or_zero(), scratch.aacc[v as usize]))
-            .collect();
+        let nw: Vec<(DVec3, DVec3, f64)> = patch.iter().enumerate().map(|(i, &v)| (mesh.vertex(v), nacc[i].normalize_or_zero(), aacc[i])).collect();
         let mut m = [[0.0; 3]; 3];
         for &(_, nv, w) in &nw {
             add_outer(&mut m, nv, w);
@@ -199,9 +279,9 @@ pub fn estimate_vessel_cross_section(
 
         // Refine with the actual cross-section through the click.
         let plane = Plane::from_point_normal(cn, a);
-        let ctx = CutContext::for_triangles(mesh, plane, eps, &tris, std::mem::take(&mut sd_buf));
+        let ctx = CutContext::for_triangles_in(mesh, plane, eps, &tris, sd_buf);
         let curves = compute_curves(mesh, &ctx, Some(&tris));
-        sd_buf = ctx.sd;
+        sd_buf = ctx.into_buffer();
         let best = curves
             .iter()
             .filter(|cv| cv.closed)
@@ -227,21 +307,36 @@ pub fn estimate_vessel_cross_section(
             break;
         }
     }
+    scratch.sd = sd_buf;
     if axis == DVec3::ZERO {
         return Err(EditError::Failed("could not estimate a vessel axis".into()));
     }
-    let nv = mesh.vertex_count().max(1) as f64;
-    let centroid = mesh.vertex_ids().map(|v| mesh.vertex(v)).sum::<DVec3>() / nv;
+    let centroid = scratch.centroid(mesh);
     if (c - centroid).dot(axis) < 0.0 {
         axis = -axis;
     }
     Ok(VesselCrossSection { plane: Plane::from_point_normal(c, axis), center: c, axis, radius: r, area })
 }
 
+/// The nearest triangle to `p` and the nearest point on it; of triangles equally near, the one
+/// with the lowest id. With a tree the same as the walk over all triangles below: every
+/// triangle as near as the tree's answer has its box within that distance of `p`, so it is
+/// among the triangles found there, and they are compared the same way.
 fn nearest_point(mesh: &Mesh, bvh: Option<&Bvh>, p: DVec3) -> (u32, DVec3) {
     if let Some(b) = bvh {
         if let Some(hit) = b.nearest(mesh, p, f64::INFINITY) {
-            return (hit.tid, hit.point);
+            // (Padded well past the rounding of the distance and of the triangles' boxes.)
+            let r = hit.dist_sq.sqrt() * (1.0 + 1e-9) + 1e-9 * (1.0 + p.abs().max_element());
+            let mut best = (hit.tid, hit.point, hit.dist_sq);
+            b.query_aabb(&Aabb { min: p - DVec3::splat(r), max: p + DVec3::splat(r) }, |t| {
+                let [a, b, c] = mesh.tri_positions(t);
+                let (x, _) = closest_point_on_triangle(p, a, b, c);
+                let d = x.distance_squared(p);
+                if d < best.2 || (d == best.2 && t < best.0) {
+                    best = (t, x, d);
+                }
+            });
+            return (best.0, best.1);
         }
     }
     let mut best = (mm_core::INVALID, p, f64::INFINITY);
@@ -281,32 +376,114 @@ fn first_hit(mesh: &Mesh, bvh: Option<&Bvh>, ray: Ray, min_t: f64) -> Option<f64
     best
 }
 
-struct Scratch {
-    vmark: Vec<u32>,
-    tmark: Vec<u32>,
-    nacc: Vec<DVec3>,
-    aacc: Vec<f64>,
-    stamp: u32,
-}
-
-/// Vertices connected to `v0` through vertices within `rho` of `c` (v0 always included).
-/// Marks them in `scratch.vmark` with a fresh stamp.
+/// Vertices connected to `v0` through vertices within `rho` of `c` (v0 always included), in
+/// the order found. Marks them in `scratch.vert` with a fresh stamp and their place in the
+/// list.
 fn gather(mesh: &Mesh, v0: u32, c: DVec3, rho: f64, scratch: &mut Scratch) -> Vec<u32> {
-    scratch.stamp += 1;
-    let stamp = scratch.stamp;
+    let stamp = scratch.next();
     let r2 = rho * rho;
-    scratch.vmark[v0 as usize] = stamp;
+    scratch.vert[v0 as usize] = (stamp, 0);
     let mut out = vec![v0];
     let mut i = 0;
     while i < out.len() {
         let v = out[i];
         i += 1;
         for w in mesh.vertex_neighbors(v) {
-            if scratch.vmark[w as usize] != stamp && mesh.vertex(w).distance_squared(c) <= r2 {
-                scratch.vmark[w as usize] = stamp;
+            if scratch.vert[w as usize].0 != stamp && mesh.vertex(w).distance_squared(c) <= r2 {
+                scratch.vert[w as usize] = (stamp, out.len() as u32);
                 out.push(w);
             }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn the_tree_finds_the_triangle_the_walk_over_all_finds() {
+        // A grid (many triangles equally near its vertices and edges) and a tube, probed at
+        // vertices, edge midpoints, centroids and points off the surface.
+        let mut grid = primitives::plane_grid(4.0, 4.0, 16, 16);
+        grid.transform(|p| DVec3::new(p.x, p.y, 0.2 * (p.x * 0.7).sin()));
+        let path: Vec<DVec3> = (0..=30).map(|i| DVec3::new(0.0, 0.0, 0.3 * i as f64)).collect();
+        let tube = primitives::tube_along(&path, &vec![1.0; path.len()], 16);
+        for m in [grid, tube] {
+            let bvh = Bvh::build(&m);
+            let mut probes: Vec<DVec3> = m.vertex_ids().map(|v| m.vertex(v)).collect();
+            for t in m.triangle_ids() {
+                let [a, b, c] = m.tri_positions(t);
+                probes.extend([(a + b) * 0.5, m.tri_centroid(t), m.tri_centroid(t) + m.tri_normal(t) * 0.3, c * 1.05]);
+            }
+            let mut ties = 0;
+            for p in probes {
+                let walked = nearest_point(&m, None, p);
+                let treed = nearest_point(&m, Some(&bvh), p);
+                assert_eq!(treed.0, walked.0, "at {p:?}");
+                assert_eq!(treed.1.to_array().map(f64::to_bits), walked.1.to_array().map(f64::to_bits));
+                ties += usize::from(bvh.nearest(&m, p, f64::INFINITY).is_some_and(|h| h.tid != walked.0));
+            }
+            assert!(ties > 0, "the plain tree query picks other triangles at ties");
+        }
+    }
+
+    fn same(a: &VesselCrossSection, b: &VesselCrossSection) -> bool {
+        a.center.to_array().map(f64::to_bits) == b.center.to_array().map(f64::to_bits)
+            && a.axis.to_array().map(f64::to_bits) == b.axis.to_array().map(f64::to_bits)
+            && (a.radius.to_bits(), a.area.map(f64::to_bits)) == (b.radius.to_bits(), b.area.map(f64::to_bits))
+    }
+
+    #[test]
+    fn a_cross_section_with_a_tree_is_the_one_without() {
+        let path: Vec<DVec3> = (0..=60).map(|i| DVec3::new(0.3 * (0.1 * i as f64).sin(), 0.0, 0.5 * i as f64)).collect();
+        let m = primitives::tube_along(&path, &vec![2.0; path.len()], 32);
+        let bvh = Bvh::build(&m);
+        for v in m.vertex_ids().step_by(97) {
+            let a = estimate_vessel_cross_section(&m, None, m.vertex(v), None).unwrap();
+            let b = estimate_vessel_cross_section(&m, Some(&bvh), m.vertex(v), None).unwrap();
+            assert!(same(&a, &b));
+        }
+    }
+
+    #[test]
+    fn kept_marks_change_nothing_and_survive_their_stamp_wrapping() {
+        // A kept scratch, after other meshes (bigger and smaller) and with its stamp about to
+        // wrap, gives what a fresh one gives.
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.2 * (0.2 * i as f64).cos(), 0.5 * i as f64)).collect();
+        let m = primitives::tube_along(&path, &vec![1.5; path.len()], 24);
+        let big = primitives::icosphere(3.0, 5);
+        let p = m.vertex(300);
+        let fresh = estimate(&m, None, p, None, &mut Scratch::default()).unwrap();
+        let mut kept = Scratch::default();
+        estimate(&big, None, big.vertex(7), None, &mut kept).unwrap();
+        assert!(kept.vert.len() >= big.max_vid());
+        assert!(same(&estimate(&m, None, p, None, &mut kept).unwrap(), &fresh));
+        assert_eq!((kept.vert.len(), kept.tri.len()), (m.max_vid(), m.max_tid()), "the big mesh's marks are let go");
+        assert!(kept.sd.iter().all(|&x| x.to_bits() == 0), "the distances are cleared after");
+        kept.stamp = u32::MAX - 2;
+        assert!(same(&estimate(&m, None, p, None, &mut kept).unwrap(), &fresh));
+        assert!(kept.stamp < 1000, "wrapped");
+        assert!(same(&estimate(&m, None, p, None, &mut kept).unwrap(), &fresh));
+        assert!(same(&estimate_vessel_cross_section(&m, None, p, None).unwrap(), &fresh));
+        // The kept centroid is the one of the mesh at hand: with a part far below added, the
+        // axis turns the other way (away from the centroid), with a scratch kept or fresh.
+        let mut low = m.clone();
+        let mut part = primitives::icosphere(2.0, 2);
+        part.transform(|q| q - DVec3::Z * 200.0);
+        low.append_mesh(&part, 3);
+        let fresh_low = estimate(&low, None, p, None, &mut Scratch::default()).unwrap();
+        assert!(fresh_low.axis.dot(fresh.axis) < 0.0);
+        for (mesh, want) in [(&low, &fresh_low), (&m, &fresh), (&low, &fresh_low)] {
+            assert!(same(&estimate(mesh, None, p, None, &mut kept).unwrap(), want));
+            assert_eq!(kept.centroid.map(|c| c.0), Some(mesh.shape_version()));
+        }
+        // Moved: a new shape, a new centroid.
+        let mut moved = m.clone();
+        moved.transform(|q| q + DVec3::X);
+        let fresh_moved = estimate(&moved, None, p + DVec3::X, None, &mut Scratch::default()).unwrap();
+        assert!(same(&estimate(&moved, None, p + DVec3::X, None, &mut kept).unwrap(), &fresh_moved));
+    }
 }

@@ -126,8 +126,17 @@ pub struct AlignTool {
     src_pivot: Option<usize>,
     pressed_at: Option<egui::Pos2>,
     preview: Option<Mesh>,
+    /// The preview's mesh while there is no alignment, kept for reuse: the preview is a copy
+    /// of the source made once, whose positions each rebuild rewrites. Keeping it costs the
+    /// memory of one copy of the object while nothing is previewed (for example Surface Point
+    /// with nothing picked yet), the same as while a preview shows, and saves copying the
+    /// object again when an alignment comes back. It goes when the tool closes.
+    spare: Option<Mesh>,
     alignment: Option<Alignment>,
     dirty: bool,
+    /// Base Point's reach along a normal (the bits of the normal, the reach): the source does
+    /// not change, so the scan over its vertices is redone only for another normal.
+    reach: std::cell::Cell<Option<([u64; 3], f64)>>,
 }
 
 impl AlignTool {
@@ -157,8 +166,10 @@ impl AlignTool {
             pivots,
             pressed_at: None,
             preview: None,
+            spare: None,
             alignment: None,
             dirty: true,
+            reach: std::cell::Cell::new(None),
         }
     }
 
@@ -170,7 +181,15 @@ impl AlignTool {
         match self.source_type {
             SourceType::CenterPoint => Some(Frame { p: c, n }),
             SourceType::BasePoint => {
-                let reach = m.vertex_ids().map(|v| (m.vertex(v) - c).dot(n)).fold(f64::NEG_INFINITY, f64::max);
+                let key = n.to_array().map(f64::to_bits);
+                let reach = match self.reach.get() {
+                    Some((k, r)) if k == key => r,
+                    _ => {
+                        let r = m.vertex_ids().map(|v| (m.vertex(v) - c).dot(n)).fold(f64::NEG_INFINITY, f64::max);
+                        self.reach.set(Some((key, r)));
+                        r
+                    }
+                };
                 (reach.is_finite()).then_some(Frame { p: c + n * reach, n })
             }
             SourceType::SurfacePoint => self.picked,
@@ -197,11 +216,18 @@ impl AlignTool {
             (Some(src), Destination::Pivot { pivot, .. }) => Some(align_frames(&src, &pivot, self.mode, self.flip)),
             _ => self.source_frame(up).map(|s| align(s, self.dest, up, self.mode, self.flip)),
         };
-        self.preview = self.alignment.map(|a| {
-            let mut m = (*self.source).clone();
-            m.transform(|p| a.apply(p));
-            m
-        });
+        match self.alignment {
+            Some(a) => {
+                let mut m = self.preview.take().or_else(|| self.spare.take()).unwrap_or_else(|| (*self.source).clone());
+                transform_from(&mut m, &self.source, |p| a.apply(p));
+                self.preview = Some(m);
+            }
+            None => {
+                if let Some(m) = self.preview.take() {
+                    self.spare = Some(m);
+                }
+            }
+        }
     }
 
     /// Hit on the active object as displayed, in its original coordinates.
@@ -574,6 +600,12 @@ impl Tool for AlignTool {
         Some((self.object?, self.preview.as_ref()?))
     }
 
+    fn preview_transform(&self) -> Option<glam::DMat4> {
+        // A rigid motion of the object's mesh: x ↦ r (x − pivot) + to.
+        let a = self.alignment.filter(|_| self.preview.is_some() && !self.dirty)?;
+        Some(glam::DMat4::from_rotation_translation(a.r, a.to - a.r * a.pivot))
+    }
+
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
         self.commit(cx)
     }
@@ -621,8 +653,10 @@ mod tests {
             src_pivot: None,
             pressed_at: None,
             preview: None,
+            spare: None,
             alignment: None,
             dirty: true,
+            reach: std::cell::Cell::new(None),
         };
         t.rebuild(DVec3::Y);
         let out = t.preview.as_ref().unwrap();
@@ -705,5 +739,64 @@ mod tests {
         let f = cx.scene.last_tool_frame.clone().unwrap();
         assert_eq!(f.tool, "Align");
         assert!(close(f.pivot.position, dst.position) && f.pivot.frame.angle_between(dst.frame) < 1e-6);
+    }
+
+    #[test]
+    fn previews_are_rewritten_in_place_as_fresh_copies() {
+        let mut m = mm_core::primitives::icosphere(1.0, 3);
+        m.transform(|p| DVec3::new(2.0 * p.x, p.y, 0.5 * p.z) + DVec3::new(1.0, 2.0, 3.0));
+        let source = Arc::new(m);
+        let mut t = AlignTool {
+            object: Some(1),
+            bvh: Arc::new(mm_core::Bvh::build(&source)),
+            source,
+            frame: DQuat::IDENTITY,
+            source_type: SourceType::BasePoint,
+            dest: Destination::WorldOrigin(1),
+            mode: Transformation::TranslateAndRotate,
+            flip: false,
+            picked: None,
+            scribble: Vec::new(),
+            pivots: Vec::new(),
+            src_pivot: None,
+            pressed_at: None,
+            preview: None,
+            spare: None,
+            alignment: None,
+            dirty: true,
+            reach: std::cell::Cell::new(None),
+        };
+        let bits = |p: DVec3| p.to_array().map(f64::to_bits);
+        let picks = [None, Some(Frame { p: DVec3::ZERO, n: DVec3::new(1.0, 0.2, 0.0).normalize() }), Some(Frame { p: DVec3::ONE, n: DVec3::Z })];
+        for (k, picked) in picks.into_iter().enumerate() {
+            for source_type in [SourceType::BasePoint, SourceType::CenterPoint, SourceType::SurfacePoint, SourceType::BasePoint] {
+                for flip in [false, true] {
+                    (t.picked, t.source_type, t.flip) = (picked, source_type, flip);
+                    t.rebuild(DVec3::Y);
+                    let what = format!("pick {k}, {source_type:?}, flip {flip}");
+                    match t.alignment {
+                        Some(a) => {
+                            // As the tool used to build it: a fresh copy, moved.
+                            let mut fresh = (*t.source).clone();
+                            fresh.transform(|p| a.apply(p));
+                            let preview = t.preview.as_ref().unwrap();
+                            assert!(preview.positions().iter().zip(fresh.positions()).all(|(p, q)| bits(*p) == bits(*q)), "{what}");
+                            assert_eq!(preview.topology_version(), t.source.topology_version());
+                            let r = t.preview_transform().unwrap();
+                            assert!(t.source.vertex_ids().all(|v| r.transform_point3(t.source.vertex(v)).distance(preview.vertex(v)) < 1e-9), "{what}");
+                        }
+                        None => assert!(t.preview.is_none() && t.preview_transform().is_none(), "{what}"),
+                    }
+                    if source_type == SourceType::BasePoint {
+                        // The reach along this normal is kept, and what a new scan gives.
+                        let n = picked.map_or(-DVec3::Y, |f| f.n);
+                        let (key, reach) = t.reach.get().unwrap();
+                        assert_eq!(key, n.to_array().map(f64::to_bits));
+                        let c = t.source.bounds().center();
+                        assert_eq!(reach, t.source.vertex_ids().map(|v| (t.source.vertex(v) - c).dot(n)).fold(f64::NEG_INFINITY, f64::max));
+                    }
+                }
+            }
+        }
     }
 }

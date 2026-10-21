@@ -350,7 +350,7 @@ impl Tool for TrimTool {
         self.poll();
         if self.job.is_some() {
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.label("Computing cut…");
             });
         }
@@ -564,6 +564,10 @@ pub struct FlowExtensionTool {
     job: Option<(FlowParams, crate::jobs::Job<FlowOut>)>,
     preview: Option<(FlowParams, FlowOut)>,
     error: Option<String>,
+    /// The settings the last error came from (not built again until they change).
+    failed: Option<FlowParams>,
+    /// Settings changed in the panel, waiting to settle before they are built, and since when.
+    changed: Option<(FlowParams, std::time::Instant)>,
 }
 
 impl FlowExtensionTool {
@@ -578,16 +582,71 @@ impl FlowExtensionTool {
             job: None,
             preview: None,
             error: None,
+            failed: None,
+            changed: None,
+        }
+    }
+
+    /// Whether the current settings have a preview, a build under way or an error.
+    fn up_to_date(&self) -> bool {
+        let p = Some(&self.params);
+        self.preview.as_ref().map(|x| &x.0) == p || self.job.as_ref().map(|x| &x.0) == p || self.failed.as_ref() == p
+    }
+
+    /// Collect a finished build, and build the panel's settings once they have stayed put for
+    /// [`SETTLE`] (a slider drag would otherwise start a whole-mesh build every frame).
+    fn update(&mut self, cx: &mut ToolCx) {
+        self.update_at(std::time::Instant::now(), cx);
+    }
+
+    /// [`Self::update`] at `now`.
+    fn update_at(&mut self, now: std::time::Instant, cx: &mut ToolCx) {
+        if let Some((_, j)) = &self.job {
+            if let Some(r) = j.poll() {
+                let (p, _) = self.job.take().unwrap();
+                match r {
+                    Ok(out) => self.preview = Some((p, out)),
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                        self.failed = Some(p);
+                    }
+                }
+            }
+        }
+        if !self.params.selected.contains(&true) {
+            // Nothing to build: drop the preview at once.
+            self.changed = None;
+            if self.preview.is_some() || self.job.is_some() {
+                self.start(cx);
+            }
+            return;
+        }
+        if self.up_to_date() {
+            self.changed = None;
+            return;
+        }
+        match &self.changed {
+            Some((p, since)) if *p == self.params && now.saturating_duration_since(*since) >= SETTLE => self.start(cx),
+            Some((p, since)) if *p == self.params => cx.egui.request_repaint_after(SETTLE - now.saturating_duration_since(*since)),
+            _ => {
+                self.changed = Some((self.params.clone(), now));
+                cx.egui.request_repaint_after(SETTLE);
+            }
         }
     }
 
     fn start(&mut self, cx: &mut ToolCx) {
+        self.changed = None;
         let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
         let src = o.mesh.clone();
         let source = src.clone();
         let ends: Vec<VesselEnd> = self.ends.iter().zip(&self.params.selected).filter(|(_, s)| **s).map(|(e, _)| e.clone()).collect();
         if ends.is_empty() {
             self.preview = None;
+            // A build for ends no longer chosen would only keep the tool busy.
+            if let Some((_, j)) = self.job.take() {
+                j.cancel();
+            }
             return;
         }
         let p = self.params.clone();
@@ -596,6 +655,7 @@ impl FlowExtensionTool {
             j.cancel();
         }
         self.error = None;
+        self.failed = None;
         self.job = Some((
             p,
             crate::jobs::Job::spawn("Flow extensions", cx.egui.clone(), move |progress| {
@@ -704,21 +764,15 @@ impl Tool for FlowExtensionTool {
         ui.checkbox(&mut self.params.circular, "Blend to circular cross-section");
         ui.checkbox(&mut self.params.cap, "Cap the ends");
         if self.params != before {
-            self.start(cx);
+            // Built once the settings settle (see `update`).
+            self.changed = Some((self.params.clone(), std::time::Instant::now()));
         }
-        if let Some((_, j)) = &self.job {
-            if let Some(r) = j.poll() {
-                let (p, _) = self.job.take().unwrap();
-                match r {
-                    Ok(out) => self.preview = Some((p, out)),
-                    Err(e) => self.error = Some(format!("{e:#}")),
-                }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Building…");
-                });
-            }
+        self.update(cx);
+        if self.job.is_some() || self.changed.is_some() {
+            ui.horizontal(|ui| {
+                polymix_workspace::spinner(ui);
+                ui.label("Building…");
+            });
         }
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(240, 110, 90), e);
@@ -746,7 +800,7 @@ impl Tool for FlowExtensionTool {
     }
 
     fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
-        if self.preview.is_none() || self.job.is_some() {
+        if self.preview.is_none() || self.job.is_some() || self.changed.is_some() {
             draw_end_markers(painter, cx, &self.ends, &self.params.selected);
         }
     }
@@ -762,6 +816,11 @@ impl Tool for FlowExtensionTool {
 
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
         if self.job.is_some() {
+            return false;
+        }
+        if self.changed.is_some() && !self.up_to_date() {
+            // Settings still settling: build them now, and accept once built.
+            self.start(cx);
             return false;
         }
         let Some((p, out)) = self.preview.take() else { return false };
@@ -787,6 +846,11 @@ impl Tool for FlowExtensionTool {
 
     fn busy(&self) -> Option<(String, f32)> {
         self.job.as_ref().map(|(_, j)| ("Flow extensions".to_string(), j.progress()))
+    }
+
+    fn pending(&self) -> bool {
+        // Settling, or chosen ends whose extensions are not built yet.
+        self.job.is_none() && self.params.selected.contains(&true) && !self.up_to_date()
     }
 
     fn settings(&self) -> Option<Value> {
@@ -868,12 +932,53 @@ pub struct CapTool {
     ends: Vec<VesselEnd>,
     remeshed: bool,
     message: Option<String>,
+    /// The panel's Cap All, running in the background (seconds on a large mesh), and the mesh
+    /// it caps a copy of.
+    job: Option<(std::sync::Arc<Mesh>, crate::jobs::Job<Capped>)>,
+}
+
+/// Cap All's result.
+struct Capped {
+    mesh: Mesh,
+    /// The caps' new face groups, in the order they were made (named outlet_N in that order).
+    groups: Vec<i32>,
+    message: String,
+    /// The open ends left.
+    ends: Vec<VesselEnd>,
+}
+
+/// Cap every open boundary of a copy of `src`, one loop at a time so each gets its own plane
+/// fit and group. `progress` gets the fraction of loops done and may return false to stop
+/// (then `None`).
+fn cap_loops(src: &Mesh, remeshed: bool, progress: &dyn Fn(f32) -> bool) -> Option<Capped> {
+    let target = src.average_edge_length();
+    let fill = if remeshed { mm_edit::CutFill::FlatRemeshed { target_edge_length: target } } else { mm_edit::CutFill::Flat };
+    let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(src).into_iter().map(|l| l.vertices).collect();
+    let mut m = src.clone();
+    let mut capped = 0;
+    let mut failed = 0;
+    let mut groups = Vec::new();
+    for (k, lp) in loops.iter().enumerate() {
+        if !progress(k as f32 / loops.len() as f32) {
+            return None;
+        }
+        match mm_edit::cap_planar_loops(&mut m, std::slice::from_ref(lp), None, fill) {
+            Ok(r) if r.failed_loops.is_empty() => {
+                capped += 1;
+                groups.extend(r.groups);
+            }
+            _ => failed += 1,
+        }
+    }
+    let message = format!("Capped {capped} loop(s){}", if failed > 0 { format!(", {failed} could not be capped flat") } else { String::new() });
+    let ends = find_vessel_ends(&m).into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
+    Some(Capped { mesh: m, groups, message, ends })
 }
 
 impl CapTool {
     pub fn new(cx: &mut ToolCx) -> Self {
         let ends = cx.scene.active().map(|o| find_vessel_ends(&o.mesh)).unwrap_or_default().into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
-        Self { object: cx.scene.active, ends, remeshed: true, message: None }
+        Self { object: cx.scene.active, ends, remeshed: true, message: None, job: None }
     }
 }
 
@@ -884,6 +989,7 @@ impl Tool for CapTool {
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Cap open ends");
+        self.poll(cx);
         let Some(id) = self.object.filter(|id| cx.scene.get(*id).is_some()) else {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
@@ -891,8 +997,14 @@ impl Tool for CapTool {
         ui.label(format!("{} open boundary loop(s)", self.ends.len()));
         ui.checkbox(&mut self.remeshed, "Remesh caps to match the surrounding edge length");
         ui.small("Each cap becomes its own named patch (outlet_N). Non-planar holes are better filled with the Inspector's smooth fill.");
-        if ui.add_enabled(!self.ends.is_empty(), egui::Button::new("Cap all")).clicked() {
-            self.cap_all(cx, id);
+        if ui.add_enabled(!self.ends.is_empty() && self.job.is_none(), egui::Button::new("Cap all")).clicked() {
+            self.start(cx, id);
+        }
+        if let Some((_, j)) = &self.job {
+            ui.horizontal(|ui| {
+                polymix_workspace::spinner(ui);
+                ui.add(egui::ProgressBar::new(j.progress()).show_percentage());
+            });
         }
         if let Some(m) = &self.message {
             ui.label(m);
@@ -906,6 +1018,10 @@ impl Tool for CapTool {
 
     fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
         draw_end_markers(painter, cx, &self.ends, &[]);
+    }
+
+    fn busy(&self) -> Option<(String, f32)> {
+        self.job.as_ref().map(|(_, j)| ("Capping".to_string(), j.progress()))
     }
 
     fn settings(&self) -> Option<Value> {
@@ -935,6 +1051,9 @@ impl Tool for CapTool {
         match action {
             "cap_all" => {
                 let id = self.object.filter(|id| cx.scene.get(*id).is_some()).ok_or("no active object")?;
+                if self.job.is_some() {
+                    return Err("Cap all is running: app_wait".into());
+                }
                 if self.ends.is_empty() {
                     return Err("there are no open ends to cap".into());
                 }
@@ -946,37 +1065,48 @@ impl Tool for CapTool {
 }
 
 impl CapTool {
+    /// Cap All now (agents).
     fn cap_all(&mut self, cx: &mut ToolCx, id: ObjectId) -> String {
-        {
-            cx.history.push("Cap open ends", cx.scene);
-            let o = cx.scene.get_mut(id).unwrap();
-            let target = o.mesh.average_edge_length();
-            let fill = if self.remeshed { mm_edit::CutFill::FlatRemeshed { target_edge_length: target } } else { mm_edit::CutFill::Flat };
-            let loops: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&o.mesh).into_iter().map(|l| l.vertices).collect();
-            let mut m = (*o.mesh).clone();
-            let mut capped = 0;
-            let mut failed = 0;
-            let mut groups = Vec::new();
-            // Cap loops one at a time so each gets its own plane fit and group.
-            for lp in &loops {
-                match mm_edit::cap_planar_loops(&mut m, std::slice::from_ref(lp), None, fill) {
-                    Ok(r) if r.failed_loops.is_empty() => {
-                        capped += 1;
-                        groups.extend(r.groups);
-                    }
-                    _ => failed += 1,
-                }
-            }
-            o.set_mesh(m);
-            for g in groups {
-                let n = next_name(&o.group_names, "outlet");
-                o.group_names.insert(g, n);
-            }
-            self.message = Some(format!("Capped {capped} loop(s){}", if failed > 0 { format!(", {failed} could not be capped flat") } else { String::new() }));
-            *cx.status = self.message.clone().unwrap();
-            self.ends = find_vessel_ends(&o.mesh).into_iter().filter(|e| matches!(e.kind, EndKind::Open)).collect();
-        }
+        cx.history.push("Cap open ends", cx.scene);
+        let o = cx.scene.get_mut(id).unwrap();
+        let capped = cap_loops(&o.mesh, self.remeshed, &|_| true).expect("not cancelled");
+        self.apply(o, capped, cx.status);
         self.message.clone().unwrap_or_default()
+    }
+
+    /// The panel's Cap All, in the background.
+    fn start(&mut self, cx: &mut ToolCx, id: ObjectId) {
+        let Some(o) = cx.scene.get(id) else { return };
+        let (source, src) = (o.mesh.clone(), o.mesh.clone());
+        let remeshed = self.remeshed;
+        self.job = Some((source, crate::jobs::Job::spawn("Cap open ends", cx.egui.clone(), move |progress| cap_loops(&src, remeshed, progress).ok_or_else(|| anyhow::anyhow!("cancelled")))));
+    }
+
+    /// Keep a finished Cap All, if the object still holds the mesh it capped.
+    fn poll(&mut self, cx: &mut ToolCx) {
+        let Some(r) = self.job.as_ref().and_then(|(_, j)| j.poll()) else { return };
+        let (source, _) = self.job.take().unwrap();
+        let id = self.object.filter(|id| cx.scene.get(*id).is_some_and(|o| std::sync::Arc::ptr_eq(&o.mesh, &source)));
+        match (r, id) {
+            (Ok(capped), Some(id)) => {
+                cx.history.push("Cap open ends", cx.scene);
+                let o = cx.scene.get_mut(id).unwrap();
+                self.apply(o, capped, cx.status);
+            }
+            (Ok(_), None) => self.message = Some("Nothing was capped: the object changed meanwhile.".into()),
+            (Err(e), _) => self.message = Some(format!("Capping failed: {e:#}")),
+        }
+    }
+
+    fn apply(&mut self, o: &mut crate::scene::SceneObject, c: Capped, status: &mut String) {
+        o.set_mesh(c.mesh);
+        for g in c.groups {
+            let n = next_name(&o.group_names, "outlet");
+            o.group_names.insert(g, n);
+        }
+        self.message = Some(c.message);
+        *status = self.message.clone().unwrap();
+        self.ends = c.ends;
     }
 }
 
@@ -1278,7 +1408,7 @@ impl Tool for BridgeTool {
                 }
             }
             if key.is_some() && !ready && self.error.as_ref().map(|e| e.0) != key {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.weak("Previewing…");
             }
         });
@@ -1315,5 +1445,104 @@ impl Tool for BridgeTool {
     fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
         let sel: Vec<bool> = (0..self.ends.len()).map(|i| self.picked.contains(&i)).collect();
         draw_end_markers(painter, cx, &self.ends, &sel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+    use std::time::{Duration, Instant};
+
+    fn vessel_scene() -> Scene {
+        let mut scene = Scene::default();
+        let path: Vec<DVec3> = (0..30).map(|i| DVec3::new(0.0, (i as f64 * 0.1).sin(), i as f64 * 0.5)).collect();
+        scene.add("vessel", primitives::tube_along(&path, &[1.0; 30], 32));
+        scene
+    }
+
+    #[test]
+    fn flow_extensions_build_a_slider_drag_once_it_settles() {
+        let mut scene = vessel_scene();
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        assert_eq!(tool.ends.len(), 2);
+        // Tick an end and drag the length, a frame every 10 ms: no build starts meanwhile. (The
+        // test sets the clock, so a slow machine cannot make the drag look settled.)
+        let start = Instant::now();
+        tool.params.selected[0] = true;
+        for k in 0..20 {
+            tool.params.diameters = 2.0 + 0.1 * k as f64;
+            tool.update_at(start + Duration::from_millis(10 * k), &mut cx);
+            assert!(tool.job.is_none(), "frame {k}");
+            assert!(tool.pending());
+        }
+        let last = start + Duration::from_millis(10 * 19);
+        tool.update_at(last + SETTLE - Duration::from_millis(1), &mut cx);
+        assert!(tool.job.is_none() && tool.pending());
+        // It settles: one build, of the last value, and the preview.
+        let t0 = Instant::now();
+        let mut builds = 0;
+        while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && t0.elapsed() < Duration::from_secs(30) {
+            let had = tool.job.is_some();
+            tool.update_at(last + SETTLE + t0.elapsed(), &mut cx);
+            builds += (!had && tool.job.is_some()) as usize;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(builds, 1);
+        assert!(!tool.pending() && tool.busy().is_none());
+        assert!(tool.preview().is_some(), "{:?}", tool.error);
+        // Marker clicks and agents still build at once; no end chosen drops the build.
+        tool.params.selected[1] = true;
+        tool.start(&mut cx);
+        assert!(tool.job.is_some());
+        tool.params.selected = vec![false; 2];
+        tool.update(&mut cx);
+        assert!(tool.job.is_none() && tool.preview.is_none() && !tool.pending());
+    }
+
+    #[test]
+    fn cap_all_in_the_background_caps_as_the_agents_do() {
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let (mut camera, mut status) = (crate::camera::Camera::default(), String::new());
+        // At once, as the agents' cap_all does it.
+        let (mut direct, mut history) = (vessel_scene(), crate::scene::History::default());
+        let mut cx = ToolCx { scene: &mut direct, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = CapTool::new(&mut cx);
+        let id = cx.scene.active.unwrap();
+        let reply = tool.act("cap_all", &json!({}), &mut cx).unwrap();
+        let direct_ends = tool.ends.len();
+        // In the background, as the panel's button does it.
+        let (mut scene, mut history2, mut status2) = (vessel_scene(), crate::scene::History::default(), String::new());
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history2, camera: &mut camera, status: &mut status2, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = CapTool::new(&mut cx);
+        let id2 = cx.scene.active.unwrap();
+        tool.start(&mut cx, id2);
+        assert!(tool.busy().is_some());
+        let t0 = Instant::now();
+        while tool.job.is_some() && t0.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+            tool.poll(&mut cx);
+        }
+        assert_eq!(tool.message.as_deref(), Some(reply.as_str()));
+        assert_eq!(*cx.status, reply);
+        assert_eq!(tool.ends.len(), direct_ends);
+        let (a, b) = (direct.get(id).unwrap(), cx.scene.get(id2).unwrap());
+        assert_eq!(a.mesh.to_arrays().1, b.mesh.to_arrays().1);
+        assert_eq!(a.mesh.to_arrays().2, b.mesh.to_arrays().2);
+        assert_eq!(a.group_names, b.group_names);
+        assert!(cx.history.can_undo());
+        // A mesh changed meanwhile is not overwritten.
+        tool.start(&mut cx, id2);
+        cx.scene.get_mut(id2).unwrap().set_mesh(primitives::icosphere(1.0, 1));
+        while tool.job.is_some() {
+            std::thread::sleep(Duration::from_millis(5));
+            tool.poll(&mut cx);
+        }
+        assert_eq!(cx.scene.get(id2).unwrap().mesh.triangle_count(), primitives::icosphere(1.0, 1).triangle_count());
     }
 }

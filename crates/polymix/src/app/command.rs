@@ -330,14 +330,32 @@ impl MeshWorkspace {
                 self.status = format!("Sent {name} to the Segmentation tab");
                 Ok(self.status.clone())
             }
-            C::SeparateShells | C::CombineVisible | C::GenerateComplex | C::SplitComplex | C::Duplicate | C::Delete(_) | C::ClearScene | C::AddShape(_) => {
+            C::GenerateComplex => {
+                if !self.accept_tools(0, ctx, vp) {
+                    return Err("Wait for the open tool to finish computing (or cancel it).".into());
+                }
+                // The booleans take seconds on large inputs: a tool computes them in the
+                // background and adds the complex when they are done.
+                match commands::complex_inputs(&self.scene) {
+                    Ok(inputs) => {
+                        let n = inputs.len();
+                        self.tools.push(Box::new(crate::tools::complex::GenerateComplexTool::new(inputs, ctx)));
+                        self.status = format!("Generate Complex: computing the cells of {n} objects…");
+                        Ok("Generate Complex is computing the cells; app_wait, then the complex is the active object (named Complex)".into())
+                    }
+                    Err(e) => {
+                        self.status = e;
+                        Err(self.status.clone())
+                    }
+                }
+            }
+            C::SeparateShells | C::CombineVisible | C::SplitComplex | C::Duplicate | C::Delete(_) | C::ClearScene | C::AddShape(_) => {
                 if !self.accept_tools(0, ctx, vp) {
                     return Err("Wait for the open tool to finish computing (or cancel it).".into());
                 }
                 match cmd {
                     C::SeparateShells => commands::separate_shells(&mut self.cmd_cx()),
                     C::CombineVisible => commands::combine_visible(&mut self.cmd_cx()),
-                    C::GenerateComplex => commands::generate_complex(&mut self.cmd_cx()),
                     C::SplitComplex => commands::split_complex(&mut self.cmd_cx()),
                     C::Duplicate => commands::duplicate_object(&mut self.cmd_cx()),
                     C::Delete(id) => {

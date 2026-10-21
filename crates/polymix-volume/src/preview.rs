@@ -196,7 +196,7 @@ impl Preview {
             r.on_hover_text("Left drag or wheel: slices · Right drag: pan · Middle drag: zoom · Left + right drag: window / level · Double-click: reset");
         } else if self.job.is_some() {
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.weak("Loading…");
             });
         }
@@ -222,7 +222,7 @@ impl Preview {
                     }
                 }
                 if self.job.is_some() {
-                    ui.spinner();
+                    polymix_workspace::spinner(ui);
                 }
             });
         }

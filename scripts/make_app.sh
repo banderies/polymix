@@ -1,13 +1,14 @@
 #!/bin/sh
-# Build a release binary and wrap it in a double-clickable macOS app bundle:
+# Build an optimised binary (the dist profile: release with the workspace's library crates in
+# one codegen unit each, see Cargo.toml) and wrap it in a double-clickable macOS app bundle:
 #   scripts/make_app.sh            -> dist/Polymix.app
 set -e
 cd "$(dirname "$0")/.."
-cargo build -p polymix --release
+cargo build -p polymix --profile dist
 APP=dist/Polymix.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/polymix "$APP/Contents/MacOS/polymix"
+cp "${CARGO_TARGET_DIR:-target}/dist/polymix" "$APP/Contents/MacOS/polymix"
 # App icon from assets/icon_1024.png (regenerate with: cargo run -p polymix --example gen_icon -- assets/icon_1024.png)
 if [ -f assets/icon_1024.png ] && command -v iconutil >/dev/null; then
   ICONSET=$(mktemp -d)/Polymix.iconset

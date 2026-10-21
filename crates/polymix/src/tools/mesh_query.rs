@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::ui_util;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,8 +64,8 @@ pub struct MeshQueryTool {
     range: (f64, f64),
     /// Per-triangle values of the current scalar mode.
     values: Vec<f64>,
-    /// Per-vertex curvatures (computed on demand).
-    curvature: Option<(Vec<f64>, Vec<f64>)>,
+    /// Per-vertex curvatures (computed on demand), Gaussian and mean.
+    curvature: Option<Arc<(Vec<f64>, Vec<f64>)>>,
     query: Option<Query>,
     dirty: bool,
     /// The scalar field's distribution and its worst triangles (agents).
@@ -86,13 +87,31 @@ fn pack(c: [f64; 3]) -> u32 {
     (b(c[0]) << 16) | (b(c[1]) << 8) | b(c[2])
 }
 
+/// Triangle slots coloured by one parallel task.
+const CHUNK: usize = 1 << 14;
+
+/// The values that would stand at `ranks` (ascending) were `v` sorted by `total_cmp`, found
+/// by selection rather than a full sort. `v` is reordered.
+fn ranked(v: &mut [f64], ranks: &[usize]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(ranks.len());
+    let mut lo = 0;
+    for &k in ranks {
+        // Selecting rank `lo` left the `lo` smallest values in front of it, so rank `k` is
+        // rank `k - lo` of the rest.
+        let (_, x, _) = v[lo..].select_nth_unstable_by(k - lo, f64::total_cmp);
+        out.push(*x);
+        lo = k;
+    }
+    out
+}
+
 impl MeshQueryTool {
     pub fn new(cx: &mut ToolCx) -> Self {
         Self { object: cx.scene.active, mode: ColorMode::SurfaceNormal, range: (0.0, 1.0), values: Vec::new(), curvature: None, query: None, dirty: true, summary: None }
     }
 
-    fn curvatures(&mut self, m: &Mesh) -> &(Vec<f64>, Vec<f64>) {
-        self.curvature.get_or_insert_with(|| (mm_core::measure::gaussian_curvature(m), mm_core::measure::mean_curvature(m)))
+    fn curvatures(&mut self, m: &Mesh) -> Arc<(Vec<f64>, Vec<f64>)> {
+        self.curvature.get_or_insert_with(|| Arc::new((mm_core::measure::gaussian_curvature(m), mm_core::measure::mean_curvature(m)))).clone()
     }
 
     /// Recompute the per-triangle values and, for scalar modes, an automatic range (2nd to
@@ -107,24 +126,31 @@ impl MeshQueryTool {
                 self.values[t as usize] = mm_core::measure::triangle_angles(m, t).iter().fold(f64::INFINITY, |a, &b| a.min(b)).to_degrees()
             }),
             ColorMode::GaussianCurvature => {
-                let (k, _) = self.curvatures(m).clone();
-                tris.iter().for_each(|&t| self.values[t as usize] = per_vertex(&k, t));
+                let c = self.curvatures(m);
+                tris.iter().for_each(|&t| self.values[t as usize] = per_vertex(&c.0, t));
             }
             ColorMode::MeanCurvature => {
-                let (_, h) = self.curvatures(m).clone();
-                tris.iter().for_each(|&t| self.values[t as usize] = per_vertex(&h, t));
+                let c = self.curvatures(m);
+                tris.iter().for_each(|&t| self.values[t as usize] = per_vertex(&c.1, t));
             }
             _ => {
                 self.summary = None;
                 return;
             }
         }
-        let mut sorted: Vec<f64> = tris.iter().map(|&t| self.values[t as usize]).filter(|x| x.is_finite()).collect();
-        sorted.sort_by(f64::total_cmp);
-        self.summary = (!sorted.is_empty()).then(|| {
+        // The quantiles below and the automatic range, as they stand in the sorted values.
+        let mut finite: Vec<f64> = tris.iter().map(|&t| self.values[t as usize]).filter(|x| x.is_finite()).collect();
+        let n = finite.len();
+        let q_rank = |f: f64| ((n.max(1) - 1) as f64 * f) as usize;
+        let range_ranks = (n * 2 / 100, (n * 98 / 100).min(n.max(1) - 1));
+        let mut ranks = vec![q_rank(0.0), q_rank(0.02), q_rank(0.5), q_rank(0.98), q_rank(1.0), range_ranks.0, range_ranks.1];
+        ranks.sort_unstable();
+        ranks.dedup();
+        let at_rank = if n > 0 { ranked(&mut finite, &ranks) } else { Vec::new() };
+        let sorted = |k: usize| at_rank[ranks.binary_search(&k).unwrap_or(0)];
+        self.summary = (n > 0).then(|| {
             use polymix_workspace::agent::{round, vec3};
-            let n = sorted.len();
-            let q = |f: f64| round(sorted[((n - 1) as f64 * f) as usize], 6);
+            let q = |f: f64| round(sorted(q_rank(f)), 6);
             // Worst: the most elongated (aspect ratio), the sharpest (internal angle), the
             // most curved (either sign).
             let badness = |t: u32| match self.mode {
@@ -145,34 +171,43 @@ impl MeshQueryTool {
                 "worst": worst.iter().map(|&t| serde_json::json!({"triangle": t, "value": round(self.values[t as usize], 6), "centre_mm": vec3(m.tri_centroid(t).to_array(), 3)})).collect::<Vec<_>>(),
             })
         });
-        if let (Some(_), n) = (sorted.first(), sorted.len()) {
-            self.range = (sorted[n * 2 / 100], sorted[(n * 98 / 100).min(n - 1)]);
+        if n > 0 {
+            self.range = (sorted(range_ranks.0), sorted(range_ranks.1));
             if self.range.1 <= self.range.0 {
                 self.range.1 = self.range.0 + 1e-9;
             }
         }
     }
 
+    /// Per-triangle colours of the current mode. The triangle slots are independent of each
+    /// other, so they are filled in parallel.
     fn colors(&self, m: &Mesh) -> Vec<u32> {
-        let b = m.bounds();
-        let ext = b.extents().max(DVec3::splat(1e-300));
+        let (mode, (lo, hi), values) = (self.mode, self.range, &self.values);
+        // Only Vertex Position needs the box.
+        let frame = (mode == ColorMode::VertexPosition).then(|| {
+            let b = m.bounds();
+            (b.min, b.extents().max(DVec3::splat(1e-300)))
+        });
+        let colour = |t: u32| match (mode, frame) {
+            (ColorMode::VertexPosition, Some((min, ext))) => {
+                let c = (m.tri_centroid(t) - min) / ext;
+                pack([c.x, c.y, c.z])
+            }
+            (ColorMode::SurfaceNormal, _) => {
+                let n = m.tri_normal(t) * 0.5 + DVec3::splat(0.5);
+                pack([n.x, n.y, n.z])
+            }
+            _ => pack(heat((values[t as usize] - lo) / (hi - lo))),
+        };
         let mut out = vec![0u32; m.max_tid()];
-        for t in m.triangle_ids() {
-            out[t as usize] = match self.mode {
-                ColorMode::VertexPosition => {
-                    let c = (m.tri_centroid(t) - b.min) / ext;
-                    pack([c.x, c.y, c.z])
+        out.par_chunks_mut(CHUNK).enumerate().for_each(|(k, chunk)| {
+            for (i, out) in chunk.iter_mut().enumerate() {
+                let t = (k * CHUNK + i) as u32;
+                if m.is_triangle(t) {
+                    *out = colour(t);
                 }
-                ColorMode::SurfaceNormal => {
-                    let n = m.tri_normal(t) * 0.5 + DVec3::splat(0.5);
-                    pack([n.x, n.y, n.z])
-                }
-                _ => {
-                    let (lo, hi) = self.range;
-                    pack(heat((self.values[t as usize] - lo) / (hi - lo)))
-                }
-            };
-        }
+            }
+        });
         out
     }
 
@@ -385,7 +420,8 @@ impl MeshQueryTool {
             (pa + ab * s).distance(hit.point)
         };
         let edge = m.tri_edges(t).into_iter().min_by(|&a, &b| seg(a).total_cmp(&seg(b))).unwrap_or(0);
-        let (k, h) = self.curvatures(m).clone();
+        let c = self.curvatures(m);
+        let (k, h) = (&c.0, &c.1);
         self.query = Some(Query {
             tri: t,
             group: m.tri_group(t),
@@ -418,5 +454,82 @@ mod tests {
         let rgb = c[tx as usize];
         assert!((rgb >> 16) & 0xff > 240 && (rgb >> 8) & 0xff < 160);
         assert_eq!(pack(heat(0.0)), pack([0.15, 0.25, 0.85]));
+    }
+
+    /// The colouring as it was: one triangle after another, the box always measured.
+    fn colors_serial(t: &MeshQueryTool, m: &Mesh) -> Vec<u32> {
+        let b = m.bounds();
+        let ext = b.extents().max(DVec3::splat(1e-300));
+        let mut out = vec![0u32; m.max_tid()];
+        for x in m.triangle_ids() {
+            out[x as usize] = match t.mode {
+                ColorMode::VertexPosition => {
+                    let c = (m.tri_centroid(x) - b.min) / ext;
+                    pack([c.x, c.y, c.z])
+                }
+                ColorMode::SurfaceNormal => {
+                    let n = m.tri_normal(x) * 0.5 + DVec3::splat(0.5);
+                    pack([n.x, n.y, n.z])
+                }
+                _ => {
+                    let (lo, hi) = t.range;
+                    pack(heat((t.values[x as usize] - lo) / (hi - lo)))
+                }
+            };
+        }
+        out
+    }
+
+    #[test]
+    fn colours_and_quantiles_match_the_serial_sorted_ones() {
+        // A bumpy sphere with a hole (dead triangle slots).
+        let mut m = mm_core::primitives::icosphere(2.0, 4);
+        m.transform(|p| p * (1.0 + 0.1 * (p.x * 3.0).sin() * (p.y * 2.0).cos()));
+        let gone: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 1.6).collect();
+        m.remove_triangles(gone);
+        let mut t = MeshQueryTool { object: None, mode: ColorMode::SurfaceNormal, range: (0.0, 1.0), values: Vec::new(), curvature: None, query: None, dirty: true, summary: None };
+        for mode in ColorMode::ALL {
+            t.mode = mode;
+            t.compute_values(&m);
+            assert_eq!(t.colors(&m), colors_serial(&t, &m), "{mode:?}");
+            if mode.is_scalar() {
+                // The automatic range and the summary's quantiles, from a full sort.
+                let mut sorted: Vec<f64> = m.triangle_ids().map(|x| t.values[x as usize]).filter(|x| x.is_finite()).collect();
+                sorted.sort_by(f64::total_cmp);
+                let n = sorted.len();
+                let mut range = (sorted[n * 2 / 100], sorted[(n * 98 / 100).min(n - 1)]);
+                if range.1 <= range.0 {
+                    range.1 = range.0 + 1e-9;
+                }
+                assert_eq!(t.range, range, "{mode:?}");
+                let q = |f: f64| serde_json::json!(polymix_workspace::agent::round(sorted[((n - 1) as f64 * f) as usize], 6));
+                let s = t.summary.as_ref().unwrap();
+                assert_eq!([&s["min"], &s["p2"], &s["median"], &s["p98"], &s["max"]], [&q(0.0), &q(0.02), &q(0.5), &q(0.98), &q(1.0)], "{mode:?}");
+                // Another range from the panel recolours the same way.
+                t.range = (range.0 * 0.5, range.1 * 1.5 + 0.1);
+                assert_eq!(t.colors(&m), colors_serial(&t, &m), "{mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_ranks_are_the_sorted_ones() {
+        let mut seed = 7u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as f64 / (1u64 << 31) as f64
+        };
+        for n in [1usize, 2, 3, 7, 50, 101, 1000] {
+            // Many repeats, both zeros and negative values.
+            let v: Vec<f64> = (0..n).map(|i| match i % 5 { 0 => 0.0, 1 => -0.0, 2 => (rnd() * 4.0).floor() - 2.0, _ => rnd() - 0.5 }).collect();
+            let mut sorted = v.clone();
+            sorted.sort_by(f64::total_cmp);
+            let mut ranks = vec![0, n / 50, n / 2, n * 98 / 100, n - 1, (n * 2 / 100).min(n - 1)];
+            ranks.sort_unstable();
+            ranks.dedup();
+            let got = ranked(&mut v.clone(), &ranks);
+            let want: Vec<f64> = ranks.iter().map(|&k| sorted[k]).collect();
+            assert_eq!(got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "{n}");
+        }
     }
 }

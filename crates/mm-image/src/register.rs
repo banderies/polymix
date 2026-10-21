@@ -95,19 +95,20 @@ pub struct Registration {
     pub iterations: Vec<usize>,
 }
 
-/// One pyramid level of an image: values with world → voxel and voxel → world maps.
-struct Level {
+/// One pyramid level of an image: values (the image's own at full size) with world → voxel
+/// and voxel → world maps.
+struct Level<'a> {
     dims: [usize; 3],
-    values: Vec<f32>,
+    values: std::borrow::Cow<'a, [f32]>,
     to_voxel: DMat4,
     to_world: DMat4,
 }
 
-impl Level {
-    fn new(vol: &LoadedVolume, f: usize, progress: Progress) -> Result<Self> {
+impl<'a> Level<'a> {
+    fn new(vol: &'a LoadedVolume, f: usize, progress: Progress) -> Result<Self> {
         let g = &vol.geometry;
         if f <= 1 {
-            return Ok(Self { dims: vol.dims, values: vol.values.clone(), to_voxel: g.matrix().inverse(), to_world: g.matrix() });
+            return Ok(Self { dims: vol.dims, values: std::borrow::Cow::Borrowed(&vol.values), to_voxel: g.matrix().inverse(), to_world: g.matrix() });
         }
         let d = vol.dims.map(|n| n.div_ceil(f));
         let mut values = vec![0.0f32; d[0] * d[1] * d[2]];
@@ -131,7 +132,7 @@ impl Level {
         // Level voxel v is the centre of block v: original index f·v + (f − 1)/2.
         let half = (f as f64 - 1.0) * 0.5;
         let to_world = g.matrix() * DMat4::from_translation(DVec3::splat(half)) * DMat4::from_scale(DVec3::splat(f as f64));
-        Ok(Self { dims: d, values, to_voxel: to_world.inverse(), to_world })
+        Ok(Self { dims: d, values: std::borrow::Cow::Owned(values), to_voxel: to_world.inverse(), to_world })
     }
 
     /// Trilinear value at continuous voxel coordinates; `None` outside the grid.
@@ -172,28 +173,78 @@ impl Rng {
     }
 }
 
-/// Voxels above half of Otsu's threshold (all voxels when that finds nothing).
-fn foreground(values: &[f32]) -> Vec<usize> {
+/// Half of Otsu's threshold, the foreground's lower bound (`None`: the image has no classes).
+fn foreground_threshold(values: &[f32]) -> Option<f32> {
     let step = (values.len() / 1_000_000).max(1);
     let sample: Vec<f32> = values.iter().step_by(step).copied().collect();
-    let t = mm_segment::ops::otsu(&sample).map(|t| t * 0.5);
-    let fg: Vec<usize> = match t {
-        Some(t) => (0..values.len()).filter(|&n| values[n] > t).collect(),
-        None => Vec::new(),
-    };
-    if fg.len() < 16 { (0..values.len()).collect() } else { fg }
+    mm_segment::ops::otsu(&sample).map(|t| t * 0.5)
 }
 
-/// Intensity-weighted centre of the foreground, in world coordinates.
+/// Whether the voxels above `t` are too few to count as a foreground (then every voxel is).
+fn too_few(values: &[f32], t: Option<f32>) -> bool {
+    t.is_none_or(|t| values.par_iter().filter(|&&x| x > t).count() < 16)
+}
+
+/// Voxel indices in increasing order: those above half of Otsu's threshold, or every voxel
+/// when that finds fewer than 16.
+enum Foreground {
+    All(usize),
+    /// Indices of an image under 2³² voxels (half the memory of `usize`).
+    Some32(Vec<u32>),
+    Some(Vec<usize>),
+}
+
+impl Foreground {
+    fn of(values: &[f32]) -> Self {
+        let t = foreground_threshold(values);
+        match t {
+            _ if too_few(values, t) => Foreground::All(values.len()),
+            Some(t) if values.len() <= u32::MAX as usize => Foreground::Some32((0..values.len() as u32).into_par_iter().filter(|&n| values[n as usize] > t).collect()),
+            Some(t) => Foreground::Some((0..values.len()).into_par_iter().filter(|&n| values[n] > t).collect()),
+            None => Foreground::All(values.len()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Foreground::All(n) => *n,
+            Foreground::Some32(v) => v.len(),
+            Foreground::Some(v) => v.len(),
+        }
+    }
+
+    /// The `i`-th index.
+    fn get(&self, i: usize) -> usize {
+        match self {
+            Foreground::All(_) => i,
+            Foreground::Some32(v) => v[i] as usize,
+            Foreground::Some(v) => v[i],
+        }
+    }
+}
+
+/// Intensity-weighted centre of the foreground, in world coordinates (summed in voxel order).
 fn centre_of_mass(vol: &LoadedVolume) -> DVec3 {
-    let fg = foreground(&vol.values);
+    let t = foreground_threshold(&vol.values);
+    let t = if too_few(&vol.values, t) { None } else { t };
     let (mut sum, mut w) = (DVec3::ZERO, 0.0f64);
-    let plane = vol.dims[0] * vol.dims[1];
-    for &n in &fg {
-        let x = vol.values[n].max(0.0) as f64;
-        let ijk = DVec3::new((n % vol.dims[0]) as f64, ((n / vol.dims[0]) % vol.dims[1]) as f64, (n / plane) as f64);
-        sum += ijk * x;
-        w += x;
+    // Voxel (i, j, k) of value index n, counted along.
+    let [mut i, mut j, mut k] = [0usize; 3];
+    for &v in vol.values.iter() {
+        if t.is_none_or(|t| v > t) {
+            let x = v.max(0.0) as f64;
+            sum += DVec3::new(i as f64, j as f64, k as f64) * x;
+            w += x;
+        }
+        i += 1;
+        if i == vol.dims[0] {
+            i = 0;
+            j += 1;
+            if j == vol.dims[1] {
+                j = 0;
+                k += 1;
+            }
+        }
     }
     let ijk = if w > 0.0 { sum / w } else { DVec3::new(vol.dims[0] as f64 - 1.0, vol.dims[1] as f64 - 1.0, vol.dims[2] as f64 - 1.0) * 0.5 };
     vol.geometry.world(ijk)
@@ -219,12 +270,38 @@ struct Problem<'a> {
     fixed: Vec<f32>,
     /// Fixed histogram bin of each point (mutual information).
     fixed_bin: Vec<u16>,
-    moving: &'a Level,
+    moving: &'a Level<'a>,
     moving_range: (f32, f32),
     metric: Metric,
 }
 
+/// Points per chunk of a score's sums: each chunk is summed in order, then the chunks in
+/// order, so a score does not depend on how the work was shared out.
+const SCORE_CHUNK: usize = 1024;
+
 impl Problem<'_> {
+    /// Per chunk of points, `add` folded over its points (from `zero`), then those added up in
+    /// chunk order with `merge`.
+    fn chunked<T: Send>(&self, zero: impl Fn() -> T + Sync, add: impl Fn(&mut T, &DVec3, usize) + Sync, merge: impl Fn(&mut T, T)) -> T {
+        let parts: Vec<T> = self
+            .points
+            .par_chunks(SCORE_CHUNK)
+            .enumerate()
+            .map(|(c, chunk)| {
+                let mut a = zero();
+                for (n, p) in chunk.iter().enumerate() {
+                    add(&mut a, p, c * SCORE_CHUNK + n);
+                }
+                a
+            })
+            .collect();
+        let mut total = zero();
+        for part in parts {
+            merge(&mut total, part);
+        }
+        total
+    }
+
     /// Score of `t` (fixed world → moving world); very low when the images barely overlap.
     fn score(&self, t: &DMat4) -> f64 {
         let to_vox = self.moving.to_voxel * *t;
@@ -232,27 +309,21 @@ impl Problem<'_> {
         let min_overlap = (n / 4).max(8);
         match self.metric {
             Metric::Correlation => {
-                let s = self
-                    .points
-                    .par_iter()
-                    .zip(&self.fixed)
-                    .with_min_len(1024)
-                    .fold(
-                        || [0.0f64; 6],
-                        |mut a, (p, &f)| {
-                            if let Some(m) = self.moving.linear((to_vox * p.extend(1.0)).truncate()) {
-                                let (f, m) = (f as f64, m as f64);
-                                a[0] += 1.0;
-                                a[1] += f;
-                                a[2] += m;
-                                a[3] += f * f;
-                                a[4] += m * m;
-                                a[5] += f * m;
-                            }
-                            a
-                        },
-                    )
-                    .reduce(|| [0.0; 6], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4], a[5] + b[5]]);
+                let s = self.chunked(
+                    || [0.0f64; 6],
+                    |a, p, q| {
+                        if let Some(m) = self.moving.linear((to_vox * p.extend(1.0)).truncate()) {
+                            let (f, m) = (self.fixed[q] as f64, m as f64);
+                            a[0] += 1.0;
+                            a[1] += f;
+                            a[2] += m;
+                            a[3] += f * f;
+                            a[4] += m * m;
+                            a[5] += f * m;
+                        }
+                    },
+                    |a, b| a.iter_mut().zip(b).for_each(|(x, y)| *x += y),
+                );
                 if (s[0] as usize) < min_overlap {
                     return -1e9;
                 }
@@ -266,28 +337,20 @@ impl Problem<'_> {
             Metric::MutualInformation => {
                 let (lo, hi) = self.moving_range;
                 let scale = (BINS - 1) as f32 / (hi - lo);
-                let joint = self
-                    .points
-                    .par_iter()
-                    .zip(&self.fixed_bin)
-                    .with_min_len(1024)
-                    .fold(
-                        || vec![0.0f64; BINS * BINS],
-                        |mut h, (p, &fb)| {
-                            if let Some(m) = self.moving.linear((to_vox * p.extend(1.0)).truncate()) {
-                                let c = ((m - lo) * scale).clamp(0.0, (BINS - 1) as f32);
-                                let b = (c.floor() as usize).min(BINS - 2);
-                                let w = (c - b as f32) as f64;
-                                h[fb as usize * BINS + b] += 1.0 - w;
-                                h[fb as usize * BINS + b + 1] += w;
-                            }
-                            h
-                        },
-                    )
-                    .reduce(|| vec![0.0f64; BINS * BINS], |mut a, b| {
-                        a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
-                        a
-                    });
+                let joint = self.chunked(
+                    || vec![0.0f64; BINS * BINS],
+                    |h, p, q| {
+                        if let Some(m) = self.moving.linear((to_vox * p.extend(1.0)).truncate()) {
+                            let fb = self.fixed_bin[q] as usize;
+                            let c = ((m - lo) * scale).clamp(0.0, (BINS - 1) as f32);
+                            let b = (c.floor() as usize).min(BINS - 2);
+                            let w = (c - b as f32) as f64;
+                            h[fb * BINS + b] += 1.0 - w;
+                            h[fb * BINS + b + 1] += w;
+                        }
+                    },
+                    |a, b| a.iter_mut().zip(b).for_each(|(x, y)| *x += y),
+                );
                 let total: f64 = joint.iter().sum();
                 if (total as usize) < min_overlap {
                     return -1e9;
@@ -356,13 +419,13 @@ pub fn register(fixed: &LoadedVolume, moving: &LoadedVolume, p: &RegisterParams,
         let ml = Level::new(moving, f, &lp(0.1))?;
         check(progress, (level as f32 + 0.1) / levels as f32)?;
         // Sample points: random foreground voxels of the fixed level, jittered inside the voxel.
-        let fg = foreground(&fl.values);
+        let fg = Foreground::of(&fl.values);
         let count = p.samples.max(100).min(fg.len() * 4);
         let plane = fl.dims[0] * fl.dims[1];
         let mut points = Vec::with_capacity(count);
         let mut fixed_values = Vec::with_capacity(count);
         for _ in 0..count {
-            let n = fg[(seed.next() % fg.len() as u64) as usize];
+            let n = fg.get((seed.next() % fg.len() as u64) as usize);
             let ijk = DVec3::new((n % fl.dims[0]) as f64, ((n / fl.dims[0]) % fl.dims[1]) as f64, (n / plane) as f64);
             let jitter = DVec3::new(seed.unit() - 0.5, seed.unit() - 0.5, seed.unit() - 0.5) * 0.8;
             let v = (ijk + jitter).clamp(DVec3::ZERO, DVec3::new(fl.dims[0] as f64 - 1.0, fl.dims[1] as f64 - 1.0, fl.dims[2] as f64 - 1.0));
@@ -399,7 +462,9 @@ pub fn register(fixed: &LoadedVolume, moving: &LoadedVolume, p: &RegisterParams,
         while it < p.iterations && step > min_step {
             it += 1;
             // Gradient with respect to the scaled parameters.
+            // Its 2·np scores at once (each is the same however the work is shared).
             let grad: Vec<f64> = (0..np)
+                .into_par_iter()
                 .map(|k| {
                     let mut a = x.clone();
                     let mut b = x.clone();
@@ -592,6 +657,53 @@ mod tests {
         let (e_rigid, e_affine) = (error_mm(g * rigid_only.transform.matrix), error_mm(g * r.transform.matrix));
         eprintln!("affine: rigid {e_rigid:.3} mm, affine {e_affine:.3} mm, iterations {:?}", r.iterations);
         assert!(e_affine < 1.0 && e_affine < e_rigid / 3.0, "rigid {e_rigid:.3}, affine {e_affine:.3}");
+    }
+
+    #[test]
+    fn the_result_does_not_depend_on_the_threads() {
+        let fixed = image([40, 44, 36], 3.0, DVec3::new(-58.0, -64.0, -52.0), |p| phantom(p, T1));
+        let moving = image([40, 44, 36], 3.0, DVec3::new(-58.0, -64.0, -52.0), |q| phantom(rigid(5.0, DVec3::new(0.2, 0.3, 1.0), DVec3::new(4.0, -3.0, 2.0)).transform_point3(q), [700.0, 200.0, 450.0, 950.0]));
+        for metric in [Metric::MutualInformation, Metric::Correlation] {
+            let p = RegisterParams { metric, iterations: 30, ..Default::default() };
+            let many = register(&fixed, &moving, &p, no_progress()).unwrap();
+            let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| register(&fixed, &moving, &p, no_progress()).unwrap());
+            assert_eq!(many, one, "{metric:?}");
+        }
+    }
+
+    #[test]
+    fn foreground_and_centre_match_the_plain_computation() {
+        // As they were: the foreground's indices collected, then summed over in order.
+        let reference_foreground = |values: &[f32]| -> Vec<usize> {
+            let step = (values.len() / 1_000_000).max(1);
+            let sample: Vec<f32> = values.iter().step_by(step).copied().collect();
+            let fg: Vec<usize> = match mm_segment::ops::otsu(&sample).map(|t| t * 0.5) {
+                Some(t) => (0..values.len()).filter(|&n| values[n] > t).collect(),
+                None => Vec::new(),
+            };
+            if fg.len() < 16 { (0..values.len()).collect() } else { fg }
+        };
+        let reference_centre = |vol: &LoadedVolume| -> DVec3 {
+            let (mut sum, mut w) = (DVec3::ZERO, 0.0f64);
+            let plane = vol.dims[0] * vol.dims[1];
+            for n in reference_foreground(&vol.values) {
+                let x = vol.values[n].max(0.0) as f64;
+                sum += DVec3::new((n % vol.dims[0]) as f64, ((n / vol.dims[0]) % vol.dims[1]) as f64, (n / plane) as f64) * x;
+                w += x;
+            }
+            vol.geometry.world(if w > 0.0 { sum / w } else { DVec3::new(vol.dims[0] as f64 - 1.0, vol.dims[1] as f64 - 1.0, vol.dims[2] as f64 - 1.0) * 0.5 })
+        };
+        let head = image([30, 34, 26], 4.0, DVec3::new(-60.0, -66.0, -50.0), |p| phantom(p, T1));
+        let flat = LoadedVolume::from_values("f", [8, 7, 6], vec![3.0; 336], grid_of(&head));
+        let mut speck = vec![0.0f32; 8 * 7 * 6];
+        speck[100] = 50.0;
+        let speck = LoadedVolume::from_values("s", [8, 7, 6], speck, grid_of(&head));
+        for vol in [&head, &flat, &speck] {
+            let fg = Foreground::of(&vol.values);
+            assert_eq!((0..fg.len()).map(|i| fg.get(i)).collect::<Vec<_>>(), reference_foreground(&vol.values));
+            let (a, b) = (centre_of_mass(vol), reference_centre(vol));
+            assert_eq!(a.to_array().map(f64::to_bits), b.to_array().map(f64::to_bits));
+        }
     }
 
     #[test]

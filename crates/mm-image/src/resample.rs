@@ -195,6 +195,129 @@ fn fill(src: &LoadedVolume, dims: [usize; 3], to_src: DMat4, interp: Interpolati
     Ok(out)
 }
 
+/// Along one axis of a map that scales and shifts each axis on its own: per output index,
+/// whether its source coordinate is inside the grid, and its taps (as [`taps`] gives them).
+struct AxisTaps {
+    inside: Vec<bool>,
+    taps: Vec<(i64, [f64; 6], usize)>,
+}
+
+impl AxisTaps {
+    fn new(coords: impl Iterator<Item = f64>, n: usize, interp: Interpolation) -> Self {
+        let (inside, taps) = coords.map(|x| (x >= -0.5 && x <= n as f64 - 0.5, taps(x, n, interp))).unzip();
+        Self { inside, taps }
+    }
+}
+
+/// [`fill`] for a map `to_src` that only scales and shifts each axis (as
+/// [`resample_to_spacing`] makes), from `values` on a grid of `src_dims`, with the same
+/// arithmetic per voxel. The x sum `Σ wx · v` that [`sample`] makes for a source row and an
+/// output column is the same for every output row and plane, so each source plane's sums are
+/// made once (and kept while consecutive output planes read it); every output voxel then adds
+/// its y and z taps' sums in [`sample`]'s order, a whole output row at a time.
+fn fill_scaled(values: &[f32], src_dims: [usize; 3], dims: [usize; 3], to_src: DMat4, interp: Interpolation, outside: f32, progress: Progress) -> Result<Vec<f32>> {
+    let n = dims[0] * dims[1] * dims[2];
+    if n > MAX_VOXELS {
+        bail!("the result would have {} million voxels (the limit is {} million)", n / 1_000_000, MAX_VOXELS / 1_000_000);
+    }
+    let d = src_dims;
+    // The products `fill` makes, with the other coordinates 0 (their terms add only zeros).
+    let tx = AxisTaps::new((0..dims[0]).map(|i| (to_src * DVec4::new(i as f64, 0.0, 0.0, 1.0)).x), d[0], interp);
+    let ty = AxisTaps::new((0..dims[1]).map(|j| (to_src * DVec4::new(0.0, j as f64, 0.0, 1.0)).y), d[1], interp);
+    let tz = AxisTaps::new((0..dims[2]).map(|k| (to_src * DVec4::new(0.0, 0.0, k as f64, 1.0)).z), d[2], interp);
+    let clamp = |i: i64, n: usize| i.clamp(0, n as i64 - 1) as usize;
+    // Per output column, the source column of each x tap.
+    let cx = tx.taps.first().map_or(0, |t| t.2);
+    let columns: Vec<usize> = tx.taps.iter().flat_map(|&(b, _, c)| (0..c).map(move |a| clamp(b + a as i64, d[0]))).collect();
+    let x_sums = |kk: usize, sums: &mut [f64]| {
+        for jj in 0..d[1] {
+            let row = &values[(kk * d[1] + jj) * d[0]..][..d[0]];
+            for (i, s) in sums[jj * dims[0]..][..dims[0]].iter_mut().enumerate() {
+                let (w, cols) = (&tx.taps[i].1, &columns[i * cx..][..cx]);
+                let mut line = 0.0;
+                for (&wkx, &col) in w.iter().zip(cols) {
+                    line += wkx * row[col] as f64;
+                }
+                *s = line;
+            }
+        }
+    };
+    let plane = dims[0] * dims[1];
+    // Runs of consecutive output planes share their source planes' x sums.
+    let run = (dims[2] / (4 * rayon::current_num_threads())).clamp(1, 8);
+    let mut out = vec![0.0f32; n];
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    out.par_chunks_mut((plane * run).max(1)).enumerate().for_each(|(r, planes)| {
+        // (source plane, its x sums for every source row and output column).
+        let mut cache: Vec<(usize, Vec<f64>)> = Vec::new();
+        let mut acc = vec![0.0f64; dims[0]];
+        for (dk, p) in planes.chunks_mut(plane).enumerate() {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let k = r * run + dk;
+            let (bz, wz, cz) = tz.taps[k];
+            if !tz.inside[k] {
+                p.fill(outside);
+            } else {
+                // The cache slot of each z tap's source plane (taps of weight 0 are skipped).
+                let need: Vec<Option<usize>> = (0..cz).map(|c| (wz[c] != 0.0).then(|| clamp(bz + c as i64, d[2]))).collect();
+                let mut slot = [0usize; 6];
+                for (c, kk) in need.iter().enumerate() {
+                    let Some(kk) = *kk else { continue };
+                    slot[c] = match cache.iter().position(|e| e.0 == kk) {
+                        Some(s) => s,
+                        None => {
+                            // Reuse a slot no tap of this plane reads.
+                            let s = match cache.iter().position(|e| !need.contains(&Some(e.0))) {
+                                Some(s) => s,
+                                None => {
+                                    cache.push((kk, vec![0.0; d[1] * dims[0]]));
+                                    cache.len() - 1
+                                }
+                            };
+                            cache[s].0 = kk;
+                            x_sums(kk, &mut cache[s].1);
+                            s
+                        }
+                    };
+                }
+                for j in 0..dims[1] {
+                    let o = &mut p[j * dims[0]..][..dims[0]];
+                    if !ty.inside[j] {
+                        o.fill(outside);
+                        continue;
+                    }
+                    let (by, wy, cy) = ty.taps[j];
+                    acc.fill(0.0);
+                    for c in (0..cz).filter(|&c| need[c].is_some()) {
+                        let sums = &cache[slot[c]].1;
+                        for b in (0..cy).filter(|&b| wy[b] != 0.0) {
+                            let w = wz[c] * wy[b];
+                            let jj = clamp(by + b as i64, d[1]);
+                            for (a, &s) in acc.iter_mut().zip(&sums[jj * dims[0]..][..dims[0]]) {
+                                *a += w * s;
+                            }
+                        }
+                    }
+                    for ((o, &a), &inside) in o.iter_mut().zip(&acc).zip(&tx.inside) {
+                        *o = if inside { a as f32 } else { outside };
+                    }
+                }
+            }
+            let dn = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if !progress(dn as f32 / dims[2] as f32) {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(out)
+}
+
 /// Resample to a new voxel size over the same extent and orientation (dims = extent /
 /// spacing, rounded; the new grid is centred on the old one). When shrinking, the image is
 /// first smoothed (Gaussian, σ = ½·√(f² − 1) voxels for a size ratio f) so detail finer than
@@ -212,18 +335,17 @@ pub fn resample_to_spacing(vol: &LoadedVolume, spacing: [f64; 3], interp: Interp
     // Anti-aliasing when shrinking (not for nearest: labels must stay labels).
     let sigma = ratio.map(|f| if f > 1.01 && interp != Interpolation::Nearest { 0.5 * (f * f - 1.0).sqrt() } else { 0.0 });
     let smoothed;
-    let src = if sigma.iter().any(|&s| s > 0.1) {
-        let v = crate::filter::gaussian(&vol.values, vol.dims, sigma, &|f| progress(0.3 * f))?;
-        smoothed = crate::image::with_values(vol, &vol.name, v);
+    let src: &[f32] = if sigma.iter().any(|&s| s > 0.1) {
+        smoothed = crate::filter::gaussian(&vol.values, vol.dims, sigma, &|f| progress(0.3 * f))?;
         &smoothed
     } else {
-        vol
+        &vol.values
     };
     // New voxel i ↔ old index c + (i − c') · ratio, centres c and c' of the two grids.
     let c = [0, 1, 2].map(|a| (vol.dims[a] as f64 - 1.0) * 0.5);
     let c2 = [0, 1, 2].map(|a| (dims[a] as f64 - 1.0) * 0.5);
     let new_to_old = DMat4::from_translation(DVec3::new(c[0] - c2[0] * ratio[0], c[1] - c2[1] * ratio[1], c[2] - c2[2] * ratio[2])) * DMat4::from_scale(DVec3::new(ratio[0], ratio[1], ratio[2]));
-    let values = fill(src, dims, new_to_old, interp, 0.0, &|f| progress(0.3 + 0.7 * f))?;
+    let values = fill_scaled(src, vol.dims, dims, new_to_old, interp, 0.0, &|f| progress(0.3 + 0.7 * f))?;
     let affine = vol.geometry.matrix() * new_to_old;
     let geometry = Geometry::from_affine([dims[0], dims[1], dims[2], 1], affine);
     check(progress, 1.0)?;
@@ -313,6 +435,39 @@ mod tests {
         assert_eq!(r.geometry.spacing.map(|s| (s * 1e6).round() / 1e6), [0.5, 0.5, 0.5]);
         assert!(resample_to_spacing(&v, [0.0, 1.0, 1.0], Interpolation::Linear, no_progress()).is_err());
         assert!(resample_to_spacing(&v, [0.001, 0.001, 0.001], Interpolation::Linear, no_progress()).is_err(), "size cap");
+    }
+
+    #[test]
+    fn scaled_fill_matches_the_general_one_bit_for_bit() {
+        let mut v = image([23, 19, 14], [1.0, 1.5, 2.0], smooth);
+        // Noise and exact zeros of both signs, so every term counts.
+        let mut seed = 5u64;
+        for (q, x) in v.values.iter_mut().enumerate() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x = if q % 11 == 0 { -0.0 } else if q % 7 == 0 { 0.0 } else { *x + ((seed >> 40) as f32 / 65536.0 - 128.0) };
+        }
+        let maps = [
+            // Up, down, mixed, unit ratios (as resample_to_spacing makes them) …
+            ([0.47, 0.6, 0.31], [0.1, -0.2, 0.3], [49, 31, 45]),
+            ([2.0, 2.5, 1.7], [0.5, 0.75, 0.35], [12, 8, 8]),
+            ([1.0, 0.5, 3.0], [0.0, -0.25, 1.0], [23, 38, 5]),
+            ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [23, 19, 14]),
+            // … and shifts that put voxels outside on every side.
+            ([0.9, 1.3, 0.7], [-4.0, -3.0, 2.5], [30, 20, 22]),
+            ([-0.8, 1.1, -1.2], [20.0, -1.0, 15.0], [31, 17, 13]),
+        ];
+        for interp in Interpolation::ALL {
+            for (ratio, shift, dims) in maps {
+                let m = DMat4::from_translation(DVec3::from(shift)) * DMat4::from_scale(DVec3::from(ratio));
+                for outside in [0.0, -3.0] {
+                    let a = fill_scaled(&v.values, v.dims, dims, m, interp, outside, no_progress()).unwrap();
+                    let b = fill(&v, dims, m, interp, outside, no_progress()).unwrap();
+                    let same = a.iter().zip(&b).filter(|(x, y)| x.to_bits() == y.to_bits()).count();
+                    assert_eq!(same, b.len(), "{interp:?} ratio {ratio:?} shift {shift:?}");
+                }
+            }
+        }
+        assert!(fill_scaled(&v.values, v.dims, [9, 9, 9], DMat4::IDENTITY, Interpolation::Linear, 0.0, &|_| false).is_err());
     }
 
     #[test]

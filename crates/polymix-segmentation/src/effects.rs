@@ -7,6 +7,7 @@ use mm_core::Mesh;
 use mm_segment::{mask_to_mesh, ops, AutoThreshold, Connectivity, HollowSide, Mask, MeshParams};
 use mm_volume::geometry::Geometry;
 use mm_volume::load::LoadedVolume;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -831,17 +832,25 @@ pub fn dab(dims: [usize; 3], spacing: [f64; 3], c: DVec3, r: f64, disc_axis: Opt
     }
 }
 
-/// The voxels of dabs from `a` to `b` close enough together to leave no gaps.
-pub fn stroke(dims: [usize; 3], spacing: [f64; 3], a: DVec3, b: DVec3, r: f64, disc_axis: Option<usize>) -> Vec<usize> {
+/// The voxels of dabs from `a` to `b` close enough together to leave no gaps: one dab when
+/// `a` is `b`, and none at `a` when `a_painted` (the stroke's last step ended there and
+/// nothing changed since). Where dabs overlap, voxels are listed again (in no order):
+/// painting a voxel twice changes nothing, and sorting a large ball's voxels took longer
+/// than painting them.
+pub fn stroke(dims: [usize; 3], spacing: [f64; 3], a: DVec3, b: DVec3, r: f64, disc_axis: Option<usize>, a_painted: bool) -> Vec<usize> {
+    let mut out = Vec::new();
+    if a == b {
+        if !a_painted {
+            dab(dims, spacing, a, r, disc_axis, &mut out);
+        }
+        return out;
+    }
     let mm = (0..3).map(|k| ((b[k] - a[k]) * spacing[k]).powi(2)).sum::<f64>().sqrt();
     let step = (r * 0.5).max(spacing.iter().cloned().fold(f64::INFINITY, f64::min) * 0.5);
     let n = (mm / step).ceil().max(1.0) as usize;
-    let mut out = Vec::new();
-    for s in 0..=n {
+    for s in (a_painted as usize)..=n {
         dab(dims, spacing, a.lerp(b, s as f64 / n as f64), r, disc_axis, &mut out);
     }
-    out.sort_unstable();
-    out.dedup();
     out
 }
 
@@ -856,10 +865,12 @@ pub enum Outcome {
     /// A seeded effect's result for the label map at `version`: the labels it gives (0
     /// outside its region), for the seed labels `seeds`.
     Seeded { effect: Effect, version: u64, labels: Vec<u8>, seeds: Vec<u8> },
-    /// Segment `label` becomes `keep`; each of `islands` becomes a new segment.
-    Split { label: u8, keep: Mask, islands: Vec<Mask> },
+    /// Segment `label` keeps the voxels in slot 1; the `islands` islands (slots 2, 3…) become
+    /// new segments ([`crate::segmentation::Segmentation::split`]).
+    Split { label: u8, slots: Vec<u8>, islands: usize },
     Meshes(Vec<(String, Mesh)>),
-    Saved { path: String, version: u64 },
+    /// Saved as the labels were at `version` and the segments at `style_version`.
+    Saved { path: String, version: u64, style_version: u64 },
     /// A new image saved among the derived images.
     Volume { path: std::path::PathBuf },
     /// A segment's centerline and cross-sections.
@@ -922,10 +933,14 @@ pub fn run(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, op: Op) -> any
                     let (ids, sizes) = ops::components(&m, conn);
                     let mut order: Vec<usize> = (1..sizes.len()).filter(|&c| sizes[c] >= s.min_island).collect();
                     order.sort_by_key(|&c| std::cmp::Reverse(sizes[c]));
-                    let piece = |c: usize| Mask { dims: m.dims, data: ids.iter().map(|&i| (i as usize == c) as u8).collect() };
-                    let keep = order.first().map(|&c| piece(c)).unwrap_or_else(|| Mask::new(m.dims));
-                    let islands = order.iter().skip(1).take(200).map(|&c| piece(c)).collect();
-                    return Ok(Outcome::Split { label, keep, islands });
+                    // A byte per voxel for all the pieces (rather than a mask per piece): the
+                    // largest is kept (slot 1), the next 200 become segments (slots 2…201).
+                    let mut slot = vec![0u8; sizes.len()];
+                    for (k, &c) in order.iter().take(201).enumerate() {
+                        slot[c] = 1 + k as u8;
+                    }
+                    let slots = ids.par_iter().map(|&i| slot[i as usize]).collect();
+                    return Ok(Outcome::Split { label, slots, islands: order.len().saturating_sub(1).min(200) });
                 }
                 IslandOp::KeepSelected | IslandOp::RemoveSelected => {
                     let seed = seed.ok_or_else(|| anyhow::anyhow!("click an island"))?;
@@ -1030,16 +1045,18 @@ pub fn run(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, op: Op) -> any
     }
 }
 
-/// Split volume: for each (name, segment), the volume cropped to the segment's box grown by
-/// `pad_mm`, with `blank` (when given) outside the segment, saved among the derived images.
-pub fn split_volume(vol: &LoadedVolume, segments: &[(String, Mask)], pad_mm: f64, blank: Option<f32>, progress: &dyn Fn(f32) -> bool) -> anyhow::Result<Vec<std::path::PathBuf>> {
+/// Split volume: for each segment (name, label) of the label map `labels`, the volume cropped
+/// to the segment's box grown by `pad_mm`, with `blank` (when given) outside the segment,
+/// saved among the derived images. Each segment's mask is made in its turn.
+pub fn split_volume(vol: &LoadedVolume, labels: &[u8], segments: &[(String, u8)], pad_mm: f64, blank: Option<f32>, progress: &dyn Fn(f32) -> bool) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let dir = polymix_workspace::derived_dir().ok_or_else(|| anyhow::anyhow!("no data folder to save into"))?;
     std::fs::create_dir_all(&dir)?;
     let mut paths = Vec::new();
-    for (k, (name, mask)) in segments.iter().enumerate() {
+    for (k, (name, label)) in segments.iter().enumerate() {
         if !progress(k as f32 / segments.len().max(1) as f32) {
             anyhow::bail!("cancelled");
         }
+        let mask = Mask::from_labels(vol.dims, labels, *label);
         let Some((lo, hi)) = mask.bounds() else { continue };
         let pad = vol.geometry.spacing.map(|s| (pad_mm / s).ceil().max(0.0) as usize);
         let lo = [0, 1, 2].map(|a| lo[a].saturating_sub(pad[a]));
@@ -1084,12 +1101,12 @@ pub fn refine_edges(vol: &LoadedVolume, region: &Mask, how: Refine, feature_mm: 
     ops::grow(&mut outer, f, spacing);
     let mut roi = region.clone();
     ops::grow(&mut roi, 2.0 * f, spacing);
-    let seeds: Vec<u8> = (0..region.len()).map(|n| if inner.data[n] != 0 { 1 } else if roi.data[n] != 0 && outer.data[n] == 0 { 2 } else { 0 }).collect();
+    let seeds: Vec<u8> = inner.data.par_iter().zip(&roi.data).zip(&outer.data).map(|((&i, &r), &o)| if i != 0 { 1 } else if r != 0 && o == 0 { 2 } else { 0 }).collect();
     let out = match how {
         Refine::Watershed => mm_segment::watershed(vol, &seeds, 0.5 * f, Some(&roi), 0.0),
         _ => mm_segment::grow_from_seeds(vol, &seeds, Some(&roi), 0.0, 0.0),
     };
-    Mask { dims: region.dims, data: out.iter().map(|&l| (l == 1) as u8).collect() }
+    Mask { dims: region.dims, data: out.par_iter().map(|&l| (l == 1) as u8).collect() }
 }
 
 /// The volume's values with `inside` filled in where `segment` is (or `outside` where it is
@@ -1118,9 +1135,7 @@ pub fn mask_volume(vol: &LoadedVolume, segment: &Mask, fill: MaskFill, inside: f
 /// it), as of `version`.
 pub fn run_seeded(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, labels: Vec<u8>, version: u64) -> anyhow::Result<Outcome> {
     if effect == Effect::FillBetweenSlices {
-        let mut segments: Vec<u8> = labels.iter().copied().filter(|&l| l != 0).collect();
-        segments.sort_unstable();
-        segments.dedup();
+        let segments = labels_present(&labels);
         if segments.is_empty() {
             anyhow::bail!("segment a few slices of a visible segment first");
         }
@@ -1145,9 +1160,7 @@ pub fn run_seeded(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, labels:
     if seeds.len() < 2 {
         anyhow::bail!("paint seeds in at least two visible segments: the structure, and what surrounds it");
     }
-    let mut all: Vec<u8> = labels.iter().copied().filter(|&l| l != 0).collect();
-    all.sort_unstable();
-    all.dedup();
+    let all = labels_present(&labels);
     let out = match effect {
         Effect::Watershed => mm_segment::watershed(vol, &labels, s.watershed_mm as f64, None, s.seed_margin_mm as f64),
         _ => mm_segment::grow_from_seeds(vol, &labels, None, s.seed_margin_mm as f64, s.seed_locality as f64),
@@ -1155,20 +1168,43 @@ pub fn run_seeded(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, labels:
     Ok(Outcome::Seeded { effect, version, labels: out, seeds: all })
 }
 
-/// Closed surface meshes of segments (name, voxels), in LPS millimetres as 3D Slicer
-/// exports models.
-pub fn meshes(segments: Vec<(String, Mask)>, geometry: &Geometry, smoothing_mm: f64, progress: &dyn Fn(f32) -> bool) -> anyhow::Result<Vec<(String, Mesh)>> {
+/// The labels other than 0 in a label map, in increasing order: a table of the labels seen,
+/// filled in parallel, rather than every voxel's label collected and sorted.
+fn labels_present(labels: &[u8]) -> Vec<u8> {
+    let seen = labels
+        .par_chunks(1 << 16)
+        .fold(
+            || [false; 256],
+            |mut seen, chunk| {
+                for &l in chunk {
+                    seen[l as usize] = true;
+                }
+                seen
+            },
+        )
+        .reduce(|| [false; 256], |mut a, b| {
+            a.iter_mut().zip(b).for_each(|(x, y)| *x |= y);
+            a
+        });
+    (1..=255u8).filter(|&l| seen[l as usize]).collect()
+}
+
+/// Closed surface meshes of segments (name, label) of the label map `labels` (on a `dims`
+/// grid), in LPS millimetres as 3D Slicer exports models. Each segment's mask is made in its
+/// turn.
+pub fn meshes(labels: &[u8], dims: [usize; 3], segments: &[(String, u8)], geometry: &Geometry, smoothing_mm: f64, progress: &dyn Fn(f32) -> bool) -> anyhow::Result<Vec<(String, Mesh)>> {
     let n = segments.len().max(1);
     let mut out = Vec::new();
-    for (k, (name, mask)) in segments.into_iter().enumerate() {
+    for (k, (name, label)) in segments.iter().enumerate() {
         if !progress(k as f32 / n as f32) {
             anyhow::bail!("cancelled");
         }
+        let mask = Mask::from_labels(dims, labels, *label);
         if mask.count() == 0 {
             continue;
         }
         let params = MeshParams { smoothing_mm, cell_mm: None, lps: true };
-        out.push((name, mask_to_mesh(&mask, geometry, &params, None)?));
+        out.push((name.clone(), mask_to_mesh(&mask, geometry, &params, None)?));
     }
     if out.is_empty() {
         anyhow::bail!("the segment is empty");
@@ -1202,9 +1238,74 @@ mod tests {
 
     #[test]
     fn strokes_leave_no_gaps() {
-        let s = stroke([40, 5, 5], [1.0; 3], DVec3::new(2.0, 2.0, 2.0), DVec3::new(37.0, 2.0, 2.0), 1.0, Some(2));
+        let mut s = stroke([40, 5, 5], [1.0; 3], DVec3::new(2.0, 2.0, 2.0), DVec3::new(37.0, 2.0, 2.0), 1.0, Some(2), false);
+        s.sort_unstable();
+        s.dedup();
         let row: Vec<usize> = s.iter().filter(|&&i| i / 40 % 5 == 2).map(|&i| i % 40).collect();
         assert_eq!(row, (1..=38).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn labels_present_as_sorted() {
+        for (k, labels) in [vec![], vec![0, 0], vec![7, 0, 3, 7, 255, 1, 3], (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 27) as u8).collect()].into_iter().enumerate() {
+            let mut sorted: Vec<u8> = labels.iter().copied().filter(|&l| l != 0).collect();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(labels_present(&labels), sorted, "case {k}");
+        }
+    }
+
+    /// The voxels of a stroke as the dabs give them, every dab from `a` to `b` included.
+    fn all_dabs(dims: [usize; 3], spacing: [f64; 3], a: DVec3, b: DVec3, r: f64, disc_axis: Option<usize>) -> Vec<usize> {
+        let mm = (0..3).map(|k| ((b[k] - a[k]) * spacing[k]).powi(2)).sum::<f64>().sqrt();
+        let step = (r * 0.5).max(spacing.iter().cloned().fold(f64::INFINITY, f64::min) * 0.5);
+        let n = (mm / step).ceil().max(1.0) as usize;
+        let mut out = Vec::new();
+        for s in 0..=n {
+            dab(dims, spacing, a.lerp(b, s as f64 / n as f64), r, disc_axis, &mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn strokes_cover_every_dab() {
+        // Strokes of any length, size and shape, in steps as the pointer moves: one dab where
+        // the pointer stays, and each step's start left out (the step before ended there)
+        // still cover what every dab of every step covers.
+        let (dims, spacing) = ([30, 24, 18], [0.7, 0.45, 1.3]);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for case in 0..60 {
+            let r = [0.0, 0.3, 1.0, 2.5, 4.0][case % 5];
+            let disc = [None, Some(0), Some(1), Some(2)][case % 4];
+            let mut at = DVec3::new(next() * 29.0, next() * 23.0, next() * 17.0);
+            let (mut covered, mut wanted) = (Vec::new(), Vec::new());
+            covered.extend(stroke(dims, spacing, at, at, r, disc, false));
+            wanted.extend(all_dabs(dims, spacing, at, at, r, disc));
+            for step in 0..6 {
+                // Some steps do not move.
+                let to = if step % 3 == 2 { at } else { (at + DVec3::new(next() - 0.5, next() - 0.5, next() - 0.5) * 8.0).clamp(DVec3::ZERO, DVec3::new(29.0, 23.0, 17.0)) };
+                covered.extend(stroke(dims, spacing, at, to, r, disc, true));
+                wanted.extend(all_dabs(dims, spacing, at, to, r, disc));
+                at = to;
+            }
+            for v in [&mut covered, &mut wanted] {
+                v.sort_unstable();
+                v.dedup();
+            }
+            assert_eq!(covered, wanted, "case {case}");
+        }
+        // A single dab where the pointer stays at the start of a stroke.
+        let p = DVec3::new(10.2, 7.7, 3.1);
+        assert_eq!({ let mut v = stroke(dims, spacing, p, p, 2.0, None, false); v.sort_unstable(); v }, all_dabs(dims, spacing, p, p, 2.0, None));
+        assert!(stroke(dims, spacing, p, p, 2.0, None, true).is_empty());
     }
 
     #[test]
@@ -1280,8 +1381,9 @@ mod tests {
         assert_eq!(mask.count(), 64);
         s.islands = IslandOp::Split;
         s.min_island = 1;
-        let Ok(Outcome::Split { keep, islands, .. }) = run(Effect::Islands, &s, &vol, Op { segment: both.clone(), ..empty() }) else { panic!() };
-        assert_eq!((keep.count(), islands.len(), islands[0].count()), (64, 1, 8));
+        let Ok(Outcome::Split { slots, islands, .. }) = run(Effect::Islands, &s, &vol, Op { segment: both.clone(), ..empty() }) else { panic!() };
+        let in_slot = |k: u8| slots.iter().filter(|&&s| s == k).count();
+        assert_eq!((in_slot(1), islands, in_slot(2), in_slot(0)), (64, 1, 8, 1000 - 72));
         // Flood fill from the small block only reaches it.
         s.flood_tolerance = 10.0;
         let Ok(Outcome::Edit { mask, mode: Mode::Add, .. }) = run(Effect::FloodFill, &s, &vol, Op { seed: Some([7, 7, 7]), ..empty() }) else { panic!() };

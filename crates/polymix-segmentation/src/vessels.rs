@@ -20,6 +20,9 @@ pub(crate) struct VesselResult {
     /// Per branch: the sections along it, and the narrowest (index, narrowing %).
     pub sections: Vec<Vec<CrossSection>>,
     pub narrowest: Vec<Option<(usize, f64)>>,
+    /// Per branch: the smallest and largest equivalent diameter of its sections (`None`
+    /// when none has one).
+    pub diameters: Vec<Option<(f64, f64)>>,
 }
 
 /// The settings and results of the vessel analysis.
@@ -68,7 +71,8 @@ impl SegmentationWorkspace {
             }
             let sections: Vec<Vec<CrossSection>> = tree.branches.iter().map(|b| mm_segment::cross_sections(&mask, &vol.geometry, b, step)).collect();
             let narrowest = sections.iter().map(|s| narrowest(s)).collect();
-            Ok(Outcome::Centerline(Box::new(VesselResult { label, version, tree, sections, narrowest })))
+            let diameters = sections.iter().map(|s| diameter_range(s)).collect();
+            Ok(Outcome::Centerline(Box::new(VesselResult { label, version, tree, sections, narrowest, diameters })))
         });
         self.running = Some(crate::Running { what: "Extracting the centerline".into(), job, bypass: false });
     }
@@ -118,9 +122,7 @@ impl SegmentationWorkspace {
                         v.branch = k;
                     }
                     ui.label(format!("{:.1}", b.length_mm));
-                    let d: Vec<f64> = r.sections[k].iter().map(|s| s.equivalent_diameter_mm).filter(|d| *d > 0.0).collect();
-                    let (lo, hi) = d.iter().fold((f64::INFINITY, 0f64), |(a, b), &x| (a.min(x), b.max(x)));
-                    ui.label(if d.is_empty() { "—".into() } else { format!("{lo:.2} – {hi:.2}") });
+                    ui.label(r.diameters[k].map_or("—".into(), |(lo, hi)| format!("{lo:.2} – {hi:.2}")));
                     match r.narrowest[k] {
                         Some((i, pct)) => {
                             if ui.link(format!("{pct:.0}% at {:.1} mm", r.sections[k][i].distance_mm)).on_hover_text("Show it: the crosshair moves there").clicked() {
@@ -178,21 +180,27 @@ impl SegmentationWorkspace {
             return;
         };
         let to_voxel = vol.geometry.matrix().inverse();
+        // The 3D view's camera, worked out once for every point of every branch.
+        let project_3d = view3d.map(|rect| (rect, self.view3d.projector(vol, rect)));
+        let mut on_map: Vec<(Pos2, f64)> = Vec::new();
         for (k, b) in r.tree.branches.iter().enumerate() {
             let width = if k == self.vessels.branch { 2.5 } else { 1.5 };
             let pts: Vec<DVec3> = b.points.iter().map(|p| DVec3::from(p.voxel)).collect();
             for m in maps {
                 let painter = ui.painter_at(m.rect);
-                for w in pts.windows(2) {
-                    let ((a, da), (b, db)) = (m.project(w[0]), m.project(w[1]));
+                // Each point placed once, for the segments either side of it.
+                on_map.clear();
+                on_map.extend(pts.iter().map(|&p| m.project(p)));
+                for w in on_map.windows(2) {
+                    let ((a, da), (b, db)) = (w[0], w[1]);
                     if da.abs() <= 1.0 && db.abs() <= 1.0 {
                         painter.line_segment([a, b], Stroke::new(width, LINE));
                     }
                 }
             }
-            if let Some(rect) = view3d {
-                let painter = ui.painter_at(rect);
-                let line: Vec<Pos2> = pts.iter().filter_map(|&p| self.view3d.project(vol, rect, p)).collect();
+            if let Some((rect, project)) = &project_3d {
+                let painter = ui.painter_at(*rect);
+                let line: Vec<Pos2> = pts.iter().filter_map(|&p| project(p)).collect();
                 painter.add(egui::Shape::line(line, Stroke::new(width, LINE)));
             }
         }
@@ -236,6 +244,14 @@ fn narrowest(sections: &[CrossSection]) -> Option<(usize, f64)> {
     }).collect();
     let (first, last) = (*inner.first()?, *inner.last()?);
     mm_segment::stenosis(&sections[first..=last]).map(|(i, pct)| (first + i, pct))
+}
+
+/// The smallest and largest equivalent diameter of a branch's sections, of those that have
+/// one.
+fn diameter_range(sections: &[CrossSection]) -> Option<(f64, f64)> {
+    let d: Vec<f64> = sections.iter().map(|s| s.equivalent_diameter_mm).filter(|d| *d > 0.0).collect();
+    let (lo, hi) = d.iter().fold((f64::INFINITY, 0f64), |(a, b), &x| (a.min(x), b.max(x)));
+    (!d.is_empty()).then_some((lo, hi))
 }
 
 /// The equivalent diameter along a branch (the narrowest section marked); the section

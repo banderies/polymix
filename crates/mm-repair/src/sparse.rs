@@ -15,6 +15,37 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 /// Row count above which matrix/vector kernels run in parallel.
 const PAR_THRESHOLD: usize = 4096;
 
+/// Length of the pieces a long sum is cut into. The pieces are fixed (rayon's adaptive
+/// splitting would depend on the threads' timing) and their partial sums are added in order,
+/// so a sum always rounds the same way, whether the pieces were summed in parallel or not. A
+/// vector of at most this length is summed in one piece, exactly like a plain serial sum.
+const REDUCE_CHUNK: usize = 16 * 1024;
+
+/// Length from which the per-iteration vector kernels of the solver (sums, updates, the
+/// Jacobi step) run in parallel. They do a few flops per entry, so below this a parallel
+/// pass costs more in dispatch than it saves (much more on a busy machine).
+const VEC_PAR_MIN: usize = 64 * 1024;
+
+/// Stored entries from which [`CsrMatrix::mul_vec`] runs in parallel.
+const MUL_PAR_MIN_NNZ: usize = 128 * 1024;
+
+/// Sum of `f` over `0..n`: in one piece up to [`REDUCE_CHUNK`], otherwise one partial sum per
+/// [`REDUCE_CHUNK`] items (in parallel for long vectors), added in order.
+#[inline]
+fn chunked_sum<T: Element>(n: usize, f: impl Fn(std::ops::Range<usize>) -> T + Sync) -> T {
+    if n <= REDUCE_CHUNK {
+        return f(0..n);
+    }
+    let piece = |c: usize| f(c * REDUCE_CHUNK..((c + 1) * REDUCE_CHUNK).min(n));
+    let pieces = n.div_ceil(REDUCE_CHUNK);
+    let partial: Vec<T> = if n >= VEC_PAR_MIN { (0..pieces).into_par_iter().map(piece).collect() } else { (0..pieces).map(piece).collect() };
+    let mut s = partial[0];
+    for p in &partial[1..] {
+        s += *p;
+    }
+    s
+}
+
 /// Vector element usable by [`solve_pcg`]: `f64` or `DVec3` (component-wise semantics).
 pub trait Element:
     Copy
@@ -296,7 +327,7 @@ impl CsrMatrix {
             }
             *yr = acc;
         };
-        if self.nrows >= PAR_THRESHOLD {
+        if self.nnz() >= MUL_PAR_MIN_NNZ && self.nrows >= PAR_THRESHOLD {
             y.par_iter_mut().enumerate().for_each(f);
         } else {
             y.iter_mut().enumerate().for_each(f);
@@ -439,17 +470,28 @@ pub struct PcgStats {
     pub breakdown: bool,
 }
 
+/// Dot product, summed in fixed chunks (see [`chunked_sum`]).
 #[inline]
 fn dot<T: Element>(a: &[T], b: &[T]) -> T {
-    if a.len() >= PAR_THRESHOLD {
-        a.par_iter().zip(b.par_iter()).map(|(x, y)| x.cmul(*y)).reduce(T::zero, |p, q| p + q)
-    } else {
+    chunked_sum(a.len().min(b.len()), |r| {
         let mut s = T::zero();
-        for (x, y) in a.iter().zip(b) {
+        for (x, y) in a[r.clone()].iter().zip(&b[r]) {
             s += x.cmul(*y);
         }
         s
+    })
+}
+
+/// One CG step on a piece of the vectors: `x += α p`, `r -= α q`; returns the piece's `‖r‖²`.
+#[inline]
+fn step_piece<T: Element>(x: &mut [T], r: &mut [T], p: &[T], q: &[T], alpha: T) -> T {
+    let mut s = T::zero();
+    for ((xi, ri), (pi, qi)) in x.iter_mut().zip(r.iter_mut()).zip(p.iter().zip(q)) {
+        *xi += alpha.cmul(*pi);
+        *ri -= alpha.cmul(*qi);
+        s += ri.cmul(*ri);
     }
+    s
 }
 
 /// A symmetric positive-definite preconditioner: `z ≈ A⁻¹ r`.
@@ -473,7 +515,7 @@ impl Jacobi {
 
 impl<T: Element> Preconditioner<T> for Jacobi {
     fn apply(&self, r: &[T], z: &mut [T]) {
-        if r.len() >= PAR_THRESHOLD {
+        if r.len() >= VEC_PAR_MIN {
             z.par_iter_mut().zip(r.par_iter().zip(self.inv_diag.par_iter())).for_each(|(zi, (ri, d))| *zi = *ri * *d);
         } else {
             for ((zi, ri), d) in z.iter_mut().zip(r).zip(&self.inv_diag) {
@@ -520,7 +562,7 @@ pub fn solve_pcg_preconditioned<T: Element>(
         stats.converged = true;
         return stats;
     }
-    let par = n >= PAR_THRESHOLD;
+    let par = n >= VEC_PAR_MIN;
     let mut r = vec![T::zero(); n];
     a.mul_vec(x, &mut r);
     for (ri, bi) in r.iter_mut().zip(b) {
@@ -557,15 +599,28 @@ pub fn solve_pcg_preconditioned<T: Element>(
             break;
         }
         let alpha = rz.cdiv(pq);
-        let update = |((xi, ri), (pi, qi)): ((&mut T, &mut T), (&T, &T))| -> T {
-            *xi += alpha.cmul(*pi);
-            *ri -= alpha.cmul(*qi);
-            ri.cmul(*ri)
-        };
-        let rr = if par {
-            x.par_iter_mut().zip(r.par_iter_mut()).zip(p.par_iter().zip(q.par_iter())).map(update).reduce(T::zero, |u, v| u + v)
+        // ‖r‖², summed in the fixed pieces of [`chunked_sum`] and added in order.
+        let rr = if n <= REDUCE_CHUNK {
+            step_piece(x, &mut r, &p, &q, alpha)
         } else {
-            x.iter_mut().zip(r.iter_mut()).zip(p.iter().zip(q.iter())).map(update).fold(T::zero(), |u, v| u + v)
+            let partial: Vec<T> = if par {
+                x.par_chunks_mut(REDUCE_CHUNK)
+                    .zip(r.par_chunks_mut(REDUCE_CHUNK))
+                    .zip(p.par_chunks(REDUCE_CHUNK).zip(q.par_chunks(REDUCE_CHUNK)))
+                    .map(|((xc, rc), (pc, qc))| step_piece(xc, rc, pc, qc, alpha))
+                    .collect()
+            } else {
+                x.chunks_mut(REDUCE_CHUNK)
+                    .zip(r.chunks_mut(REDUCE_CHUNK))
+                    .zip(p.chunks(REDUCE_CHUNK).zip(q.chunks(REDUCE_CHUNK)))
+                    .map(|((xc, rc), (pc, qc))| step_piece(xc, rc, pc, qc, alpha))
+                    .collect()
+            };
+            let mut s = partial[0];
+            for v in &partial[1..] {
+                s += *v;
+            }
+            s
         };
         precond.apply(&r, &mut z);
         let rz_new = dot(&r, &z);
@@ -1067,6 +1122,50 @@ mod tests {
             let s3 = solve_pcg_preconditioned(a, &b3, &mut x3, &p, &amg.preconditioner(1), None);
             assert!(s3.converged);
             assert!((x3[17].y + xs[17]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn sums_do_not_depend_on_the_threads() {
+        // Short vectors sum serially in order; long ones in fixed pieces added in order, the
+        // same whichever threads ran the pieces.
+        let v: Vec<DVec3> = (0..150_000).map(|i| DVec3::new((i as f64 * 0.37).sin(), (i as f64 * 0.11).cos(), 1e-3 * i as f64)).collect();
+        for n in [100, REDUCE_CHUNK, REDUCE_CHUNK + 1, 40_000, VEC_PAR_MIN + 7, 150_000] {
+            let (a, b) = (&v[..n], &v[v.len() - n..]);
+            let mut serial = DVec3::ZERO;
+            for (x, y) in a.iter().zip(b) {
+                serial += x.cmul(*y);
+            }
+            let mut pieces = DVec3::ZERO;
+            for (k, (x, y)) in a.chunks(REDUCE_CHUNK).zip(b.chunks(REDUCE_CHUNK)).enumerate() {
+                let mut s = DVec3::ZERO;
+                for (x, y) in x.iter().zip(y) {
+                    s += x.cmul(*y);
+                }
+                pieces = if k == 0 { s } else { pieces + s };
+            }
+            let d = dot(a, b);
+            assert_eq!(d, pieces, "n = {n}");
+            if n <= REDUCE_CHUNK {
+                assert_eq!(d, serial, "n = {n}");
+            }
+        }
+        // A whole solve, on one thread and on several.
+        for n in [20_000usize, 100_000] {
+            let a = poisson1d(n);
+            let b: Vec<DVec3> = (0..n).map(|i| DVec3::new((i as f64 * 0.01).sin(), 1.0, (i as f64 * 0.003).cos())).collect();
+            let solve = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                pool.install(|| {
+                    let mut x = vec![DVec3::ZERO; n];
+                    let st = solve_pcg(&a, &b, &mut x, &PcgParams { tolerance: 1e-12, max_iterations: 400 });
+                    (x, st)
+                })
+            };
+            let (x1, s1) = solve(1);
+            let (x4, s4) = solve(4);
+            assert_eq!(s1, s4);
+            assert!(x1.iter().zip(&x4).all(|(p, q)| p.to_array().map(f64::to_bits) == q.to_array().map(f64::to_bits)), "n = {n}");
         }
     }
 

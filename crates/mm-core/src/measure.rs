@@ -1,5 +1,6 @@
 //! Global measurements: area, volume, centroid.
 
+use crate::geom::Aabb;
 use crate::mesh::Mesh;
 use glam::DVec3;
 
@@ -39,8 +40,18 @@ pub fn surface_centroid(m: &Mesh) -> DVec3 {
 /// or degenerate mesh has no well-defined volume).
 pub fn center_of_mass(m: &Mesh) -> DVec3 {
     if m.is_closed() {
+        center_of_mass_with(m, &m.bounds(), true)
+    } else {
+        surface_centroid(m)
+    }
+}
+
+/// [`center_of_mass`] for a caller that already has the mesh's bounds and knows whether it is
+/// closed (no boundary edges), so neither is computed again. Same result, bit for bit.
+pub fn center_of_mass_with(m: &Mesh, bounds: &Aabb, closed: bool) -> DVec3 {
+    if closed {
         // Sum of signed tetrahedra (o, a, b, c) about a nearby origin, for precision.
-        let o = m.bounds().center();
+        let o = bounds.center();
         let (mut c, mut v) = (DVec3::ZERO, 0.0);
         for t in m.triangle_ids() {
             let [a, b, d] = m.tri_positions(t).map(|p| p - o);
@@ -48,7 +59,7 @@ pub fn center_of_mass(m: &Mesh) -> DVec3 {
             c += (a + b + d) * (vt / 4.0);
             v += vt;
         }
-        let scale = m.bounds().diagonal().powi(3);
+        let scale = bounds.diagonal().powi(3);
         if v.abs() > 1e-9 * scale {
             return o + c / v;
         }
@@ -282,5 +293,43 @@ mod tests {
         // An open surface falls back to the surface centroid.
         let plane = primitives::plane_grid(2.0, 2.0, 4, 4);
         assert!(center_of_mass(&plane).length() < 1e-12);
+    }
+
+    /// `center_of_mass` as it was before `center_of_mass_with`: bounds computed twice, by
+    /// walking the triangles.
+    fn center_of_mass_before(m: &Mesh) -> DVec3 {
+        let bounds = |m: &Mesh| Aabb::from_points(m.triangle_ids().flat_map(|t| m.tri_positions(t)));
+        if m.is_closed() {
+            let o = bounds(m).center();
+            let (mut c, mut v) = (DVec3::ZERO, 0.0);
+            for t in m.triangle_ids() {
+                let [a, b, d] = m.tri_positions(t).map(|p| p - o);
+                let vt = a.dot(b.cross(d)) / 6.0;
+                c += (a + b + d) * (vt / 4.0);
+                v += vt;
+            }
+            let scale = bounds(m).diagonal().powi(3);
+            if v.abs() > 1e-9 * scale {
+                return o + c / v;
+            }
+        }
+        surface_centroid(m)
+    }
+
+    #[test]
+    fn center_of_mass_with_matches_the_old_path_bit_for_bit() {
+        let mut shifted = primitives::icosphere(1.3, 3);
+        shifted.transform(|p| DVec3::new(p.x * 2.0 + 7.25, p.y - 3.5, p.z * 0.5 + 1e3));
+        let mut open = primitives::cube(2.0, 4);
+        let first: Vec<u32> = open.triangle_ids().take(3).collect();
+        open.remove_triangles(first);
+        let flat = primitives::plane_grid(3.0, 1.0, 5, 2);
+        let tube = primitives::cylinder(0.4, 5.0, 16, 8, true);
+        for (name, m) in [("shifted sphere", &shifted), ("open cube", &open), ("plane", &flat), ("capped tube", &tube), ("empty", &Mesh::new())] {
+            let want = center_of_mass_before(m).to_array().map(f64::to_bits);
+            assert_eq!(center_of_mass(m).to_array().map(f64::to_bits), want, "{name}");
+            let closed = m.boundary_edge_ids().count() == 0;
+            assert_eq!(center_of_mass_with(m, &m.bounds(), closed).to_array().map(f64::to_bits), want, "{name}");
+        }
     }
 }

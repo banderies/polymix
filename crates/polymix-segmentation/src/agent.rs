@@ -39,7 +39,7 @@ pub fn tools() -> Vec<AgentTool> {
 pub fn call(ws: &mut SegmentationWorkspace, tool: &str, args: &Value, _ctx: &egui::Context) -> AgentReply {
     match tool {
         "segmentation_state" => AgentReply::Now(Ok(state(ws))),
-        "segmentation_statistics" => AgentReply::Now(statistics(ws, args)),
+        "segmentation_statistics" => statistics(ws, args),
         "segmentation_centerline" => AgentReply::Now(centerline(ws, args)),
         _ => AgentReply::error(format!("the Segmentation workspace has no tool {tool}")),
     }
@@ -189,21 +189,34 @@ fn centerline(ws: &mut SegmentationWorkspace, args: &Value) -> Result<Value, Str
     Ok(json!({"segment": name, "segments_changed_since": stale, "branches": branches}))
 }
 
-fn statistics(ws: &mut SegmentationWorkspace, args: &Value) -> Result<Value, String> {
-    let vol = loaded(ws)?;
-    let seg = ws.seg.as_ref().ok_or("No segmentation")?;
+/// Measured on a worker thread, from a copy of the label map (each segment's mask made in
+/// its turn): the UI does not wait for it.
+fn statistics(ws: &mut SegmentationWorkspace, args: &Value) -> AgentReply {
+    let vol = match loaded(ws) {
+        Ok(v) => v,
+        Err(e) => return AgentReply::error(e),
+    };
+    let Some(seg) = ws.seg.as_ref() else { return AgentReply::error("No segmentation") };
     let wanted: Vec<usize> = match args.get("segments").and_then(Value::as_array) {
-        Some(list) => list.iter().map(|v| find(seg, v)).collect::<Result<_, _>>()?,
+        Some(list) => match list.iter().map(|v| find(seg, v)).collect::<Result<_, _>>() {
+            Ok(w) => w,
+            Err(e) => return AgentReply::error(e),
+        },
         None => (0..seg.segments.len()).collect(),
     };
-    let rows = wanted
-        .into_iter()
-        .map(|k| {
-            let g = &seg.segments[k];
-            let s = mm_segment::segment_stats(&seg.mask_of(g.label), &vol);
+    let segments: Vec<(u8, String)> = wanted.into_iter().map(|k| (seg.segments[k].label, seg.segments[k].name.clone())).collect();
+    let (labels, dims) = (seg.labels.clone(), seg.dims);
+    AgentReply::later(move || polymix_workspace::in_job_pool(|| Ok(statistics_of(&vol, &labels, dims, &segments))))
+}
+
+fn statistics_of(vol: &LoadedVolume, labels: &[u8], dims: [usize; 3], segments: &[(u8, String)]) -> Value {
+    let rows = segments
+        .iter()
+        .map(|(label, name)| {
+            let s = mm_segment::segment_stats(&mm_segment::Mask::from_labels(dims, labels, *label), vol);
             json!({
-                "label": g.label,
-                "name": g.name,
+                "label": label,
+                "name": name,
                 "empty": s.is_none(),
                 "stats": s.map(|s| json!({
                     "voxels": s.voxels,
@@ -223,7 +236,7 @@ fn statistics(ws: &mut SegmentationWorkspace, args: &Value) -> Result<Value, Str
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({"segments": rows}))
+    json!({"segments": rows})
 }
 
 /// The start of `segmentation_do`'s description.
@@ -566,13 +579,19 @@ fn act_now(ws: &mut SegmentationWorkspace, action: &str, a: &Args, ctx: &egui::C
             if let Some(c) = colour {
                 s.colour = c;
             }
-            if let Some(v) = a.opt_bool("visible") {
+            let shown = a.opt_bool("visible");
+            if let Some(v) = shown {
                 s.visible = v;
             }
             if let Some(st) = a.opt_str("status") {
                 s.status = crate::segmentation::Status::ALL.into_iter().find(|x| x.key() == st).ok_or("status must be notstarted, inprogress, completed or flagged")?;
             }
-            seg.changed(true);
+            // Only showing or hiding changes what edits and the 3D view see; the rest is how
+            // the segment looks.
+            seg.restyled();
+            if shown.is_some() {
+                seg.changed(true);
+            }
             Ok(format!("Changed {}", named(seg, k)))
         }
         "remove_segment" => {
@@ -1645,7 +1664,8 @@ mod tests {
     fn statistics_hollow_and_smoothing() {
         let (mut ws, ctx) = ball_ws();
         let ball = voxels(&mut ws, 1);
-        let AgentReply::Now(Ok(st)) = call(&mut ws, "segmentation_statistics", &json!({}), &ctx) else { panic!() };
+        let AgentReply::Later(measure) = call(&mut ws, "segmentation_statistics", &json!({}), &ctx) else { panic!("measured on a worker thread") };
+        let st = measure().unwrap();
         let s = &st["segments"][0]["stats"];
         let exact = 4.0 / 3.0 * std::f64::consts::PI * 512.0 / 1000.0;
         assert!((s["volume_ml"].as_f64().unwrap() / exact - 1.0).abs() < 0.03, "{s}");

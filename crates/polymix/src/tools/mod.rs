@@ -228,6 +228,26 @@ pub trait Tool {
     fn preview(&self) -> Option<(ObjectId, &Mesh)> {
         None
     }
+    /// The vertices whose positions the preview changed since [`Tool::clear_preview_moves`]
+    /// was last called, with the preview's shape version then (`from`) and now (`to`), so the
+    /// renderer can upload just those when it holds the preview as it was at `from`. None
+    /// when the tool does not keep the list, or when the preview was replaced or its topology
+    /// changed since: then only a full upload is right.
+    #[allow(dead_code)] // For the renderer's partial preview upload, which does not use it yet.
+    fn preview_moves(&self) -> Option<(u64, u64, &[u32])> {
+        None
+    }
+    /// The renderer has the preview as it is now: start a new [`Tool::preview_moves`] list.
+    #[allow(dead_code)] // For the renderer's partial preview upload, which does not use it yet.
+    fn clear_preview_moves(&mut self) {}
+    /// When the preview is the active object's own mesh moved by a similarity transform
+    /// (rotation, uniform positive scale and translation, so its shading is the same), that
+    /// transform: the renderer can then draw the object's own GPU mesh with it (in the
+    /// preview's style) instead of uploading the preview.
+    #[allow(dead_code)] // For the renderer's preview drawing, which does not use it yet.
+    fn preview_transform(&self) -> Option<glam::DMat4> {
+        None
+    }
     /// Keyboard shortcuts while the tool is active. Return true if a key was used (the app
     /// then skips its own shortcuts for it).
     fn keys(&mut self, _input: &egui::InputState, _cx: &mut ToolCx) -> bool {
@@ -325,6 +345,79 @@ pub trait Tool {
     fn act(&mut self, action: &str, _args: &serde_json::Value, _cx: &mut ToolCx) -> Result<String, String> {
         Err(format!("{} has no action {action}", self.name()))
     }
+}
+
+/// Vertices a tool's preview moved since the renderer last took it (see
+/// [`Tool::preview_moves`]).
+#[derive(Default)]
+#[allow(dead_code)] // Read through Tool::preview_moves, which the renderer does not use yet.
+pub struct PreviewMoves {
+    /// The preview's shape version when the list was started, and after its latest change.
+    from: u64,
+    to: u64,
+    verts: Vec<u32>,
+    /// The list covers every change since `from`.
+    valid: bool,
+}
+
+#[allow(dead_code)] // Read through Tool::preview_moves, which the renderer does not use yet.
+impl PreviewMoves {
+    /// The preview was replaced or its topology changed: only a full upload is right until
+    /// the next [`PreviewMoves::clear`].
+    pub fn reset(&mut self) {
+        self.verts.clear();
+        self.valid = false;
+    }
+
+    /// `verts` were rewritten in place, taking the preview from shape version `before` to
+    /// `after`. The list is dropped (a full upload is then needed) once it grows past
+    /// `limit` entries, or if `before` is not where the list ended.
+    pub fn record(&mut self, before: u64, after: u64, verts: impl IntoIterator<Item = u32>, limit: usize) {
+        if !self.valid || self.to != before {
+            self.reset();
+            return;
+        }
+        self.verts.extend(verts);
+        self.to = after;
+        if self.verts.len() > limit {
+            self.reset();
+        }
+    }
+
+    /// (from, to, vertices), if the list is complete.
+    pub fn get(&self) -> Option<(u64, u64, &[u32])> {
+        self.valid.then_some((self.from, self.to, &self.verts[..]))
+    }
+
+    /// The renderer has the preview at shape version `now` (None: there is no preview).
+    pub fn clear(&mut self, now: Option<u64>) {
+        self.verts.clear();
+        match now {
+            Some(v) => {
+                (self.from, self.to, self.valid) = (v, v, true);
+            }
+            None => self.valid = false,
+        }
+    }
+}
+
+/// Overwrite the live vertex positions of `dst`, a copy of `src` (same vertices), with `f` of
+/// the source's, as [`Mesh::transform`] does on a fresh copy, in parallel for big meshes.
+pub(crate) fn transform_from(dst: &mut Mesh, src: &Mesh, f: impl Fn(DVec3) -> DVec3 + Sync) {
+    use rayon::prelude::*;
+    let from = src.positions();
+    let pos = dst.positions_mut();
+    let write = |(i, p): (usize, &mut DVec3)| {
+        if src.is_vertex(i as u32) {
+            *p = f(from[i]);
+        }
+    };
+    if pos.len() >= 16 * 1024 {
+        pos.par_iter_mut().enumerate().with_min_len(4096).for_each(write);
+    } else {
+        pos.iter_mut().enumerate().for_each(write);
+    }
+    dst.bump_shape_version();
 }
 
 /// `changes` merged into `settings` (both JSON objects; nested objects merge too). Every key

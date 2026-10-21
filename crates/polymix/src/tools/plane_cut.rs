@@ -371,7 +371,7 @@ impl Tool for PlaneCutTool {
 
         if let Some(job) = &self.job {
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.label("Cutting…");
             });
             if let Some(r) = job.poll() {

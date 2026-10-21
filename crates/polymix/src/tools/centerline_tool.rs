@@ -13,9 +13,11 @@ pub struct CenterlineTool {
     inlet: Option<usize>,
     /// Inlet chosen by clicking the surface (closed meshes without ends).
     inlet_point: Option<DVec3>,
+    /// The inlet point was clicked, so it lies on the surface (an agent's may lie off it).
+    inlet_clicked: bool,
     step: f64,
     auto_step: bool,
-    job: Option<Job<Centerline>>,
+    job: Option<Job<Option<Centerline>>>,
     result: Option<Centerline>,
     hovered_branch: Option<usize>,
     message: Option<String>,
@@ -32,6 +34,16 @@ const BRANCH_COLORS: [[f32; 3]; 8] = [
     [0.7, 1.0, 0.3],
 ];
 
+/// The inlet near a picked point `p` on a closed model: the vertices of the triangle nearest
+/// to it, and the vessel radius there. `bvh` is the mesh's tree if one is at hand (else, or if
+/// it is for another state of the mesh, one is built).
+fn inlet_near(mesh: &Mesh, bvh: Option<std::sync::Arc<mm_core::Bvh>>, p: DVec3) -> Option<(Vec<u32>, f64)> {
+    let bvh = bvh.filter(|b| b.is_current(mesh)).unwrap_or_else(|| std::sync::Arc::new(mm_core::Bvh::build(mesh)));
+    let h = bvh.nearest(mesh, p, f64::INFINITY)?;
+    let r = mm_edit::estimate_vessel_cross_section(mesh, Some(&bvh), h.point, None).map(|x| x.radius).unwrap_or(mesh.average_edge_length() * 5.0);
+    Some((mesh.triangle(h.tid).to_vec(), r))
+}
+
 impl CenterlineTool {
     pub fn new(cx: &mut ToolCx) -> Self {
         let ends = cx.scene.active().map(|o| find_vessel_ends(&o.mesh)).unwrap_or_default();
@@ -47,6 +59,7 @@ impl CenterlineTool {
             ends,
             inlet,
             inlet_point: None,
+            inlet_clicked: false,
             step: 0.5,
             auto_step: true,
             job: None,
@@ -59,7 +72,8 @@ impl CenterlineTool {
     fn start(&mut self, cx: &mut ToolCx) {
         let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
         let mesh = o.mesh.clone();
-        let (sources, radius): (Vec<u32>, f64) = if let Some(i) = self.inlet {
+        // The inlet's vertices and radius, or a picked point to find them from in the job.
+        let inlet: Result<(Vec<u32>, f64), DVec3> = if let Some(i) = self.inlet {
             let e = &self.ends[i];
             let verts: Vec<u32> = match e.kind {
                 EndKind::Cap(g) => {
@@ -74,23 +88,39 @@ impl CenterlineTool {
                     .map(|l| l.vertices)
                     .unwrap_or_default(),
             };
-            (verts, e.diameter * 0.5)
+            Ok((verts, e.diameter * 0.5))
         } else if let Some(p) = self.inlet_point {
-            let bvh = mm_core::Bvh::build(&mesh);
-            let Some(h) = bvh.nearest(&mesh, p, f64::INFINITY) else { return };
-            let r = mm_edit::estimate_vessel_cross_section(&mesh, Some(&bvh), h.point, None).map(|x| x.radius).unwrap_or(mesh.average_edge_length() * 5.0);
-            (mesh.triangle(h.tid).to_vec(), r)
+            Err(p)
         } else {
             self.message = Some("Pick an inlet first.".into());
             return;
         };
-        if sources.is_empty() {
+        if inlet.as_ref().is_ok_and(|(sources, _)| sources.is_empty()) {
             self.message = Some("Could not find the inlet boundary.".into());
             return;
         }
         let params = CenterlineParams { step: if self.auto_step { 0.0 } else { self.step }, ..Default::default() };
         self.message = None;
-        self.job = Some(Job::spawn("Centerline", cx.egui.clone(), move |_| Ok(centerline::compute(&mesh, &sources, radius, &params))));
+        // Building the BVH takes about half a second on a large mesh, so that is done in the
+        // job, or the scene's is used if it is up to date (the Shift+click that picked the point
+        // made it). A clicked point nearly always lies inside a triangle, which any tree finds
+        // alike. Where several triangles are equally near, which one is taken depends on the
+        // order a tree meets them in: a click exactly on a shared edge or vertex can then start
+        // from the other triangle there if the scene's tree was refitted rather than built, a
+        // difference of one source vertex. A point off the surface (an agent's) is often
+        // equally near several triangles around a vertex, so for those the job builds a fresh
+        // tree, as before.
+        let bvh = if self.inlet_clicked { o.cached_bvh() } else { None };
+        self.job = Some(Job::spawn("Centerline", cx.egui.clone(), move |_| {
+            let (sources, radius) = match inlet {
+                Ok(s) => s,
+                Err(p) => match inlet_near(&mesh, bvh, p) {
+                    Some(s) => s,
+                    None => return Ok(None),
+                },
+            };
+            Ok(Some(centerline::compute(&mesh, &sources, radius, &params)))
+        }));
     }
 
     fn save(&mut self, csv: bool) {
@@ -118,10 +148,12 @@ impl CenterlineTool {
         if let Some(r) = self.job.as_ref().and_then(|j| j.poll()) {
             self.job = None;
             match r {
-                Ok(cl) => {
+                Ok(Some(cl)) => {
                     *cx.status = format!("Centerline: {} branch(es)", cl.branches.len());
                     self.result = Some(cl);
                 }
+                // No surface near the picked point (an empty mesh): nothing to compute.
+                Ok(None) => {}
                 Err(e) => self.message = Some(format!("{e:#}")),
             }
         }
@@ -160,7 +192,7 @@ impl Tool for CenterlineTool {
         }
         self.poll(cx);
         if self.job.is_some() {
-            ui.spinner();
+            polymix_workspace::spinner(ui);
         }
         self.hovered_branch = None;
         if let Some(cl) = &self.result {
@@ -214,6 +246,7 @@ impl Tool for CenterlineTool {
         if input.shift {
             if let Some((_, h)) = cx.pick(pos, self.object) {
                 self.inlet_point = Some(h.point);
+                self.inlet_clicked = true;
                 self.inlet = None;
             }
             return;
@@ -348,7 +381,7 @@ impl Tool for CenterlineTool {
                     Ok(format!("Inlet: end {k} (⌀ {:.2} mm)", self.ends[i].diameter))
                 }
                 (None, Some(p)) => {
-                    (self.inlet, self.inlet_point) = (None, Some(DVec3::from_array(p)));
+                    (self.inlet, self.inlet_point, self.inlet_clicked) = (None, Some(DVec3::from_array(p)), false);
                     Ok("Inlet: near the given point".into())
                 }
                 _ => Err("give `end` or `at`".into()),
@@ -377,5 +410,42 @@ impl Tool for CenterlineTool {
             }
             _ => Err(format!("Centerline has no action {action}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn the_inlet_near_a_clicked_point_is_the_same_from_the_scene_tree() {
+        // A closed, bent vessel; its tree built, then the vessel bent further (a sculpt), so the
+        // scene's tree is a refitted one. Clicks land where rays from around hit it.
+        let path: Vec<DVec3> = (0..30).map(|i| DVec3::new((i as f64 * 0.2).sin() * 3.0, 0.0, i as f64 * 0.6)).collect();
+        let mut m = primitives::tube_along(&path, &[1.5; 30], 32);
+        let caps: Vec<Vec<u32>> = mm_core::topology::boundary_loops(&m).into_iter().map(|l| l.vertices).collect();
+        mm_edit::cap_planar_loops(&mut m, &caps, None, mm_edit::CutFill::Flat).unwrap();
+        let mut refit = mm_core::Bvh::build(&m);
+        let ids: Vec<u32> = m.vertex_ids().collect();
+        for v in ids {
+            let p = m.vertex(v);
+            m.set_vertex(v, p + DVec3::new(0.0, 0.02 * p.z * p.z, 0.0));
+        }
+        refit.refit(&m);
+        let refit = std::sync::Arc::new(refit);
+        let fresh = mm_core::Bvh::build(&m);
+        let mut clicks = 0;
+        for k in 0..24 {
+            let a = k as f64 * 0.7;
+            let origin = DVec3::new(20.0 * a.cos(), 20.0 * a.sin(), 1.0 + k as f64 * 0.6);
+            let Some(hit) = fresh.raycast(&m, &mm_core::Ray::new(origin, DVec3::new(0.0, 0.0, origin.z) - origin)) else { continue };
+            let p = origin + (DVec3::new(0.0, 0.0, origin.z) - origin).normalize() * hit.t;
+            let (built, reused) = (inlet_near(&m, None, p).unwrap(), inlet_near(&m, Some(refit.clone()), p).unwrap());
+            assert_eq!(built.0, reused.0, "click {k}");
+            assert_eq!(built.1.to_bits(), reused.1.to_bits(), "click {k}");
+            clicks += 1;
+        }
+        assert!(clicks > 10, "{clicks} clicks hit");
     }
 }

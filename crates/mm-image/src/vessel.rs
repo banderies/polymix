@@ -90,15 +90,10 @@ pub fn eigenvalues(a00: f64, a01: f64, a02: f64, a11: f64, a12: f64, a22: f64) -
     e
 }
 
-/// The scale-normalised Hessian eigenvalues at voxel `q` of the smoothed image `g` (sorted by
-/// magnitude), with the sign flipped for dark vessels so vessels always give λ2, λ3 < 0.
-fn hessian_eigen(g: &[f32], n: [usize; 3], h: [f64; 3], ijk: [usize; 3], scale2: f64, bright: bool) -> [f64; 3] {
-    let at = |di: i64, dj: i64, dk: i64| {
-        let i = (ijk[0] as i64 + di).clamp(0, n[0] as i64 - 1) as usize;
-        let j = (ijk[1] as i64 + dj).clamp(0, n[1] as i64 - 1) as usize;
-        let k = (ijk[2] as i64 + dk).clamp(0, n[2] as i64 - 1) as usize;
-        g[(k * n[1] + j) * n[0] + i] as f64
-    };
+/// The scale-normalised Hessian (xx, xy, xz, yy, yz, zz) at voxel `ijk` of the smoothed image
+/// `g`, with the sign flipped for dark vessels so vessels always give λ2, λ3 < 0. `at` gives
+/// the value at an offset from the voxel.
+fn hessian_with(at: impl Fn(i64, i64, i64) -> f64, h: [f64; 3], scale2: f64, bright: bool) -> [f64; 6] {
     let c = at(0, 0, 0);
     let dxx = (at(1, 0, 0) - 2.0 * c + at(-1, 0, 0)) / (h[0] * h[0]);
     let dyy = (at(0, 1, 0) - 2.0 * c + at(0, -1, 0)) / (h[1] * h[1]);
@@ -107,24 +102,106 @@ fn hessian_eigen(g: &[f32], n: [usize; 3], h: [f64; 3], ijk: [usize; 3], scale2:
     let dxz = (at(1, 0, 1) - at(1, 0, -1) - at(-1, 0, 1) + at(-1, 0, -1)) / (4.0 * h[0] * h[2]);
     let dyz = (at(0, 1, 1) - at(0, 1, -1) - at(0, -1, 1) + at(0, -1, -1)) / (4.0 * h[1] * h[2]);
     let s = if bright { scale2 } else { -scale2 };
-    eigenvalues(dxx * s, dxy * s, dxz * s, dyy * s, dyz * s, dzz * s)
+    [dxx * s, dxy * s, dxz * s, dyy * s, dyz * s, dzz * s]
 }
 
-/// Run `f` on the eigenvalues of every voxel (in parallel, plane by plane).
-fn per_voxel<T: Send>(g: &[f32], n: [usize; 3], h: [f64; 3], scale2: f64, bright: bool, f: impl Fn(usize, [f64; 3]) -> T + Sync) -> Vec<Vec<T>> {
+/// The scale-normalised Hessian at voxel `ijk` (see [`hessian_with`]), its neighbours clamped
+/// to the grid.
+fn hessian(g: &[f32], n: [usize; 3], h: [f64; 3], ijk: [usize; 3], scale2: f64, bright: bool) -> [f64; 6] {
+    let at = |di: i64, dj: i64, dk: i64| {
+        let i = (ijk[0] as i64 + di).clamp(0, n[0] as i64 - 1) as usize;
+        let j = (ijk[1] as i64 + dj).clamp(0, n[1] as i64 - 1) as usize;
+        let k = (ijk[2] as i64 + dk).clamp(0, n[2] as i64 - 1) as usize;
+        g[(k * n[1] + j) * n[0] + i] as f64
+    };
+    hessian_with(at, h, scale2, bright)
+}
+
+/// The scale-normalised Hessian eigenvalues at voxel `ijk` of the smoothed image `g` (sorted by
+/// magnitude), with the sign flipped for dark vessels so vessels always give λ2, λ3 < 0.
+#[cfg(test)]
+fn hessian_eigen(g: &[f32], n: [usize; 3], h: [f64; 3], ijk: [usize; 3], scale2: f64, bright: bool) -> [f64; 3] {
+    let [a00, a01, a02, a11, a12, a22] = hessian(g, n, h, ijk, scale2, bright);
+    eigenvalues(a00, a01, a02, a11, a12, a22)
+}
+
+/// Run `f` on the scale-normalised Hessian of every voxel of plane `k`, in voxel order (the
+/// index within the plane, the Hessian). Voxels away from the grid's edges read their
+/// neighbours directly; the values are the same as [`hessian`]'s.
+fn plane_hessians(g: &[f32], n: [usize; 3], h: [f64; 3], k: usize, scale2: f64, bright: bool, mut f: impl FnMut(usize, [f64; 6])) {
+    let [nx, ny, nz] = n;
+    let (sy, sz) = (nx as isize, (nx * ny) as isize);
+    for j in 0..ny {
+        for i in 0..nx {
+            let interior = (1..nx - 1).contains(&i) && (1..ny - 1).contains(&j) && (1..nz - 1).contains(&k);
+            let a = if interior {
+                let q = ((k * ny + j) * nx + i) as isize;
+                hessian_with(|di, dj, dk| g[(q + di as isize + dj as isize * sy + dk as isize * sz) as usize] as f64, h, scale2, bright)
+            } else {
+                hessian(g, n, h, [i, j, k], scale2, bright)
+            };
+            f(j * nx + i, a);
+        }
+    }
+}
+
+/// The largest squared Frobenius norm of the scale-normalised Hessian over the image (the sum
+/// of its squared eigenvalues, without finding them).
+fn max_hessian_norm2(g: &[f32], n: [usize; 3], h: [f64; 3], scale2: f64, bright: bool) -> f64 {
     (0..n[2])
         .into_par_iter()
         .map(|k| {
-            let mut out = Vec::with_capacity(n[0] * n[1]);
-            for j in 0..n[1] {
-                for i in 0..n[0] {
-                    let q = (k * n[1] + j) * n[0] + i;
-                    out.push(f(q, hessian_eigen(g, n, h, [i, j, k], scale2, bright)));
-                }
-            }
-            out
+            let mut most = 0.0f64;
+            plane_hessians(g, n, h, k, scale2, bright, |_, a| {
+                most = most.max(a[0] * a[0] + a[3] * a[3] + a[5] * a[5] + 2.0 * (a[1] * a[1] + a[2] * a[2] + a[4] * a[4]));
+            });
+            most
         })
-        .collect()
+        .reduce(|| 0.0, f64::max)
+}
+
+/// The largest absolute entry of a Hessian (xx, xy, xz, yy, yz, zz).
+fn largest_entry(a: &[f64; 6]) -> f64 {
+    a.iter().fold(0.0f64, |m, x| m.max(x.abs()))
+}
+
+/// The largest −λ3 over the image (and 0). Voxels whose −λ3 cannot reach the largest found so
+/// far are not solved: [`eigenvalues`] gives |q| ≤ m and p ≤ √3·m for the largest entry m,
+/// so every value it returns is within 12·m (with rounding to spare).
+fn max_neg_l3(g: &[f32], n: [usize; 3], h: [f64; 3], scale2: f64, bright: bool) -> f64 {
+    (0..n[2])
+        .into_par_iter()
+        .map(|k| {
+            let mut most = 0.0f64;
+            plane_hessians(g, n, h, k, scale2, bright, |_, a| {
+                // (`largest_entry` passes over NaNs, so the bound is never NaN.)
+                if 12.0 * largest_entry(&a) * (1.0 + 1e-12) >= most {
+                    most = most.max(-eigenvalues(a[0], a[1], a[2], a[3], a[4], a[5])[2]);
+                }
+            });
+            most
+        })
+        .reduce(|| 0.0, f64::max)
+}
+
+/// Whether λ2 and λ3 (the two largest in magnitude) cannot both be negative at a voxel: then
+/// λ1 + λ2 + λ3 ≤ λ3 < 0 (as |λ1| ≤ |λ2|), and [`eigenvalues`] makes its three values add up
+/// to the trace to within rounding far below this margin.
+fn not_tubular(a: &[f64; 6]) -> bool {
+    a[0] + a[3] + a[5] > 1e-9 * largest_entry(a)
+}
+
+/// Raise every voxel of `out` to `f(eigenvalues)` where that is larger (in parallel, plane by
+/// plane). `f` must be 0 unless λ2 and λ3 are both negative (as every response here is), so
+/// voxels where they cannot be are not solved.
+fn max_into(out: &mut [f32], g: &[f32], n: [usize; 3], h: [f64; 3], scale2: f64, bright: bool, f: impl Fn([f64; 3]) -> f32 + Sync) {
+    out.par_chunks_mut((n[0] * n[1]).max(1)).enumerate().for_each(|(k, o)| {
+        plane_hessians(g, n, h, k, scale2, bright, |q, a| {
+            if !not_tubular(&a) {
+                o[q] = o[q].max(f(eigenvalues(a[0], a[1], a[2], a[3], a[4], a[5])));
+            }
+        });
+    });
 }
 
 /// Frangi's vesselness (λ1 ≈ 0 along the vessel, λ2, λ3 < 0 across it).
@@ -184,26 +261,31 @@ pub fn vesselness(vol: &LoadedVolume, p: &VesselParams, progress: Progress) -> a
     let mut out = vec![0.0f32; vol.values.len()];
     match p.method {
         VesselMethod::Frangi => {
-            // c: half the largest Hessian norm over all scales, unless given.
+            // c: half the largest Hessian norm over all scales, unless given. The last scale's
+            // smoothed image is kept for the responses, which then go from the last scale back
+            // (the largest response does not depend on the order).
+            let mut kept = None;
             let c = if p.c > 0.0 {
                 p.c
             } else {
                 let mut most = 0.0f64;
-                for &s in &sigmas {
+                for (si, &s) in sigmas.iter().enumerate() {
                     let g = smooth(s, done / steps, (done + 0.7) / steps)?;
-                    let norms = per_voxel(&g, n, h, s * s, p.bright, |_, l| l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
-                    most = most.max(norms.iter().flatten().fold(0.0f64, |a, &b| a.max(b)).sqrt());
+                    most = most.max(max_hessian_norm2(&g, n, h, s * s, p.bright).sqrt());
                     done += 1.0;
                     check(progress, done / steps)?;
+                    if si + 1 == sigmas.len() {
+                        kept = Some(g);
+                    }
                 }
                 (0.5 * most).max(1e-12)
             };
-            for &s in &sigmas {
-                let g = smooth(s, done / steps, (done + 0.7) / steps)?;
-                let v = per_voxel(&g, n, h, s * s, p.bright, |_, l| frangi(l, p.alpha, p.beta, c) as f32);
-                for (o, x) in out.iter_mut().zip(v.into_iter().flatten()) {
-                    *o = o.max(x);
-                }
+            for &s in sigmas.iter().rev() {
+                let g = match kept.take() {
+                    Some(g) => g,
+                    None => smooth(s, done / steps, (done + 0.7) / steps)?,
+                };
+                max_into(&mut out, &g, n, h, s * s, p.bright, |l| frangi(l, p.alpha, p.beta, c) as f32);
                 done += 1.0;
                 check(progress, done / steps)?;
             }
@@ -211,15 +293,12 @@ pub fn vesselness(vol: &LoadedVolume, p: &VesselParams, progress: Progress) -> a
         VesselMethod::Sato => {
             for &s in &sigmas {
                 let g = smooth(s, done / steps, (done + 0.7) / steps)?;
-                let v = per_voxel(&g, n, h, s * s, p.bright, |_, l| sato(l) as f32);
-                for (o, x) in out.iter_mut().zip(v.into_iter().flatten()) {
-                    *o = o.max(x);
-                }
+                max_into(&mut out, &g, n, h, s * s, p.bright, |l| sato(l) as f32);
                 done += 1.0;
                 check(progress, done / steps)?;
             }
             // Sato's measure has the image's units: scale the strongest response to 1.
-            let top = out.iter().fold(0.0f32, |a, &b| a.max(b));
+            let top = out.par_iter().copied().reduce(|| 0.0f32, f32::max);
             if top > 0.0 {
                 out.par_iter_mut().for_each(|x| *x /= top);
             }
@@ -228,17 +307,13 @@ pub fn vesselness(vol: &LoadedVolume, p: &VesselParams, progress: Progress) -> a
             for &s in &sigmas {
                 let g = smooth(s, done / steps, (done + 0.7) / steps)?;
                 // λρ: λ3 regularised by τ times its largest value at this scale.
-                let l3 = per_voxel(&g, n, h, s * s, p.bright, |_, l| -l[2]);
-                let top = l3.iter().flatten().fold(0.0f64, |a, &b| a.max(b));
+                let top = max_neg_l3(&g, n, h, s * s, p.bright);
                 let floor = p.tau * top;
-                let v = per_voxel(&g, n, h, s * s, p.bright, |_, l| {
+                max_into(&mut out, &g, n, h, s * s, p.bright, |l| {
                     let l3 = -l[2];
                     let lrho = if l3 > floor { l3 } else if l3 > 0.0 { floor } else { 0.0 };
                     jerman(l, lrho) as f32
                 });
-                for (o, x) in out.iter_mut().zip(v.into_iter().flatten()) {
-                    *o = o.max(x);
-                }
                 done += 1.0;
                 check(progress, done / steps)?;
             }
@@ -341,5 +416,140 @@ mod tests {
             }
         }
         assert!(vesselness(&tube(3.0, true), &p(VesselMethod::Frangi), &|_| false).is_err());
+    }
+
+    #[test]
+    fn the_shortcuts_skip_only_voxels_they_may() {
+        // Random symmetric matrices over many magnitudes, near-diagonal and near-singular
+        // ones among them.
+        let mut seed = 9u64;
+        let mut unit = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        for n in 0..400_000 {
+            let scale = 10f64.powi((n % 61) * 10 - 300);
+            let mut a: [f64; 6] = std::array::from_fn(|_| unit() * scale);
+            match n % 5 {
+                0 => [1, 2, 4].iter().for_each(|&o| a[o] *= 1e-9),
+                1 => a[5] = -(a[0] + a[3]) + unit() * scale * 1e-12,
+                2 => [0, 3, 5].iter().for_each(|&d| a[d] = -a[d].abs()),
+                _ => {}
+            }
+            let l = eigenvalues(a[0], a[1], a[2], a[3], a[4], a[5]);
+            if not_tubular(&a) {
+                assert!(!(l[1] < 0.0 && l[2] < 0.0), "{a:?} → {l:?}");
+            }
+            assert!(-l[2] <= 12.0 * largest_entry(&a) * (1.0 + 1e-12), "{a:?} → {l:?}");
+        }
+    }
+
+    /// Vesselness written plainly: every voxel's eigenvalues collected per scale, c from the
+    /// largest sum of squared eigenvalues, the scales in order.
+    fn reference(vol: &LoadedVolume, p: &VesselParams) -> Vec<f32> {
+        let (n, h) = (vol.dims, vol.geometry.spacing);
+        let eig = |s: f64| -> Vec<[f64; 3]> {
+            let g = gaussian(&vol.values, n, h.map(|sp| s / sp), no_progress()).unwrap();
+            let mut l = Vec::new();
+            for k in 0..n[2] {
+                for j in 0..n[1] {
+                    for i in 0..n[0] {
+                        l.push(hessian_eigen(&g, n, h, [i, j, k], s * s, p.bright));
+                    }
+                }
+            }
+            l
+        };
+        let mut out = vec![0.0f32; vol.values.len()];
+        let raise = |out: &mut Vec<f32>, v: Vec<f32>| out.iter_mut().zip(v).for_each(|(o, x)| *o = o.max(x));
+        for &s in &scales(p) {
+            let l = eig(s);
+            let v: Vec<f32> = match p.method {
+                VesselMethod::Frangi => {
+                    let c = if p.c > 0.0 { p.c } else { reference_c(vol, p) };
+                    l.iter().map(|&l| frangi(l, p.alpha, p.beta, c) as f32).collect()
+                }
+                VesselMethod::Sato => l.iter().map(|&l| sato(l) as f32).collect(),
+                VesselMethod::Jerman => {
+                    let floor = p.tau * l.iter().map(|l| -l[2]).fold(0.0f64, f64::max);
+                    l.iter()
+                        .map(|&l| {
+                            let l3 = -l[2];
+                            jerman(l, if l3 > floor { l3 } else if l3 > 0.0 { floor } else { 0.0 }) as f32
+                        })
+                        .collect()
+                }
+            };
+            raise(&mut out, v);
+        }
+        if p.method == VesselMethod::Sato {
+            let top = out.iter().fold(0.0f32, |a, &b| a.max(b));
+            if top > 0.0 {
+                out.iter_mut().for_each(|x| *x /= top);
+            }
+        }
+        out
+    }
+
+    /// Frangi's automatic c from the eigenvalues: half the largest √(λ1² + λ2² + λ3²).
+    fn reference_c(vol: &LoadedVolume, p: &VesselParams) -> f64 {
+        let (n, h) = (vol.dims, vol.geometry.spacing);
+        let mut most = 0.0f64;
+        for &s in &scales(p) {
+            let g = gaussian(&vol.values, n, h.map(|sp| s / sp), no_progress()).unwrap();
+            for k in 0..n[2] {
+                for j in 0..n[1] {
+                    for i in 0..n[0] {
+                        let l = hessian_eigen(&g, n, h, [i, j, k], s * s, p.bright);
+                        most = most.max((l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt());
+                    }
+                }
+            }
+        }
+        (0.5 * most).max(1e-12)
+    }
+
+    #[test]
+    fn matches_the_plain_per_voxel_filter() {
+        // Two tubes and a ball on an anisotropic grid, with noise.
+        let mut seed = 3u64;
+        let mut vol = grid([29, 23, 17], |q| {
+            let t1 = (q.x - 9.0).hypot(q.y - 11.0) <= 2.5;
+            let t2 = (q.y - 6.0).hypot(q.z - 8.0) <= 1.5;
+            let ball = (q - DVec3::new(20.0, 15.0, 9.0)).length() <= 4.0;
+            if t1 || t2 || ball { 120.0 } else { 15.0 }
+        });
+        for x in vol.values.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *x += (seed >> 40) as f32 / (1u64 << 24) as f32 * 10.0;
+        }
+        vol.geometry = Geometry::from_axes([29, 23, 17, 1], [0.6, 0.7, 1.1], [DVec3::X, DVec3::Y, DVec3::Z], DVec3::ZERO);
+        let base = VesselParams { min_diameter_mm: 1.5, max_diameter_mm: 5.0, scales: 3, ..Default::default() };
+        for method in VesselMethod::ALL {
+            for bright in [true, false] {
+                // With c given (and for Sato and Jerman, which have none) nothing changes at all.
+                let p = VesselParams { method, bright, c: 40.0, ..base.clone() };
+                let a = vesselness(&vol, &p, no_progress()).unwrap();
+                let b = reference(&vol, &p);
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{method:?} bright {bright}");
+            }
+        }
+        // The automatic c: the Frobenius norm instead of the eigenvalues' changes it only by
+        // rounding, and the responses barely.
+        for bright in [true, false] {
+            let p = VesselParams { bright, ..base.clone() };
+            let (n, h) = (vol.dims, vol.geometry.spacing);
+            let mut most = 0.0f64;
+            for &s in &scales(&p) {
+                let g = gaussian(&vol.values, n, h.map(|sp| s / sp), no_progress()).unwrap();
+                most = most.max(max_hessian_norm2(&g, n, h, s * s, bright).sqrt());
+            }
+            let (c, want) = ((0.5 * most).max(1e-12), reference_c(&vol, &p));
+            assert!((c - want).abs() <= 1e-12 * want, "c {c} vs {want}");
+            let a = vesselness(&vol, &p, no_progress()).unwrap();
+            let b = reference(&vol, &p);
+            let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            assert!(worst <= 1e-6, "largest difference {worst}");
+        }
     }
 }

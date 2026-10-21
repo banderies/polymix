@@ -184,39 +184,57 @@ pub fn close_cracks_in(mesh: &mut Mesh, tolerance: f64, only: Option<&[u32]>) ->
     let n0 = mesh.max_vid();
     let allowed = |v: u32| mask.as_ref().is_none_or(|m| v as usize >= n0 || m[v as usize]);
     let tol = tolerance.max(0.0);
-    // Plain welding first; T-junction splits only help where the split vertices can then be
-    // welded, so keep them only if they leave fewer open edges.
-    let mut welded = mesh.clone();
-    let plain = CloseCracksReport { splits: 0, weld: weld_boundary_vertices_in(&mut welded, tol, &allowed) };
-    let mut best = (welded, plain);
+    // T-junction splits only help where the split vertices can then be welded, so they are
+    // made on a copy, kept only if it leaves fewer open edges than plain welding. The first
+    // round is planned on the mesh itself, so there is no copy when nothing would be split.
+    let mut split: Option<(Mesh, CloseCracksReport)> = None;
     if tol > 0.0 {
-        let mut split = mesh.clone();
-        let mut report = CloseCracksReport::default();
-        // A few rounds: a split creates new boundary edges that may host further vertices.
-        for _ in 0..8 {
-            let n = split_t_junctions(&mut split, tol, &allowed);
-            report.splits += n;
-            if n == 0 {
-                break;
+        let first = plan_t_junctions(mesh, tol, &allowed);
+        if !first.is_empty() {
+            let mut copy = mesh.clone();
+            let mut report = CloseCracksReport::default();
+            let mut planned = Some(first);
+            // A few rounds: a split creates new boundary edges that may host further vertices.
+            for _ in 0..8 {
+                let n = match planned.take() {
+                    Some(splits) => apply_t_junctions(&mut copy, splits),
+                    None => split_t_junctions(&mut copy, tol, &allowed),
+                };
+                report.splits += n;
+                if n == 0 {
+                    break;
+                }
             }
-        }
-        if report.splits > 0 {
-            report.weld = weld_boundary_vertices_in(&mut split, tol, &allowed);
-            if split.boundary_edge_ids().count() < best.0.boundary_edge_ids().count() {
-                best = (split, report);
+            if report.splits > 0 {
+                split = Some((copy, report));
             }
         }
     }
-    *mesh = best.0;
-    best.1
+    // Plain welding, in place.
+    let plain = CloseCracksReport { splits: 0, weld: weld_boundary_vertices_in(mesh, tol, &allowed) };
+    if let Some((mut copy, mut report)) = split {
+        report.weld = weld_boundary_vertices_in(&mut copy, tol, &allowed);
+        if copy.boundary_edge_ids().count() < mesh.boundary_edge_ids().count() {
+            *mesh = copy;
+            return report;
+        }
+    }
+    plain
 }
 
 /// Split boundary edges that have a boundary vertex (not their own) within `tol` of their
 /// interior, at that vertex's projection. Returns the number of splits.
 fn split_t_junctions(mesh: &mut Mesh, tol: f64, allowed: &dyn Fn(u32) -> bool) -> usize {
+    let splits = plan_t_junctions(mesh, tol, allowed);
+    apply_t_junctions(mesh, splits)
+}
+
+/// The splits [`split_t_junctions`] makes: (boundary edge, split parameter), at most one per
+/// edge.
+fn plan_t_junctions(mesh: &Mesh, tol: f64, allowed: &dyn Fn(u32) -> bool) -> Vec<(u32, f64)> {
     let bedges: Vec<u32> = mesh.boundary_edge_ids().filter(|&e| mesh.edge_vertices(e).iter().all(|&v| allowed(v))).collect();
     if bedges.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mean = bedges.iter().map(|&e| mesh.edge_length(e)).sum::<f64>() / bedges.len() as f64;
     let cell = mean.max(tol * 2.0).max(1e-12);
@@ -269,6 +287,11 @@ fn split_t_junctions(mesh: &mut Mesh, tol: f64, allowed: &dyn Fn(u32) -> bool) -
             splits.push((e, t));
         }
     }
+    splits
+}
+
+/// Make the splits [`plan_t_junctions`] planned on `mesh`. Returns the number made.
+fn apply_t_junctions(mesh: &mut Mesh, splits: Vec<(u32, f64)>) -> usize {
     let mut n = 0;
     for (e, t) in splits {
         if mesh.is_edge(e) && mesh.is_boundary_edge(e) && mesh.split_edge_at(e, t).is_ok() {
@@ -695,4 +718,126 @@ pub fn orient_outward(mesh: &mut Mesh) -> usize {
         n += c.len();
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    /// Exactly the same mesh: vertex and triangle slots, positions (bits), triangles, groups.
+    fn same_mesh(a: &Mesh, b: &Mesh) -> bool {
+        let bits = |p: DVec3| p.to_array().map(f64::to_bits);
+        a.max_vid() == b.max_vid()
+            && a.max_tid() == b.max_tid()
+            && (0..a.max_vid() as u32).all(|v| a.is_vertex(v) == b.is_vertex(v) && (!a.is_vertex(v) || bits(a.vertex(v)) == bits(b.vertex(v))))
+            && (0..a.max_tid() as u32).all(|t| a.is_triangle(t) == b.is_triangle(t) && (!a.is_triangle(t) || (a.triangle(t) == b.triangle(t) && a.tri_group(t) == b.tri_group(t))))
+    }
+
+    /// [`close_cracks_in`] as it was: plain welding on one copy, T-junction splits on another,
+    /// the better copy replacing the mesh.
+    fn close_cracks_reference(mesh: &mut Mesh, tolerance: f64, only: Option<&[u32]>) -> CloseCracksReport {
+        let mask: Option<Vec<bool>> = only.map(|vs| {
+            let mut m = vec![false; mesh.max_vid()];
+            for &v in vs {
+                if (v as usize) < m.len() {
+                    m[v as usize] = true;
+                }
+            }
+            m
+        });
+        let n0 = mesh.max_vid();
+        let allowed = |v: u32| mask.as_ref().is_none_or(|m| v as usize >= n0 || m[v as usize]);
+        let tol = tolerance.max(0.0);
+        let mut welded = mesh.clone();
+        let plain = CloseCracksReport { splits: 0, weld: weld_boundary_vertices_in(&mut welded, tol, &allowed) };
+        let mut best = (welded, plain);
+        if tol > 0.0 {
+            let mut split = mesh.clone();
+            let mut report = CloseCracksReport::default();
+            for _ in 0..8 {
+                let n = split_t_junctions(&mut split, tol, &allowed);
+                report.splits += n;
+                if n == 0 {
+                    break;
+                }
+            }
+            if report.splits > 0 {
+                report.weld = weld_boundary_vertices_in(&mut split, tol, &allowed);
+                if split.boundary_edge_ids().count() < best.0.boundary_edge_ids().count() {
+                    best = (split, report);
+                }
+            }
+        }
+        *mesh = best.0;
+        best.1
+    }
+
+    /// A fine and a coarse grid meeting along x = 0 without sharing vertices (T-junctions).
+    fn t_junctions() -> Mesh {
+        let mut left = primitives::plane_grid(2.0, 4.0, 2, 4);
+        left.transform(|p| p - DVec3::new(1.0, 0.0, 0.0));
+        let mut right = primitives::plane_grid(2.0, 4.0, 2, 8);
+        right.transform(|p| p + DVec3::new(1.0 + 1e-7, 0.0, 0.0));
+        let mut m = left.clone();
+        m.append_mesh(&right, 0);
+        m
+    }
+
+    /// A grid whose triangles right of x = `cut` have their own copies of the vertices (a
+    /// duplicated seam), the copies nudged by `nudge`.
+    fn seam(cut: f64, nudge: f64) -> Mesh {
+        let g = primitives::plane_grid(4.0, 4.0, 24, 24);
+        let (pos, tris, _) = g.to_arrays();
+        let mut p = pos.clone();
+        let mut t = Vec::new();
+        for tv in tris {
+            let c = (pos[tv[0] as usize] + pos[tv[1] as usize] + pos[tv[2] as usize]) / 3.0;
+            if c.x > cut {
+                let base = p.len() as u32;
+                for (k, &v) in tv.iter().enumerate() {
+                    p.push(pos[v as usize] + DVec3::new(nudge * (k as f64 - 1.0), nudge, 0.0));
+                }
+                t.push([base, base + 1, base + 2]);
+            } else {
+                t.push(tv);
+            }
+        }
+        Mesh::from_triangles(&p, &t, None).0
+    }
+
+    /// A triangle whose tip touches the middle of a strip's edge: splitting there and welding
+    /// the tip leaves more open edges than not splitting, so the plain weld is kept.
+    fn touching_tip() -> Mesh {
+        let mut m = primitives::plane_grid(2.0, 1.0, 1, 1);
+        let tip = Mesh::from_triangles(&[DVec3::new(0.0, 0.5, 0.0), DVec3::new(0.2, 1.5, 0.0), DVec3::new(-0.2, 1.5, 0.0)], &[[0, 1, 2]], None).0;
+        m.append_mesh(&tip, 0);
+        m
+    }
+
+    #[test]
+    fn close_cracks_matches_the_two_copy_version() {
+        // The tip is split for, and that copy turned down.
+        assert!(!plan_t_junctions(&touching_tip(), 1e-6, &|_| true).is_empty());
+        let cases: Vec<(&str, Mesh, f64)> = vec![
+            ("touching tip", touching_tip(), 1e-6),
+            ("t-junctions", t_junctions(), 1e-5),
+            ("t-junctions, no tolerance", t_junctions(), 0.0),
+            ("seam", seam(0.3, 0.0), 1e-6),
+            ("nudged seam", seam(-0.7, 1e-4), 1e-3),
+            ("seam too far", seam(0.3, 1e-2), 1e-3),
+            ("closed sphere", primitives::icosphere(1.0, 2), 1e-6),
+        ];
+        for (name, m, tol) in cases {
+            let half: Vec<u32> = m.vertex_ids().filter(|&v| m.vertex(v).y > 0.0).collect();
+            for only in [None, Some(&half[..])] {
+                let (mut a, mut b) = (m.clone(), m.clone());
+                let ra = close_cracks_in(&mut a, tol, only);
+                let rb = close_cracks_reference(&mut b, tol, only);
+                assert_eq!(ra, rb, "{name} (only {})", only.is_some());
+                assert!(same_mesh(&a, &b), "{name} (only {}): {ra:?}", only.is_some());
+                a.check_validity().unwrap();
+            }
+        }
+    }
 }

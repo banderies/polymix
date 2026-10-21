@@ -178,6 +178,22 @@ impl SceneObject {
         self.selection_stamp = next_stamp();
     }
 
+    /// `self.selection.sync(&self.mesh)`, without its walk over every triangle when nothing
+    /// is selected: an empty selection only needs its length to follow the triangle ids, and
+    /// stays all clear. The result is the same as `sync`'s.
+    pub fn sync_selection(&mut self) {
+        let n = self.mesh.max_tid();
+        let len = self.selection.bits().len();
+        if !self.selection.is_empty() || len > n {
+            self.selection.sync(&self.mesh);
+        } else if len < n {
+            // Inserting the last id grows the bits (all clear) to the id range; it then goes.
+            let last = n as u32 - 1;
+            self.selection.insert(last);
+            self.selection.remove(last);
+        }
+    }
+
     /// BVH for picking, rebuilt lazily after geometry changes.
     pub fn bvh(&mut self) -> Arc<Bvh> {
         match &mut self.bvh {
@@ -186,6 +202,33 @@ impl SceneObject {
             _ => self.bvh = Some(Arc::new(Bvh::build(&self.mesh))),
         }
         self.bvh.clone().unwrap()
+    }
+
+    /// The BVH if it matches the mesh as it is now, without building or refitting it (for
+    /// code that only has `&self`, such as tool panels).
+    pub fn bvh_if_current(&self) -> Option<&Arc<Bvh>> {
+        self.bvh.as_ref().filter(|b| b.is_current(&self.mesh))
+    }
+
+    /// A handle on the current BVH for a background job, if there is one (otherwise the job
+    /// builds its own from the mesh).
+    pub fn cached_bvh(&self) -> Option<Arc<Bvh>> {
+        self.bvh_if_current().cloned()
+    }
+
+    /// Take a BVH built elsewhere (e.g. by a background job) over all of the mesh's
+    /// triangles. It is kept only if it matches the mesh as it is now and the object has no
+    /// current BVH yet: versions are unique, so a BVH built for an earlier state, or for
+    /// another mesh, is turned away. Returns whether it was kept.
+    pub fn install_bvh(&mut self, bvh: impl Into<Arc<Bvh>>) -> bool {
+        let bvh = bvh.into();
+        // A tree over only some triangles would answer queries (and bounds) for those only.
+        let whole = bvh.tris.len() == self.mesh.triangle_count();
+        if !bvh.is_current(&self.mesh) || !whole || self.bvh_if_current().is_some() {
+            return false;
+        }
+        self.bvh = Some(bvh);
+        true
     }
 
     pub fn bounds(&self) -> Aabb {
@@ -216,6 +259,9 @@ pub struct Scene {
     pub target: Option<ObjectId>,
     /// The frame the last tool that records one worked in (not saved in projects).
     pub last_tool_frame: Option<ToolFrame>,
+    /// History::undo / redo made this restored scene coherent already, knowing the scene it
+    /// replaced: the [`Scene::after_restore`] their callers make next has nothing to do.
+    restored: bool,
 }
 
 /// A target surface ready for nearest-point queries.
@@ -326,6 +372,12 @@ impl History {
         self.redo.clear();
     }
 
+    /// Count a change that adds no undo step of its own (a later part of a gesture whose
+    /// first change pushed the step), so autosave still sees the final state.
+    pub fn touch(&mut self) {
+        self.generation += 1;
+    }
+
     pub fn push(&mut self, label: impl Into<String>, scene: &Scene) {
         self.generation += 1;
         let label = label.into();
@@ -377,6 +429,8 @@ impl History {
         let (label, prev) = self.undo.pop()?;
         let cur = std::mem::replace(scene, prev);
         scene.carry_metadata(&cur);
+        scene.after_restore_from(&cur);
+        scene.restored = true;
         self.redo.push((label.clone(), cur));
         Some(label)
     }
@@ -386,18 +440,47 @@ impl History {
         let (label, next) = self.redo.pop()?;
         let cur = std::mem::replace(scene, next);
         scene.carry_metadata(&cur);
+        scene.after_restore_from(&cur);
+        scene.restored = true;
         self.undo.push((label.clone(), cur));
         Some(label)
     }
 
 }
 
+/// The same selection (the derived `==`, without walking two empty ones).
+fn same_selection(a: &TriSelection, b: &TriSelection) -> bool {
+    a.len() == b.len() && a.bits().len() == b.bits().len() && (a.is_empty() || a.bits() == b.bits())
+}
+
 impl Scene {
-    /// Make sure selections and stamps are coherent after restoring a snapshot.
+    /// Make sure selections and stamps are coherent after restoring a snapshot. After
+    /// History::undo / redo there is nothing left to do: they restore with
+    /// [`Scene::after_restore_from`] themselves.
     pub fn after_restore(&mut self) {
+        if std::mem::take(&mut self.restored) {
+            return;
+        }
         for o in &mut self.objects {
             o.selection.sync(&o.mesh);
             o.touch_selection();
+            o.moved_vertices.clear();
+            o.scalars = None;
+            o.colors = None;
+        }
+    }
+
+    /// [`Scene::after_restore`] for a snapshot that took the place of `replaced`. An object
+    /// whose mesh and selection are the very ones it had there keeps that selection stamp,
+    /// so what was made from them (the GPU's per-face flags) is still good; the others get
+    /// a new one. Selections are synced either way (cheaply when empty).
+    pub fn after_restore_from(&mut self, replaced: &Scene) {
+        for o in &mut self.objects {
+            o.sync_selection();
+            match replaced.get(o.id).filter(|r| Arc::ptr_eq(&r.mesh, &o.mesh) && same_selection(&r.selection, &o.selection)) {
+                Some(r) => o.selection_stamp = r.selection_stamp,
+                None => o.touch_selection(),
+            }
             o.moved_vertices.clear();
             o.scalars = None;
             o.colors = None;
@@ -444,5 +527,150 @@ mod history_tests {
         h.by_agent = true;
         h.push("Remesh", &s);
         assert_eq!(h.undo_label(), Some("Agent: Remesh"));
+        let g2 = h.generation();
+        let undo_steps = h.labels().0.len();
+        h.touch();
+        assert!(h.generation() > g2, "a coalesced change counts");
+        assert_eq!(h.labels().0.len(), undo_steps, "without an undo step");
+    }
+
+    #[test]
+    fn undo_keeps_the_stamps_of_objects_it_did_not_change() {
+        let mut s = Scene::default();
+        let a = s.add("a", mm_core::primitives::icosphere(1.0, 2));
+        let b = s.add("b", mm_core::primitives::cube(1.0, 2));
+        let c = s.add("c", mm_core::primitives::cube(2.0, 1));
+        s.get_mut(c).unwrap().selection.insert(3);
+        let mut h = History::default();
+        h.push("edit", &s);
+        let stamps = |s: &Scene| [a, b, c].map(|id| s.get(id).unwrap().selection_stamp);
+        let before = stamps(&s);
+        // a's mesh changes, c's selection changes, b stays as it was.
+        s.get_mut(a).unwrap().mesh_mut().set_vertex(0, glam::DVec3::splat(2.0));
+        let o = s.get_mut(c).unwrap();
+        o.selection.insert(5);
+        o.touch_selection();
+        for o in &mut s.objects {
+            o.moved_vertices.push(1);
+            o.scalars = Some((next_stamp(), Arc::new(vec![0.5; o.mesh.max_tid()])));
+            o.colors = Some((next_stamp(), Arc::new(vec![0; o.mesh.max_tid()])));
+        }
+        let edited = stamps(&s);
+        h.undo(&mut s);
+        let undone = stamps(&s);
+        assert_ne!(undone[0], edited[0], "a's mesh changed back");
+        assert_eq!(undone[1], edited[1], "b is the same");
+        assert_ne!(undone[2], edited[2], "c's selection changed back");
+        assert!([undone[0], undone[2]].iter().all(|x| !before.contains(x) && !edited.contains(x)), "fresh stamps");
+        assert!(s.objects.iter().all(|o| o.moved_vertices.is_empty() && o.scalars.is_none() && o.colors.is_none()));
+        assert_eq!(s.get(c).unwrap().selection.to_vec(), vec![3]);
+        // The caller's after_restore has nothing left to do; called on its own it renews all.
+        s.after_restore();
+        assert_eq!(stamps(&s), undone);
+        s.after_restore();
+        assert!(stamps(&s).iter().zip(&undone).all(|(x, y)| x != y));
+        // Redo: b keeps its stamp again.
+        let restamped = stamps(&s);
+        h.redo(&mut s);
+        s.after_restore();
+        let redone = stamps(&s);
+        assert_eq!(redone[1], restamped[1]);
+        assert!(redone[0] != restamped[0] && redone[2] != restamped[2]);
+        assert_eq!(s.get(c).unwrap().selection.to_vec(), vec![3, 5]);
+    }
+
+    #[test]
+    fn restoring_syncs_selections_as_before() {
+        // A snapshot whose selection is out of step with its mesh (longer, holding a removed
+        // triangle) or shorter than the mesh's triangle ids: synced as the full walk does.
+        let mut m = mm_core::primitives::icosphere(1.0, 2);
+        let mut s = Scene::default();
+        let a = s.add("a", m.clone());
+        let b = s.add("b", m.clone());
+        m.remove_triangles([7, 8]);
+        let grown = {
+            let mut g = m.clone();
+            g.append_mesh(&mm_core::primitives::cube(0.2, 1), 1);
+            g
+        };
+        {
+            let o = s.get_mut(a).unwrap();
+            o.mesh = Arc::new(m.clone());
+            o.selection.insert(7);
+            o.selection.insert(9);
+            let o = s.get_mut(b).unwrap();
+            o.mesh = Arc::new(grown.clone());
+        }
+        let snapshot = s.clone();
+        let mut want = snapshot.clone();
+        want.after_restore();
+        let mut h = History::default();
+        h.push("x", &s);
+        s.get_mut(a).unwrap().set_mesh(mm_core::primitives::cube(1.0, 1));
+        h.undo(&mut s);
+        for (o, w) in s.objects.iter().zip(&want.objects) {
+            assert_eq!(o.selection, w.selection, "object {}", o.id);
+            assert_eq!(o.selection.bits().len(), o.mesh.max_tid());
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+    use glam::DVec3;
+
+    fn bits(b: Aabb) -> [u64; 6] {
+        let (lo, hi) = (b.min.to_array(), b.max.to_array());
+        [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]].map(f64::to_bits)
+    }
+
+    /// The bounds without any cache: every corner of every live triangle, in order.
+    fn walked(m: &Mesh) -> Aabb {
+        Aabb::from_points(m.triangle_ids().flat_map(|t| m.tri_positions(t)))
+    }
+
+    #[test]
+    fn a_stale_bvh_is_told_from_a_current_one() {
+        let mut sphere = mm_core::primitives::icosphere(2.0, 3);
+        sphere.transform(|p| p * DVec3::new(1.0, 0.5, 3.0) + DVec3::new(4.0, -1.25, 0.25));
+        let mut o = SceneObject::new(1, "sphere", sphere);
+        assert!(o.bvh_if_current().is_none() && o.cached_bvh().is_none());
+        assert_eq!(bits(o.bounds()), bits(walked(&o.mesh)), "no BVH");
+        let _ = o.bvh();
+        assert!(o.bvh_if_current().is_some() && o.cached_bvh().is_some());
+        // Dabs: the mesh moves (its kept bounds and the tree go stale), then the BVH is refitted.
+        for step in 0..20u32 {
+            let v = (step * 37) % o.mesh.max_vid() as u32;
+            let m = o.mesh_mut();
+            let p = m.vertex(v);
+            m.set_vertex(v, p + DVec3::new(0.3, -0.2, 0.1) * step as f64);
+            assert!(o.mesh.cached_bounds().is_none(), "step {step}");
+            assert!(o.bvh_if_current().is_none() && o.cached_bvh().is_none(), "step {step}: stale tree");
+            assert_eq!(bits(o.bounds()), bits(walked(&o.mesh)), "step {step}");
+            assert!(o.mesh.cached_bounds().is_some(), "step {step}: kept for the next call");
+            let b = o.bvh();
+            assert!(Arc::ptr_eq(o.bvh_if_current().expect("refitted"), &b), "step {step}");
+        }
+    }
+
+    #[test]
+    fn install_bvh_keeps_only_a_current_whole_tree() {
+        let mut o = SceneObject::new(1, "cube", mm_core::primitives::cube(1.0, 2));
+        let all = Bvh::build(&o.mesh);
+        let some: Vec<u32> = o.mesh.triangle_ids().take(5).collect();
+        assert!(!o.install_bvh(Bvh::build_subset(&o.mesh, &some)), "part of the triangles");
+        // Built for an older state of the mesh.
+        let old = Bvh::build(&o.mesh);
+        o.mesh_mut().set_vertex(0, DVec3::splat(3.0));
+        assert!(!o.install_bvh(old), "stale");
+        assert!(!o.install_bvh(all), "stale too");
+        assert!(o.bvh_if_current().is_none());
+        let fresh = Arc::new(Bvh::build(&o.mesh));
+        assert!(o.install_bvh(fresh.clone()));
+        assert!(Arc::ptr_eq(o.bvh_if_current().unwrap(), &fresh));
+        assert!(Arc::ptr_eq(&o.bvh(), &fresh), "used as it is");
+        assert!(!o.install_bvh(Bvh::build(&o.mesh)), "already has a current one");
+        assert!(Arc::ptr_eq(&o.cached_bvh().unwrap(), &fresh));
     }
 }

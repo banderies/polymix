@@ -32,22 +32,35 @@ pub fn applies_to(v: &Volume) -> bool {
 
 /// Run `f` (which reports progress from any thread) on its own thread, forwarding its
 /// progress to `progress` as `lo + span · fraction` and cancelling when `progress` says so.
+/// `f`'s parallel loops run in a job pool, out of the way of the UI thread's (rayon's global
+/// pool), and this thread goes on as soon as `f` ends, not at its next 50 ms look.
 fn with_progress<T: Send>(progress: ProgressFn, lo: f32, span: f32, f: impl FnOnce(&(dyn Fn(f32) -> bool + Sync)) -> T + Send) -> T {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    /// Marks the work done and wakes the thread waiting for it, also when the work panics.
+    struct Done<'a>(&'a AtomicBool, std::thread::Thread);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            self.1.unpark();
+        }
+    }
     let frac = AtomicU32::new(0f32.to_bits());
     let stop = AtomicBool::new(false);
     let done = AtomicBool::new(false);
+    let waiting = std::thread::current();
     std::thread::scope(|s| {
         let worker = s.spawn(|| {
-            let r = f(&|x: f32| {
-                frac.store(x.to_bits(), Ordering::Relaxed);
-                !stop.load(Ordering::Relaxed)
-            });
-            done.store(true, Ordering::Relaxed);
-            r
+            let _done = Done(&done, waiting);
+            polymix_workspace::in_job_pool(|| {
+                f(&|x: f32| {
+                    frac.store(x.to_bits(), Ordering::Relaxed);
+                    !stop.load(Ordering::Relaxed)
+                })
+            })
         });
-        while !done.load(Ordering::Relaxed) && !worker.is_finished() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        // (A wake-up without the work done, early or stray, only reports progress once more.)
+        while !done.load(Ordering::Acquire) && !worker.is_finished() {
+            std::thread::park_timeout(std::time::Duration::from_millis(50));
             if !progress(lo + span * f32::from_bits(frac.load(Ordering::Relaxed))) {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -67,14 +80,21 @@ fn save(dir: &Path, source: &str, suffix: &str, vol: &LoadedVolume, description:
     use mm_volume::write::{nifti, Data, Intent};
     std::fs::create_dir_all(dir)?;
     let path = output_path(dir, source, suffix, ".nii.gz");
-    let integral = vol.values.iter().all(|&x| x.fract() == 0.0 && (i16::MIN as f32..=i16::MAX as f32).contains(&x));
-    if integral {
+    if integral(&vol.values) {
         let v: Vec<i16> = vol.values.iter().map(|&x| x as i16).collect();
         nifti(&path, Data::I16(&v), vol.dims, &vol.geometry, description, Intent::None)?;
     } else {
         nifti(&path, Data::F32(&vol.values), vol.dims, &vol.geometry, description, Intent::None)?;
     }
     Ok(path)
+}
+
+/// Whether every value is a whole number that fits 16 bits. Checked a block at a time
+/// without a branch per value, so that it vectorises (several times faster than stopping at
+/// the first value that is not); the first block with one ends the look.
+fn integral(values: &[f32]) -> bool {
+    let (lo, hi) = (i16::MIN as f32, i16::MAX as f32);
+    values.chunks(4096).all(|block| block.iter().fold(true, |all, &x| all & (x.fract() == 0.0) & (x >= lo) & (x <= hi)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -961,7 +981,7 @@ impl Prepare {
                 ui.label("");
                 ui.horizontal(|ui| {
                     if self.box_job.is_some() {
-                        ui.spinner();
+                        polymix_workspace::spinner(ui);
                     } else if ui.button("Fit to the head").on_hover_text("The box around the head (or object), with a 5 mm margin").clicked() {
                         let v = v.clone();
                         self.box_job = Some(Job::spawn("Finding the head", ui.ctx().clone(), move |p| {
@@ -1298,6 +1318,86 @@ mod tests {
         assert_eq!(output_path(&dir, "Series 8 · T2 AX", " N4", ".tfm").file_name().unwrap(), "Series 8 _ T2 AX N4.tfm");
         assert_eq!((trim_num(0.5), trim_num(1.0), trim_num(0.75)), ("0.5".into(), "1".into(), "0.75".into()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_integer_check_is_as_before() {
+        let before = |v: &[f32]| v.iter().all(|&x| x.fract() == 0.0 && (i16::MIN as f32..=i16::MAX as f32).contains(&x));
+        let edges = [0.0f32, -0.0, 0.5, -0.5, 1e-40, -1e-40, 3.0, -7.0, 32767.0, 32767.5, 32768.0, -32768.0, -32768.5, -32769.0, 1e30, f32::MAX, f32::MIN, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        for a in edges {
+            for b in edges {
+                assert_eq!(integral(&[a, b]), before(&[a, b]), "{a} {b}");
+            }
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for len in [0usize, 1, 7, 4095, 4096, 4097, 8192 + 13, 50_000] {
+            let whole: Vec<f32> = (0..len).map(|_| next(65536) as f32 - 32768.0).collect();
+            assert!(integral(&whole) && before(&whole));
+            // One value that is not, anywhere (first, last, at a block's edge, inside).
+            for at in [0, len.saturating_sub(1), 4095, 4096, next(len.max(1) as u64) as usize].into_iter().filter(|&i| i < len) {
+                for bad in edges {
+                    let mut v = whole.clone();
+                    v[at] = bad;
+                    assert_eq!(integral(&v), before(&v), "length {len}, {bad} at {at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_progress_runs_in_a_job_pool_and_returns_at_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Mutex;
+        let reported = Mutex::new(Vec::new());
+        let progress = |f: f32| {
+            reported.lock().unwrap().push(f);
+            true
+        };
+        let (thread, sum) = with_progress(&progress, 0.2, 0.5, |q| {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            assert!(q(0.5));
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            (std::thread::current().name().map(str::to_string), (0..100u32).sum::<u32>())
+        });
+        assert_eq!(sum, 4950);
+        assert!(thread.as_deref().is_some_and(|n| n.starts_with("polymix-job-pool-")), "{thread:?}");
+        let reported = reported.into_inner().unwrap();
+        let (start, half) = (0.2f32, 0.2f32 + 0.5 * 0.5);
+        assert!(reported.iter().all(|f| [start, half].contains(f)) && reported.contains(&half), "{reported:?}");
+        // Short work: no wait for the next 50 ms look (the best of a few, on a busy machine).
+        let fastest = (0..5)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                assert_eq!(with_progress(&|_| true, 0.0, 1.0, |_| 7), 7);
+                start.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(fastest < std::time::Duration::from_millis(30), "{fastest:?}");
+        // Cancelled by the progress callback: the work sees it.
+        let calls = AtomicU32::new(0);
+        let saw_stop = with_progress(
+            &|_| calls.fetch_add(1, Ordering::Relaxed) < 1,
+            0.0,
+            1.0,
+            |q| {
+                let start = std::time::Instant::now();
+                while q(0.1) && start.elapsed() < std::time::Duration::from_secs(20) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                !q(0.1)
+            },
+        );
+        assert!(saw_stop);
+        // A panic in the work comes back out (and does not leave the caller waiting).
+        let r = std::panic::catch_unwind(|| with_progress(&|_| true, 0.0, 1.0, |_| -> u32 { panic!("in the work") }));
+        assert!(r.is_err());
     }
 
     #[test]

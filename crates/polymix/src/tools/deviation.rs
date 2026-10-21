@@ -20,15 +20,25 @@ pub struct DeviationStats {
 }
 
 pub struct DeviationResult {
-    /// Signed distance per vertex id (positive = outside the reference).
-    pub per_vertex: Vec<f64>,
     pub stats: DeviationStats,
+    /// Mean of each triangle's signed vertex distances (positive = outside the reference), per
+    /// triangle id: what the colours show, mapped again at each change of their range.
+    pub per_triangle: Vec<f64>,
 }
 
 /// Signed vertex distances from `mesh` to `reference`. The sign comes from the reference's
 /// triangle normal at the nearest point (outward-oriented references give + outside).
-pub fn compute_deviation(mesh: &Mesh, reference: &Mesh) -> DeviationResult {
-    let bvh = mm_core::Bvh::build(reference);
+///
+/// `mesh_bvh` is the object's BVH if one is at hand (`None`, or one for another state of the
+/// mesh: built here). Only the distance back from the reference uses it, which is the same
+/// from any tree over the mesh: the nearest distance does not depend on which of two equally
+/// near triangles is met first. The distances to the reference take their sign from the
+/// nearest triangle, and at exact ties (a vertex nearest to a corner of the reference, common
+/// for an unchanged region) another tree, such as the scene's refitted one, could pick another
+/// triangle with another sign; so the reference's tree is always built here, as it always was.
+pub fn compute_deviation(mesh: &Mesh, reference: &Mesh, mesh_bvh: Option<Arc<mm_core::Bvh>>) -> DeviationResult {
+    // The two trees build at once (each build is serial).
+    let (bvh, obvh) = rayon::join(|| mm_core::Bvh::build(reference), || mesh_bvh.filter(|b| b.is_current(mesh)).unwrap_or_else(|| Arc::new(mm_core::Bvh::build(mesh))));
     let ids: Vec<u32> = mesh.vertex_ids().collect();
     let vals: Vec<(u32, f64)> = ids
         .par_iter()
@@ -54,10 +64,11 @@ pub fn compute_deviation(mesh: &Mesh, reference: &Mesh) -> DeviationResult {
     }
     let n = vals.len().max(1) as f64;
     let mut abs: Vec<f64> = vals.iter().map(|(_, d)| d.abs()).collect();
-    abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Equal magnitudes are equal bits (no −0 after abs), so an unstable sort gives the same
+    // order, and the mean below the same sum.
+    abs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
     let p95 = abs.get(((abs.len() as f64 * 0.95) as usize).min(abs.len().saturating_sub(1))).copied().unwrap_or(0.0);
     // Reverse direction: reference vertices to the object.
-    let obvh = mm_core::Bvh::build(mesh);
     let rids: Vec<u32> = reference.vertex_ids().collect();
     let reverse_max = rids
         .par_iter()
@@ -71,7 +82,18 @@ pub fn compute_deviation(mesh: &Mesh, reference: &Mesh) -> DeviationResult {
         max_in: vals.iter().map(|(_, d)| -*d).fold(0.0, f64::max),
         reverse_max,
     };
-    DeviationResult { per_vertex, stats }
+    let per_triangle = (0..mesh.max_tid() as u32)
+        .into_par_iter()
+        .map(|t| {
+            if !mesh.is_triangle(t) {
+                return 0.0;
+            }
+            let [a, b, c] = mesh.triangle(t);
+            let at = |v: u32| per_vertex.get(v as usize).copied().unwrap_or(0.0);
+            (at(a) + at(b) + at(c)) / 3.0
+        })
+        .collect();
+    DeviationResult { stats, per_triangle }
 }
 
 pub struct DeviationTool {
@@ -106,7 +128,8 @@ impl DeviationTool {
         let (Some(a), Some(b)) = (self.object, self.reference) else { return };
         let Some(key) = mesh_key(cx, a, b) else { return };
         let (Some(ma), Some(mb)) = (cx.scene.get(a).map(|o| o.mesh.clone()), cx.scene.get(b).map(|o| o.mesh.clone())) else { return };
-        self.job = Some((key, Job::spawn("Deviation", cx.egui.clone(), move |_| Ok(compute_deviation(&ma, &mb)))));
+        let bvh = cx.scene.get(a).and_then(|o| o.cached_bvh());
+        self.job = Some((key, Job::spawn("Deviation", cx.egui.clone(), move |_| Ok(compute_deviation(&ma, &mb, bvh)))));
     }
 
     /// Push per-triangle colours (mean of vertex deviations mapped to [0, 1]).
@@ -119,13 +142,10 @@ impl DeviationTool {
         let Some(o) = cx.scene.get_mut(id) else { return };
         let m = &o.mesh;
         let range = self.range.max(1e-12);
-        let mut vals = vec![0.5f32; m.max_tid()];
-        for t in m.triangle_ids() {
-            let [a, b, c] = m.triangle(t);
-            let at = |v: u32| r.per_vertex.get(v as usize).copied().unwrap_or(0.0);
-            let d = (at(a) + at(b) + at(c)) / 3.0;
-            vals[t as usize] = (0.5 + 0.5 * (d / range)).clamp(0.0, 1.0) as f32;
-        }
+        // The result is for this mesh (the key matched), so its triangle ids are this mesh's.
+        // A plain loop: about 1.5 ms at 1.3M triangles, where a parallel one on the UI thread
+        // was at best twice as fast and often slower while other work held the cores.
+        let vals: Vec<f32> = (0..m.max_tid() as u32).map(|t| if m.is_triangle(t) { (0.5 + 0.5 * (r.per_triangle[t as usize] / range)).clamp(0.0, 1.0) as f32 } else { 0.5 }).collect();
         o.scalars = Some((crate::scene::next_stamp(), Arc::new(vals)));
     }
 
@@ -293,7 +313,7 @@ impl Tool for DeviationTool {
                 }
             } else {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    polymix_workspace::spinner(ui);
                     ui.label("Computing distances…");
                 });
             }
@@ -391,12 +411,99 @@ mod tests {
         let reference = primitives::icosphere(1.0, 3);
         let mut grown = reference.clone();
         grown.transform(|p| p * 1.05);
-        let r = compute_deviation(&grown, &reference);
+        let r = compute_deviation(&grown, &reference, None);
         assert!((r.stats.mean_abs - 0.05).abs() < 0.005, "{:?}", r.stats);
         assert!(r.stats.max_in < 1e-9, "all outward");
         let mut shrunk = reference.clone();
         shrunk.transform(|p| p * 0.95);
-        let r = compute_deviation(&shrunk, &reference);
+        let r = compute_deviation(&shrunk, &reference, None);
         assert!(r.stats.max_out < 1e-9 && r.stats.max_in > 0.04);
+    }
+
+    /// The deviation as it was computed before the object's BVH could be passed in and the
+    /// colours precomputed per triangle (kept here to check the new path against).
+    fn old_deviation(mesh: &Mesh, reference: &Mesh) -> (Vec<f64>, DeviationStats) {
+        let bvh = mm_core::Bvh::build(reference);
+        let ids: Vec<u32> = mesh.vertex_ids().collect();
+        let vals: Vec<(u32, f64)> = ids
+            .par_iter()
+            .map(|&v| {
+                let p = mesh.vertex(v);
+                let d = bvh.nearest(reference, p, f64::INFINITY).map(|h| if (p - h.point).dot(reference.tri_normal(h.tid)) >= 0.0 { h.dist_sq.sqrt() } else { -h.dist_sq.sqrt() }).unwrap_or(0.0);
+                (v, d)
+            })
+            .collect();
+        let mut per_vertex = vec![0.0; mesh.max_vid()];
+        for &(v, d) in &vals {
+            per_vertex[v as usize] = d;
+        }
+        let n = vals.len().max(1) as f64;
+        let mut abs: Vec<f64> = vals.iter().map(|(_, d)| d.abs()).collect();
+        abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95 = abs.get(((abs.len() as f64 * 0.95) as usize).min(abs.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        let obvh = mm_core::Bvh::build(mesh);
+        let rids: Vec<u32> = reference.vertex_ids().collect();
+        let reverse_max = rids.par_iter().map(|&v| obvh.nearest(mesh, reference.vertex(v), f64::INFINITY).map(|h| h.dist_sq.sqrt()).unwrap_or(0.0)).reduce(|| 0.0, f64::max);
+        let stats = DeviationStats {
+            mean_abs: abs.iter().sum::<f64>() / n,
+            rms: (vals.iter().map(|(_, d)| d * d).sum::<f64>() / n).sqrt(),
+            p95,
+            max_out: vals.iter().map(|(_, d)| *d).fold(0.0, f64::max),
+            max_in: vals.iter().map(|(_, d)| -*d).fold(0.0, f64::max),
+            reverse_max,
+        };
+        (per_vertex, stats)
+    }
+
+    fn bits(s: &DeviationStats) -> [u64; 6] {
+        [s.mean_abs, s.rms, s.p95, s.max_out, s.max_in, s.reverse_max].map(f64::to_bits)
+    }
+
+    #[test]
+    fn deviation_matches_the_old_computation_bit_for_bit() {
+        // A bumpy, partly moved copy of a sphere against the sphere, with a hole so that the
+        // triangle ids have gaps: many vertices are unchanged (exact ties at the reference's
+        // corners), the others in and out.
+        let reference = primitives::icosphere(2.0, 4);
+        let mut mesh = primitives::icosphere(2.0, 4);
+        let gone: Vec<u32> = mesh.triangle_ids().filter(|&t| mesh.tri_centroid(t).z > 1.8).collect();
+        mesh.remove_triangles(gone);
+        // The scene's tree as a sculpt leaves it: built before the vertices moved, then refitted.
+        let mut scene_bvh = mm_core::Bvh::build(&mesh);
+        let moved: Vec<u32> = mesh.vertex_ids().filter(|&v| mesh.vertex(v).x > 0.3).collect();
+        for v in moved {
+            let p = mesh.vertex(v);
+            mesh.set_vertex(v, p * (1.0 + 0.05 * (p.y * 3.0).sin()));
+        }
+        scene_bvh.refit(&mesh);
+        let scene_bvh = Arc::new(scene_bvh);
+        let (per_vertex, stats) = old_deviation(&mesh, &reference);
+        for r in [compute_deviation(&mesh, &reference, None), compute_deviation(&mesh, &reference, Some(scene_bvh))] {
+            assert_eq!(bits(&r.stats), bits(&stats), "{:?} vs {stats:?}", r.stats);
+            // Each triangle's mean of its vertex values (a sign flip at one vertex shows here).
+            for t in mesh.triangle_ids() {
+                let [a, b, c] = mesh.triangle(t);
+                let old = (per_vertex[a as usize] + per_vertex[b as usize] + per_vertex[c as usize]) / 3.0;
+                assert_eq!(r.per_triangle[t as usize].to_bits(), old.to_bits(), "triangle {t}");
+            }
+            // The colours as they were made from the vertex values, per range.
+            for range in [0.01, 0.07, 1.0] {
+                let old: Vec<f32> = {
+                    let mut vals = vec![0.5f32; mesh.max_tid()];
+                    for t in mesh.triangle_ids() {
+                        let [a, b, c] = mesh.triangle(t);
+                        let at = |v: u32| per_vertex.get(v as usize).copied().unwrap_or(0.0);
+                        let d = (at(a) + at(b) + at(c)) / 3.0;
+                        vals[t as usize] = (0.5 + 0.5 * (d / range)).clamp(0.0, 1.0) as f32;
+                    }
+                    vals
+                };
+                let new: Vec<f32> = (0..mesh.max_tid() as u32)
+                    .map(|t| if mesh.is_triangle(t) { (0.5 + 0.5 * (r.per_triangle[t as usize] / range)).clamp(0.0, 1.0) as f32 } else { 0.5 })
+                    .collect();
+                assert!(old.iter().map(|x| x.to_bits()).eq(new.iter().map(|x| x.to_bits())), "range {range}");
+            }
+        }
+        assert!(stats.max_in > 0.0 && stats.max_out > 0.0);
     }
 }

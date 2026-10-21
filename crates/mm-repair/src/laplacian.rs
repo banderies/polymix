@@ -17,10 +17,11 @@
 //! the right-hand side (Dirichlet constraints). Order 2 rows reach two rings out, so the
 //! fixed set effectively consists of the two rings of vertices surrounding the free region.
 
-use crate::sparse::{solve_pcg_preconditioned, solve_pcg_with_callback, Amg, AmgParams, CsrMatrix, Element, PcgParams, PcgStats};
+use crate::sparse::{solve_pcg_preconditioned, solve_pcg_with_callback, Amg, AmgParams, CsrMatrix, Element, Jacobi, PcgParams, PcgStats};
 use crate::util::LocalIndex;
 use crate::{RepairError, Result};
 use glam::DVec3;
+use mm_core::hash::FastMap;
 use mm_core::mesh::Mesh;
 use mm_core::INVALID;
 use rayon::prelude::*;
@@ -195,6 +196,64 @@ pub(crate) struct FairSystem {
     pub rhs: Vec<DVec3>,
 }
 
+/// An order 1 or 2 fairing matrix over the constrained free set, and, per free row, the fixed
+/// vertices its right-hand side gathers with their coefficients, in the order the assembly
+/// visits them (so the right-hand side for any fixed values sums exactly as a direct assembly
+/// would).
+struct FairAssembly {
+    free: Vec<u32>,
+    matrix: CsrMatrix,
+    /// Row `i` gathers `terms[term_ptr[i]..term_ptr[i + 1]]`.
+    term_ptr: Vec<usize>,
+    terms: Vec<(u32, f64)>,
+    /// Order 2 rows subtract their terms (`rhs -= x_k c`); order 1 rows add them.
+    subtract: bool,
+}
+
+impl FairAssembly {
+    /// The right-hand side for fixed vertices at `vpos`.
+    fn rhs<V: Fn(u32) -> DVec3 + Sync>(&self, vpos: &V) -> Vec<DVec3> {
+        let row = |i: usize| -> DVec3 {
+            let mut rhs = DVec3::ZERO;
+            for &(k, c) in &self.terms[self.term_ptr[i]..self.term_ptr[i + 1]] {
+                if self.subtract {
+                    rhs -= vpos(k) * c;
+                } else {
+                    rhs += vpos(k) * c;
+                }
+            }
+            rhs
+        };
+        // Only rows next to the fixed vertices have terms: usually too few to be worth a
+        // parallel pass.
+        let n = self.free.len();
+        if self.terms.len() >= 1 << 16 {
+            (0..n).into_par_iter().map(row).collect()
+        } else {
+            (0..n).map(row).collect()
+        }
+    }
+}
+
+/// One free row of a fairing system: its matrix entries, and the fixed vertices its
+/// right-hand side gathers with their coefficients.
+type Row = (Vec<(u32, f64)>, Vec<(u32, f64)>);
+
+/// Matrix rows and right-hand-side terms per free row, flattened into a [`FairAssembly`].
+fn flatten_rows(free: Vec<u32>, rows: Vec<Row>, subtract: bool) -> FairAssembly {
+    let nf = free.len();
+    let mut term_ptr = Vec::with_capacity(nf + 1);
+    term_ptr.push(0);
+    let mut terms = Vec::with_capacity(rows.iter().map(|r| r.1.len()).sum());
+    let mut ent = Vec::with_capacity(nf);
+    for (e, t) in rows {
+        terms.extend(t);
+        term_ptr.push(terms.len());
+        ent.push(e);
+    }
+    FairAssembly { matrix: CsrMatrix::from_rows(nf, nf, ent), free, term_ptr, terms, subtract }
+}
+
 /// Drop free vertices whose connected component (through free vertices) has no fixed
 /// neighbour: their system would be singular.
 fn constrained_free_set(mesh: &Mesh, free: &[u32]) -> Vec<u32> {
@@ -255,6 +314,35 @@ pub(crate) fn build_fair_system_with<P: Fn(u32) -> DVec3 + Sync>(
     kind: LaplacianWeights,
     wpos: &P,
 ) -> FairSystem {
+    build_fair_system_at(mesh, free, order, kind, wpos, &|v| mesh.vertex(v))
+}
+
+/// [`build_fair_system_with`] with the fixed vertices' values (the right-hand side) taken from
+/// `vpos` instead of the mesh.
+fn build_fair_system_at<W: Fn(u32) -> DVec3 + Sync, V: Fn(u32) -> DVec3 + Sync>(
+    mesh: &Mesh,
+    free: &[u32],
+    order: u32,
+    kind: LaplacianWeights,
+    wpos: &W,
+    vpos: &V,
+) -> FairSystem {
+    if order >= 3 {
+        let free = constrained_free_set(mesh, free);
+        let mut fidx = LocalIndex::new(mesh.max_vid(), free.len());
+        for (i, &v) in free.iter().enumerate() {
+            fidx.insert(v, i as u32);
+        }
+        return build_order3_system(mesh, free, fidx, kind, wpos, vpos);
+    }
+    let a = assemble(mesh, free, order, kind, wpos);
+    let rhs = a.rhs(vpos);
+    FairSystem { free: a.free, matrix: a.matrix, rhs }
+}
+
+/// The order 1 (or less) or 2 matrix for `free` (other vertices fixed), with the right-hand
+/// side's terms left unevaluated.
+fn assemble<W: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: &[u32], order: u32, kind: LaplacianWeights, wpos: &W) -> FairAssembly {
     let free = constrained_free_set(mesh, free);
     let nf = free.len();
     let mut fidx = LocalIndex::new(mesh.max_vid(), nf);
@@ -264,26 +352,21 @@ pub(crate) fn build_fair_system_with<P: Fn(u32) -> DVec3 + Sync>(
     let par = nf >= 2048;
 
     if order <= 1 {
-        let build = |&v: &u32| -> (Vec<(u32, f64)>, DVec3) {
+        let build = |&v: &u32| -> Row {
             let row = lap_row(mesh, v, kind, wpos);
             let mut ent = Vec::with_capacity(row.nbrs.len() + 1);
-            let mut rhs = DVec3::ZERO;
+            let mut terms = Vec::new();
             ent.push((fidx.get(v).unwrap(), row.diag));
             for &(k, w) in &row.nbrs {
                 match fidx.get(k) {
                     Some(l) => ent.push((l, -w)),
-                    None => rhs += mesh.vertex(k) * w,
+                    None => terms.push((k, w)),
                 }
             }
-            (ent, rhs)
+            (ent, terms)
         };
-        let rows: Vec<(Vec<(u32, f64)>, DVec3)> =
-            if par { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
-        let (ent, rhs): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-        return FairSystem { matrix: CsrMatrix::from_rows(nf, nf, ent), rhs, free };
-    }
-    if order >= 3 {
-        return build_order3_system(mesh, free, fidx, kind, wpos);
+        let rows: Vec<Row> = if par { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
+        return flatten_rows(free, rows, false);
     }
 
     // Order 2: Laplacian rows are needed for the free vertices and their one ring.
@@ -306,13 +389,13 @@ pub(crate) fn build_fair_system_with<P: Fn(u32) -> DVec3 + Sync>(
     } else {
         row_verts.iter().map(|&v| lap_row(mesh, v, kind, wpos)).collect()
     };
-    let build = |&i: &u32| -> (Vec<(u32, f64)>, DVec3) {
+    let build = |&i: &u32| -> Row {
         let mut ent: Vec<(u32, f64)> = Vec::with_capacity(64);
-        let mut rhs = DVec3::ZERO;
+        let mut terms = Vec::new();
         let li = &lap[ridx.get(i).unwrap() as usize];
         let mut add = |k: u32, val: f64, ent: &mut Vec<(u32, f64)>| match fidx.get(k) {
             Some(l) => ent.push((l, val)),
-            None => rhs -= mesh.vertex(k) * val,
+            None => terms.push((k, val)),
         };
         // Σ_j L_ij M_j⁻¹ L_jk over j ∈ {i} ∪ N(i).
         let js = std::iter::once((i, -li.diag)).chain(li.nbrs.iter().copied());
@@ -324,17 +407,22 @@ pub(crate) fn build_fair_system_with<P: Fn(u32) -> DVec3 + Sync>(
                 add(k, c * wjk, &mut ent);
             }
         }
-        (ent, rhs)
+        (ent, terms)
     };
-    let rows: Vec<(Vec<(u32, f64)>, DVec3)> =
-        if par { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
-    let (ent, rhs): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-    FairSystem { matrix: CsrMatrix::from_rows(nf, nf, ent), rhs, free }
+    let rows: Vec<Row> = if par { free.par_iter().map(build).collect() } else { free.iter().map(build).collect() };
+    flatten_rows(free, rows, true)
 }
 
 /// Order 3: rows `−(L M⁻¹ L M⁻¹ L)ᵢ` for the free vertices, from Laplacian rows of the free
 /// vertices and their two rings.
-fn build_order3_system<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: Vec<u32>, fidx: LocalIndex, kind: LaplacianWeights, wpos: &P) -> FairSystem {
+fn build_order3_system<P: Fn(u32) -> DVec3 + Sync, V: Fn(u32) -> DVec3 + Sync>(
+    mesh: &Mesh,
+    free: Vec<u32>,
+    fidx: LocalIndex,
+    kind: LaplacianWeights,
+    wpos: &P,
+    vpos: &V,
+) -> FairSystem {
     let nf = free.len();
     let mut ridx = LocalIndex::new(mesh.max_vid(), nf * 3);
     let mut row_verts: Vec<u32> = Vec::with_capacity(nf * 3);
@@ -366,7 +454,7 @@ fn build_order3_system<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: Vec<u32>, 
     let l_row = |v: u32| std::iter::once((v, -row_of(v).diag)).chain(row_of(v).nbrs.iter().copied());
     let build = |&i: &u32| -> (Vec<(u32, f64)>, DVec3) {
         // r = e_iᵀ L M⁻¹ L M⁻¹ L, accumulated sparsely.
-        let mut acc: std::collections::HashMap<u32, f64> = std::collections::HashMap::with_capacity(64);
+        let mut acc: FastMap<u32, f64> = FastMap::with_capacity_and_hasher(64, Default::default());
         for (j, lij) in l_row(i) {
             let cj = lij / row_of(j).mass;
             for (l, ljl) in l_row(j) {
@@ -376,13 +464,17 @@ fn build_order3_system<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: Vec<u32>, 
                 }
             }
         }
-        let mut ent = Vec::with_capacity(acc.len());
+        // The right-hand side is summed in vertex order, so the result does not depend on the
+        // map's layout (it used to vary from run to run with the random hash seed).
+        let mut terms: Vec<(u32, f64)> = acc.into_iter().collect();
+        terms.sort_unstable_by_key(|t| t.0);
+        let mut ent = Vec::with_capacity(terms.len());
         let mut rhs = DVec3::ZERO;
-        for (k, val) in acc {
+        for (k, val) in terms {
             // Negated: L is negative semi-definite, so −L M⁻¹ L M⁻¹ L is positive.
             match fidx.get(k) {
                 Some(l) => ent.push((l, -val)),
-                None => rhs += mesh.vertex(k) * val,
+                None => rhs += vpos(k) * val,
             }
         }
         (ent, rhs)
@@ -395,25 +487,35 @@ fn build_order3_system<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: Vec<u32>, 
 /// Systems at least this large are preconditioned with smoothed-aggregation AMG.
 const AMG_MIN_UNKNOWNS: usize = 1500;
 
-/// Low-energy vectors of the fairing operator on `free`: constants (order 1), plus the
-/// coordinate functions, whose thin-plate energy vanishes (order 2).
-fn near_null_space(mesh: &Mesh, free: &[u32], order: u32) -> Vec<Vec<f64>> {
+/// Low-energy vectors of the fairing operator on `free` (at positions `vpos`): constants
+/// (order 1), plus the coordinate functions, whose thin-plate energy vanishes (order 2).
+fn near_null_space<V: Fn(u32) -> DVec3>(vpos: &V, free: &[u32], order: u32) -> Vec<Vec<f64>> {
     let n = free.len();
     let mut out = vec![vec![1.0; n]];
     if order >= 2 && n > 0 {
-        let c = free.iter().map(|&v| mesh.vertex(v)).sum::<DVec3>() / n as f64;
-        let r = free.iter().map(|&v| mesh.vertex(v).distance(c)).fold(0.0, f64::max).max(1e-300);
+        let c = free.iter().map(|&v| vpos(v)).sum::<DVec3>() / n as f64;
+        let r = free.iter().map(|&v| vpos(v).distance(c)).fold(0.0, f64::max).max(1e-300);
         for axis in 0..3 {
-            out.push(free.iter().map(|&v| (mesh.vertex(v) - c)[axis] / r).collect());
+            out.push(free.iter().map(|&v| (vpos(v) - c)[axis] / r).collect());
         }
     }
     out
 }
 
+/// The AMG hierarchy [`solve_fair`] uses for a system on `free` (at positions `vpos`), if the
+/// system is large enough to want one and the matrix coarsens.
+fn fair_amg<V: Fn(u32) -> DVec3>(vpos: &V, free: &[u32], order: u32, a: &CsrMatrix) -> Option<Amg> {
+    if free.len() >= AMG_MIN_UNKNOWNS {
+        Amg::new(a, &near_null_space(vpos, free, order), &AmgParams::default())
+    } else {
+        None
+    }
+}
+
 /// PCG with AMG for large systems, Jacobi otherwise.
 #[allow(clippy::too_many_arguments)]
-fn solve_fair<T: Element>(
-    mesh: &Mesh,
+fn solve_fair<T: Element, V: Fn(u32) -> DVec3>(
+    vpos: &V,
     free: &[u32],
     order: u32,
     a: &CsrMatrix,
@@ -422,12 +524,28 @@ fn solve_fair<T: Element>(
     pcg: &PcgParams,
     callback: Option<&dyn Fn(usize, f64) -> bool>,
 ) -> PcgStats {
-    if free.len() >= AMG_MIN_UNKNOWNS {
-        if let Some(amg) = Amg::new(a, &near_null_space(mesh, free, order), &AmgParams::default()) {
-            return solve_pcg_preconditioned(a, b, x, pcg, &amg.preconditioner(1), callback);
-        }
+    if let Some(amg) = fair_amg(vpos, free, order, a) {
+        return solve_pcg_preconditioned(a, b, x, pcg, &amg.preconditioner(1), callback);
     }
     solve_pcg_with_callback(a, b, x, pcg, callback)
+}
+
+/// The checks [`fair_vertices`] makes on a solve before using it.
+fn check_solution(stats: &PcgStats, x: &[DVec3]) -> Result<()> {
+    if stats.breakdown {
+        return Err(RepairError::Solver("fairing matrix is not positive definite".into()));
+    }
+    if x.iter().any(|p| !p.is_finite()) {
+        return Err(RepairError::Solver("non-finite solution".into()));
+    }
+    Ok(())
+}
+
+fn check_order(order: u32) -> Result<()> {
+    if order == 0 || order > 3 {
+        return Err(RepairError::InvalidParameter(format!("fairing order must be 1, 2 or 3, got {order}")));
+    }
+    Ok(())
 }
 
 /// Solve the fairing system for `free` and write the result into the mesh.
@@ -440,27 +558,117 @@ pub(crate) fn fair_vertices(
     pcg: &PcgParams,
     callback: Option<&dyn Fn(usize, f64) -> bool>,
 ) -> Result<PcgStats> {
-    if order == 0 || order > 3 {
-        return Err(RepairError::InvalidParameter(format!("fairing order must be 1, 2 or 3, got {order}")));
-    }
-    let sys = build_fair_system(mesh, free, order, kind);
-    if sys.free.is_empty() {
-        return Ok(PcgStats { converged: true, ..Default::default() });
-    }
-    let mut x: Vec<DVec3> = sys.free.iter().map(|&v| mesh.vertex(v)).collect();
-    let stats = solve_fair(mesh, &sys.free, order, &sys.matrix, &sys.rhs, &mut x, pcg, callback);
-    if stats.breakdown {
-        return Err(RepairError::Solver("fairing matrix is not positive definite".into()));
-    }
-    if x.iter().any(|p| !p.is_finite()) {
-        return Err(RepairError::Solver("non-finite solution".into()));
+    let m: &Mesh = mesh;
+    let sol = fair_positions_with(m, free, order, kind, &|v| m.vertex(v), pcg, callback)?;
+    if sol.free.is_empty() {
+        return Ok(sol.stats);
     }
     let pos = mesh.positions_mut();
-    for (&v, p) in sys.free.iter().zip(x) {
+    for (&v, p) in sol.free.iter().zip(sol.positions) {
         pos[v as usize] = p;
     }
     mesh.bump_shape_version();
-    Ok(stats)
+    Ok(sol.stats)
+}
+
+/// Result of [`fair_positions`].
+#[derive(Clone, Debug, Default)]
+pub struct FairSolution {
+    /// The vertices solved for: the free vertices given, in order, less those whose connected
+    /// free region has no fixed neighbour.
+    pub free: Vec<u32>,
+    /// Their new positions.
+    pub positions: Vec<DVec3>,
+    /// Solver statistics.
+    pub stats: PcgStats,
+}
+
+/// Fair `free` (order 1, 2 or 3, every other vertex fixed) on positions `pos` instead of the
+/// mesh's own, which gives only the connectivity: what [`crate::fair_region`] would compute
+/// (with its default solver settings replaced by `pcg`) on a copy of the mesh whose vertex `v`
+/// sits at `pos(v)`, without making the copy or writing anything. Every position the solve
+/// reads (weights, masses, the fixed values, the starting guess and the near-null space of
+/// the multigrid preconditioner) comes from `pos`.
+pub fn fair_positions<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: &[u32], order: u32, kind: LaplacianWeights, pos: &P, pcg: &PcgParams) -> Result<FairSolution> {
+    fair_positions_with(mesh, free, order, kind, pos, pcg, None)
+}
+
+/// [`fair_positions`] with a solver callback (see [`crate::sparse::solve_pcg_with_callback`]).
+fn fair_positions_with<P: Fn(u32) -> DVec3 + Sync>(
+    mesh: &Mesh,
+    free: &[u32],
+    order: u32,
+    kind: LaplacianWeights,
+    pos: &P,
+    pcg: &PcgParams,
+    callback: Option<&dyn Fn(usize, f64) -> bool>,
+) -> Result<FairSolution> {
+    check_order(order)?;
+    let sys = build_fair_system_at(mesh, free, order, kind, pos, pos);
+    if sys.free.is_empty() {
+        return Ok(FairSolution { stats: PcgStats { converged: true, ..Default::default() }, ..Default::default() });
+    }
+    let mut x: Vec<DVec3> = sys.free.iter().map(|&v| pos(v)).collect();
+    let stats = solve_fair(pos, &sys.free, order, &sys.matrix, &sys.rhs, &mut x, pcg, callback);
+    check_solution(&stats, &x)?;
+    Ok(FairSolution { free: sys.free, positions: x, stats })
+}
+
+/// An order 1 or 2 fairing system assembled once (matrix, preconditioner) and solved for
+/// many sets of fixed values, e.g. a displacement field re-solved on every move of a drag:
+/// each [`FairSolver::solve`] only gathers the right-hand side and runs the solver.
+///
+/// The weights and masses come from the positions given to [`FairSolver::new`]. A solve
+/// for values `values` gives exactly what [`fair_positions`] gives for positions `values`
+/// whenever the system does not depend on them (uniform weights) and `values` agrees with the
+/// construction positions on the free vertices, which set the multigrid's near-null space.
+pub struct FairSolver {
+    assembly: FairAssembly,
+    order: u32,
+    amg: Option<Amg>,
+    jacobi: Jacobi,
+}
+
+impl FairSolver {
+    /// Assemble the system for `free` (other vertices fixed) on positions `pos`. Orders 1
+    /// and 2 only.
+    pub fn new<P: Fn(u32) -> DVec3 + Sync>(mesh: &Mesh, free: &[u32], order: u32, kind: LaplacianWeights, pos: &P) -> Result<Self> {
+        if order == 0 || order > 2 {
+            return Err(RepairError::InvalidParameter(format!("a cached fairing system must be of order 1 or 2, got {order}")));
+        }
+        let assembly = assemble(mesh, free, order, kind, pos);
+        let amg = fair_amg(pos, &assembly.free, order, &assembly.matrix);
+        let jacobi = Jacobi::new(&assembly.matrix);
+        Ok(Self { assembly, order, amg, jacobi })
+    }
+
+    /// The vertices solved for (see [`FairSolution::free`]).
+    pub fn free(&self) -> &[u32] {
+        &self.assembly.free
+    }
+
+    /// Fairing order.
+    pub fn order(&self) -> u32 {
+        self.order
+    }
+
+    /// New positions of [`FairSolver::free`], with every other vertex at `values` (which
+    /// also gives the free vertices' starting guess).
+    pub fn solve<P: Fn(u32) -> DVec3 + Sync>(&self, values: &P, pcg: &PcgParams) -> Result<(Vec<DVec3>, PcgStats)> {
+        let free = &self.assembly.free;
+        if free.is_empty() {
+            return Ok((Vec::new(), PcgStats { converged: true, ..Default::default() }));
+        }
+        let rhs = self.assembly.rhs(values);
+        let mut x: Vec<DVec3> = free.iter().map(|&v| values(v)).collect();
+        let a = &self.assembly.matrix;
+        let stats = match &self.amg {
+            Some(amg) => solve_pcg_preconditioned(a, &rhs, &mut x, pcg, &amg.preconditioner(1), None),
+            None => solve_pcg_preconditioned(a, &rhs, &mut x, pcg, &self.jacobi, None),
+        };
+        check_solution(&stats, &x)?;
+        Ok((x, stats))
+    }
 }
 
 /// Direction along which [`fair_vertices_along`] moves vertices.
@@ -522,7 +730,7 @@ pub(crate) fn fair_vertices_along(
         .collect();
     let k = CsrMatrix::from_rows(nf, nf, rows);
     let mut s = vec![0.0f64; nf];
-    let stats = solve_fair(mesh, &sys.free, order, &k, &rhs, &mut s, pcg, None);
+    let stats = solve_fair(&|v| mesh.vertex(v), &sys.free, order, &k, &rhs, &mut s, pcg, None);
     if stats.breakdown {
         return Err(RepairError::Solver("fairing matrix is not positive definite".into()));
     }
@@ -599,6 +807,67 @@ mod tests {
         for (&v, p) in free.iter().zip(before) {
             assert!(m.vertex(v).distance(p) < 1e-6);
         }
+    }
+
+    fn bits(p: DVec3) -> [u64; 3] {
+        p.to_array().map(f64::to_bits)
+    }
+
+    /// Positions to fair from: the mesh's own, bumped.
+    fn bumped(m: &Mesh) -> Vec<DVec3> {
+        (0..m.max_vid()).map(|v| m.vertex(v as u32) * (1.0 + 0.05 * (v as f64 * 0.37).sin())).collect()
+    }
+
+    #[test]
+    fn fair_positions_match_fairing_a_copy() {
+        // Below and above the AMG threshold (1500 unknowns).
+        for (m, zcut) in [(primitives::icosphere(1.0, 3), 0.4), (primitives::icosphere(1.0, 5), 0.2)] {
+            let free: Vec<u32> = m.vertex_ids().filter(|&v| m.vertex(v).z > zcut).collect();
+            let p = bumped(&m);
+            let at = |v: u32| p[v as usize];
+            let mut copy = m.clone();
+            for v in copy.vertex_ids().collect::<Vec<_>>() {
+                copy.set_vertex(v, p[v as usize]);
+            }
+            for kind in [LaplacianWeights::Uniform, LaplacianWeights::Cotangent, LaplacianWeights::MeanValue] {
+                for order in [1, 2, 3] {
+                    let pcg = PcgParams { tolerance: 1e-9, max_iterations: 5000 };
+                    let mut c = copy.clone();
+                    let st = fair_vertices(&mut c, &free, order, kind, &pcg, None).unwrap();
+                    let sol = fair_positions(&m, &free, order, kind, &at, &pcg).unwrap();
+                    assert_eq!(sol.free, free, "every free vertex has a fixed neighbour");
+                    assert_eq!(sol.stats.iterations, st.iterations, "{kind:?} order {order}");
+                    for (&v, x) in sol.free.iter().zip(&sol.positions) {
+                        assert_eq!(bits(c.vertex(v)), bits(*x), "{kind:?} order {order}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cached_system_solves_like_a_fresh_one() {
+        // A displacement field (zero but on a few fixed vertices) re-solved for several moves,
+        // as Stretchy soft transforms and warps do.
+        for (m, zcut) in [(primitives::icosphere(1.0, 3), 0.4), (primitives::icosphere(1.0, 5), 0.2)] {
+            let free: Vec<u32> = m.vertex_ids().filter(|&v| m.vertex(v).z > zcut).collect();
+            let ring: Vec<u32> = m.vertex_ids().filter(|&v| m.vertex(v).z <= zcut && m.vertex(v).z > zcut - 0.15).collect();
+            for order in [1, 2] {
+                let solver = FairSolver::new(&m, &free, order, LaplacianWeights::Uniform, &|_| DVec3::ZERO).unwrap();
+                assert_eq!(solver.free(), &free[..]);
+                for k in 0..3 {
+                    let lift = DVec3::new(0.1 * k as f64, -0.05, 0.3 + 0.1 * k as f64);
+                    let values = |v: u32| if ring.binary_search(&v).is_ok() { lift * (1.0 + m.vertex(v).x) } else { DVec3::ZERO };
+                    let pcg = PcgParams { tolerance: 1e-7, max_iterations: 10_000 };
+                    let (x, st) = solver.solve(&values, &pcg).unwrap();
+                    let fresh = fair_positions(&m, &free, order, LaplacianWeights::Uniform, &values, &pcg).unwrap();
+                    assert_eq!(st.iterations, fresh.stats.iterations);
+                    assert!(x.iter().zip(&fresh.positions).all(|(a, b)| bits(*a) == bits(*b)), "order {order}, move {k}");
+                    assert!(x.iter().any(|p| p.length() > 1e-3), "the field is not trivial");
+                }
+            }
+        }
+        assert!(FairSolver::new(&primitives::icosphere(1.0, 1), &[0], 3, LaplacianWeights::Uniform, &|_| DVec3::ZERO).is_err());
     }
 
     #[test]

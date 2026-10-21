@@ -22,8 +22,10 @@ pub struct CfdReport {
     pub groups: usize,
 }
 
-pub fn analyze(mesh: &Mesh) -> CfdReport {
-    let bvh = mm_core::Bvh::build(mesh);
+/// Check `mesh`, with its BVH if one is at hand (`None`, or one for another state of the mesh:
+/// built here). Any tree over the mesh finds the same intersecting pairs.
+pub fn analyze(mesh: &Mesh, bvh: Option<std::sync::Arc<mm_core::Bvh>>) -> CfdReport {
+    let bvh = bvh.filter(|b| b.is_current(mesh)).unwrap_or_else(|| std::sync::Arc::new(mm_core::Bvh::build(mesh)));
     let pairs = mm_core::intersect::self_intersections(mesh, &bvh);
     let mut tris: Vec<u32> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
     tris.sort_unstable();
@@ -83,9 +85,9 @@ impl CfdCheckTool {
             self.report = None;
         }
         if self.job.is_none() && (again || self.report.is_none() || self.analyzed != version) {
-            let m = o.mesh.clone();
+            let (m, bvh) = (o.mesh.clone(), o.cached_bvh());
             self.analyzed = version;
-            self.job = Some(Job::spawn("CFD check", cx.egui.clone(), move |_| Ok(analyze(&m))));
+            self.job = Some(Job::spawn("CFD check", cx.egui.clone(), move |_| Ok(analyze(&m, bvh))));
         }
     }
 
@@ -161,7 +163,7 @@ impl Tool for CfdCheckTool {
         self.poll();
         if self.job.is_some() {
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.label("Checking…");
             });
         }
@@ -270,5 +272,32 @@ impl Tool for CfdCheckTool {
             }
             _ => Err(format!("Check for CFD has no action {action}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+
+    #[test]
+    fn a_refitted_scene_bvh_finds_the_same_defects() {
+        // Two overlapping spheres in one object (self-intersecting, two shells), one of them
+        // moved after the tree was built, as a sculpt or a transform leaves the scene's tree.
+        let mut m = primitives::icosphere(1.0, 3);
+        let mut b = primitives::icosphere(0.8, 3);
+        b.transform(|p| p + DVec3::new(1.2, 0.1, 0.0));
+        m.append_mesh(&b, 1);
+        let mut bvh = mm_core::Bvh::build(&m);
+        let moved: Vec<u32> = m.vertex_ids().filter(|&v| m.vertex(v).x > 1.0).collect();
+        for v in moved {
+            let p = m.vertex(v);
+            m.set_vertex(v, p - DVec3::new(0.15, 0.0, 0.0));
+        }
+        bvh.refit(&m);
+        let fresh = analyze(&m, None);
+        let reused = analyze(&m, Some(std::sync::Arc::new(bvh)));
+        assert!(!fresh.self_intersecting.is_empty());
+        assert_eq!(format!("{fresh:?}"), format!("{reused:?}"));
     }
 }

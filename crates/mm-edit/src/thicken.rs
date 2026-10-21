@@ -21,12 +21,16 @@
 //!    input itself, never cut: only its prolongation, a twentieth of the wall's thickness
 //!    long, stays on in front of each opening up to its rim.
 
-use crate::boolean::{mesh_boolean, BooleanOp};
+use crate::boolean::{mesh_boolean_with, mesh_boolean_with_trees, BooleanOp};
 use crate::util::{loop_outward_direction, mean, positions};
 use crate::{EditError, EditResult};
 use mm_core::{measure, Bvh, DVec3, Mesh};
+use mm_solid::field::FIELD_BETA;
+use mm_solid::WindingNumber;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::f64::consts::TAU;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Which way the wall grows from the surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -113,6 +117,77 @@ pub fn openings(mesh: &Mesh) -> Vec<(Vec<u32>, Opening)> {
 /// Thicken `mesh` into a shell (see the module documentation). `progress` gets 0..1 and
 /// may return `false` to cancel.
 pub fn thicken(mesh: &Mesh, params: &ThickenParams, progress: mm_solid::Progress) -> EditResult<ThickenResult> {
+    let report = |x: f32| progress.is_none_or(|p| p(x));
+    let shell = make_shell(mesh, params, &report)?;
+    finish(shell, params.remesh, &report)
+}
+
+/// The first part of [`thicken`]: the shell with its new side smoothed, not yet remeshed
+/// (a preview can show it while [`thicken_finish`] runs). `progress` gets 0..1 over this
+/// part and may return `false` to cancel.
+pub fn thicken_shell(mesh: &Mesh, params: &ThickenParams, progress: mm_solid::Progress) -> EditResult<ThickenShell> {
+    let report = |x: f32| progress.is_none_or(|p| p(x / SHELL_DONE));
+    let shell = make_shell(mesh, params, &report)?;
+    report(SHELL_DONE);
+    Ok(shell)
+}
+
+/// The rest of [`thicken`]: remesh the shell's new wall (when `remesh`) and check the result.
+/// `thicken_finish(thicken_shell(mesh, params, ..)?, params.remesh, ..)` gives exactly
+/// what [`thicken`] gives. `progress` gets 0..1 over this part and may return `false` to
+/// cancel.
+pub fn thicken_finish(shell: ThickenShell, remesh: bool, progress: mm_solid::Progress) -> EditResult<ThickenResult> {
+    let report = |x: f32| progress.is_none_or(|p| p(((x - SHELL_DONE) / (1.0 - SHELL_DONE)).max(0.0)));
+    finish(shell, remesh, &report)
+}
+
+/// The share of [`thicken`]'s progress taken by [`thicken_shell`].
+const SHELL_DONE: f32 = 0.86;
+
+/// What [`thicken_shell`] makes: the shell, its wall carved and the new side smoothed,
+/// before the remesh.
+#[derive(Clone, Debug)]
+pub struct ThickenShell {
+    /// The shell: closed, the input surface (when kept) one side of its wall.
+    pub mesh: Mesh,
+    pub openings: Vec<Opening>,
+    /// Face groups of the new wall and of the rims.
+    pub wall_group: i32,
+    pub rim_group: i32,
+    /// The wall's thickness: least, mean and most (see [`ThickenResult::measured`]).
+    pub measured: [f64; 3],
+    /// The grid spacing used.
+    pub cell_size: f64,
+    /// The surface's side of the wall was rebuilt from the distance field.
+    pub rebuilt: bool,
+    /// Triangles of `mesh` (by id) within three rings of a rim, which the remesh leaves alone.
+    near: Vec<bool>,
+    /// The input surface's average edge length, which the remesh aims for.
+    edge_length: f64,
+}
+
+impl ThickenShell {
+    /// The shell as a finished result without the remesh (what [`thicken`] gives with
+    /// `remesh` off).
+    pub fn into_result(self) -> ThickenResult {
+        let ThickenShell { mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt, .. } = self;
+        ThickenResult { mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt }
+    }
+}
+
+fn cancelled() -> EditError {
+    EditError::Failed("cancelled".into())
+}
+
+fn is_cancelled(e: &EditError) -> bool {
+    matches!(e, EditError::Failed(m) if m == "cancelled")
+}
+
+/// Search trees of a mesh, as the booleans and Make Solid take them.
+type Trees<'a> = Option<(&'a Bvh, &'a WindingNumber)>;
+
+/// Steps 1 to 3 and the smoothing; `report` gets [`thicken`]'s progress.
+fn make_shell(mesh: &Mesh, params: &ThickenParams, report: &dyn Fn(f32) -> bool) -> EditResult<ThickenShell> {
     let t = params.thickness;
     if !(t > 0.0 && t.is_finite()) {
         return Err(EditError::InvalidParameter("the wall thickness must be positive".into()));
@@ -120,23 +195,22 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams, progress: mm_solid::Progress
     if mesh.triangle_count() == 0 {
         return Err(EditError::InvalidParameter("the mesh is empty".into()));
     }
-    let report = |x: f32| progress.is_none_or(|p| p(x));
     let ends = openings(mesh);
     // The grid: a sixth of the thickness, coarser where the narrow band around a large
     // surface would hold more than about 40 million cells.
     let area = measure::surface_area(mesh);
     let h = params.cell_size.unwrap_or_else(|| (t / 6.0).max((area * 3.0 * t / 4e7).cbrt())).max(1e-6 * t);
+    let edge_length = mesh.average_edge_length();
 
     // 1. The lumen: the surface, oriented outward, each opening prolonged straight on and
     // closed. The prolongations and their ends get groups of their own.
-    let mut surface = mesh.clone();
-    let groups: Vec<i32> = surface.triangle_ids().map(|tr| surface.tri_group(tr)).collect();
+    let groups: Vec<i32> = mesh.triangle_ids().map(|tr| mesh.tri_group(tr)).collect();
     let top = groups.iter().copied().max().unwrap_or(0);
     let main = most_common(&groups);
     let (prolonged, closing, new_side, wall_group, rim_group) = (top + 1, top + 2, top + 3, top + 4, top + 5);
     // (Far enough that the offset near the opening does not see the closing cap.)
     let reach = t + 4.0 * h;
-    let mut closed = surface.clone();
+    let mut closed = mesh.clone();
     for (lp, o) in &ends {
         let n = lp.len();
         let row: Vec<u32> = lp.iter().map(|&v| closed.append_vertex(closed.vertex(v) + o.normal * reach)).collect();
@@ -152,38 +226,38 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams, progress: mm_solid::Progress
         return Err(EditError::Failed("the surface has holes besides its openings, or is not manifold: repair it first (Analysis → Inspector)".into()));
     }
     if measure::volume(&closed) < 0.0 {
-        surface.reverse_orientation();
         closed.reverse_orientation();
     }
     if !report(0.05) {
-        return Err(EditError::Failed("cancelled".into()));
+        return Err(cancelled());
     }
+    // The lumen's search trees, built once for the offset solids, the wall's measurement,
+    // the booleans that take the lumen itself and the rebuild.
+    let (bvh_c, wn_c) = rayon::join(|| Bvh::build(&closed), || WindingNumber::with_beta(&closed, FIELD_BETA));
+    let lumen: Trees = Some((&bvh_c, &wn_c));
 
     // 2. The offset solid(s), as the wall's new side.
     let offset = |d: f64, from: f32, to: f32| -> EditResult<Mesh> {
         let sub = |x: f32| report(from + (to - from) * x);
         let solid_params = mm_solid::MakeSolidParams { cell_size: h, offset: d, transfer_colors: false, ..Default::default() };
-        let mut m = mm_solid::make_solid(&closed, &solid_params, Some(&sub)).map_err(|e| EditError::Failed(format!("the offset surface: {e}")))?;
+        let mut m = mm_solid::solid::make_solid_with(&closed, &solid_params, lumen, Some(&sub)).map_err(|e| EditError::Failed(format!("the offset surface: {e}")))?;
         for tr in m.triangle_ids().collect::<Vec<_>>() {
             m.set_tri_group(tr, new_side);
         }
         Ok(m)
     };
-    let (outer, inner) = match params.side {
-        ThickenSide::Outward => (offset(t, 0.05, 0.7)?, closed.clone()),
-        ThickenSide::Inward => (closed.clone(), offset(-t, 0.05, 0.7)?),
-        ThickenSide::Centered => (offset(0.5 * t, 0.05, 0.4)?, offset(-0.5 * t, 0.4, 0.7)?),
-    };
-    let measured = match params.side {
-        ThickenSide::Outward => measure_wall(&outer, &closed),
-        ThickenSide::Inward => measure_wall(&inner, &closed),
-        ThickenSide::Centered => measure_wall(&outer, &inner),
+    let side = params.side;
+    let (outer, inner): (Cow<Mesh>, Cow<Mesh>) = match side {
+        ThickenSide::Outward => (Cow::Owned(offset(t, 0.05, 0.7)?), Cow::Borrowed(&closed)),
+        ThickenSide::Inward => (Cow::Borrowed(&closed), Cow::Owned(offset(-t, 0.05, 0.7)?)),
+        ThickenSide::Centered => (Cow::Owned(offset(0.5 * t, 0.05, 0.4)?), Cow::Owned(offset(-0.5 * t, 0.4, 0.7)?)),
     };
     // Each opening's rim stands this far in front of its plane.
     let ahead = 0.05 * t;
     // An inner solid that does not reach through an opening would close it.
+    let inner_ids: Vec<u32> = inner.vertex_ids().collect();
     for (i, (_, o)) in ends.iter().enumerate() {
-        let through = inner.vertex_ids().map(|v| inner.vertex(v) - o.centre).any(|q| q.dot(o.normal) > ahead + h && (q - o.normal * q.dot(o.normal)).length() < o.extent + h);
+        let through = inner_ids.par_iter().map(|&v| inner.vertex(v) - o.centre).any(|q| q.dot(o.normal) > ahead + h && (q - o.normal * q.dot(o.normal)).length() < o.extent + h);
         if !through {
             return Err(EditError::Failed(format!(
                 "opening {} (⌀ {:.1}) is too narrow for a wall this thick: the lumen closes up inside it; thicken outward, or thinner",
@@ -192,26 +266,220 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams, progress: mm_solid::Progress
             )));
         }
     }
+    drop(inner_ids);
 
     // 3. The outer solid cut back by a cylinder standing on each opening, then the inner
-    // solid taken out of it.
-    // (After each boolean the second mesh's triangles, whose groups follow the first's,
-    // are told apart by group and relabelled at once.)
-    let carve = |outer: &Mesh, inner: &Mesh| -> EditResult<Mesh> {
-        let mut shell = outer.clone();
-        for (i, (_, o)) in ends.iter().enumerate() {
-            let cyl = cylinder(o.centre + o.normal * ahead, o.normal, o.extent + t + 4.0 * h, reach + t + 4.0 * h, h);
-            let before = shell.max_group_id();
-            let cut = mesh_boolean(&shell, &cyl, BooleanOp::Difference).map_err(|e| EditError::Failed(format!("cutting the wall back at opening {}: {e}", i + 1)))?;
-            shell = cut.mesh;
-            for tr in shell.triangle_ids().collect::<Vec<_>>() {
-                if shell.tri_group(tr) > before {
-                    shell.set_tri_group(tr, rim_group);
+    // solid taken out of it. The wall is measured meanwhile.
+    let carver = Carver { ends: &ends, t, h, ahead, reach, prolonged, closing, new_side, wall_group, rim_group, main, report };
+    // The lumen's trees serve whichever solid is the lumen itself.
+    let outer_trees = if side == ThickenSide::Inward { lumen } else { None };
+    let inner_trees = if side == ThickenSide::Outward { lumen } else { None };
+    let carve = || -> EditResult<(Mesh, bool)> {
+        let cut = carver.cut_rims(&outer, outer_trees, 0.7, 0.78);
+        let first = match &cut {
+            Ok(shell) => carver.hollow(shell, &inner, inner_trees, 0.8),
+            Err(e) => Err(e.clone()),
+        };
+        let first = match first {
+            Ok(m) => return Ok((m, false)),
+            Err(e) if is_cancelled(&e) || side == ThickenSide::Centered => return Err(e),
+            Err(e) => e,
+        };
+        // The surface runs into itself (overlapping pieces merged without a union), which
+        // the exact booleans cannot take: its side of the wall is rebuilt as the distance
+        // field's zero set, which cannot run into itself (snapping it back onto the surface
+        // could, where the surface does).
+        if !report(0.8) {
+            return Err(cancelled());
+        }
+        // Outward the same outer solid is cut by the same cylinders again, so their cut is
+        // kept, and when that cut failed the rebuild cannot help.
+        let kept = match (side, cut) {
+            (ThickenSide::Outward, Ok(shell)) => Some(shell),
+            (ThickenSide::Outward, Err(_)) => return Err(first),
+            _ => None,
+        };
+        let sub = |x: f32| report(0.8 + 0.03 * x);
+        let rebuild = mm_solid::MakeSolidParams { mode: mm_solid::SolidMode::Fast, cell_size: h, transfer_groups: true, transfer_colors: false, ..Default::default() };
+        let clean = match mm_solid::solid::make_solid_with(&closed, &rebuild, lumen, Some(&sub)) {
+            Ok(m) => m,
+            Err(mm_solid::SolidError::Cancelled) => return Err(cancelled()),
+            Err(_) => return Err(first),
+        };
+        let second = match kept {
+            Some(shell) => carver.hollow(&shell, &clean, None, 0.85),
+            None => carver.cut_rims(&clean, None, 0.83, 0.845).and_then(|shell| carver.hollow(&shell, &inner, None, 0.85)),
+        };
+        match second {
+            Ok(m) => Ok((m, true)),
+            Err(e) if is_cancelled(&e) => Err(e),
+            Err(_) => Err(first),
+        }
+    };
+    // The wall's thickness, from the new side to the solid across the wall, measured
+    // alongside the carving (which reports progress, so it stays on this thread).
+    let (from, to, to_bvh): (&Mesh, &Mesh, Option<&Bvh>) = match side {
+        ThickenSide::Outward => (&outer, &closed, Some(&bvh_c)),
+        ThickenSide::Inward => (&inner, &closed, Some(&bvh_c)),
+        ThickenSide::Centered => (&outer, &inner, None),
+    };
+    let stop = AtomicBool::new(false);
+    let mut measured = None;
+    let carved = rayon::in_place_scope(|s| {
+        s.spawn(|_| measured = measure_wall(from, to, to_bvh, &stop));
+        let r = carve();
+        if r.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        r
+    });
+    let (mut out, rebuilt) = carved?;
+    let measured = measured.expect("the wall is measured unless stopped");
+    // The solids and the lumen's trees are done with.
+    drop(outer);
+    drop(inner);
+    drop(closed);
+    drop(bvh_c);
+    drop(wn_c);
+    if !report(0.85) {
+        return Err(cancelled());
+    }
+
+    // The new wall smoothed (here) and remeshed to the surface's edge length ([`finish`]),
+    // away from the rims: three rings of triangles beside each rim stay as they are (the
+    // rims, flat, too), since moving a vertex next to that corner could carry it across the
+    // rim's plane.
+    // - Smoothing: where the wall meets itself in a crease (outside a junction of branches)
+    //   the grid leaves it stair-stepped; a few volume-keeping (Taubin) steps even it out,
+    //   moving the crease outward, so the wall only thickens a little there.
+    // - A remesh, or smoothing, that made the wall run into anything is undone.
+    let mut near = vec![false; out.max_tid()];
+    let mut ring: Vec<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == rim_group).collect();
+    for &tr in &ring {
+        near[tr as usize] = true;
+    }
+    for _ in 0..3 {
+        // Each ring is what touches the one before (earlier rings' neighbours are marked).
+        let mut next = Vec::new();
+        for &tr in &ring {
+            for v in out.triangle(tr) {
+                for o in out.vertex_triangles(v) {
+                    if !near[o as usize] {
+                        near[o as usize] = true;
+                        next.push(o);
+                    }
                 }
             }
         }
+        ring = next;
+    }
+    let mut free: Vec<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == wall_group).flat_map(|tr| out.triangle(tr)).collect();
+    free.sort_unstable();
+    free.dedup();
+    free.retain(|&v| out.vertex_triangles(v).iter().all(|&tr| out.tri_group(tr) == wall_group && !near[tr as usize]));
+    // Only the free vertices move, so only their positions are kept to undo the smoothing.
+    let before: Vec<DVec3> = free.iter().map(|&v| out.vertex(v)).collect();
+    if !taubin(&mut out, &free, 20, &|| report(0.85)) {
+        return Err(cancelled());
+    }
+    let mut moved: Vec<u32> = free.iter().flat_map(|&v| out.vertex_triangles(v)).collect();
+    moved.sort_unstable();
+    moved.dedup();
+    match runs_into_anything(&out, &moved, &|| report(0.855)) {
+        Crossing::Hit => {
+            for (&v, &p) in free.iter().zip(&before) {
+                out.set_vertex(v, p);
+            }
+        }
+        Crossing::Clear => {}
+        Crossing::Cancelled => return Err(cancelled()),
+    }
+    Ok(ThickenShell { mesh: out, openings: ends.into_iter().map(|(_, o)| o).collect(), wall_group, rim_group, measured, cell_size: h, rebuilt, near, edge_length })
+}
+
+/// The remesh of the shell's new wall and the result; `report` gets [`thicken`]'s progress.
+fn finish(shell: ThickenShell, remesh: bool, report: &dyn Fn(f32) -> bool) -> EditResult<ThickenResult> {
+    if !report(SHELL_DONE) {
+        return Err(cancelled());
+    }
+    let ThickenShell { mesh: mut out, openings, wall_group, rim_group, measured, cell_size, rebuilt, near, edge_length } = shell;
+    if remesh {
+        let part: Vec<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == wall_group && !near[tr as usize]).collect();
+        let rp = mm_remesh::RemeshParams {
+            target_edge_length: edge_length,
+            iterations: 6,
+            preserve_group_boundaries: true,
+            region: Some(part),
+            ..mm_remesh::RemeshParams::with_target(edge_length)
+        };
+        let before = out.clone();
+        let sub = |f: f32| report(SHELL_DONE + 0.12 * f);
+        let remeshed = mm_remesh::remesh(&mut out, &rp, Some(&sub)).map_err(|e| EditError::Failed(format!("remeshing the new wall: {e}")))?;
+        if remeshed.cancelled {
+            return Err(cancelled());
+        }
+        if let Some(region) = remeshed.region_triangles {
+            match runs_into_anything(&out, &region, &|| report(0.98)) {
+                Crossing::Hit => out = before,
+                Crossing::Clear => {}
+                Crossing::Cancelled => return Err(cancelled()),
+            }
+        }
+    }
+    report(1.0);
+    Ok(ThickenResult { mesh: out, openings, wall_group, rim_group, measured, cell_size, rebuilt })
+}
+
+/// The booleans of step 3, with what they share.
+struct Carver<'a> {
+    ends: &'a [(Vec<u32>, Opening)],
+    t: f64,
+    h: f64,
+    ahead: f64,
+    reach: f64,
+    prolonged: i32,
+    closing: i32,
+    new_side: i32,
+    wall_group: i32,
+    rim_group: i32,
+    /// The surface's commonest group.
+    main: i32,
+    report: &'a dyn Fn(f32) -> bool,
+}
+
+impl Carver<'_> {
+    /// `outer` cut back by a cylinder standing on each opening; the cylinders' bases become
+    /// the rims. (After each boolean the cylinder's triangles, whose groups follow the
+    /// shell's, are told apart by group and relabelled at once.) `outer_trees` are the trees
+    /// of `outer` itself. Progress goes from `from` to `to`.
+    fn cut_rims<'m>(&self, outer: &'m Mesh, outer_trees: Trees, from: f32, to: f32) -> EditResult<Cow<'m, Mesh>> {
+        let (t, h) = (self.t, self.h);
+        let mut shell: Cow<Mesh> = Cow::Borrowed(outer);
+        for (i, (_, o)) in self.ends.iter().enumerate() {
+            let cyl = cylinder(o.centre + o.normal * self.ahead, o.normal, o.extent + t + 4.0 * h, self.reach + t + 4.0 * h, h);
+            let before = shell.max_group_id();
+            let trees = if i == 0 { outer_trees } else { None };
+            let cut = mesh_boolean_with_trees(&shell, &cyl, BooleanOp::Difference, trees, None)
+                .map_err(|e| EditError::Failed(format!("cutting the wall back at opening {}: {e}", i + 1)))?;
+            let mut m = cut.mesh;
+            for tr in m.triangle_ids().collect::<Vec<_>>() {
+                if m.tri_group(tr) > before {
+                    m.set_tri_group(tr, self.rim_group);
+                }
+            }
+            shell = Cow::Owned(m);
+            if !(self.report)(from + (to - from) * (i + 1) as f32 / self.ends.len() as f32) {
+                return Err(cancelled());
+            }
+        }
+        Ok(shell)
+    }
+
+    /// `inner` taken out of `shell`, with the groups settled. `inner_trees` are the trees
+    /// of `inner`. Reports `at` when done.
+    fn hollow(&self, shell: &Mesh, inner: &Mesh, inner_trees: Trees, at: f32) -> EditResult<Mesh> {
         let before = shell.max_group_id();
-        let hollow = mesh_boolean(&shell, inner, BooleanOp::Difference).map_err(|e| EditError::Failed(format!("taking the lumen out of the wall: {e}")))?;
+        let hollow = mesh_boolean_with(shell, inner, BooleanOp::Difference, inner_trees).map_err(|e| EditError::Failed(format!("taking the lumen out of the wall: {e}")))?;
         let from_inner = hollow.group_offset;
         let mut out = hollow.mesh;
         // Groups: the kept surface keeps its own (its prolongations take its commonest), the
@@ -219,86 +487,22 @@ pub fn thicken(mesh: &Mesh, params: &ThickenParams, progress: mm_solid::Progress
         for tr in out.triangle_ids().collect::<Vec<_>>() {
             let raw = out.tri_group(tr);
             let g = if raw > before { raw - from_inner } else { raw };
-            let g = if raw <= before && raw == rim_group {
-                rim_group
-            } else if g == new_side {
-                wall_group
-            } else if g == prolonged || g == closing {
-                main
+            let g = if raw <= before && raw == self.rim_group {
+                self.rim_group
+            } else if g == self.new_side {
+                self.wall_group
+            } else if g == self.prolonged || g == self.closing {
+                self.main
             } else {
                 g
             };
             out.set_tri_group(tr, g);
         }
+        if !(self.report)(at) {
+            return Err(cancelled());
+        }
         Ok(out)
-    };
-    let mut rebuilt = false;
-    let mut out = match carve(&outer, &inner) {
-        Ok(m) => m,
-        Err(first) if params.side != ThickenSide::Centered => {
-            // The surface runs into itself (overlapping pieces merged without a union), which
-            // the exact booleans cannot take: its side of the wall is rebuilt as the distance
-            // field's zero set, which cannot run into itself (snapping it back onto the
-            // surface could, where the surface does).
-            let rebuild = mm_solid::MakeSolidParams { mode: mm_solid::SolidMode::Fast, cell_size: h, transfer_groups: true, transfer_colors: false, ..Default::default() };
-            let clean = mm_solid::make_solid(&closed, &rebuild, None).map_err(|_| first.clone())?;
-            rebuilt = true;
-            match params.side {
-                ThickenSide::Outward => carve(&outer, &clean),
-                _ => carve(&clean, &inner),
-            }
-            .map_err(|_| first)?
-        }
-        Err(e) => return Err(e),
-    };
-    if !report(0.85) {
-        return Err(EditError::Failed("cancelled".into()));
     }
-
-    // The new wall smoothed and remeshed to the surface's edge length, away from the rims:
-    // three rings of triangles beside each rim stay as they are (the rims, flat, too), since
-    // moving a vertex next to that corner could carry it across the rim's plane.
-    // - Smoothing: where the wall meets itself in a crease (outside a junction of branches)
-    //   the grid leaves it stair-stepped; a few volume-keeping (Taubin) steps even it out,
-    //   moving the crease outward, so the wall only thickens a little there.
-    // - A remesh, or smoothing, that made the wall run into anything is undone.
-    let mut near: std::collections::HashSet<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == rim_group).collect();
-    for _ in 0..3 {
-        let more: Vec<u32> = near.iter().flat_map(|&tr| out.triangle(tr)).flat_map(|v| out.vertex_triangles(v)).collect();
-        near.extend(more);
-    }
-    {
-        let mut free: Vec<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == wall_group).flat_map(|tr| out.triangle(tr)).collect();
-        free.sort_unstable();
-        free.dedup();
-        free.retain(|&v| out.vertex_triangles(v).iter().all(|tr| out.tri_group(*tr) == wall_group && !near.contains(tr)));
-        let before = out.clone();
-        taubin(&mut out, &free, 20);
-        let moved: Vec<u32> = free.iter().flat_map(|&v| out.vertex_triangles(v)).collect();
-        if runs_into_anything(&out, &moved) {
-            out = before;
-        }
-    }
-    if params.remesh {
-        let part: Vec<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == wall_group && !near.contains(&tr)).collect();
-        let rp = mm_remesh::RemeshParams {
-            target_edge_length: mesh.average_edge_length(),
-            iterations: 6,
-            preserve_group_boundaries: true,
-            region: Some(part),
-            ..mm_remesh::RemeshParams::with_target(mesh.average_edge_length())
-        };
-        let before = out.clone();
-        let report = mm_remesh::remesh(&mut out, &rp, None).map_err(|e| EditError::Failed(format!("remeshing the new wall: {e}")))?;
-        if let Some(region) = report.region_triangles {
-            if runs_into_anything(&out, &region) {
-                out = before;
-            }
-        }
-    }
-
-    report(1.0);
-    Ok(ThickenResult { mesh: out, openings: ends.into_iter().map(|(_, o)| o).collect(), wall_group, rim_group, measured, cell_size: h, rebuilt })
 }
 
 /// A closed cylinder standing on the disk of radius `r` about `c` square to `n`, `len` long
@@ -393,37 +597,75 @@ impl Builder {
 }
 
 /// The wall's thickness: each vertex of the new side `from` against the solid across the
-/// wall, `to`. Least, mean and most.
-fn measure_wall(from: &Mesh, to: &Mesh) -> [f64; 3] {
-    let bvh = Bvh::build(to);
+/// wall, `to` (whose BVH may come built). Least, mean and most; `None` when `stop` was set
+/// before the end.
+fn measure_wall(from: &Mesh, to: &Mesh, to_bvh: Option<&Bvh>, stop: &AtomicBool) -> Option<[f64; 3]> {
+    let built;
+    let bvh = match to_bvh {
+        Some(b) => b,
+        None => {
+            built = Bvh::build(to);
+            &built
+        }
+    };
     let ids: Vec<u32> = from.vertex_ids().collect();
-    let d: Vec<f64> = ids.par_iter().filter_map(|&v| bvh.nearest(to, from.vertex(v), f64::INFINITY).map(|h| h.dist_sq.sqrt())).collect();
-    if d.is_empty() {
-        return [0.0; 3];
+    let mut d: Vec<f64> = Vec::with_capacity(ids.len());
+    // In chunks, so that a carving that fails or is cancelled does not wait for all of it.
+    for chunk in ids.chunks(1 << 16) {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        d.par_extend(chunk.par_iter().filter_map(|&v| bvh.nearest(to, from.vertex(v), f64::INFINITY).map(|h| h.dist_sq.sqrt())));
     }
-    [d.iter().copied().fold(f64::INFINITY, f64::min), d.iter().sum::<f64>() / d.len() as f64, d.iter().copied().fold(0.0, f64::max)]
+    if d.is_empty() {
+        return Some([0.0; 3]);
+    }
+    Some([d.iter().copied().fold(f64::INFINITY, f64::min), d.iter().sum::<f64>() / d.len() as f64, d.iter().copied().fold(0.0, f64::max)])
+}
+
+/// Whether a check for crossings found one.
+enum Crossing {
+    Hit,
+    Clear,
+    Cancelled,
 }
 
 /// Whether any of `tris` cuts through another triangle of `m` (neighbours sharing a vertex
-/// aside).
-fn runs_into_anything(m: &Mesh, tris: &[u32]) -> bool {
+/// aside). `go_on` is asked between chunks of triangles whether to carry on.
+fn runs_into_anything(m: &Mesh, tris: &[u32], go_on: &dyn Fn() -> bool) -> Crossing {
+    if !go_on() {
+        return Crossing::Cancelled;
+    }
     let bvh = Bvh::build(m);
-    tris.par_iter().any(|&t| {
-        let (tv, tp) = (m.triangle(t), m.tri_positions(t));
-        let mut hit = false;
-        bvh.query_aabb(&mm_core::Aabb::from_points(tp), |o| {
-            if !hit && o != t && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
-                hit = true;
-            }
+    for chunk in tris.chunks(1 << 16) {
+        if !go_on() {
+            return Crossing::Cancelled;
+        }
+        let hit = chunk.par_iter().any(|&t| {
+            let (tv, tp) = (m.triangle(t), m.tri_positions(t));
+            let mut hit = false;
+            bvh.query_aabb(&mm_core::Aabb::from_points(tp), |o| {
+                if !hit && o != t && !m.triangle(o).iter().any(|v| tv.contains(v)) && mm_core::intersect::triangles_intersect(tp, m.tri_positions(o)) {
+                    hit = true;
+                }
+            });
+            hit
         });
-        hit
-    })
+        if hit {
+            return Crossing::Hit;
+        }
+    }
+    Crossing::Clear
 }
 
 /// Volume-keeping smoothing (Taubin λ|μ steps) of the vertices `free`, the rest held.
-fn taubin(m: &mut Mesh, free: &[u32], iterations: usize) {
+/// `go_on` is asked before each iteration; returns `false` when it said stop.
+fn taubin(m: &mut Mesh, free: &[u32], iterations: usize, go_on: &dyn Fn() -> bool) -> bool {
     let rings: Vec<Vec<u32>> = free.iter().map(|&v| m.vertex_neighbors(v).collect()).collect();
     for _ in 0..iterations {
+        if !go_on() {
+            return false;
+        }
         for step in [0.5, -0.53] {
             let moved: Vec<DVec3> = free
                 .par_iter()
@@ -434,11 +676,14 @@ fn taubin(m: &mut Mesh, free: &[u32], iterations: usize) {
                     p + (mean - p) * step
                 })
                 .collect();
+            let pos = m.positions_mut();
             for (&v, p) in free.iter().zip(moved) {
-                m.set_vertex(v, p);
+                pos[v as usize] = p;
             }
+            m.bump_shape_version();
         }
     }
+    true
 }
 
 /// The commonest of `groups` (0 when empty).
@@ -448,4 +693,99 @@ fn most_common(groups: &[i32]) -> i32 {
         *count.entry(g).or_default() += 1;
     }
     count.into_iter().max_by_key(|&(g, n)| (n, -g)).map_or(0, |(g, _)| g)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_core::primitives;
+    use std::sync::atomic::AtomicUsize;
+
+    fn same(a: &ThickenResult, b: &ThickenResult) -> bool {
+        let (x, y) = (&a.mesh, &b.mesh);
+        x.max_vid() == y.max_vid()
+            && x.max_tid() == y.max_tid()
+            && x.vertex_ids().eq(y.vertex_ids())
+            && x.vertex_ids().all(|v| x.vertex(v).to_array().map(f64::to_bits) == y.vertex(v).to_array().map(f64::to_bits))
+            && x.triangle_ids().eq(y.triangle_ids())
+            && x.triangle_ids().all(|t| x.triangle(t) == y.triangle(t) && x.tri_group(t) == y.tri_group(t))
+            && a.measured.map(f64::to_bits) == b.measured.map(f64::to_bits)
+            && a.openings == b.openings
+            && (a.wall_group, a.rim_group, a.cell_size.to_bits(), a.rebuilt) == (b.wall_group, b.rim_group, b.cell_size.to_bits(), b.rebuilt)
+    }
+
+    fn tube(x: f64, r: f64) -> Mesh {
+        let points: Vec<DVec3> = (0..=80).map(|k| DVec3::new(x + (k as f64 * 0.05).sin(), 0.0, 20.0 * k as f64 / 80.0)).collect();
+        primitives::tube_along(&points, &vec![r; points.len()], 32)
+    }
+
+    /// Two tubes side by side, overlapping along their length: Thicken's rebuild path.
+    fn overlapping_tubes() -> Mesh {
+        let mut m = tube(0.0, 3.0);
+        m.append_mesh(&tube(1.7, 2.6), 0);
+        m
+    }
+
+    #[test]
+    fn shell_then_finish_is_thicken() {
+        let m = tube(0.0, 3.0);
+        for side in [ThickenSide::Outward, ThickenSide::Inward, ThickenSide::Centered] {
+            for remesh in [true, false] {
+                let params = ThickenParams { thickness: 1.5, side, cell_size: Some(0.3), remesh };
+                let whole = thicken(&m, &params, None).unwrap();
+                let shell = thicken_shell(&m, &params, None).unwrap();
+                if !remesh {
+                    assert!(same(&whole, &shell.clone().into_result()), "{side:?}: shell as the result");
+                }
+                assert!(same(&whole, &thicken_finish(shell, remesh, None).unwrap()), "{side:?} remesh {remesh}");
+            }
+        }
+        let params = ThickenParams { thickness: 1.0, cell_size: Some(0.25), ..Default::default() };
+        let whole = thicken(&overlapping_tubes(), &params, None).unwrap();
+        assert!(whole.rebuilt);
+        assert!(same(&whole, &thicken_finish(thicken_shell(&overlapping_tubes(), &params, None).unwrap(), true, None).unwrap()));
+    }
+
+    #[test]
+    fn rings_beside_the_rims_are_those_of_three_passes() {
+        let shell = thicken_shell(&tube(0.0, 3.0), &ThickenParams { thickness: 1.5, cell_size: Some(0.3), ..Default::default() }, None).unwrap();
+        let out = &shell.mesh;
+        // Three times over: every triangle sharing a corner with one already near.
+        let mut near: std::collections::HashSet<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == shell.rim_group).collect();
+        assert!(!near.is_empty());
+        for _ in 0..3 {
+            let more: Vec<u32> = near.iter().flat_map(|&tr| out.triangle(tr)).flat_map(|v| out.vertex_triangles(v)).collect();
+            near.extend(more);
+        }
+        let marked: std::collections::HashSet<u32> = out.triangle_ids().filter(|&tr| shell.near[tr as usize]).collect();
+        assert_eq!(near, marked);
+    }
+
+    /// Cancelled at any progress report, Thicken stops with a cancellation, including on its
+    /// rebuild path.
+    #[test]
+    fn cancels_at_every_report() {
+        for (m, params) in [
+            (tube(0.0, 3.0), ThickenParams { thickness: 1.5, cell_size: Some(0.3), ..Default::default() }),
+            (overlapping_tubes(), ThickenParams { thickness: 1.0, cell_size: Some(0.25), ..Default::default() }),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let count = |_: f32| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                true
+            };
+            thicken(&m, &params, Some(&count)).unwrap();
+            let total = calls.load(Ordering::Relaxed);
+            assert!(total > 10, "{total} reports");
+            // The last report (1.0) comes after the work and is not asked to stop it.
+            for stop_at in (0..total - 1).step_by((total / 12).max(1)) {
+                let seen = AtomicUsize::new(0);
+                let cb = |_: f32| seen.fetch_add(1, Ordering::Relaxed) < stop_at;
+                let e = thicken(&m, &params, Some(&cb)).unwrap_err();
+                assert!(e.to_string().contains("cancelled"), "stopped at report {stop_at} of {total}: {e}");
+                // Nothing more than a check or two after the refusal.
+                assert!(seen.load(Ordering::Relaxed) <= stop_at + 2, "stopped at report {stop_at}: {} reports", seen.load(Ordering::Relaxed));
+            }
+        }
+    }
 }

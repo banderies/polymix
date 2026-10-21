@@ -197,6 +197,9 @@ struct Stroke {
     object: ObjectId,
     deselect: bool,
     last: Option<DVec3>,
+    /// The mesh (allocation and topology version) the selection was last synced with: the
+    /// brush only adds and removes live triangles, so it stays in sync until they change.
+    synced: Option<(usize, u64)>,
 }
 
 impl Default for SelectTool {
@@ -309,7 +312,12 @@ impl SelectTool {
         };
         let bvh = o.bvh();
         let mesh = o.mesh.clone();
-        o.selection.sync(&mesh);
+        // Versions are never reused, so the same key means the same live triangles.
+        let key = (std::sync::Arc::as_ptr(&mesh) as usize, mesh.topology_version());
+        if stroke.synced != Some(key) || o.selection.bits().len() != mesh.max_tid() {
+            o.selection.sync(&mesh);
+            stroke.synced = Some(key);
+        }
         // Stamp along the segment from the previous sample so fast strokes stay continuous.
         let mut stamps = vec![(hit.tid, hit.point)];
         if let Some(prev) = last {
@@ -380,35 +388,33 @@ impl SelectTool {
         let o = cx.scene.get_mut(id).unwrap();
         let bvh = o.bvh();
         let mesh = o.mesh.clone();
-        // Side of the curve for every triangle in front of the camera (by centroid).
-        let side: Vec<(u32, bool)> = mesh
-            .triangle_ids()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .filter_map(|&t| {
+        // Side of the curve for every triangle in front of the camera (by centroid), in id
+        // order, with its area for the laser (worked out here, summed in order below).
+        let laser = !curve.closed;
+        let side: Vec<(u32, bool, f64)> = (0..mesh.max_tid() as u32)
+            .into_par_iter()
+            .filter(|&t| mesh.is_triangle(t))
+            .filter_map(|t| {
                 let clip = view_proj * mesh.tri_centroid(t).extend(1.0);
                 if clip.w <= 0.0 {
                     return None;
                 }
                 let sp = vp.to_screen(clip.truncate() / clip.w);
-                Some((t, curve.contains(to_dvec(sp))))
+                Some((t, curve.contains(to_dvec(sp)), if laser { mesh.tri_area(t) } else { 0.0 }))
             })
             .collect();
         // Closed: the inside. Open (laser): the side with less surface area.
         let pick_inside = curve.closed || {
-            let (a_in, a_out) = side.iter().fold((0.0, 0.0), |(i, o), &(t, inside)| {
-                let a = mesh.tri_area(t);
-                if inside { (i + a, o) } else { (i, o + a) }
-            });
+            let (a_in, a_out) = side.iter().fold((0.0, 0.0), |(i, o), &(_, inside, a)| if inside { (i + a, o) } else { (i, o + a) });
             a_in <= a_out
         };
         let hits: Vec<u32> = side
             .par_iter()
-            .filter(|&&(_, inside)| inside == pick_inside)
-            .map(|&(t, _)| t)
+            .filter(|&&(_, inside, _)| inside == pick_inside)
+            .map(|&(t, _, _)| t)
             .filter(|&t| through || view.visible(&mesh, &bvh, t))
             .collect();
-        o.selection.sync(&mesh);
+        o.sync_selection();
         for t in hits {
             if deselect {
                 o.selection.remove(t);
@@ -469,7 +475,7 @@ impl SelectTool {
         }
         cx.snapshot("Lasso select");
         let o = cx.scene.get_mut(id).unwrap();
-        o.selection.sync(&mesh);
+        o.sync_selection();
         for t in faces {
             if deselect {
                 o.selection.remove(t);
@@ -904,7 +910,7 @@ impl Tool for SelectTool {
                 (SelectMode::Brush, Some((id, _))) => {
                     cx.scene.active = Some(id);
                     cx.snapshot("Brush select");
-                    self.stroke = Some(Stroke { object: id, deselect, last: None });
+                    self.stroke = Some(Stroke { object: id, deselect, last: None, synced: None });
                 }
                 // Magic wand: one click selects a region.
                 (SelectMode::Wand, Some((id, h))) => {

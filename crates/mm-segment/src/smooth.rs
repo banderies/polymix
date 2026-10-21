@@ -19,60 +19,8 @@
 
 use crate::mask::Mask;
 use crate::ops::distance_sq;
+use crate::region::Region;
 use rayon::prelude::*;
-
-/// A box of voxels within a grid: its first voxel and its size.
-#[derive(Clone, Copy, Debug)]
-struct Region {
-    lo: [usize; 3],
-    dims: [usize; 3],
-}
-
-impl Region {
-    /// The voxels from `lo` to `hi` (inclusive) and `pad` more along each axis, within a grid
-    /// of `full`.
-    fn around(lo: [usize; 3], hi: [usize; 3], pad: [usize; 3], full: [usize; 3]) -> Self {
-        let a = [0, 1, 2].map(|x| lo[x].saturating_sub(pad[x]));
-        let b = [0, 1, 2].map(|x| hi[x].saturating_add(pad[x]).min(full[x] - 1));
-        Self { lo: a, dims: [0, 1, 2].map(|x| b[x] - a[x] + 1) }
-    }
-
-    fn len(&self) -> usize {
-        self.dims[0] * self.dims[1] * self.dims[2]
-    }
-
-    /// Grid (j, k) of the region's row `r` (rows run along i).
-    fn row_jk(&self, r: usize) -> (usize, usize) {
-        (self.lo[1] + r % self.dims[1], self.lo[2] + r / self.dims[1])
-    }
-
-    /// The region's row number of grid row (j, k), if the region has it.
-    fn row_at(&self, j: usize, k: usize) -> Option<usize> {
-        let (y, z) = (j.wrapping_sub(self.lo[1]), k.wrapping_sub(self.lo[2]));
-        // Lazily: out of range, y and z have wrapped round and their row number would overflow.
-        (y < self.dims[1] && z < self.dims[2]).then(|| z * self.dims[1] + y)
-    }
-
-    /// `f` of each of the region's voxels of `data` (a grid of `full`), as a grid of its own.
-    fn gather<T: Copy + Sync, U: Copy + Default + Send>(&self, data: &[T], full: [usize; 3], f: impl Fn(T) -> U + Sync) -> Vec<U> {
-        let mut out = vec![U::default(); self.len()];
-        out.par_chunks_mut(self.dims[0]).enumerate().for_each(|(r, row)| {
-            let (j, k) = self.row_jk(r);
-            let at = (k * full[1] + j) * full[0] + self.lo[0];
-            for (o, &v) in row.iter_mut().zip(&data[at..at + self.dims[0]]) {
-                *o = f(v);
-            }
-        });
-        out
-    }
-
-    /// The region's part of each row of `data` (a grid of `full`), in parallel, with the row's
-    /// number in the region.
-    fn par_rows_mut<'a, T: Send>(&self, data: &'a mut [T], full: [usize; 3]) -> impl ParallelIterator<Item = (usize, &'a mut [T])> + 'a {
-        let b = *self;
-        data.par_chunks_mut(full[0]).enumerate().filter_map(move |(r, row)| b.row_at(r % full[1], r / full[1]).map(|q| (q, &mut row[b.lo[0]..b.lo[0] + b.dims[0]])))
-    }
-}
 
 /// Normalised weights of a Gaussian with a standard deviation of `s` samples, truncated at
 /// three standard deviations (centre at index `len / 2`).
@@ -83,11 +31,106 @@ fn kernel(s: f64) -> Vec<f32> {
     w.iter().map(|&v| (v / total) as f32).collect()
 }
 
+/// Normalised weights of a Gaussian with a standard deviation of `s` samples over `2 · r + 1`
+/// samples (centre at index `r`), as the blurs of seeded growth and level sets take them.
+pub(crate) fn gauss_weights(s: f64, r: usize) -> Vec<f32> {
+    let w: Vec<f64> = (0..=2 * r).map(|t| (-((t as f64 - r as f64).powi(2)) / (2.0 * s * s)).exp()).collect();
+    let total: f64 = w.iter().sum();
+    w.iter().map(|x| (x / total) as f32).collect()
+}
+
+/// `values` (a grid of `dims`, i fastest) convolved along `axis` with the weights `w` (centre
+/// at index `w.len() / 2`), the grid's edge values continuing past its edges: each voxel
+/// becomes `finish` of the sum, from `start`, of its weighted neighbours taken in order. `src`
+/// is scratch of the grid's size. Whole rows along i at a time, so that across i the rows
+/// before and after a row are added to it in turn and memory is read in order.
+pub(crate) fn convolve(values: &mut [f32], src: &mut [f32], dims: [usize; 3], axis: usize, w: &[f32], start: f32, finish: impl Fn(f32) -> f32 + Sync) {
+    let [nx, ny, nz] = dims;
+    if values.is_empty() {
+        return;
+    }
+    let r = w.len() / 2;
+    src.copy_from_slice(values);
+    if axis == 0 {
+        values.par_chunks_mut(nx).zip(src.par_chunks(nx)).for_each(|(out, line)| {
+            for (x, o) in out.iter_mut().enumerate() {
+                let mut acc = start;
+                for (t, &wt) in w.iter().enumerate() {
+                    acc += wt * line[(x + t).saturating_sub(r).min(nx - 1)];
+                }
+                *o = finish(acc);
+            }
+        });
+    } else {
+        let (len, step) = if axis == 1 { (ny, 1) } else { (nz, ny) };
+        let src = &*src;
+        values.par_chunks_mut(nx).enumerate().for_each(|(l, out)| {
+            let p = if axis == 1 { l % ny } else { l / ny };
+            let base = l - p * step;
+            out.fill(start);
+            for (t, &wt) in w.iter().enumerate() {
+                let q = base + (p + t).saturating_sub(r).min(len - 1) * step;
+                for (o, &v) in out.iter_mut().zip(&src[q * nx..(q + 1) * nx]) {
+                    *o += wt * v;
+                }
+            }
+            out.iter_mut().for_each(|o| *o = finish(*o));
+        });
+    }
+}
+
+/// Separable blur of `values` (a grid of `dims`) with the weights `kernels[a]` along each axis
+/// a (an axis without is left alone), each sum from −0 as `Iterator::sum` starts it.
+pub(crate) fn blur_rows(values: &mut [f32], dims: [usize; 3], kernels: [Option<Vec<f32>>; 3]) {
+    let mut src = Vec::new();
+    for (axis, w) in kernels.iter().enumerate() {
+        let Some(w) = w else { continue };
+        src.resize(values.len(), 0.0);
+        convolve(values, &mut src, dims, axis, w, -0.0, |a| a);
+    }
+}
+
+/// Gradient magnitude (per mm) of a grid of `dims` values `spacing` mm apart, by central
+/// differences (one-sided at the grid's faces), a row at a time.
+pub(crate) fn gradient_magnitude(values: &[f32], dims: [usize; 3], spacing: [f64; 3]) -> Vec<f32> {
+    let [nx, ny, nz] = dims;
+    let mut out = vec![0f32; values.len()];
+    if out.is_empty() {
+        return out;
+    }
+    // The span (mm) of a one-sided and of a central difference along each axis.
+    let span = spacing.map(|h| [h as f32, (2.0 * h) as f32]);
+    let line = |j: usize, k: usize| &values[(k * ny + j) * nx..(k * ny + j + 1) * nx];
+    out.par_chunks_mut(nx).enumerate().for_each(|(l, row)| {
+        let (j, k) = (l % ny, l / ny);
+        // The neighbouring rows along j and k (the row itself at the grid's faces).
+        let (j0, j1, k0, k1) = (j.saturating_sub(1), (j + 1).min(ny - 1), k.saturating_sub(1), (k + 1).min(nz - 1));
+        let (here, back_j, next_j, back_k, next_k) = (line(j, k), line(j0, k), line(j1, k), line(j, k0), line(j, k1));
+        for (x, g) in row.iter_mut().enumerate() {
+            let (x0, x1) = (x.saturating_sub(1), (x + 1).min(nx - 1));
+            let mut g2 = 0.0f32;
+            if x0 != x1 {
+                let d = (here[x1] - here[x0]) / span[0][x1 - x0 - 1];
+                g2 += d * d;
+            }
+            if j0 != j1 {
+                let d = (next_j[x] - back_j[x]) / span[1][j1 - j0 - 1];
+                g2 += d * d;
+            }
+            if k0 != k1 {
+                let d = (next_k[x] - back_k[x]) / span[2][k1 - k0 - 1];
+                g2 += d * d;
+            }
+            *g = g2.sqrt();
+        }
+    });
+    out
+}
+
 /// Separable Gaussian blur of `values` (a grid of `dims`, i fastest) with a standard deviation
 /// of `sigma` voxels along each axis; the grid's edge values continue past its edges. Below a
 /// twentieth of a voxel the kernel is the identity, and the axis is left alone.
 pub(crate) fn blur(values: &mut [f32], dims: [usize; 3], sigma: [f64; 3]) {
-    let [nx, ny, nz] = dims;
     if values.is_empty() {
         return;
     }
@@ -98,30 +141,10 @@ pub(crate) fn blur(values: &mut [f32], dims: [usize; 3], sigma: [f64; 3]) {
         }
         // Past the grid's length a wider Gaussian only flattens further.
         let w = kernel(sigma[axis].min(dims[axis] as f64));
-        let r = w.len() / 2;
-        src.copy_from_slice(values);
-        if axis == 0 {
-            values.par_chunks_mut(nx).zip(src.par_chunks(nx)).for_each(|(out, line)| {
-                for (x, o) in out.iter_mut().enumerate() {
-                    *o = w.iter().enumerate().map(|(t, &wt)| wt * line[(x + t).saturating_sub(r).min(nx - 1)]).sum();
-                }
-            });
-        } else {
-            // Whole rows at a time: row (j, k) is the weighted sum of the rows before and after
-            // it along the axis, which keeps the memory access sequential.
-            let (len, step) = if axis == 1 { (ny, 1) } else { (nz, ny) };
-            values.par_chunks_mut(nx).enumerate().for_each(|(l, out)| {
-                let p = if axis == 1 { l % ny } else { l / ny };
-                let base = l - p * step;
-                out.fill(0.0);
-                for (t, &wt) in w.iter().enumerate() {
-                    let q = base + (p + t).saturating_sub(r).min(len - 1) * step;
-                    for (o, &v) in out.iter_mut().zip(&src[q * nx..(q + 1) * nx]) {
-                        *o += wt * v;
-                    }
-                }
-            });
-        }
+        // Sums along i start from −0 (as `Iterator::sum` does), along j and k from +0: they
+        // differ only in the sign of a sum of −0 terms.
+        let start = if axis == 0 { -0.0 } else { 0.0 };
+        convolve(values, &mut src, dims, axis, &w, start, |a| a);
     }
 }
 
@@ -331,6 +354,22 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn smooth_blur_is_the_old_one_to_the_bit() {
+        use crate::reference::{smooth_blur, unit, DIMS};
+        for &dims in &DIMS {
+            let n = dims.iter().product::<usize>();
+            // Signed values, −0 among them.
+            let v: Vec<f32> = (0..n).map(|q| if q % 5 == 0 { -0.0 } else { (unit(q as u64 + 5) * 2.0 - 1.0) as f32 }).collect();
+            for sigma in [[0.0, 0.0, 0.0], [0.05, 0.7, 1.0], [3.0, 0.04, 40.0], [f64::NAN, 1.5, 0.3]] {
+                let (mut a, mut b) = (v.clone(), v.clone());
+                smooth_blur(&mut a, dims, sigma);
+                blur(&mut b, dims, sigma);
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{dims:?} {sigma:?}");
+            }
+        }
     }
 
     #[test]

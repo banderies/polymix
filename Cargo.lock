@@ -2920,6 +2920,7 @@ dependencies = [
  "eframe",
  "egui",
  "log",
+ "rayon",
  "serde_json",
 ]
 

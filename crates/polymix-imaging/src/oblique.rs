@@ -9,6 +9,7 @@ use glam::{DMat4, DVec3};
 use mm_volume::load::LoadedVolume;
 use mm_volume::slice::Plane;
 use rayon::prelude::*;
+use std::ops::Range;
 
 /// A plane's frame in RAS: right and down on the screen, and its normal (unit vectors).
 pub type Frame = [DVec3; 3];
@@ -116,7 +117,7 @@ impl ObliqueGrid {
     /// `half_mm` on each side combined as `mode`; 0 outside the volume.
     pub fn sample(&self, vol: &LoadedVolume, values: &[f32], smooth: bool, half_mm: f64, mode: SlabMode) -> Vec<f32> {
         let [w, h] = self.size;
-        let steps = if mode == SlabMode::Off { 0 } else { (half_mm / self.px).round() as i64 };
+        let steps = self.slab_steps(half_mm, mode);
         (0..w * h)
             .into_par_iter()
             .map(|p| {
@@ -142,20 +143,45 @@ impl ObliqueGrid {
             .collect()
     }
 
+    /// Samples along the normal on each side of the plane that [`Self::sample`] combines for a
+    /// slab of `half_mm` on each side (0 or less: the plane alone). The values depend on the
+    /// slab through this alone.
+    pub(crate) fn slab_steps(&self, half_mm: f64, mode: SlabMode) -> i64 {
+        if mode == SlabMode::Off {
+            0
+        } else {
+            (half_mm / self.px).round() as i64
+        }
+    }
+
     /// The labels under each pixel (nearest voxel).
     pub fn sample_labels(&self, vol: &LoadedVolume, labels: &[u8]) -> Vec<u8> {
         let [w, h] = self.size;
-        (0..w * h)
-            .into_par_iter()
-            .map(|p| {
-                let v = self.to_voxel.transform_point3(self.world((p % w) as f64 + 0.5, (p / w) as f64 + 0.5));
-                let i = [0, 1, 2].map(|a| v[a].round());
-                if (0..3).any(|a| i[a] < 0.0 || i[a] >= vol.dims[a] as f64) {
-                    return 0;
-                }
-                labels[(i[2] as usize * vol.dims[1] + i[1] as usize) * vol.dims[0] + i[0] as usize]
-            })
-            .collect()
+        (0..w * h).into_par_iter().map(|p| self.label_at(vol.dims, labels, p % w, p / w)).collect()
+    }
+
+    /// Re-sample the labels of pixels `x` × `y` into `out` (the whole image's labels, row by
+    /// row, as `sample_labels` makes them), leaving the other pixels as they are.
+    pub(crate) fn sample_labels_in(&self, vol: &LoadedVolume, labels: &[u8], out: &mut [u8], x: Range<usize>, y: Range<usize>) {
+        // On this thread: even a whole image of the largest size is a few milliseconds, which
+        // tasks on a busy machine would take longer to finish (see slice_view::PARALLEL_WORK).
+        let w = self.size[0];
+        for (r, row) in out[y.start * w..y.end * w].chunks_mut(w).enumerate() {
+            for (i, l) in row[x.clone()].iter_mut().enumerate() {
+                *l = self.label_at(vol.dims, labels, x.start + i, y.start + r);
+            }
+        }
+    }
+
+    /// The label under pixel (`x`, `y`): its centre's nearest voxel's, 0 outside the volume.
+    /// The whole image and its parts are sampled by this alone, so they agree.
+    fn label_at(&self, dims: [usize; 3], labels: &[u8], x: usize, y: usize) -> u8 {
+        let v = self.to_voxel.transform_point3(self.world(x as f64 + 0.5, y as f64 + 0.5));
+        let i = [0, 1, 2].map(|a| v[a].round());
+        if (0..3).any(|a| i[a] < 0.0 || i[a] >= dims[a] as f64) {
+            return 0;
+        }
+        labels[(i[2] as usize * dims[1] + i[1] as usize) * dims[0] + i[0] as usize]
     }
 }
 
@@ -260,5 +286,42 @@ mod tests {
         assert!(img[row + u.floor() as usize + 2] < img[row + u.floor() as usize]);
         // Outside the volume: 0.
         assert_eq!(img[0], 0.0);
+    }
+
+    #[test]
+    fn labels_sampled_in_parts_match_the_whole() {
+        // An anisotropic, flipped grid and a turned plane, so many pixels sample near voxel
+        // boundaries; labels are a hash of the voxel.
+        let g = Geometry::from_axes([23, 17, 13, 1], [0.7, 0.9, 1.3], [DVec3::NEG_X, DVec3::NEG_Y, DVec3::Z], DVec3::new(5.0, 3.0, -4.0));
+        let v = LoadedVolume::from_values("t", [23, 17, 13], vec![0.0; 23 * 17 * 13], g);
+        let mut labels: Vec<u8> = (0..v.values.len()).map(|n| ((n as u32).wrapping_mul(2654435761) >> 27) as u8).collect();
+        let frame = rotated(standard_frame(Plane::Coronal), DVec3::new(0.4, 1.0, 0.3).normalize(), 0.6);
+        let ob = ObliqueGrid::new(&v, frame, DVec3::new(11.0, 8.0, 6.0));
+        let [w, h] = ob.size;
+        // The whole image as it was sampled before (verbatim).
+        let before: Vec<u8> = (0..w * h)
+            .map(|p| {
+                let x = ob.to_voxel.transform_point3(ob.world((p % w) as f64 + 0.5, (p / w) as f64 + 0.5));
+                let i = [0, 1, 2].map(|a| x[a].round());
+                if (0..3).any(|a| i[a] < 0.0 || i[a] >= v.dims[a] as f64) {
+                    return 0;
+                }
+                labels[(i[2] as usize * v.dims[1] + i[1] as usize) * v.dims[0] + i[0] as usize]
+            })
+            .collect();
+        let mut img = ob.sample_labels(&v, &labels);
+        assert_eq!(img, before);
+        // Change the labels, then re-sample parts: the image is whole sampling's wherever
+        // the parts reach, and as it was elsewhere.
+        labels.iter_mut().for_each(|l| *l = l.wrapping_add(1));
+        let whole = ob.sample_labels(&v, &labels);
+        for (x, y) in [(3..9, 0..1), (w - 1..w, 5..h), (4..w - 2, 7..19), (0..w, 0..h)] {
+            let old = img.clone();
+            ob.sample_labels_in(&v, &labels, &mut img, x.clone(), y.clone());
+            for p in 0..w * h {
+                let inside = x.contains(&(p % w)) && y.contains(&(p / w));
+                assert_eq!(img[p], if inside { whole[p] } else { old[p] });
+            }
+        }
     }
 }

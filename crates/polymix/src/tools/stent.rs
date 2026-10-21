@@ -10,7 +10,7 @@
 
 use super::*;
 use crate::centerline::{self, Centerline, CenterlineParams};
-use crate::jobs::Job;
+use crate::jobs::{Job, ProgressFn};
 use crate::ui_util;
 use mm_edit::EndContinuity;
 use rayon::prelude::*;
@@ -138,6 +138,9 @@ pub struct StentTool {
     sized: [bool; 2],
     trace: Option<(u64, Arc<Mesh>, Arc<VesselTrace>)>,
     trace_job: Option<(u64, Job<VesselTrace>)>,
+    /// The vessel capped at its open ends, with its tree, for the traces (built once per shape
+    /// of the mesh rather than for each pair of ends; dropped with the tool).
+    capped: centerline::CappedCache,
     job: Option<(StentKey, Job<StentOut>)>,
     preview: Option<(StentKey, StentOut)>,
     changed: Option<(StentKey, Instant)>,
@@ -156,6 +159,7 @@ impl StentTool {
             sized: [false; 2],
             trace: None,
             trace_job: None,
+            capped: centerline::CappedCache::default(),
             job: None,
             preview: None,
             changed: None,
@@ -219,15 +223,31 @@ impl StentTool {
 
     /// The reshaped vessel for `key` (in the background, or at once for scripts).
     fn build(source: &Mesh, trace: &VesselTrace, sections: [mm_edit::StentSection; 2], key: &StentKey) -> anyhow::Result<(Mesh, mm_edit::StentPlacement, mm_edit::StentReport, usize)> {
+        Self::build_with(source, trace, sections, key, None)
+    }
+
+    /// [`StentTool::build`] reporting to `progress`, which stops the work early (with an
+    /// error) once a newer preview has taken its place.
+    fn build_with(source: &Mesh, trace: &VesselTrace, sections: [mm_edit::StentSection; 2], key: &StentKey, progress: Option<ProgressFn>) -> anyhow::Result<(Mesh, mm_edit::StentPlacement, mm_edit::StentReport, usize)> {
         let params = key.ui.params();
         // Centred in the lumen at each section (on the traced path).
         let sections = [0, 1].map(|i| mm_edit::StentSection { center: trace.ends[i], normal: sections[i].normal });
         let placement = mm_edit::place_stent(&trace.path, sections, &params)?;
         let mut mesh = source.clone();
-        let report = mm_edit::apply_stent(&mut mesh, &placement, &params, Some(&trace.owner))?;
+        // (The reshaping takes most of the time, the two crossing counts the rest.)
+        let reshaping = |x: f32| progress.is_none_or(|p| p(0.9 * x));
+        let report = mm_edit::stent::apply_stent_with(&mut mesh, &placement, &params, Some(&trace.owner), progress.map(|_| &reshaping as &dyn Fn(f32) -> bool))?;
+        let going = |x: f32| progress.is_none_or(|p| p(x));
         // Only crossings the stent made (a mesh may cross itself already, e.g. where
         // vessels were merged without a union).
-        let crossings = ops::crossings(&mesh, &report.triangles).saturating_sub(ops::crossings(source, &report.source_triangles));
+        if !going(0.9) {
+            anyhow::bail!("cancelled");
+        }
+        let made = ops::crossings(&mesh, &report.triangles);
+        if !going(0.95) {
+            anyhow::bail!("cancelled");
+        }
+        let crossings = made.saturating_sub(ops::crossings(source, &report.source_triangles));
         Ok((mesh, placement, report, crossings))
     }
 
@@ -289,7 +309,8 @@ impl StentTool {
             if self.trace_job.as_ref().is_none_or(|(rev, _)| *rev != self.revision) {
                 let sections = [self.sections[0].clone(), self.sections[1].clone()];
                 let mesh = source.clone();
-                self.trace_job = Some((self.revision, Job::spawn("Centerline", cx.egui.clone(), move |_| trace_vessel(&mesh, &sections))));
+                let capped = self.capped.clone();
+                self.trace_job = Some((self.revision, Job::spawn("Centerline", cx.egui.clone(), move |progress| trace_vessel_with(&mesh, &sections, &capped, Some(progress)))));
             }
             return;
         }
@@ -313,8 +334,8 @@ impl StentTool {
         let sections = [self.sections[0].stent(), self.sections[1].stent()];
         self.job = Some((
             key,
-            Job::spawn("Stent", cx.egui.clone(), move |_| {
-                let (mesh, placement, report, crossings) = Self::build(&source, &trace, sections, &key)?;
+            Job::spawn("Stent", cx.egui.clone(), move |progress| {
+                let (mesh, placement, report, crossings) = Self::build_with(&source, &trace, sections, &key, Some(progress))?;
                 Ok(StentOut { source, mesh, placement, report, crossings })
             }),
         ));
@@ -332,7 +353,7 @@ impl StentTool {
             _ => {
                 let trace = match &self.trace {
                     Some((rev, m, t)) if *rev == self.revision && Arc::ptr_eq(m, &source) => t.clone(),
-                    _ => Arc::new(trace_vessel(&source, &[self.sections[0].clone(), self.sections[1].clone()]).map_err(|e| format!("{e:#}"))?),
+                    _ => Arc::new(trace_vessel_with(&source, &[self.sections[0].clone(), self.sections[1].clone()], &self.capped, None).map_err(|e| format!("{e:#}"))?),
                 };
                 let (mesh, _, report, _) = Self::build(&source, &trace, [self.sections[0].stent(), self.sections[1].stent()], &key).map_err(|e| format!("{e:#}"))?;
                 (mesh, report)
@@ -358,6 +379,9 @@ impl StentTool {
         self.sections.clear();
         self.sections_changed();
         self.error = None;
+        // The next stent is traced through the result: the capped vessel of the source has
+        // done its work (and is a copy of the whole mesh).
+        self.capped = centerline::CappedCache::default();
         Ok(format!("Stent {label}: narrowest lumen ⌀ {:.2} → {:.2} mm{}", 2.0 * report.narrowest[0], 2.0 * report.narrowest[1], sealed_text(&report)))
     }
 }
@@ -412,13 +436,25 @@ fn point_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
 
 /// Trace the vessel's centerline from the first section through the second and on past
 /// both (the straightest way at each junction).
+#[cfg_attr(not(test), allow(dead_code))]
 fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTrace> {
+    trace_vessel_with(mesh, sections, &centerline::CappedCache::default(), None)
+}
+
+/// [`trace_vessel`], with the capped vessel kept in `capped` for the next trace through the
+/// same mesh, and stopping early (with an error) once `progress` says the trace is no longer
+/// wanted.
+fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], capped: &centerline::CappedCache, progress: Option<ProgressFn>) -> anyhow::Result<VesselTrace> {
+    let going = |x: f32| progress.is_none_or(|p| p(x));
     let [a, b] = sections;
     let h = mesh.average_edge_length();
     let n = a.normal.normalize_or_zero();
-    let sources: Vec<u32> = mesh
-        .vertex_ids()
+    let sources: Vec<u32> = (0..mesh.max_vid() as u32)
+        .into_par_iter()
         .filter(|&v| {
+            if !mesh.is_vertex(v) {
+                return false;
+            }
             let p = mesh.vertex(v);
             (p - a.center).dot(n).abs() < h && a.ring.iter().any(|s| point_segment_distance(p, s[0], s[1]) < h)
         })
@@ -426,7 +462,15 @@ fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTr
     if sources.is_empty() {
         anyhow::bail!("could not find the first end's cross-section on the surface");
     }
-    let cl = centerline::compute(mesh, &sources, 0.5 * a.diameter, &CenterlineParams::default());
+    if !going(0.05) {
+        anyhow::bail!("cancelled");
+    }
+    let Some(cl) = centerline::compute_with(mesh, &sources, 0.5 * a.diameter, &CenterlineParams::default(), Some(&|x| going(0.05 + 0.35 * x))) else {
+        anyhow::bail!("cancelled");
+    };
+    if !going(0.4) {
+        anyhow::bail!("cancelled");
+    }
     let mut on_branch = vec![false; cl.nodes.len()];
     let mut adjacent: Vec<Vec<usize>> = vec![Vec::new(); cl.nodes.len()];
     for br in &cl.branches {
@@ -455,7 +499,10 @@ fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTr
     let on_path: std::collections::HashSet<usize> = nodes.iter().copied().collect();
     let owner = cl.vertex_node.iter().map(|n| on_path.contains(n)).collect();
     let mut path = mm_edit::VesselPath { points: nodes.iter().map(|&i| pos(i)).collect(), radii: nodes.iter().map(|&i| cl.nodes[i].radius).collect() };
-    let min_lumen = inscribed_between(mesh, &mut path, sections);
+    let min_lumen = inscribed_between_with(mesh, &mut path, sections, capped, &|x| going(0.4 + 0.4 * x));
+    if !going(0.8) {
+        anyhow::bail!("cancelled");
+    }
     if min_lumen.is_none() {
         recentre(mesh, &mut path, sections);
     }
@@ -477,15 +524,16 @@ fn crossing(path: &[DVec3], c: DVec3, n: DVec3) -> Option<DVec3> {
 /// Between the sections, replace the traced path by the lumen's centerline through the
 /// centres of the largest spheres inside it (see [`centerline::inscribed_path`]), with those
 /// spheres' radii. Returns the minimal lumen diameter there; `None` (the path unchanged) where
-/// the centerline cannot be found.
-fn inscribed_between(mesh: &Mesh, path: &mut mm_edit::VesselPath, sections: &[Section; 2]) -> Option<f64> {
+/// the centerline cannot be found (or once `progress` returns false). The capped vessel is
+/// taken from (or kept in) `capped`.
+fn inscribed_between_with(mesh: &Mesh, path: &mut mm_edit::VesselPath, sections: &[Section; 2], capped: &centerline::CappedCache, progress: ProgressFn) -> Option<f64> {
     let near = |c: DVec3| (0..path.points.len()).min_by(|&i, &j| path.points[i].distance(c).total_cmp(&path.points[j].distance(c)));
     let (ia, ib) = (near(sections[0].center)?, near(sections[1].center)?);
     let ((ia, a), (ib, b)) = if ia <= ib { ((ia, sections[0].center), (ib, sections[1].center)) } else { ((ib, sections[1].center), (ia, sections[0].center)) };
     if ib <= ia {
         return None;
     }
-    let lumen = centerline::inscribed_path(mesh, &path.points[ia..=ib], &path.radii[ia..=ib], a, b)?;
+    let lumen = centerline::inscribed_path_with(mesh, capped, &path.points[ia..=ib], &path.radii[ia..=ib], a, b, Some(progress))?;
     let narrowest = 2.0 * lumen.radii.iter().copied().fold(f64::INFINITY, f64::min);
     let mut points: Vec<DVec3> = path.points[..ia].iter().chain(&lumen.points).chain(&path.points[ib + 1..]).copied().collect();
     let radii: Vec<f64> = path.radii[..ia].iter().chain(&lumen.radii).chain(&path.radii[ib + 1..]).copied().collect();
@@ -601,8 +649,10 @@ fn recentre(mesh: &Mesh, path: &mut mm_edit::VesselPath, sections: &[Section; 2]
     let pad = DVec3::splat(4.0 * radii.iter().copied().fold(0.0, f64::max) + 2.0 * h);
     let (lo, hi) = active.iter().fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(a, b), &i| (a.min(pts[i]), b.max(pts[i])));
     let (lo, hi) = (lo - pad, hi + pad);
-    let near: Vec<u32> = mesh.triangle_ids().filter(|&t| mesh.tri_positions(t).iter().any(|p| p.cmpge(lo).all() && p.cmple(hi).all())).collect();
+    let near: Vec<u32> = (0..mesh.max_tid() as u32).into_par_iter().filter(|&t| mesh.is_triangle(t) && mesh.tri_positions(t).iter().any(|p| p.cmpge(lo).all() && p.cmple(hi).all())).collect();
     let bvh = mm_core::Bvh::build_subset(mesh, &near);
+    // The on-plane distance for every outline below, found once.
+    let snap = mm_edit::cut::snap_distance(mesh);
     // Points within `mm` of point i along the path, each side.
     let window = |i: usize, mm: f64| -> usize {
         let spacing = (cum[(i + 1).min(n - 1)] - cum[i.saturating_sub(1)]).max(1e-9) / 2.0;
@@ -619,7 +669,7 @@ fn recentre(mesh: &Mesh, path: &mut mm_edit::VesselPath, sections: &[Section; 2]
         }
         let p = pts[i];
         let reach = 3.0 * radii[i] + 2.0 * h + 1.0;
-        let curves = mm_edit::local_intersection_curves(mesh, &bvh, mm_core::Plane::from_point_normal(p, t), p, reach);
+        let curves = mm_edit::cut::local_intersection_curves_with(mesh, &bvh, mm_core::Plane::from_point_normal(p, t), p, reach, snap);
         let closed = curves.into_iter().filter(|c| c.closed && c.area > 0.0);
         let (around, other): (Vec<_>, Vec<_>) = closed.partition(|c| c.encloses(p, t));
         let c = around.into_iter().min_by(|a, b| a.area.total_cmp(&b.area)).or_else(|| other.into_iter().filter(|c| c.distance(p) < 2.0 * radii[i] + 1.0).min_by(|a, b| a.distance(p).total_cmp(&b.distance(p))))?;
@@ -1029,7 +1079,7 @@ impl Tool for StentTool {
                 }
             }
             if key.is_some() && !ready && self.error.as_ref().map(|e| e.0) != key {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.weak(if self.trace_job.is_some() { "Tracing the centerline…" } else { "Previewing…" });
             }
         });
@@ -1205,6 +1255,83 @@ mod tests {
         assert_eq!(changed_past_the_end_blend(&m, &mesh, &placement).0, 0);
         let out = StentOut { source: Arc::new(m.clone()), mesh, placement, report, crossings };
         assert!(warnings(&out).iter().any(|w| w.contains("lengthen the end blend")), "{:?}", warnings(&out));
+    }
+
+    #[test]
+    fn traces_share_the_capped_vessel_and_superseded_work_stops() {
+        let (m, centre) = bent_stenosis();
+        let bvh = mm_core::Bvh::build(&m);
+        let wall = |s: f64| bvh.nearest(&m, centre(s) + DVec3::Z * 4.0, f64::INFINITY).unwrap().point;
+        let (a0, b0) = (15.0 + 25.0 * 30f64.to_radians(), 15.0 + 25.0 * 90f64.to_radians());
+        let sections = [Section::at(&m, &bvh, wall(a0)).unwrap(), Section::at(&m, &bvh, wall(b0)).unwrap()];
+        let moved = [Section::at(&m, &bvh, wall(a0 + 3.0)).unwrap(), Section::at(&m, &bvh, wall(b0 - 2.0)).unwrap()];
+        let same = |a: &VesselTrace, b: &VesselTrace| {
+            let bits = |p: &[DVec3]| p.iter().map(|q| q.to_array().map(f64::to_bits)).collect::<Vec<_>>();
+            bits(&a.path.points) == bits(&b.path.points)
+                && a.path.radii.iter().map(|r| r.to_bits()).eq(b.path.radii.iter().map(|r| r.to_bits()))
+                && bits(&a.ends) == bits(&b.ends)
+                && a.owner == b.owner
+                && a.span.to_bits() == b.span.to_bits()
+                && a.min_lumen.map(f64::to_bits) == b.min_lumen.map(f64::to_bits)
+        };
+        // A trace through the kept capped vessel is the trace capping it afresh, for the
+        // ends it was first made for and for others.
+        let capped = centerline::CappedCache::default();
+        for ends in [&sections, &moved, &sections] {
+            let kept = trace_vessel_with(&m, ends, &capped, None).unwrap();
+            assert!(kept.min_lumen.is_some());
+            assert!(same(&kept, &trace_vessel(&m, ends).unwrap()));
+        }
+        // A trace no longer wanted stops at whichever check it is told to (in the centerline,
+        // the capping and the inscribed path), with the capped vessel kept or still to build.
+        for kept in [true, false] {
+            let cache = || if kept { capped.clone() } else { centerline::CappedCache::default() };
+            let reports = std::cell::Cell::new(0);
+            let count = |_: f32| {
+                reports.set(reports.get() + 1);
+                true
+            };
+            trace_vessel_with(&m, &sections, &cache(), Some(&count)).unwrap();
+            let total = reports.get();
+            assert!(total >= if kept { 8 } else { 10 }, "{total} reports");
+            for after in 0..total {
+                let calls = std::cell::Cell::new(0);
+                let stop = |_: f32| {
+                    calls.set(calls.get() + 1);
+                    calls.get() <= after
+                };
+                let r = trace_vessel_with(&m, &sections, &cache(), Some(&stop));
+                assert!(r.is_err_and(|e| e.to_string() == "cancelled"), "kept {kept}: stopped after {after} of {total} reports");
+                // (Asked at most once more on the way out of the inscribed path.)
+                assert!(calls.get() <= after + 2);
+            }
+        }
+        // So does a superseded preview, from the first report to the crossing counts; one that
+        // runs to the end is the plain build.
+        let trace = trace_vessel(&m, &sections).unwrap();
+        let key = StentKey { sections: 1, ui: StentUi { length: 30.0, ..Default::default() } };
+        let ends = [sections[0].stent(), sections[1].stent()];
+        let (plain, _, plain_rep, plain_crossings) = StentTool::build(&m, &trace, ends, &key).unwrap();
+        let reports = std::cell::Cell::new(0);
+        let count = |_: f32| {
+            reports.set(reports.get() + 1);
+            true
+        };
+        let (watched, _, rep, crossings) = StentTool::build_with(&m, &trace, ends, &key, Some(&count)).unwrap();
+        assert!(watched.vertex_ids().eq(plain.vertex_ids()) && watched.vertex_ids().all(|v| watched.vertex(v) == plain.vertex(v)));
+        assert!(watched.triangle_ids().eq(plain.triangle_ids()) && watched.triangle_ids().all(|t| watched.triangle(t) == plain.triangle(t)));
+        assert_eq!((rep.triangles, crossings), (plain_rep.triangles, plain_crossings));
+        let total = reports.get();
+        for after in [0, total / 2, total - 2, total - 1] {
+            let calls = std::cell::Cell::new(0);
+            let stop = |_: f32| {
+                calls.set(calls.get() + 1);
+                calls.get() <= after
+            };
+            let r = StentTool::build_with(&m, &trace, ends, &key, Some(&stop));
+            assert!(r.is_err_and(|e| e.to_string() == "cancelled"), "stopped after {after} of {total} reports");
+            assert_eq!(calls.get(), after + 1);
+        }
     }
 
     #[test]

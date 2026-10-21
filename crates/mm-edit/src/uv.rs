@@ -16,6 +16,7 @@ use crate::{EditError, EditResult};
 use glam::{DVec2, DVec3};
 use mm_core::{topology, Mesh};
 use mm_repair::sparse::{solve_pcg, CsrMatrix, PcgParams};
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub enum UnwrapElements {
@@ -379,6 +380,26 @@ fn flatten(mesh: &Mesh, tris: Vec<u32>, kind: UnwrapType) -> Chart {
     Chart { tris, uv: corners, size: (hi - lo).max(DVec2::ZERO) }
 }
 
+/// The discs of the charts (see [`discs`]), in chart order.
+fn pieces(mesh: &Mesh, by: UnwrapElements) -> Vec<Vec<u32>> {
+    // Charts are cut on their own, so they are spread over the threads; collecting keeps
+    // their order.
+    initial_charts(mesh, by)
+        .into_par_iter()
+        .flat_map_iter(|chart| {
+            let mut out = Vec::new();
+            discs(mesh, chart, 0, &mut out);
+            out
+        })
+        .collect()
+}
+
+/// Every disc flattened (see [`flatten`]), in the order of [`pieces`]. Each disc is flattened
+/// on its own (a small one wholly on one thread), so they are spread over the threads.
+fn flattened(mesh: &Mesh, p: &UnwrapParams) -> Vec<Chart> {
+    pieces(mesh, p.elements).into_par_iter().map(|t| flatten(mesh, t, p.kind)).collect()
+}
+
 /// Chart offsets for `packing` at scale `s`; returns the offsets and the used extent.
 fn place(charts: &[Chart], packing: Packing, s: f64, width: f64, border: f64) -> (Vec<DVec2>, DVec2) {
     let mut off = vec![DVec2::ZERO; charts.len()];
@@ -428,11 +449,7 @@ pub fn unwrap(mesh: &Mesh, p: &UnwrapParams) -> EditResult<UvLayout> {
     if !(p.width > 0.0 && p.height > 0.0 && p.border >= 0.0) {
         return Err(EditError::InvalidParameter("the sheet needs a positive width and height".into()));
     }
-    let mut pieces = Vec::new();
-    for chart in initial_charts(mesh, p.elements) {
-        discs(mesh, chart, 0, &mut pieces);
-    }
-    let charts: Vec<Chart> = pieces.into_iter().map(|t| flatten(mesh, t, p.kind)).collect();
+    let charts = flattened(mesh, p);
     // Largest scale (≤ 1) at which the layout fits the sheet.
     let fits = |s: f64| {
         let (_, used) = place(&charts, p.packing, s, p.width, p.border);
@@ -518,6 +535,39 @@ mod tests {
             }
             // Rigid keeps areas better than conformal (a half tube flattens almost exactly).
             assert!(distortion[1] < distortion[0] + 1e-6, "{name}: {distortion:?}");
+        }
+    }
+
+    #[test]
+    fn charts_flattened_together_are_the_same_as_one_by_one() {
+        // Separate patches, a closed sphere and a tube (cut into several discs each), in face
+        // groups: spread over threads, every chart comes out bit for bit as on its own, in the
+        // same order. (Charts this small solve on one thread, so each is deterministic.)
+        let mut m = Mesh::new();
+        for i in 0..12 {
+            let mut q = primitives::plane_grid(10.0 + i as f64, 8.0, 6, 5);
+            q.transform(|p| glam::DQuat::from_rotation_x(0.2 * i as f64) * p + DVec3::new(i as f64 * 40.0, 0.0, 0.0));
+            m.append_mesh(&q, i % 3);
+        }
+        let mut sphere = primitives::icosphere(6.0, 2);
+        sphere.transform(|p| p + DVec3::new(0.0, 60.0, 0.0));
+        m.append_mesh(&sphere, 7);
+        let mut tube = primitives::cylinder(4.0, 20.0, 16, 6, false);
+        tube.transform(|p| p + DVec3::new(0.0, -60.0, 0.0));
+        m.append_mesh(&tube, 8);
+        for elements in [UnwrapElements::Groups, UnwrapElements::Components] {
+            for kind in [UnwrapType::Conformal, UnwrapType::Rigid] {
+                let mut one_by_one = Vec::new();
+                for chart in initial_charts(&m, elements) {
+                    discs(&m, chart, 0, &mut one_by_one);
+                }
+                assert_eq!(pieces(&m, elements), one_by_one);
+                let want: Vec<Chart> = one_by_one.into_iter().map(|t| flatten(&m, t, kind)).collect();
+                let got = flattened(&m, &UnwrapParams { elements, kind, ..Default::default() });
+                assert_eq!(got.len(), want.len());
+                let bits = |c: &Chart| (c.tris.clone(), c.uv.iter().flatten().flat_map(|p| [p.x.to_bits(), p.y.to_bits()]).collect::<Vec<_>>(), [c.size.x.to_bits(), c.size.y.to_bits()]);
+                assert!(got.iter().zip(&want).all(|(a, b)| bits(a) == bits(b)), "{elements:?} {kind:?}");
+            }
         }
     }
 

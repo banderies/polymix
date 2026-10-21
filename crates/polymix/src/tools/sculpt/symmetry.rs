@@ -204,18 +204,30 @@ impl Symmetry {
     /// The plane for brushing object `id` with bounds `bounds`: placed on first use, and an
     /// X / Y / Z plane follows the centre of a newly brushed object (a free plane stays).
     pub fn place(&mut self, id: ObjectId, bounds: &Aabb) -> SymPlane {
-        if self.plane.is_none() || self.object != Some(id) {
-            self.object = Some(id);
-            match self.plane {
-                Some(p) if p.axis_index().is_none() => {}
-                p => self.plane = Some(SymPlane::axis(bounds, p.and_then(|p| p.axis_index()).unwrap_or(0))),
-            }
-        }
-        self.plane.unwrap_or_else(|| SymPlane::axis(bounds, 0))
+        self.place_with(id, || *bounds)
+    }
+
+    /// [`Symmetry::place`], asking for the bounds only when the plane is placed: not at all
+    /// while the plane stays where it is (every frame of a panel showing it).
+    pub fn place_with(&mut self, id: ObjectId, bounds: impl FnOnce() -> Aabb) -> SymPlane {
+        let plane = match self.plane {
+            Some(p) if self.object == Some(id) || p.axis_index().is_none() => p,
+            p => SymPlane::axis(&bounds(), p.and_then(|p| p.axis_index()).unwrap_or(0)),
+        };
+        self.object = Some(id);
+        self.plane = Some(plane);
+        plane
     }
 
     fn active_bounds(cx: &ToolCx) -> Option<(ObjectId, Aabb)> {
         cx.scene.active().map(|o| (o.id, o.bounds()))
+    }
+
+    /// Place the plane for the active object, if there is one (see [`Symmetry::place_with`]).
+    fn place_for_active(&mut self, cx: &ToolCx) {
+        if let Some(o) = cx.scene.active() {
+            self.place_with(o.id, || o.bounds());
+        }
     }
 
     /// X / Y / Z (`axis`) through the centre of the active object.
@@ -255,9 +267,7 @@ impl Symmetry {
 
     /// Start Set mode.
     pub fn begin_edit(&mut self, cx: &ToolCx) {
-        if let Some((id, b)) = Self::active_bounds(cx) {
-            self.place(id, &b);
-        }
+        self.place_for_active(cx);
         self.enabled = true;
         self.edit = Some(SymEdit { before: self.plane, picking: false, picks: Vec::new(), drag: None, hover: None });
     }
@@ -281,9 +291,7 @@ impl Symmetry {
     /// Panel rows: the toggle, X / Y / Z, Set and Reset, the plane's offset, and while
     /// setting, the ways to place it.
     pub fn ui(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx, label: &str) {
-        if let Some((id, b)) = Self::active_bounds(cx) {
-            self.place(id, &b);
-        }
+        self.place_for_active(cx);
         enum Do {
             Preset(usize),
             Set,
@@ -589,8 +597,8 @@ impl Symmetry {
             }
             self.plane = Some(SymPlane::new(point, normal));
             self.object = cx.scene.active;
-        } else if let Some((id, b)) = Self::active_bounds(cx) {
-            self.place(id, &b);
+        } else {
+            self.place_for_active(cx);
         }
         Ok(())
     }
@@ -704,5 +712,36 @@ mod tests {
         assert_eq!(s.active(), None, "off until enabled");
         s.enabled = true;
         assert_eq!(s.active(), Some(free));
+    }
+
+    #[test]
+    fn bounds_are_asked_for_only_when_the_plane_is_placed() {
+        let (b1, b2) = (Aabb::from_points([DVec3::ZERO, DVec3::splat(2.0)]), Aabb::from_points([DVec3::splat(10.0), DVec3::splat(12.0)]));
+        let asked = std::cell::Cell::new(0);
+        let ask = |b: Aabb| {
+            asked.set(asked.get() + 1);
+            b
+        };
+        let mut s = Symmetry::new(None, None);
+        assert_eq!(s.place_with(1, || ask(b1)), SymPlane::axis(&b1, 0));
+        // Every frame of the panel after that: no bounds.
+        for _ in 0..3 {
+            assert_eq!(s.place_with(1, || ask(b1)), SymPlane::axis(&b1, 0));
+        }
+        assert_eq!(asked.get(), 1);
+        // Another object: its bounds re-centre the X / Y / Z plane, once.
+        s.set_plane(SymPlane::axis(&b1, 1));
+        assert_eq!(s.place_with(2, || ask(b2)), SymPlane::axis(&b2, 1));
+        assert_eq!(s.place_with(2, || ask(b2)), SymPlane::axis(&b2, 1));
+        assert_eq!(asked.get(), 2);
+        // A free plane stays for any object, without bounds.
+        let free = SymPlane::new(DVec3::ONE, DVec3::new(1.0, 2.0, 0.0));
+        s.set_plane(free);
+        assert_eq!(s.place_with(1, || ask(b1)), free);
+        assert_eq!(asked.get(), 2);
+        // Placed up front (as for_scene does): the first frame needs no bounds either.
+        let mut s = Symmetry::new(Some(SymPlane::axis(&b1, 0)), Some(1));
+        assert_eq!(s.place_with(1, || ask(b2)), SymPlane::axis(&b1, 0));
+        assert_eq!(asked.get(), 2);
     }
 }

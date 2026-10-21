@@ -3,6 +3,7 @@
 use super::*;
 use crate::ui_util;
 use glam::{DMat3, DMat4, DQuat, EulerRot};
+use std::sync::Arc;
 
 /// Axes the Transform tool works in (Meshmixer's "Coordinate Space").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +43,26 @@ struct SoftState {
     region: mm_edit::SoftRegion,
     /// Pivot per piece label of `region`.
     pivots: Vec<DVec3>,
+}
+
+/// The preview kept between rebuilds: a copy of the source whose positions are rewritten in
+/// place, so a drag does not copy the whole mesh on every move.
+#[derive(Default)]
+struct PreviewState {
+    /// The source the preview is a copy of (with only positions changed, and its triangles
+    /// reversed when `reversed`); None when there is no such copy (none yet, or Refine Mesh
+    /// split it).
+    source: Option<Arc<Mesh>>,
+    reversed: bool,
+    /// Region and soft modes: the vertices written by the last rebuild, and the region version
+    /// they belong to (a rebuild for another version puts them back first).
+    moved: Vec<u32>,
+    moved_version: u64,
+    /// The soft solver, for the source, region version, kind and continuity it was prepared
+    /// for.
+    soft: Option<(Arc<Mesh>, u64, mm_edit::soft::SoftSolver)>,
+    /// See [`Tool::preview_moves`].
+    moves: PreviewMoves,
 }
 
 /// Frame with Z along the area-weighted normal of `tris`.
@@ -88,6 +109,10 @@ pub struct TransformTool {
     dirty: bool,
     drag: Option<GizmoDrag>,
     hover: Option<Handle>,
+    /// Counts [`TransformTool::update_region`] calls (the region's moving vertices and soft
+    /// band are recomputed there).
+    region_version: u64,
+    cache: PreviewState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -189,6 +214,8 @@ impl TransformTool {
             dirty: true,
             drag: None,
             hover: None,
+            region_version: 0,
+            cache: PreviewState::default(),
         };
         t.snap_step = nice_step(t.source.bounds().diagonal() / 100.0);
         t.object_pivots = cx.scene.active().map(|o| o.pivots.clone()).unwrap_or_default();
@@ -288,6 +315,7 @@ impl TransformTool {
             }
             soft.pivots = members.into_iter().map(|pts| extents_of(pts.into_iter(), axes).1).collect();
         }
+        self.region_version += 1;
         self.dirty = true;
     }
 
@@ -338,48 +366,123 @@ impl TransformTool {
         DMat4::from_translation(self.pivot + self.translate) * DMat4::from_mat3(self.linear()) * DMat4::from_translation(-self.pivot)
     }
 
+    /// The soft solver for the current source, region and settings (prepared once per drag
+    /// rather than on every move).
+    fn soft_solver(&mut self) -> Option<&mm_edit::soft::SoftSolver> {
+        let soft = self.region.as_ref()?.soft.as_ref()?;
+        let current = matches!(&self.cache.soft, Some((src, version, s))
+            if Arc::ptr_eq(src, &self.source) && *version == self.region_version && s.settings() == (soft.kind, soft.continuity));
+        if !current {
+            let solver = mm_edit::soft::SoftSolver::new(&self.source, &soft.region, soft.kind, soft.continuity);
+            self.cache.soft = Some((self.source.clone(), self.region_version, solver));
+        }
+        self.cache.soft.as_ref().map(|c| &c.2)
+    }
+
+    /// Make the preview a copy of the source to rewrite in place, unless it already is one.
+    /// `oriented`: it must have the source's own orientation (and topology version), so a
+    /// reversed copy is replaced too.
+    fn preview_copy(&mut self, oriented: bool) {
+        let is_copy = self.preview.is_some()
+            && self.cache.source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.source))
+            && !(oriented && self.cache.reversed);
+        if !is_copy {
+            self.preview = Some((*self.source).clone());
+            self.cache.source = Some(self.source.clone());
+            self.cache.reversed = false;
+            // Nothing to put back, and the next write records what it moves.
+            self.cache.moved.clear();
+            self.cache.moved_version = u64::MAX;
+            self.cache.moves.reset();
+        }
+    }
+
+    /// Write `moves` into the preview (a copy of the source), first putting back the vertices
+    /// the last rebuild moved if they belonged to another region version.
+    fn write_moves(&mut self, moves: &[(u32, DVec3)]) {
+        let mesh = self.preview.as_mut().expect("a preview copy");
+        let before = mesh.shape_version();
+        let restore = self.cache.moved_version != self.region_version;
+        let pos = mesh.positions_mut();
+        let mut written = Vec::new();
+        if restore {
+            for &v in &self.cache.moved {
+                pos[v as usize] = self.source.vertex(v);
+            }
+            written = std::mem::take(&mut self.cache.moved);
+            self.cache.moved = moves.iter().map(|m| m.0).collect();
+            self.cache.moved_version = self.region_version;
+        }
+        for &(v, p) in moves {
+            pos[v as usize] = p;
+        }
+        mesh.bump_shape_version();
+        let limit = mesh.max_vid();
+        let after = mesh.shape_version();
+        self.cache.moves.record(before, after, written.into_iter().chain(moves.iter().map(|m| m.0)), limit);
+    }
+
     fn rebuild(&mut self) {
-        let mut mesh = (*self.source).clone();
         self.preview_selection = None;
         if let Some((soft, r)) = self.region.as_ref().and_then(|r| r.soft.as_ref().map(|s| (s, r))) {
             let shared = r.shared_frame;
             let lin = self.linear();
             let (pivot, t) = (self.pivot, self.translate);
-            let tf = |piece: u32, x: DVec3| {
-                let c = if shared { pivot } else { soft.pivots.get(piece as usize).copied().unwrap_or(pivot) };
+            let pivots = soft.pivots.clone();
+            let tf = move |piece: u32, x: DVec3| {
+                let c = if shared { pivot } else { pivots.get(piece as usize).copied().unwrap_or(pivot) };
                 c + t + lin * (x - c)
             };
-            if soft.refine {
-                let opts = mm_edit::soft::RefineOptions { kind: soft.kind, continuity: soft.continuity, fixed_boundary: r.fixed_boundary, max_edge: soft.max_edge };
-                let out = mm_edit::soft::soft_deform_refined(&self.source, &soft.region, &r.tris, &tf, &opts);
+            let refine = soft.refine.then_some(mm_edit::soft::RefineOptions { kind: soft.kind, continuity: soft.continuity, fixed_boundary: r.fixed_boundary, max_edge: soft.max_edge });
+            self.soft_solver();
+            let solver = self.cache.soft.as_ref().map(|c| &c.2);
+            let r = self.region.as_ref().unwrap();
+            let region = &r.soft.as_ref().unwrap().region;
+            if let Some(opts) = refine {
+                // Refining splits a fresh copy of the source on every move.
+                let out = mm_edit::soft::soft_deform_refined_in((*self.source).clone(), &self.source, region, &r.tris, &tf, &opts, solver);
                 self.sizes = extents_of(out.region.handle.iter().map(|&v| out.mesh.vertex(v)), self.axes()).0;
-                mesh = out.mesh;
+                self.preview = Some(out.mesh);
                 self.preview_selection = Some(out.selection);
+                self.cache.source = None;
+                self.cache.moves.reset();
             } else {
-                for (v, p) in mm_edit::soft_deform(&self.source, &soft.region, &tf, soft.kind, soft.continuity) {
-                    mesh.set_vertex(v, p);
-                }
-                self.sizes = extents_of(soft.region.handle.iter().map(|&v| mesh.vertex(v)), self.axes()).0;
+                let moves = solver.expect("a soft solver").deform(&self.source, region, &tf);
+                self.preview_copy(false);
+                self.write_moves(&moves);
+                let handle = &self.region.as_ref().and_then(|r| r.soft.as_ref()).unwrap().region.handle;
+                let mesh = self.preview.as_ref().unwrap();
+                self.sizes = extents_of(handle.iter().map(|&v| mesh.vertex(v)), self.axes()).0;
             }
         } else if let Some(r) = &self.region {
             let lin = self.linear();
+            let mut moves = Vec::with_capacity(r.groups.iter().map(|g| g.0.len()).sum());
             for (verts, pivot) in &r.groups {
                 let pivot = if r.shared_frame { self.pivot } else { *pivot };
-                for &v in verts {
-                    mesh.set_vertex(v, pivot + self.translate + lin * (self.source.vertex(v) - pivot));
-                }
+                moves.extend(verts.iter().map(|&v| (v, pivot + self.translate + lin * (self.source.vertex(v) - pivot))));
             }
+            self.preview_copy(false);
+            self.write_moves(&moves);
+            let mesh = self.preview.as_ref().unwrap();
+            let r = self.region.as_ref().unwrap();
             let moving = r.groups.iter().flat_map(|g| g.0.iter()).map(|&v| mesh.vertex(v));
             self.sizes = extents_of(moving, self.axes()).0;
         } else {
             let m = self.matrix();
-            mesh.transform(|p| m.transform_point3(p));
-            if m.determinant() < 0.0 {
+            let flip = m.determinant() < 0.0;
+            // Back to the source's orientation: a fresh copy, which also has its topology version.
+            self.preview_copy(!flip);
+            let mesh = self.preview.as_mut().unwrap();
+            transform_from(mesh, &self.source, |p| m.transform_point3(p));
+            if flip && !self.cache.reversed {
                 mesh.reverse_orientation();
+                self.cache.reversed = true;
             }
-            self.sizes = extents_along(&mesh, self.axes()).0;
+            // The whole mesh moves: the renderer uses [`Tool::preview_transform`] or a full upload.
+            self.cache.moves.reset();
+            let axes = self.axes();
+            self.sizes = extents_along(self.preview.as_ref().unwrap(), axes).0;
         }
-        self.preview = Some(mesh);
         self.dirty = false;
     }
 
@@ -420,7 +523,10 @@ impl TransformTool {
         if !self.is_identity() {
             self.baked = self.matrix() * self.baked;
             self.frame = (self.rotation * self.frame).normalize();
-            self.source = std::sync::Arc::new(self.preview.clone().unwrap_or_default());
+            // The preview becomes the source (the next rebuild copies it again).
+            self.source = Arc::new(self.preview.take().unwrap_or_default());
+            self.cache.source = None;
+            self.cache.moves.reset();
             // Refine Mesh split the selected triangles: the halves stay selected.
             if let (Some(r), Some(tris)) = (self.region.as_mut(), self.preview_selection.clone()) {
                 r.tris = tris;
@@ -554,6 +660,9 @@ impl TransformTool {
 
     fn drag_to(&mut self, cx: &ToolCx, p: egui::Pos2) {
         let Some(d) = self.drag else { return };
+        // The preview is rebuilt only if the (snapped) values change: holding the gizmo still,
+        // or moving within one snap step, leaves it as it is.
+        let (was_dirty, before) = (self.dirty, (self.translate, self.rotation, self.scale));
         let c3 = self.pivot + d.translate;
         let Some(c) = cx.project(c3) else { return };
         // Axes as they were when the drag started.
@@ -615,7 +724,7 @@ impl TransformTool {
                 self.scale = d.scale * f;
             }
         }
-        self.dirty = true;
+        self.dirty = was_dirty || (self.translate, self.rotation, self.scale) != before;
     }
 }
 
@@ -799,7 +908,6 @@ impl Tool for TransformTool {
             }
         }
         ui.horizontal_wrapped(|ui| {
-            let b = self.source.bounds();
             if !whole {
                 if ui.button("Reset").clicked() {
                     self.translate = DVec3::ZERO;
@@ -809,7 +917,6 @@ impl Tool for TransformTool {
                 }
                 return;
             }
-            let _ = b;
             if ui.button("Center at origin").on_hover_text("Move the pivot (box centre) to the origin").clicked() {
                 self.translate = -self.pivot;
                 changed = true;
@@ -1042,9 +1149,44 @@ impl Tool for TransformTool {
         Some((self.object?, self.preview.as_ref()?))
     }
 
+    fn preview_moves(&self) -> Option<(u64, u64, &[u32])> {
+        self.cache.moves.get()
+    }
+
+    fn clear_preview_moves(&mut self) {
+        let now = self.preview.as_ref().map(|m| m.shape_version());
+        self.cache.moves.clear(now);
+    }
+
+    fn preview_transform(&self) -> Option<DMat4> {
+        // The whole object, rebuilt for the current values, straight from the object's mesh.
+        let current = self.region.is_none()
+            && !self.dirty
+            && self.preview.is_some()
+            && Arc::ptr_eq(&self.source, &self.original)
+            && self.cache.source.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.source));
+        (current && is_similarity(self.linear())).then(|| self.matrix())
+    }
+
     fn accept(&mut self, cx: &mut ToolCx) -> bool {
         self.commit(cx)
     }
+}
+
+/// Whether `l` is a rotation times a uniform positive scale (within round-off).
+#[allow(dead_code)] // Through Tool::preview_transform, which the renderer does not use yet.
+fn is_similarity(l: DMat3) -> bool {
+    let [a, b, c] = [l.x_axis, l.y_axis, l.z_axis];
+    let s2 = a.length_squared();
+    let tol = 1e-9 * s2;
+    s2 > 0.0
+        && s2.is_finite()
+        && (b.length_squared() - s2).abs() <= tol
+        && (c.length_squared() - s2).abs() <= tol
+        && a.dot(b).abs() <= tol
+        && b.dot(c).abs() <= tol
+        && c.dot(a).abs() <= tol
+        && l.determinant() > 0.0
 }
 
 #[cfg(test)]
@@ -1082,6 +1224,8 @@ mod tests {
             dirty: true,
             drag: None,
             hover: None,
+            region_version: 0,
+            cache: PreviewState::default(),
         };
         t.reset_pivot();
         t.rebuild();
@@ -1140,6 +1284,68 @@ mod tests {
         assert!((t.snapped_size(2.3, 2.1) - 2.5).abs() < 1e-12);
         assert!((t.snapped_size(0.1, 2.0) - 0.1).abs() < 1e-12, "never snaps to zero");
     }
+
+    fn bits(p: DVec3) -> [u64; 3] {
+        p.to_array().map(f64::to_bits)
+    }
+
+    /// Same vertices (positions to the bit, dead slots included) and triangles.
+    pub(super) fn same_mesh(a: &Mesh, b: &Mesh) -> bool {
+        a.max_vid() == b.max_vid()
+            && a.max_tid() == b.max_tid()
+            && a.positions().iter().zip(b.positions()).all(|(p, q)| bits(*p) == bits(*q))
+            && (0..a.max_tid() as u32).all(|t| a.is_triangle(t) == b.is_triangle(t) && a.triangle(t) == b.triangle(t) && a.tri_group(t) == b.tri_group(t))
+    }
+
+    #[test]
+    fn whole_object_previews_are_rewritten_in_place_as_fresh_copies() {
+        let mut t = tool(0.4, Space::Local);
+        let source_topology = t.source.topology_version();
+        let steps = [
+            (DQuat::from_rotation_x(0.3), DVec3::ONE, DVec3::new(0.2, 0.0, 0.1)),
+            (DQuat::from_rotation_y(-0.7), DVec3::splat(1.5), DVec3::ZERO),
+            // Mirrored, still mirrored, and back.
+            (DQuat::IDENTITY, DVec3::new(-1.0, 1.0, 1.0), DVec3::X),
+            (DQuat::from_rotation_z(0.2), DVec3::new(-2.0, 1.0, 0.5), DVec3::Y),
+            (DQuat::from_rotation_z(0.2), DVec3::new(2.0, 1.0, 0.5), DVec3::Y),
+            (DQuat::IDENTITY, DVec3::ONE, DVec3::ZERO),
+        ];
+        for (k, (r, s, d)) in steps.into_iter().enumerate() {
+            (t.rotation, t.scale, t.translate) = (r, s, d);
+            t.rebuild();
+            // As the tool used to build it: a fresh copy, moved, reversed if mirrored.
+            let m = t.matrix();
+            let mut fresh = (*t.source).clone();
+            fresh.transform(|p| m.transform_point3(p));
+            if m.determinant() < 0.0 {
+                fresh.reverse_orientation();
+            }
+            let preview = t.preview.as_ref().unwrap();
+            assert!(same_mesh(preview, &fresh), "step {k}");
+            assert_eq!(preview.topology_version() == source_topology, m.determinant() > 0.0, "step {k}: unmirrored previews keep the source's topology");
+            preview.check_validity().unwrap();
+        }
+    }
+
+    #[test]
+    fn rigid_previews_report_their_transform() {
+        let mut t = tool(0.4, Space::Local);
+        t.rotation = DQuat::from_rotation_x(0.3);
+        t.scale = DVec3::splat(1.7);
+        t.translate = DVec3::new(1.0, 2.0, 3.0);
+        t.dirty = true;
+        assert!(t.preview_transform().is_none(), "not before the preview is rebuilt");
+        t.rebuild();
+        let m = t.preview_transform().expect("a similarity");
+        let preview = t.preview.as_ref().unwrap();
+        assert!(t.source.vertex_ids().all(|v| bits(m.transform_point3(t.source.vertex(v))) == bits(preview.vertex(v))));
+        for scale in [DVec3::new(1.0, 2.0, 1.0), DVec3::new(-1.0, -1.0, -1.0)] {
+            t.scale = scale;
+            t.rebuild();
+            assert!(t.preview_transform().is_none(), "{scale}: not a similarity");
+        }
+        assert!(t.preview_moves().is_none(), "the whole object moves: no vertex list");
+    }
 }
 
 #[cfg(test)]
@@ -1173,6 +1379,8 @@ mod face_tests {
             dirty: true,
             drag: None,
             hover: None,
+            region_version: 0,
+            cache: PreviewState::default(),
         };
         t.region = Some(FaceRegion { tris, shared_frame: true, fixed_boundary: false, groups: Vec::new(), soft: None });
         t.update_region();
@@ -1262,6 +1470,156 @@ mod face_tests {
         t.bake();
         assert_eq!(t.source.vertex_count(), refined.vertex_count());
         assert_eq!(t.region.as_ref().unwrap().tris, tris);
+    }
+
+    /// The preview as the tool used to build it: a fresh copy of the source per rebuild.
+    fn fresh_preview(t: &TransformTool) -> Mesh {
+        let mut mesh = (*t.source).clone();
+        let r = t.region.as_ref().unwrap();
+        let lin = t.linear();
+        if let Some(soft) = &r.soft {
+            let (shared, pivot, d) = (r.shared_frame, t.pivot, t.translate);
+            let tf = |piece: u32, x: DVec3| {
+                let c = if shared { pivot } else { soft.pivots.get(piece as usize).copied().unwrap_or(pivot) };
+                c + d + lin * (x - c)
+            };
+            if soft.refine {
+                let opts = mm_edit::soft::RefineOptions { kind: soft.kind, continuity: soft.continuity, fixed_boundary: r.fixed_boundary, max_edge: soft.max_edge };
+                return mm_edit::soft::soft_deform_refined(&t.source, &soft.region, &r.tris, &tf, &opts).mesh;
+            }
+            for (v, p) in mm_edit::soft_deform(&t.source, &soft.region, &tf, soft.kind, soft.continuity) {
+                mesh.set_vertex(v, p);
+            }
+        } else {
+            for (verts, pivot) in &r.groups {
+                let pivot = if r.shared_frame { t.pivot } else { *pivot };
+                for &v in verts {
+                    mesh.set_vertex(v, pivot + t.translate + lin * (t.source.vertex(v) - pivot));
+                }
+            }
+        }
+        mesh
+    }
+
+    fn soft_state(kind: mm_edit::SoftKind) -> SoftState {
+        SoftState {
+            kind,
+            continuity: mm_edit::Continuity::SoftPosition,
+            falloff: 1.0,
+            ignore_groups: false,
+            refine: false,
+            max_edge: 0.0,
+            region: Default::default(),
+            pivots: Vec::new(),
+        }
+    }
+
+    /// Checks every rebuild against a fresh copy, and that the vertices the preview reports as
+    /// moved are enough to keep a copy of it (as the renderer holds) up to date.
+    struct Checked {
+        shadow: Vec<DVec3>,
+    }
+
+    impl Checked {
+        fn new(t: &mut TransformTool) -> Self {
+            t.rebuild();
+            t.clear_preview_moves();
+            Self { shadow: t.preview.as_ref().unwrap().positions().to_vec() }
+        }
+        fn rebuild(&mut self, t: &mut TransformTool, what: &str) {
+            let from = t.preview.as_ref().unwrap().shape_version();
+            t.rebuild();
+            let preview = t.preview.as_ref().unwrap();
+            assert!(super::tests::same_mesh(preview, &fresh_preview(t)), "{what}");
+            match t.preview_moves() {
+                Some((f, to, verts)) => {
+                    assert_eq!((f, to), (from, preview.shape_version()), "{what}");
+                    for &v in verts {
+                        self.shadow[v as usize] = preview.vertex(v);
+                    }
+                }
+                None => self.shadow = preview.positions().to_vec(),
+            }
+            assert!(self.shadow.len() == preview.max_vid() && self.shadow.iter().zip(preview.positions()).all(|(a, b)| a.to_array().map(f64::to_bits) == b.to_array().map(f64::to_bits)), "{what}");
+            t.clear_preview_moves();
+        }
+    }
+
+    #[test]
+    fn region_previews_are_rewritten_in_place_as_fresh_copies() {
+        let m = primitives::plane_grid(6.0, 6.0, 30, 30);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| (m.tri_centroid(t).x.abs() - 1.2).abs() < 0.6 && m.tri_centroid(t).y.abs() < 0.8).collect();
+        // Face transform: moves, then the region's options change (other moving vertices).
+        let mut t = face_tool(m.clone(), sel.clone());
+        let mut c = Checked::new(&mut t);
+        t.translate = DVec3::new(0.0, 0.0, 0.5);
+        c.rebuild(&mut t, "face move");
+        t.rotation = DQuat::from_rotation_x(0.4);
+        c.rebuild(&mut t, "face turn");
+        t.region.as_mut().unwrap().shared_frame = false;
+        t.update_region();
+        c.rebuild(&mut t, "separate frames");
+        t.region.as_mut().unwrap().fixed_boundary = true;
+        t.update_region();
+        c.rebuild(&mut t, "fixed boundary");
+        assert!(t.preview_moves().is_some());
+        // Soft transform, every kind, with Refine Mesh switched on and off again.
+        for kind in [mm_edit::SoftKind::Linear, mm_edit::SoftKind::Nonlinear, mm_edit::SoftKind::Flat, mm_edit::SoftKind::Stretchy] {
+            let mut t = face_tool(m.clone(), sel.clone());
+            t.region.as_mut().unwrap().soft = Some(soft_state(kind));
+            t.update_region();
+            let mut c = Checked::new(&mut t);
+            for k in 0..3 {
+                t.translate = DVec3::new(0.1, 0.0, 0.4 * k as f64);
+                t.rotation = DQuat::from_rotation_y(0.2 * k as f64);
+                c.rebuild(&mut t, &format!("{kind:?} move {k}"));
+            }
+            t.region.as_mut().unwrap().soft.as_mut().unwrap().refine = true;
+            c.rebuild(&mut t, &format!("{kind:?} refined"));
+            t.region.as_mut().unwrap().soft.as_mut().unwrap().refine = false;
+            c.rebuild(&mut t, &format!("{kind:?} unrefined"));
+            t.region.as_mut().unwrap().soft.as_mut().unwrap().falloff = 0.6;
+            t.update_region();
+            c.rebuild(&mut t, &format!("{kind:?} narrower band"));
+            t.region.as_mut().unwrap().soft.as_mut().unwrap().continuity = mm_edit::Continuity::Boundaries;
+            c.rebuild(&mut t, &format!("{kind:?} other continuity"));
+        }
+    }
+
+    #[test]
+    fn holding_the_gizmo_still_leaves_the_preview() {
+        let m = primitives::plane_grid(4.0, 4.0, 8, 8);
+        let sel: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_centroid(t).truncate().length() < 1.0).collect();
+        let mut t = face_tool(m, sel);
+        let (mut unused, ctx) = (DummyCx::default(), egui::Context::default());
+        let cx = unused.cx(&ctx);
+        let c = cx.project(t.pivot + t.translate).unwrap();
+        for handle in [Handle::Move(0), Handle::Rotate(2), Handle::Scale(1), Handle::UniformScale] {
+            t.drag = Some(GizmoDrag { handle, start: c + egui::vec2(30.0, -10.0), translate: t.translate, rotation: t.rotation, scale: t.scale, sizes: t.sizes });
+            let p = c + egui::vec2(60.0, -40.0);
+            t.drag_to(&cx, p);
+            assert!(t.dirty, "{handle:?}: a move changes the transform");
+            // (A moved gizmo is drawn at its new place, so a held arrow settles over a few
+            // frames.)
+            let mut frames = 0;
+            while t.dirty && frames < 50 {
+                t.rebuild();
+                t.drag_to(&cx, p);
+                frames += 1;
+            }
+            assert!(!t.dirty, "{handle:?}: holding still settles");
+            let version = t.preview.as_ref().unwrap().shape_version();
+            t.drag_to(&cx, p);
+            assert!(!t.dirty, "{handle:?}: holding still changes nothing");
+            assert_eq!(t.preview.as_ref().unwrap().shape_version(), version);
+            t.drag = None;
+        }
+        // With snapping, a move within one step changes nothing either.
+        t.snap = true;
+        t.snap_step = 10.0;
+        t.drag = Some(GizmoDrag { handle: Handle::Move(0), start: c, translate: t.translate, rotation: t.rotation, scale: t.scale, sizes: t.sizes });
+        t.drag_to(&cx, c + egui::vec2(3.0, 0.0));
+        assert!(!t.dirty);
     }
 
     /// A tool context for calls that need one but do not use it.

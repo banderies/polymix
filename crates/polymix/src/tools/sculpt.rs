@@ -12,6 +12,7 @@ pub mod symmetry;
 
 use super::*;
 use crate::ui_util;
+use mm_core::hash::{FastMap, FastSet};
 use mm_edit::brush_alpha::{AlphaMap, DabFrame, ScreenMap, ScreenStencil, Spacer};
 use rayon::prelude::*;
 use stencil::Alpha;
@@ -207,7 +208,7 @@ fn retriangulate(mesh: &mut Mesh, tris: Vec<u32>, target: f64, min_frac: f64, sm
 
 /// Tangential Laplacian relaxation of the vertices whose whole one-ring lies in `tris`.
 fn relax_interior(mesh: &mut Mesh, tris: &[u32], k: f64) {
-    let set: std::collections::HashSet<u32> = tris.iter().copied().collect();
+    let set: FastSet<u32> = tris.iter().copied().collect();
     let mut verts: Vec<u32> = tris.iter().flat_map(|&t| mesh.triangle(t)).filter(|&v| !mesh.is_boundary_vertex(v) && mesh.vertex_triangles(v).iter().all(|t| set.contains(t))).collect();
     verts.sort_unstable();
     verts.dedup();
@@ -263,7 +264,7 @@ fn paint_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, color: [f32; 3
 /// coarser (Reduce) triangles; AdaptiveReduce removes triangles by quadric error, so flat
 /// areas thin out while curved detail stays. Returns whether the topology changed.
 fn density_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, r: f64, strength: f64) -> bool {
-    let inside: std::collections::HashSet<u32> = verts.iter().map(|x| x.0).collect();
+    let inside: FastSet<u32> = verts.iter().map(|x| x.0).collect();
     let mut tris: Vec<u32> = verts.iter().flat_map(|&(v, _)| mesh.vertex_triangles(v)).filter(|&t| mesh.triangle(t).iter().all(|v| inside.contains(v))).collect();
     tris.sort_unstable();
     tris.dedup();
@@ -347,13 +348,20 @@ const SYM_SNAP_TOL: f64 = 0.03;
 
 /// Put back onto the plane the vertices of `verts` whose position when the stroke first
 /// reached them (`start`) was within `tol` of it.
-fn sym_snap(mesh: &mut Mesh, verts: impl Iterator<Item = u32>, start: &std::collections::HashMap<u32, DVec3>, sym: SymPlane, tol: f64) {
+fn sym_snap(mesh: &mut Mesh, verts: impl Iterator<Item = u32>, start: &FastMap<u32, DVec3>, sym: SymPlane, tol: f64) {
     for v in verts {
         if mesh.is_vertex(v) && start.get(&v).is_some_and(|&p| sym.distance(p) < tol) {
             let p = sym.project(mesh.vertex(v));
             mesh.set_vertex(v, p);
         }
     }
+}
+
+/// Sort the vertices moved since the renderer last looked and drop repeats (dabs overlap,
+/// and each one adds the whole of its footprint), so it refreshes each of them once.
+fn tidy_moved(o: &mut crate::scene::SceneObject) {
+    o.moved_vertices.sort_unstable();
+    o.moved_vertices.dedup();
 }
 
 /// Dab spacing range, in brush radii.
@@ -425,14 +433,14 @@ struct SculptStroke {
     drag_verts: Vec<(u32, f64)>,
     drag_mirror: Vec<(u32, f64)>,
     drag_origin: Option<(DVec3, egui::Pos2)>,
-    drag_start_pos: std::collections::HashMap<u32, DVec3>,
+    drag_start_pos: FastMap<u32, DVec3>,
     drag_r: f64,
     /// Previous dab centre (for stroke-direction brushes).
     last_center: Option<DVec3>,
     /// Stroke direction, smoothed over the dabs (AlignToStroke).
     dir: Option<DVec3>,
     /// Positions when the stroke first touched each vertex (Draw3's layer reference).
-    start: std::collections::HashMap<u32, DVec3>,
+    start: FastMap<u32, DVec3>,
     /// Lazy brush point on the surface, and the pointer position last frame (resting test).
     lazy: Option<DVec3>,
     last_pos: Option<egui::Pos2>,
@@ -569,7 +577,7 @@ impl SculptTool {
     /// Apply a dab and, with symmetry on, its mirror image (the same operation reflected;
     /// Meshmixer does not enforce strict mesh symmetry either). `start` collects where the
     /// stroke first found each vertex. Returns whether the triangles changed.
-    fn stamp(&self, o: &mut crate::scene::SceneObject, s: &Stamp, start: &mut std::collections::HashMap<u32, DVec3>, target: Option<&crate::scene::TargetSurface>) -> bool {
+    fn stamp(&self, o: &mut crate::scene::SceneObject, s: &Stamp, start: &mut FastMap<u32, DVec3>, target: Option<&crate::scene::TargetSurface>) -> bool {
         let (brush, r, fp) = (s.brush, s.r, self.footprint());
         let sym = self.symmetry.active();
         let mut dabs = vec![(s.center, s.motion, s.view, Some(s.seed), None)];
@@ -581,9 +589,13 @@ impl SculptTool {
         let mut frame: Option<DabFrame> = None;
         let mut retriangulated = false;
         for (c, motion, view, seed, mirror) in dabs {
-            let bvh = o.bvh();
-            let Some(seed) = seed.or_else(|| bvh.nearest(&o.mesh, c, r).map(|n| n.tid)) else { continue };
-            let mut verts = brush_vertices(&o.mesh, &bvh, c, r, Some(seed), &fp);
+            // The BVH handle goes before the mesh moves: one still held when the next dab
+            // refits the tree would make that refit copy the whole tree first.
+            let (seed, mut verts) = {
+                let bvh = o.bvh();
+                let Some(seed) = seed.or_else(|| bvh.nearest(&o.mesh, c, r).map(|n| n.tid)) else { continue };
+                (seed, brush_vertices(&o.mesh, &bvh, c, r, Some(seed), &fp))
+            };
             for &(v, _) in &verts {
                 start.entry(v).or_insert_with(|| o.mesh.vertex(v));
             }
@@ -615,9 +627,12 @@ impl SculptTool {
             }
         }
         if let (Some(sym), true) = (sym, self.sym_snap) {
-            let bvh = o.bvh();
-            let mut near = brush_vertices(&o.mesh, &bvh, s.center, r, None, &Footprint::default());
-            near.extend(brush_vertices(&o.mesh, &bvh, sym.reflect(s.center), r, None, &Footprint::default()));
+            let near = {
+                let bvh = o.bvh();
+                let mut near = brush_vertices(&o.mesh, &bvh, s.center, r, None, &Footprint::default());
+                near.extend(brush_vertices(&o.mesh, &bvh, sym.reflect(s.center), r, None, &Footprint::default()));
+                near
+            };
             sym_snap(o.mesh_mut(), near.iter().map(|x| x.0), start, sym, r * SYM_SNAP_TOL);
             o.moved_vertices.extend(near.iter().map(|x| x.0));
         }
@@ -631,11 +646,11 @@ impl Default for Footprint {
     }
 }
 
-/// Vertices within `r` of `c`, with falloff weights. Without `volumetric`, only vertices
-/// reachable along edges from `seed` (the stroked triangle) inside the sphere count, so a
-/// nearby but separate sheet of surface is left alone.
+/// Vertices within `r` of `c`, with falloff weights, in id order. Without `volumetric`, only
+/// vertices reachable along edges from `seed` (the stroked triangle) inside the sphere count,
+/// so a nearby but separate sheet of surface is left alone.
 fn brush_vertices(mesh: &Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, seed: Option<u32>, fp: &Footprint) -> Vec<(u32, f64)> {
-    let mut inside = std::collections::HashSet::new();
+    let mut inside: FastSet<u32> = FastSet::default();
     bvh.query_sphere(mesh, c, r, |t| {
         for v in mesh.triangle(t) {
             if mesh.vertex(v).distance(c) < r {
@@ -643,10 +658,11 @@ fn brush_vertices(mesh: &Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, seed: Optio
             }
         }
     });
-    let reached: std::collections::HashSet<u32> = match seed.filter(|&t| !fp.volumetric && mesh.is_triangle(t)) {
+    // The sets are only asked for membership; the vertices are put in id order below.
+    let reached: FastSet<u32> = match seed.filter(|&t| !fp.volumetric && mesh.is_triangle(t)) {
         Some(t) => {
-            let mut seen: std::collections::HashSet<u32> = mesh.triangle(t).into_iter().filter(|v| inside.contains(v)).collect();
-            let mut stack: Vec<u32> = seen.iter().copied().collect();
+            let mut seen: FastSet<u32> = mm_core::hash::fast_set_with_capacity(inside.len());
+            let mut stack: Vec<u32> = mesh.triangle(t).into_iter().filter(|v| inside.contains(v) && seen.insert(*v)).collect();
             while let Some(v) = stack.pop() {
                 for u in mesh.vertex_neighbors(v) {
                     if inside.contains(&u) && seen.insert(u) {
@@ -680,7 +696,7 @@ struct Dab<'a> {
     /// World-space motion of the brush since the previous dab.
     motion: DVec3,
     /// Draw3: positions at the start of the stroke.
-    start: &'a std::collections::HashMap<u32, DVec3>,
+    start: &'a FastMap<u32, DVec3>,
     target: Option<&'a crate::scene::TargetSurface>,
 }
 
@@ -706,15 +722,19 @@ fn apply_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, d: &Dab) {
     let m: &Mesh = mesh;
     let sign = if d.invert { -1.0 } else { 1.0 };
     let (s, r) = (d.strength, d.r);
-    // Weighted average normal and centroid of the brush region.
-    let (mut nsum, mut psum, mut wsum) = (DVec3::ZERO, DVec3::ZERO, 0.0);
-    for &(v, w) in verts {
-        nsum += m.vertex_normal(v) * w;
-        psum += m.vertex(v) * w;
-        wsum += w;
-    }
-    let navg = nsum.normalize_or_zero();
-    let pavg = if wsum > 0.0 { psum / wsum } else { d.center };
+    // Weighted average normal and centroid of the brush region, for the brushes that use
+    // them (a vertex normal walks the vertex's triangles, so the others skip it).
+    let (navg, pavg) = if matches!(brush, Brush::Draw | Brush::Draw3 | Brush::DrawMax | Brush::Flatten) {
+        let (mut nsum, mut psum, mut wsum) = (DVec3::ZERO, DVec3::ZERO, 0.0);
+        for &(v, w) in verts {
+            nsum += m.vertex_normal(v) * w;
+            psum += m.vertex(v) * w;
+            wsum += w;
+        }
+        (nsum.normalize_or_zero(), if wsum > 0.0 { psum / wsum } else { d.center })
+    } else {
+        (DVec3::ZERO, d.center)
+    };
     let tangential = |v: u32, x: DVec3| {
         let n = m.vertex_normal(v);
         x - n * x.dot(n)
@@ -738,7 +758,7 @@ fn apply_dab(mesh: &mut Mesh, verts: &[(u32, f64)], brush: Brush, d: &Dab) {
             let lambda = (0.6 * s).min(0.9);
             let mu = -lambda * 1.06;
             let first: Vec<(u32, DVec3)> = verts.par_iter().map(|&(v, w)| (v, m.vertex(v) + laplacian(m, v) * lambda * w)).collect();
-            let moved: std::collections::HashMap<u32, DVec3> = first.iter().copied().collect();
+            let moved: FastMap<u32, DVec3> = first.iter().copied().collect();
             let at = |v: u32| moved.get(&v).copied().unwrap_or_else(|| m.vertex(v));
             first
                 .iter()
@@ -855,8 +875,8 @@ impl SculptTool {
     fn dab_at(&self, cx: &mut ToolCx, stroke: &mut SculptStroke, brush: Brush, p: DVec3, r: f64, target: Option<&TargetSurface>) -> bool {
         let (view, right, screen) = (cx.camera.forward(), cx.camera.right(), Self::screen_map(cx));
         let Some(o) = cx.scene.get_mut(stroke.object) else { return false };
-        let bvh = o.bvh();
-        let Some(h) = bvh.nearest(&o.mesh, p, f64::INFINITY) else { return false };
+        // The BVH handle lasts only for this query (see `stamp`).
+        let Some(h) = o.bvh().nearest(&o.mesh, p, f64::INFINITY) else { return false };
         let center = h.point - o.mesh.tri_normal(h.tid) * (self.depth / 100.0 * r);
         let motion = stroke.advance(center);
         let across = if self.align_to_stroke { stroke.dir.unwrap_or(right) } else { right };
@@ -868,8 +888,7 @@ impl SculptTool {
         if retriangulated {
             // New triangles: the GPU copy and the selection are rebuilt.
             o.moved_vertices.clear();
-            let m = o.mesh.clone();
-            o.selection.sync(&m);
+            o.sync_selection();
             o.touch_selection();
         }
         retriangulated
@@ -883,8 +902,8 @@ impl SculptTool {
         if r <= 0.0 {
             return Err("the brush has no size".into());
         }
-        if let Some(b) = cx.scene.get(id).map(|o| o.bounds()) {
-            self.symmetry.place(id, &b);
+        if let Some(o) = cx.scene.get(id) {
+            self.symmetry.place_with(id, || o.bounds());
         }
         let mut stroke = SculptStroke::new(id, invert, self.spacing * r);
         let pts: Vec<DVec3> = path.iter().flat_map(|&p| stroke.spacer.advance(p, usize::MAX)).collect();
@@ -892,6 +911,9 @@ impl SculptTool {
         let target = cx.scene.target_surface(Some(id));
         for p in &pts {
             self.dab_at(cx, &mut stroke, self.brush, *p, r, target.as_ref());
+        }
+        if let Some(o) = cx.scene.get_mut(id) {
+            tidy_moved(o);
         }
         Ok(pts.len())
     }
@@ -902,8 +924,8 @@ impl SculptTool {
         let id = cx.scene.active.ok_or("no active object")?;
         let r = brush_radius(cx.scene, id, self.size_pct);
         let fp = self.footprint();
-        if let Some(b) = cx.scene.get(id).map(|o| o.bounds()) {
-            self.symmetry.place(id, &b);
+        if let Some(o) = cx.scene.get(id) {
+            self.symmetry.place_with(id, || o.bounds());
         }
         let sym = self.symmetry.active();
         cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
@@ -913,7 +935,8 @@ impl SculptTool {
         let delta = to - h.point;
         let verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
         let mirror = sym.and_then(|s| bvh.nearest(&o.mesh, s.reflect(h.point), r).map(|n| (s, brush_vertices(&o.mesh, &bvh, s.reflect(h.point), r, Some(n.tid), &fp)))).unwrap_or((SymPlane::new(DVec3::ZERO, DVec3::X), Vec::new()));
-        let mut moved: std::collections::HashMap<u32, DVec3> = verts.iter().chain(&mirror.1).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
+        // Keyed by vertex: each is written (and snapped) once, so the walks' order is free.
+        let mut moved: FastMap<u32, DVec3> = verts.iter().chain(&mirror.1).map(|&(v, _)| (v, o.mesh.vertex(v))).collect();
         let start = moved.clone();
         for (vs, step) in [(&verts, delta), (&mirror.1, mirror.0.reflect_dir(delta))] {
             for &(v, w) in vs {
@@ -934,6 +957,7 @@ impl SculptTool {
             sym_snap(m, moved.keys().copied(), &start, sym, r * SYM_SNAP_TOL);
         }
         o.moved_vertices.extend(moved.keys().copied());
+        tidy_moved(o);
         Ok(moved.len())
     }
 
@@ -976,7 +1000,8 @@ impl SculptTool {
                 o.moved_from = o.mesh.shape_version();
             }
             // Mirrored grabs move by the mirrored offset; where the two overlap both apply.
-            let mut moved: std::collections::HashMap<u32, DVec3> = stroke.drag_start_pos.clone();
+            // Keyed by vertex: each is written (and snapped) once, so the walks' order is free.
+            let mut moved: FastMap<u32, DVec3> = stroke.drag_start_pos.clone();
             let mirrored = sym.map_or(DVec3::ZERO, |s| s.reflect_dir(delta));
             for (verts, step) in [(&stroke.drag_verts, delta), (&stroke.drag_mirror, mirrored)] {
                 for &(v, w) in verts {
@@ -995,6 +1020,7 @@ impl SculptTool {
                 sym_snap(m, moved.keys().copied(), &stroke.drag_start_pos, sym, stroke.drag_r * SYM_SNAP_TOL);
             }
             o.moved_vertices.extend(moved.keys().copied());
+            tidy_moved(o);
             return;
         }
         let Some((_, h)) = hover else { return };
@@ -1014,8 +1040,12 @@ impl SculptTool {
             cx.egui.request_repaint();
         }
         let target = cx.scene.target_surface(Some(stroke.object));
+        let dabbed = !dabs.is_empty();
         for q in dabs {
             self.dab_at(cx, stroke, brush, q, r, target.as_ref());
+        }
+        if let (true, Some(o)) = (dabbed, cx.scene.get_mut(stroke.object)) {
+            tidy_moved(o);
         }
     }
 
@@ -1358,8 +1388,8 @@ impl Tool for SculptTool {
             if let Some((id, _)) = hover {
                 cx.scene.active = Some(id);
                 cx.snapshot(&format!("Sculpt: {}", self.brush.label()));
-                if let Some(b) = cx.scene.get(id).map(|o| o.bounds()) {
-                    self.symmetry.place(id, &b);
+                if let Some(o) = cx.scene.get(id) {
+                    self.symmetry.place_with(id, || o.bounds());
                 }
                 let r = brush_radius(cx.scene, id, self.size_pct);
                 self.stroke = Some(SculptStroke::new(id, input.command, self.spacing * r));
@@ -2091,5 +2121,158 @@ mod tests {
         assert!(tool.symmetry.accept_edit());
         let p2 = tool.symmetry.active().unwrap();
         assert!(pts.iter().all(|&p| p2.distance(p) < 1e-12));
+    }
+
+    /// `brush_vertices` as it was with the standard hash sets, for comparison.
+    fn brush_vertices_hashed(mesh: &Mesh, bvh: &mm_core::Bvh, c: DVec3, r: f64, seed: Option<u32>, fp: &Footprint) -> Vec<(u32, f64)> {
+        use std::collections::HashSet;
+        let mut inside = HashSet::new();
+        bvh.query_sphere(mesh, c, r, |t| {
+            for v in mesh.triangle(t) {
+                if mesh.vertex(v).distance(c) < r {
+                    inside.insert(v);
+                }
+            }
+        });
+        let reached: HashSet<u32> = match seed.filter(|&t| !fp.volumetric && mesh.is_triangle(t)) {
+            Some(t) => {
+                let mut seen: HashSet<u32> = mesh.triangle(t).into_iter().filter(|v| inside.contains(v)).collect();
+                let mut stack: Vec<u32> = seen.iter().copied().collect();
+                while let Some(v) = stack.pop() {
+                    for u in mesh.vertex_neighbors(v) {
+                        if inside.contains(&u) && seen.insert(u) {
+                            stack.push(u);
+                        }
+                    }
+                }
+                seen
+            }
+            None => inside,
+        };
+        let held = |v: u32| {
+            (fp.hold_boundary && mesh.is_boundary_vertex(v)) || (fp.hold_groups && {
+                let tris = mesh.vertex_triangles(v);
+                tris.iter().any(|&t| mesh.tri_group(t) != mesh.tri_group(tris[0]))
+            })
+        };
+        let mut out: Vec<(u32, f64)> = reached.into_iter().filter(|&v| !held(v)).map(|v| (v, fp.falloff.weight(mesh.vertex(v).distance(c) / r))).collect();
+        out.sort_unstable_by_key(|x| x.0);
+        out
+    }
+
+    #[test]
+    fn gathering_matches_the_hashed_walk() {
+        // Two sheets (one split into groups, with an open border) and a sphere next to them.
+        let mut m = primitives::plane_grid(2.0, 2.0, 30, 30);
+        let mut top = m.clone();
+        top.transform(|p| p + DVec3::new(0.05, 0.0, 0.08));
+        m.append_mesh(&top, 1);
+        let mut ball = primitives::icosphere(0.4, 3);
+        ball.transform(|p| p + DVec3::new(0.6, -0.5, 0.3));
+        m.append_mesh(&ball, 2);
+        for t in m.triangle_ids().collect::<Vec<_>>() {
+            if m.tri_group(t) == 0 && m.tri_centroid(t).x > 0.1 {
+                m.set_tri_group(t, 3);
+            }
+        }
+        let bvh = mm_core::Bvh::build(&m);
+        let mut checked = 0;
+        for (k, c) in [DVec3::ZERO, DVec3::new(0.1, 0.2, 0.04), DVec3::new(0.55, -0.45, 0.1), DVec3::new(0.95, 0.9, 0.0)].into_iter().enumerate() {
+            for r in [0.05, 0.3, 0.8] {
+                let seed = bvh.nearest(&m, c, f64::INFINITY).map(|h| h.tid);
+                for falloff in [Falloff::Smooth, Falloff::Sharp] {
+                    for (volumetric, hold_boundary, hold_groups) in [(false, false, false), (true, false, false), (false, true, true), (true, true, false)] {
+                        let fp = Footprint { falloff, volumetric, hold_boundary, hold_groups };
+                        for seed in [seed, None] {
+                            let got = brush_vertices(&m, &bvh, c, r, seed, &fp);
+                            let want = brush_vertices_hashed(&m, &bvh, c, r, seed, &fp);
+                            assert_eq!(got.len(), want.len(), "centre {k}, r {r}, {fp:?}");
+                            assert!(got.iter().zip(&want).all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits()), "centre {k}, r {r}, {fp:?}");
+                            checked += got.len();
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
+    }
+
+    #[test]
+    fn selection_sync_after_a_retriangulating_dab_matches_a_full_sync() {
+        use mm_core::TriSelection;
+        let mut m = primitives::icosphere(1.0, 3);
+        let before = m.clone();
+        let p = Refinement { enabled: true, refine: 60.0, ..Default::default() };
+        let bvh = mm_core::Bvh::build(&m);
+        assert!(refine_region(&mut m, &bvh, DVec3::Z, 0.5, &p));
+        m.remove_triangles(m.triangle_ids().filter(|&t| m.tri_centroid(t).z > 0.97).collect::<Vec<_>>());
+        assert!(m.max_tid() > before.max_tid() && m.triangle_ids().count() < m.max_tid(), "new ids, and some gone");
+        let picked: Vec<u32> = before.triangle_ids().filter(|&t| before.tri_centroid(t).z > 0.6).collect();
+        let small = primitives::icosphere(1.0, 1);
+        let cases = [
+            ("empty", TriSelection::new(&before)),
+            ("empty, longer than the mesh", TriSelection::new(&primitives::icosphere(1.0, 5))),
+            ("some, on retriangulated faces", TriSelection::from_tris(&before, picked)),
+            ("cleared", {
+                let mut s = TriSelection::from_tris(&before, [3, 4]);
+                s.clear();
+                s
+            }),
+            ("already synced", TriSelection::new(&m)),
+        ];
+        for (label, sel) in cases {
+            for mesh in [&m, &small] {
+                let mut want = sel.clone();
+                want.sync(mesh);
+                let mut o = crate::scene::SceneObject::new(1, "s", mesh.clone());
+                o.selection = sel.clone();
+                o.sync_selection();
+                assert_eq!(o.selection, want, "{label}");
+                assert_eq!(o.selection.bits().len(), mesh.max_tid(), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn dabs_refit_the_bvh_in_place_and_report_each_moved_vertex_once() {
+        // A handle on the BVH held while a dab moves the mesh would make the next refit copy
+        // the whole tree (the mirror dab and SymSnap refit within the dab).
+        let mut rig = Rig::new(primitives::icosphere(1.0, 4));
+        let mut cx = rig.cx();
+        let mut tool = SculptTool::build(SculptMode::Surface, Some(Brush::Draw), Symmetry::new(Some(SymPlane::new(DVec3::ZERO, DVec3::X)), None));
+        tool.symmetry.enabled = true;
+        tool.sym_snap = true;
+        let id = cx.scene.active.unwrap();
+        let tree = std::sync::Arc::as_ptr(&cx.scene.get_mut(id).unwrap().bvh());
+        let mut stroke = SculptStroke::new(id, false, 0.05);
+        for k in 0..4 {
+            let p = DVec3::new(0.15 + 0.05 * k as f64, 0.1, 1.0);
+            tool.dab_at(&mut cx, &mut stroke, Brush::Draw, p, 0.3, None);
+            let o = cx.scene.get_mut(id).unwrap();
+            assert!(o.bvh_if_current().is_none(), "dab {k} moved the mesh");
+            assert_eq!(std::sync::Arc::as_ptr(&o.bvh()), tree, "dab {k}: refitted where it is");
+        }
+        // Pointer strokes leave the moved vertices sorted, each once, and the renderer sees
+        // the same set as before (the dabs' footprints overlap).
+        let mut tool = SculptTool::new(&mut cx);
+        tool.brush = Brush::Draw;
+        tool.flow = false;
+        let (a, b) = (cx.project(DVec3::new(-0.5, 0.1, 0.9)).unwrap(), cx.project(DVec3::new(0.5, -0.1, 0.9)).unwrap());
+        cx.scene.get_mut(id).unwrap().moved_vertices.clear();
+        tool.pointer(&PointerInput { pos: Some(a), pressed: true, down: true, ..Default::default() }, &mut cx);
+        for k in 1..=3 {
+            tool.pointer(&PointerInput { pos: Some(a + (b - a) * (k as f32 / 3.0)), down: true, ..Default::default() }, &mut cx);
+            let moved = &cx.scene.get(id).unwrap().moved_vertices;
+            assert!(!moved.is_empty() && moved.windows(2).all(|w| w[0] < w[1]), "move {k}");
+        }
+        // The Move brush too.
+        tool.brush = Brush::Move;
+        tool.pointer(&PointerInput { pos: Some(a), released: true, ..Default::default() }, &mut cx);
+        tool.pointer(&PointerInput { pos: Some(b), pressed: true, down: true, ..Default::default() }, &mut cx);
+        for k in 1..=2 {
+            tool.pointer(&PointerInput { pos: Some(b + egui::vec2(10.0 * k as f32, 0.0)), down: true, ..Default::default() }, &mut cx);
+        }
+        let moved = &cx.scene.get(id).unwrap().moved_vertices;
+        assert!(!moved.is_empty() && moved.windows(2).all(|w| w[0] < w[1]));
     }
 }

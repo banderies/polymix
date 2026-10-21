@@ -97,6 +97,31 @@ pub struct EdgeCollapseInfo {
     pub e_kept: [u32; 2],
 }
 
+/// What the collapse check works out: the edge, its triangles, the vertices opposite it, and
+/// whether it is a boundary edge.
+type CollapseCheck = (u32, [u32; 2], u32, u32, bool);
+
+/// A collapse that [`Mesh::check_collapse`] found valid, holding what the check worked out
+/// and the topology version it holds for. Pass it to [`Mesh::collapse_edge_checked`].
+#[derive(Clone, Copy, Debug)]
+pub struct CollapseToken {
+    v_keep: u32,
+    v_remove: u32,
+    topo_version: u64,
+    checked: CollapseCheck,
+}
+
+impl CollapseToken {
+    /// The vertex that stays.
+    pub fn v_keep(&self) -> u32 {
+        self.v_keep
+    }
+    /// The vertex that goes.
+    pub fn v_remove(&self) -> u32 {
+        self.v_remove
+    }
+}
+
 /// Result of [`Mesh::poke_triangle`].
 #[derive(Clone, Copy, Debug)]
 pub struct PokeInfo {
@@ -107,7 +132,27 @@ pub struct PokeInfo {
 
 type EdgeList = SmallVec<[u32; 8]>;
 
-#[derive(Clone, Default)]
+/// A copy of `v` with room for `extra` more items.
+///
+/// Copies run on one thread on purpose. A copy lands in fresh memory (the original stays
+/// alive, for undo), and threads faulting in fresh pages of one process queue on the
+/// kernel's lock: measured on 1.3M and 3M meshes, a parallel copy took 2-10x longer.
+fn copy_vec<T: Copy>(v: &[T], extra: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(v.len() + extra);
+    out.extend_from_slice(v);
+    out
+}
+
+/// A copy of the vertices' edge lists, like [`copy_vec`]. `SmallVec::clone` collects item
+/// by item; `from_slice` copies a list that fits inline in one go, into the same inline
+/// list. A longer list is cloned as before (so its capacity comes out the same too).
+fn copy_edge_lists(v: &[EdgeList], extra: usize) -> Vec<EdgeList> {
+    let mut out = Vec::with_capacity(v.len() + extra);
+    out.extend(v.iter().map(|e| if e.len() > e.inline_size() { e.clone() } else { EdgeList::from_slice(e) }));
+    out
+}
+
+#[derive(Default)]
 pub struct Mesh {
     vpos: Vec<DVec3>,
     vedges: Vec<EdgeList>,
@@ -139,6 +184,9 @@ pub struct Mesh {
     vcolor: Option<Vec<[f32; 3]>>,
     /// Incremented when colours are set, enabled or cleared (like `group_version`).
     color_version: u64,
+    /// [`Mesh::bounds`] and the shape version it was computed for. Reset by every edit that
+    /// can move, add or remove a vertex of a triangle, and by `positions_mut`.
+    bounds_cache: std::sync::OnceLock<(u64, crate::Aabb)>,
 }
 
 /// Colour given to new vertices of a coloured mesh when nothing better is known.
@@ -146,6 +194,16 @@ pub const DEFAULT_VERTEX_COLOR: [f32; 3] = [0.8, 0.8, 0.8];
 
 fn lerp3(a: [f32; 3], b: [f32; 3], s: f32) -> [f32; 3] {
     [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * s)
+}
+
+/// The same copy as a derived `Clone` would make (every array element for element, the
+/// versions and the cached bounds), with the edge lists copied faster (see
+/// `copy_edge_lists`). Not marked `#[inline]` as a derived `clone` is, so the callers do
+/// not each carry a copy of it.
+impl Clone for Mesh {
+    fn clone(&self) -> Self {
+        self.clone_with_headroom(0, 0)
+    }
 }
 
 impl std::fmt::Debug for Mesh {
@@ -209,6 +267,62 @@ impl Mesh {
         m
     }
 
+    /// A copy (the same as `clone`) with spare room for `extra_v` more vertices and
+    /// `extra_t` more triangles (and their edges, half as many again), for a copy that is
+    /// about to be refined: it grows without reallocating its large arrays on the way.
+    pub fn clone_with_headroom(&self, extra_v: usize, extra_t: usize) -> Mesh {
+        // Spelled out field by field, so that a new field cannot be left out of the copy.
+        let Mesh {
+            vpos,
+            vedges,
+            vlive,
+            vfree,
+            nv,
+            tv,
+            te,
+            tgroup,
+            tlive,
+            tfree,
+            nt,
+            ev,
+            et,
+            elive,
+            efree,
+            ne,
+            topo_version,
+            shape_version,
+            group_version,
+            vcolor,
+            color_version,
+            bounds_cache,
+        } = self;
+        let extra_e = extra_t + extra_t / 2;
+        Mesh {
+            vpos: copy_vec(vpos, extra_v),
+            vedges: copy_edge_lists(vedges, extra_v),
+            vlive: copy_vec(vlive, extra_v),
+            vfree: copy_vec(vfree, 0),
+            nv: *nv,
+            tv: copy_vec(tv, extra_t),
+            te: copy_vec(te, extra_t),
+            tgroup: copy_vec(tgroup, extra_t),
+            tlive: copy_vec(tlive, extra_t),
+            tfree: copy_vec(tfree, 0),
+            nt: *nt,
+            ev: copy_vec(ev, extra_e),
+            et: copy_vec(et, extra_e),
+            elive: copy_vec(elive, extra_e),
+            efree: copy_vec(efree, 0),
+            ne: *ne,
+            topo_version: *topo_version,
+            shape_version: *shape_version,
+            group_version: *group_version,
+            vcolor: vcolor.as_ref().map(|c| copy_vec(c, extra_v)),
+            color_version: *color_version,
+            bounds_cache: bounds_cache.clone(),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Counts, validity, accessors
     // ------------------------------------------------------------------
@@ -242,7 +356,14 @@ impl Mesh {
     }
     /// Mark the mesh as changed (e.g. after bulk edits through `vertices_mut`).
     pub fn bump_shape_version(&mut self) {
+        self.touch_shape();
+    }
+    /// A new shape version, dropping what was cached for the old one. Every edit of
+    /// positions or topology ends here.
+    #[inline]
+    fn touch_shape(&mut self) {
         self.shape_version = next_version();
+        self.bounds_cache = std::sync::OnceLock::new();
     }
 
     #[inline]
@@ -265,7 +386,7 @@ impl Mesh {
     #[inline]
     pub fn set_vertex(&mut self, v: u32, p: DVec3) {
         self.vpos[v as usize] = p;
-        self.shape_version = next_version();
+        self.touch_shape();
     }
     /// Raw position array (indexed by vertex id; dead slots hold stale data).
     pub fn positions(&self) -> &[DVec3] {
@@ -273,6 +394,9 @@ impl Mesh {
     }
     /// Mutable raw position array. Call [`Mesh::bump_shape_version`] afterwards.
     pub fn positions_mut(&mut self) -> &mut [DVec3] {
+        // Some callers write without bumping the version, or bump only after reading the
+        // bounds, so the cached bounds go now.
+        self.bounds_cache = std::sync::OnceLock::new();
         &mut self.vpos
     }
 
@@ -522,7 +646,60 @@ impl Mesh {
     }
 
     /// Axis-aligned bounds of live vertices that are referenced by triangles.
+    ///
+    /// Cached per shape version, so asking again for an unchanged mesh costs nothing.
     pub fn bounds(&self) -> crate::Aabb {
+        match self.bounds_cache.get() {
+            Some(&(version, b)) if version == self.shape_version => b,
+            // Cached for another version: every edit resets the cache, so this cannot happen,
+            // but if it ever does the box is computed rather than trusted.
+            Some(_) => self.compute_bounds(),
+            None => {
+                let b = self.compute_bounds();
+                // Another thread may have filled it meanwhile, with the same box.
+                let _ = self.bounds_cache.set((self.shape_version, b));
+                b
+            }
+        }
+    }
+
+    /// [`Mesh::bounds`] if it is cached for the current shape, without computing it.
+    pub fn cached_bounds(&self) -> Option<crate::Aabb> {
+        self.bounds_cache.get().filter(|(version, _)| *version == self.shape_version).map(|&(_, b)| b)
+    }
+
+    /// The bounds from a walk over the vertices that have edges. The mesh's invariants (see
+    /// [`Mesh::check_validity`]) make those exactly the vertices of live triangles, and the
+    /// walk reads each position once instead of once per corner.
+    ///
+    /// `Aabb::include` keeps the later of two equal values and skips over NaN unevenly, so
+    /// the order of the walk shows in the result only for NaN coordinates, or when +0.0 and
+    /// -0.0 are both the minimum (or maximum) on an axis. Then the triangle walk decides, so
+    /// the result is always the very same as before the cache.
+    fn compute_bounds(&self) -> crate::Aabb {
+        let mut b = crate::Aabb::EMPTY;
+        let mut nan = false;
+        // Per axis (bit 0 x, 1 y, 2 z): a coordinate of +0.0 / -0.0 was seen.
+        let (mut pos_zero, mut neg_zero) = (0u32, 0u32);
+        for ((p, edges), &live) in self.vpos.iter().zip(&self.vedges).zip(&self.vlive) {
+            if live && !edges.is_empty() {
+                b.include(*p);
+                nan |= p.is_nan();
+                let zero = p.cmpeq(DVec3::ZERO).bitmask();
+                let neg = p.is_negative_bitmask();
+                pos_zero |= zero & !neg;
+                neg_zero |= zero & neg;
+            }
+        }
+        let zero_extreme = b.min.cmpeq(DVec3::ZERO).bitmask() | b.max.cmpeq(DVec3::ZERO).bitmask();
+        if nan || (pos_zero & neg_zero & zero_extreme) != 0 {
+            return self.bounds_by_triangles();
+        }
+        b
+    }
+
+    /// The bounds from a walk over the corners of the live triangles, in triangle order.
+    fn bounds_by_triangles(&self) -> crate::Aabb {
         let mut b = crate::Aabb::EMPTY;
         for t in self.triangle_ids() {
             for p in self.tri_positions(t) {
@@ -671,7 +848,7 @@ impl Mesh {
     // ------------------------------------------------------------------
 
     pub fn append_vertex(&mut self, p: DVec3) -> u32 {
-        self.shape_version = next_version();
+        self.touch_shape();
         self.alloc_vertex(p)
     }
 
@@ -714,7 +891,7 @@ impl Mesh {
         }
         self.te[t as usize] = te;
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(t)
     }
 
@@ -760,7 +937,7 @@ impl Mesh {
             }
         }
         m.topo_version = next_version();
-        m.shape_version = next_version();
+        m.touch_shape();
         (m, report)
     }
 
@@ -794,7 +971,7 @@ impl Mesh {
             }
         }
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(())
     }
 
@@ -835,7 +1012,7 @@ impl Mesh {
         // edges become (02, 21, 10) = (old e2, old e1, old e0)
         te.swap(0, 2);
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
     }
 
     /// Reverse the orientation of every triangle.
@@ -914,7 +1091,7 @@ impl Mesh {
             info.e_new_opp[k] = e_fr;
         }
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(info)
     }
 
@@ -981,7 +1158,7 @@ impl Mesh {
         self.vedges[c as usize].push(e);
         self.vedges[d as usize].push(e);
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(EdgeFlipInfo { e, v_old: [a, b], v_new: [c, d], t: [t0, t1] })
     }
 
@@ -990,8 +1167,25 @@ impl Mesh {
         self.collapse_check(v_keep, v_remove).map(|_| ())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn collapse_check(&self, b: u32, a: u32) -> MeshResult<(u32, [u32; 2], u32, u32, bool)> {
+    /// [`Mesh::can_collapse`], keeping what the check found in a token for
+    /// [`Mesh::collapse_edge_checked`], so that a caller who checks first and collapses later
+    /// does not pay for the check twice.
+    pub fn check_collapse(&self, v_keep: u32, v_remove: u32) -> MeshResult<CollapseToken> {
+        let checked = self.collapse_check(v_keep, v_remove)?;
+        Ok(CollapseToken { v_keep, v_remove, topo_version: self.topo_version, checked })
+    }
+
+    /// [`Mesh::collapse_edge`] for a collapse checked with [`Mesh::check_collapse`]. While the
+    /// topology is the one the token was checked on (positions may have moved), the check is
+    /// not repeated: the check reads nothing but the topology, so it would find the same.
+    /// After any topology change it is repeated, so the result is always the same as
+    /// `collapse_edge(token.v_keep(), token.v_remove())`.
+    pub fn collapse_edge_checked(&mut self, token: CollapseToken) -> MeshResult<EdgeCollapseInfo> {
+        let checked = if token.topo_version == self.topo_version { token.checked } else { self.collapse_check(token.v_keep, token.v_remove)? };
+        self.collapse_checked(token.v_keep, token.v_remove, checked)
+    }
+
+    fn collapse_check(&self, b: u32, a: u32) -> MeshResult<CollapseCheck> {
         if !self.is_vertex(a) || !self.is_vertex(b) {
             return Err(MeshError::NotAVertex);
         }
@@ -1049,9 +1243,15 @@ impl Mesh {
     /// Collapse edge (v_keep, v_remove), deleting `v_remove`. `v_keep` keeps its position;
     /// callers typically set it afterwards (e.g. to the edge midpoint).
     pub fn collapse_edge(&mut self, v_keep: u32, v_remove: u32) -> MeshResult<EdgeCollapseInfo> {
+        let checked = self.collapse_check(v_keep, v_remove)?;
+        self.collapse_checked(v_keep, v_remove, checked)
+    }
+
+    /// The collapse itself, given what `collapse_check` found for this topology.
+    fn collapse_checked(&mut self, v_keep: u32, v_remove: u32, checked: CollapseCheck) -> MeshResult<EdgeCollapseInfo> {
         let b = v_keep;
         let a = v_remove;
-        let (eab, [t0, t1], c, d, boundary) = self.collapse_check(b, a)?;
+        let (eab, [t0, t1], c, d, boundary) = checked;
 
         let eac = self.find_edge_from_tri(a, c, t0).unwrap();
         let ebc = self.find_edge_from_tri(b, c, t0).unwrap();
@@ -1114,7 +1314,7 @@ impl Mesh {
         self.free_vertex(a);
 
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(EdgeCollapseInfo {
             v_kept: b,
             v_removed: a,
@@ -1154,7 +1354,7 @@ impl Mesh {
         self.replace_edge_triangle(e_bc, t, t1);
         self.replace_edge_triangle(e_ca, t, t2);
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(PokeInfo { v_new: f, t_orig: t, t_new: [t1, t2] })
     }
 
@@ -1205,7 +1405,7 @@ impl Mesh {
             self.free_vertex(v);
         }
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         Ok(nv)
     }
 
@@ -1284,7 +1484,7 @@ impl Mesh {
                 .expect("copying a valid mesh cannot fail");
         }
         self.topo_version = next_version();
-        self.shape_version = next_version();
+        self.touch_shape();
         vmap
     }
 
@@ -1384,7 +1584,7 @@ impl Mesh {
                 self.vpos[i] = f(self.vpos[i]);
             }
         }
-        self.shape_version = next_version();
+        self.touch_shape();
     }
 
     // ------------------------------------------------------------------
@@ -1494,6 +1694,104 @@ impl Mesh {
             ));
         }
         Ok(())
+    }
+
+    /// Panics unless `other` holds exactly the same state, field for field (positions and
+    /// colours bit for bit, free lists in order, versions, cached bounds).
+    #[cfg(test)]
+    pub(crate) fn assert_same_state(&self, other: &Mesh, what: &str) {
+        self.assert_same_content(other, what);
+        let versions = |m: &Mesh| (m.topo_version, m.shape_version, m.group_version, m.color_version);
+        assert_eq!(versions(self), versions(other), "{what}: versions");
+        let cached = |m: &Mesh| m.bounds_cache.get().map(|(v, b)| (*v, b.min.to_array().map(f64::to_bits), b.max.to_array().map(f64::to_bits)));
+        assert_eq!(cached(self), cached(other), "{what}: cached bounds");
+    }
+
+    /// [`Mesh::assert_same_state`] but for the versions and the cached bounds: for two
+    /// meshes that took the same edits separately (each edit takes a fresh version).
+    #[cfg(test)]
+    pub(crate) fn assert_same_content(&self, other: &Mesh, what: &str) {
+        // Spelled out field by field, so that a new field cannot be left out.
+        let Mesh {
+            vpos,
+            vedges,
+            vlive,
+            vfree,
+            nv,
+            tv,
+            te,
+            tgroup,
+            tlive,
+            tfree,
+            nt,
+            ev,
+            et,
+            elive,
+            efree,
+            ne,
+            topo_version: _,
+            shape_version: _,
+            group_version: _,
+            vcolor,
+            color_version: _,
+            bounds_cache: _,
+        } = self;
+        let bits = |v: &[DVec3]| v.iter().map(|p| p.to_array().map(f64::to_bits)).collect::<Vec<_>>();
+        let cbits = |c: &Option<Vec<[f32; 3]>>| c.as_ref().map(|c| c.iter().map(|x| x.map(f32::to_bits)).collect::<Vec<_>>());
+        assert!(bits(vpos) == bits(&other.vpos), "{what}: positions");
+        assert!(*vedges == other.vedges && *vlive == other.vlive && *vfree == other.vfree && *nv == other.nv, "{what}: vertices");
+        assert!(*tv == other.tv && *te == other.te && *tgroup == other.tgroup && *tlive == other.tlive && *tfree == other.tfree && *nt == other.nt, "{what}: triangles");
+        assert!(*ev == other.ev && *et == other.et && *elive == other.elive && *efree == other.efree && *ne == other.ne, "{what}: edges");
+        assert!(cbits(vcolor) == cbits(&other.vcolor), "{what}: colours");
+    }
+
+    /// The copy a derived `Clone` made: every field's own `clone`.
+    #[cfg(test)]
+    pub(crate) fn clone_derived(&self) -> Mesh {
+        Mesh {
+            vpos: self.vpos.clone(),
+            vedges: self.vedges.clone(),
+            vlive: self.vlive.clone(),
+            vfree: self.vfree.clone(),
+            nv: self.nv,
+            tv: self.tv.clone(),
+            te: self.te.clone(),
+            tgroup: self.tgroup.clone(),
+            tlive: self.tlive.clone(),
+            tfree: self.tfree.clone(),
+            nt: self.nt,
+            ev: self.ev.clone(),
+            et: self.et.clone(),
+            elive: self.elive.clone(),
+            efree: self.efree.clone(),
+            ne: self.ne,
+            topo_version: self.topo_version,
+            shape_version: self.shape_version,
+            group_version: self.group_version,
+            vcolor: self.vcolor.clone(),
+            color_version: self.color_version,
+            bounds_cache: self.bounds_cache.clone(),
+        }
+    }
+
+    /// Each vertex's edge list's capacity and whether it lives on the heap.
+    #[cfg(test)]
+    pub(crate) fn edge_list_storage(&self) -> Vec<(usize, bool)> {
+        self.vedges.iter().map(|e| (e.capacity(), e.spilled())).collect()
+    }
+
+    /// Spare capacity (beyond the length) of the vertex, triangle and edge arrays: the least
+    /// over each group.
+    #[cfg(test)]
+    pub(crate) fn spare_capacity(&self) -> [usize; 3] {
+        let spare = |len: usize, caps: &[usize]| caps.iter().map(|c| c - len).min().unwrap_or(0);
+        let mut v = vec![self.vpos.capacity(), self.vedges.capacity(), self.vlive.capacity()];
+        v.extend(self.vcolor.as_ref().map(|c| c.capacity()));
+        [
+            spare(self.vpos.len(), &v),
+            spare(self.tv.len(), &[self.tv.capacity(), self.te.capacity(), self.tgroup.capacity(), self.tlive.capacity()]),
+            spare(self.ev.len(), &[self.ev.capacity(), self.et.capacity(), self.elive.capacity()]),
+        ]
     }
 
     /// True if every interior edge is shared by triangles with opposite winding.

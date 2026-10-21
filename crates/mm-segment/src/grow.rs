@@ -1,6 +1,7 @@
 //! Seeded segmentation, as 3D Slicer's Grow from seeds, Watershed and Fast marching effects.
-//! All three spread labelled seeds through a priority queue of voxels (a binary heap, first
-//! in first out among equal priorities so that even plateaus are shared out by distance):
+//! All three spread labelled seeds through a priority queue of voxels (a binary heap, or for
+//! Grow from seeds, whose priorities only grow, a radix heap; first in first out among equal
+//! priorities so that even plateaus are shared out by distance):
 //!
 //! - **Grow from seeds** ([`grow_from_seeds`]) is GrowCut (Vezhnevets & Konouchine 2005) in
 //!   the shortest-path form of Fast GrowCut (Zhu, Kolesov, Gao, Kikinis & Tannenbaum 2014):
@@ -42,9 +43,11 @@
 //!   Proc. Natl. Acad. Sci. USA 93 (4), 1996, pp. 1591–1595.
 
 use crate::mask::{Connectivity, Mask};
+use crate::region::Region;
+use crate::smooth::{blur_rows, gauss_weights, gradient_magnitude};
 use mm_volume::load::LoadedVolume;
 use rayon::prelude::*;
-use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 /// Smallest standard deviation of the fast-marching speed, as a fraction of the volume's
@@ -72,8 +75,22 @@ pub fn grow_from_seeds(vol: &LoadedVolume, seeds: &[u8], roi: Option<&Mask>, mar
     let scale = intensity_scale(vol);
     let locality = locality.max(0.0) as f32;
     let stencil = Stencil::new(b.dims, Connectivity::Six, spacing(vol));
-    let mut dist = vec![f32::INFINITY; b.len()];
-    let mut queue = Queue::default();
+    // Every step costs +0 or more, so no key pushed falls below the last one taken out, as a
+    // radix heap needs; it holds their order numbers beside them while fewer than 2³² are
+    // pushed (each voxel at most once from each neighbour, and once as a seed).
+    if b.len() <= u32::MAX as usize / 8 {
+        spread(&mut RadixQueue::default(), &values, &mut labels, &allowed, &stencil, scale, locality);
+    } else {
+        spread(&mut Queue::default(), &values, &mut labels, &allowed, &stencil, scale, locality);
+    }
+    write_labels(&b, &mut out, vol.dims, |n| (allowed[n] != 0 && labels[n] != 0).then_some(labels[n]));
+    out
+}
+
+/// The multi-label Dijkstra search of [`grow_from_seeds`] over a box: each allowed voxel takes
+/// the label of the seed it is reached from most cheaply.
+fn spread(queue: &mut impl Frontier, values: &[f32], labels: &mut [u8], allowed: &[u8], stencil: &Stencil, scale: f32, locality: f32) {
+    let mut dist = vec![f32::INFINITY; labels.len()];
     for (n, &l) in labels.iter().enumerate() {
         if l != 0 {
             dist[n] = 0.0;
@@ -98,8 +115,6 @@ pub fn grow_from_seeds(vol: &LoadedVolume, seeds: &[u8], roi: Option<&Mask>, mar
             }
         });
     }
-    b.write(&mut out, vol.dims, |n| (allowed[n] != 0 && labels[n] != 0).then_some(labels[n]));
-    out
 }
 
 /// Marker-based watershed: the gradient magnitude of the image smoothed with a Gaussian of
@@ -138,7 +153,7 @@ pub fn watershed(vol: &LoadedVolume, markers: &[u8], object_scale_mm: f64, roi: 
             }
         });
     }
-    b.write(&mut out, vol.dims, |n| (allowed[n] != 0 && labels[n] != 0).then_some(labels[n]));
+    write_labels(&b, &mut out, vol.dims, |n| (allowed[n] != 0 && labels[n] != 0).then_some(labels[n]));
     out
 }
 
@@ -242,52 +257,106 @@ pub fn fast_march(vol: &LoadedVolume, seed: &Mask, target_voxels: usize) -> Mask
     out
 }
 
-/// A voxel waiting in a [`Queue`].
-#[derive(Clone, Copy)]
-struct Item {
-    key: f32,
-    seq: u32,
-    at: u32,
-}
-
-impl Ord for Item {
-    /// Reversed (`BinaryHeap` pops the greatest): smallest key, then earliest in.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.key.total_cmp(&self.key).then(o.seq.cmp(&self.seq))
+/// The bits of `x` as a number that sorts as [`f32::total_cmp`] sorts `x`.
+pub(crate) fn order_bits(x: f32) -> u32 {
+    let b = x.to_bits();
+    if b >> 31 == 1 {
+        !b
+    } else {
+        b | 1 << 31
     }
 }
 
-impl PartialOrd for Item {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
+/// The `x` of [`order_bits`]`(x)`.
+pub(crate) fn from_order_bits(b: u32) -> f32 {
+    f32::from_bits(if b >> 31 == 1 { b & !(1 << 31) } else { !b })
 }
 
-impl PartialEq for Item {
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == Ordering::Equal
-    }
+/// A priority queue of voxels: smallest key first, first in first out among equal keys.
+trait Frontier {
+    fn push(&mut self, key: f32, at: usize);
+    fn pop(&mut self) -> Option<(f32, usize)>;
 }
-
-impl Eq for Item {}
 
 /// Voxels by smallest key, first in first out among equal keys (the order number wraps
-/// after 4 billion pushes, which only affects ties).
+/// after 4 billion pushes, which only affects ties): a binary heap of the key's [`order_bits`]
+/// and the order number, as one number.
 #[derive(Default)]
 struct Queue {
-    heap: BinaryHeap<Item>,
+    heap: BinaryHeap<Reverse<(u64, u32)>>,
     seq: u32,
 }
 
-impl Queue {
+impl Frontier for Queue {
     fn push(&mut self, key: f32, at: usize) {
         let at = u32::try_from(at).expect("more than 4 billion voxels");
-        self.heap.push(Item { key, seq: self.seq, at });
+        self.heap.push(Reverse(((order_bits(key) as u64) << 32 | self.seq as u64, at)));
         self.seq = self.seq.wrapping_add(1);
     }
 
     fn pop(&mut self) -> Option<(f32, usize)> {
-        self.heap.pop().map(|i| (i.key, i.at as usize))
+        self.heap.pop().map(|Reverse((k, at))| (from_order_bits((k >> 32) as u32), at as usize))
+    }
+}
+
+/// [`Queue`] for keys that never fall below the last one taken out, as in Dijkstra's
+/// algorithm: a radix heap (Ahuja, Mehlhorn, Orlin & Tarjan 1990) of the same numbers, in
+/// buckets by the highest bit in which they differ from the last one out. Taken out in the
+/// same order as [`Queue`] while fewer than 2³² are pushed (the order numbers then stay apart
+/// and grow with every push).
+struct RadixQueue {
+    buckets: Vec<Vec<(u64, u32)>>,
+    last: u64,
+    len: usize,
+    seq: u32,
+}
+
+impl Default for RadixQueue {
+    fn default() -> Self {
+        Self { buckets: (0..65).map(|_| Vec::new()).collect(), last: 0, len: 0, seq: 0 }
+    }
+}
+
+impl RadixQueue {
+    /// Bucket of `k`: 0 when it is the last one out, else one more than the highest bit in
+    /// which they differ.
+    fn bucket(&self, k: u64) -> usize {
+        (64 - (k ^ self.last).leading_zeros()) as usize
+    }
+}
+
+impl Frontier for RadixQueue {
+    fn push(&mut self, key: f32, at: usize) {
+        let at = u32::try_from(at).expect("more than 4 billion voxels");
+        let k = (order_bits(key) as u64) << 32 | self.seq as u64;
+        debug_assert!(k >= self.last, "a key below the last one taken out");
+        self.seq = self.seq.wrapping_add(1);
+        let b = self.bucket(k);
+        self.buckets[b].push((k, at));
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<(f32, usize)> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            // The smallest of the first bucket in use comes out next; the others of that bucket
+            // differ from it in lower bits only, and move down.
+            let i = (1..65).find(|&i| !self.buckets[i].is_empty())?;
+            let mut items = std::mem::take(&mut self.buckets[i]);
+            self.last = items.iter().map(|e| e.0).min()?;
+            for &e in &items {
+                let b = self.bucket(e.0);
+                self.buckets[b].push(e);
+            }
+            items.clear();
+            self.buckets[i] = items;
+        }
+        // Keys never repeat (their order numbers differ): bucket 0 holds one.
+        let (k, at) = self.buckets[0].pop()?;
+        self.len -= 1;
+        Some((from_order_bits((k >> 32) as u32), at as usize))
     }
 }
 
@@ -325,54 +394,16 @@ impl Stencil {
     }
 }
 
-/// A box of the voxel grid: its first voxel and its size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Region {
-    lo: [usize; 3],
-    dims: [usize; 3],
-}
-
-impl Region {
-    fn len(&self) -> usize {
-        self.dims.iter().product()
-    }
-
-    /// Grid voxel of the box's voxel `n`.
-    fn grid(&self, n: usize) -> [usize; 3] {
-        let [nx, ny, _] = self.dims;
-        [n % nx + self.lo[0], (n / nx) % ny + self.lo[1], n / (nx * ny) + self.lo[2]]
-    }
-
-    fn contains(&self, g: [usize; 3]) -> bool {
-        (0..3).all(|a| g[a] >= self.lo[a] && g[a] - self.lo[a] < self.dims[a])
-    }
-
-    /// Grown by `pad` voxels along each axis, within a grid of `grid` voxels.
-    fn grown(&self, pad: [usize; 3], grid: [usize; 3]) -> Region {
-        let lo = [0, 1, 2].map(|a| self.lo[a].saturating_sub(pad[a]));
-        let hi = [0, 1, 2].map(|a| (self.lo[a] + self.dims[a]).saturating_add(pad[a]).min(grid[a]));
-        Region { lo, dims: [0, 1, 2].map(|a| hi[a] - lo[a]) }
-    }
-
-    fn union(&self, o: &Region) -> Region {
-        let lo = [0, 1, 2].map(|a| self.lo[a].min(o.lo[a]));
-        let hi = [0, 1, 2].map(|a| (self.lo[a] + self.dims[a]).max(o.lo[a] + o.dims[a]));
-        Region { lo, dims: [0, 1, 2].map(|a| hi[a] - lo[a]) }
-    }
-
-    /// Write `f(n)`, where it is some, for the box's voxels `n` into a grid label map.
-    fn write(&self, out: &mut [u8], grid: [usize; 3], f: impl Fn(usize) -> Option<u8> + Sync) {
-        let [bx, by, bz] = self.dims;
-        out.par_chunks_mut((grid[0] * grid[1]).max(1)).enumerate().skip(self.lo[2]).take(bz).for_each(|(k, plane)| {
-            for j in 0..by {
-                for i in 0..bx {
-                    if let Some(l) = f(((k - self.lo[2]) * by + j) * bx + i) {
-                        plane[(j + self.lo[1]) * grid[0] + i + self.lo[0]] = l;
-                    }
-                }
+/// Write `f(n)`, where it is some, for the voxels `n` of box `b` into a grid label map.
+fn write_labels(b: &Region, out: &mut [u8], grid: [usize; 3], f: impl Fn(usize) -> Option<u8> + Sync) {
+    let dx = b.dims[0];
+    b.par_rows_mut(out, grid).for_each(|(r, row)| {
+        for (i, o) in row.iter_mut().enumerate() {
+            if let Some(l) = f(r * dx + i) {
+                *o = l;
             }
-        });
-    }
+        }
+    });
 }
 
 /// The bounding box of the non-zero voxels of `data`, if any.
@@ -417,19 +448,18 @@ impl Work {
     fn new(vol: &LoadedVolume, seeds: &[u8], inner: Region, pad: [usize; 3], roi: Option<&Mask>) -> Self {
         let dims = vol.dims;
         let b = inner.grown(pad, dims);
-        let at = |n: usize| {
-            let g = b.grid(n);
-            (g, (g[2] * dims[1] + g[1]) * dims[0] + g[0])
-        };
-        let values = (0..b.len()).into_par_iter().map(|n| vol.values[at(n).1]).collect();
-        let labels = (0..b.len()).into_par_iter().map(|n| seeds[at(n).1]).collect();
-        let allowed = (0..b.len())
-            .into_par_iter()
-            .map(|n| {
-                let (g, i) = at(n);
-                (inner.contains(g) && roi.is_none_or(|m| m.data[i] != 0)) as u8
-            })
-            .collect();
+        let values = b.gather(&vol.values, dims, |v| v);
+        let labels = b.gather(seeds, dims, |l| l);
+        let mut allowed = vec![0u8; b.len()];
+        if !allowed.is_empty() {
+            allowed.par_chunks_mut(b.dims[0]).enumerate().for_each(|(r, row)| {
+                let (j, k) = b.row_jk(r);
+                let at = b.row_start(r, dims);
+                for (x, a) in row.iter_mut().enumerate() {
+                    *a = (inner.contains([b.lo[0] + x, j, k]) && roi.is_none_or(|m| m.data[at + x] != 0)) as u8;
+                }
+            });
+        }
         Self { b, values, labels, allowed }
     }
 }
@@ -452,44 +482,13 @@ fn intensity_scale(vol: &LoadedVolume) -> f32 {
 /// Separable Gaussian blur of a box of `dims` voxels, with standard deviation `sigma` voxels
 /// along each axis (0 = none); the ends of each line are repeated.
 fn blur(values: &mut [f32], dims: [usize; 3], sigma: [f64; 3]) {
-    let strides = [1, dims[0], dims[0] * dims[1]];
-    for ((&s, &len), &stride) in sigma.iter().zip(&dims).zip(&strides) {
+    let kernels = [0, 1, 2].map(|a| {
+        let (s, len) = (sigma[a], dims[a]);
         // Wider than the line itself changes nothing more.
         let r = ((3.0 * s).ceil() as usize).min(2 * len);
-        if s <= 0.0 || r == 0 || len < 2 {
-            continue;
-        }
-        let w: Vec<f64> = (0..=2 * r).map(|t| (-((t as f64 - r as f64).powi(2)) / (2.0 * s * s)).exp()).collect();
-        let total: f64 = w.iter().sum();
-        let w: Vec<f32> = w.iter().map(|x| (x / total) as f32).collect();
-        let src = values.to_vec();
-        values.par_iter_mut().enumerate().for_each(|(n, v)| {
-            let x = (n / stride) % len;
-            let base = n - x * stride;
-            *v = w.iter().enumerate().map(|(t, &wt)| wt * src[base + (x + t).saturating_sub(r).min(len - 1) * stride]).sum();
-        });
-    }
-}
-
-/// Gradient magnitude (per mm) of a box of `dims` voxels, by central differences (one-sided
-/// at the ends of lines).
-fn gradient_magnitude(values: &[f32], dims: [usize; 3], spacing: [f64; 3]) -> Vec<f32> {
-    let strides = [1, dims[0], dims[0] * dims[1]];
-    (0..values.len())
-        .into_par_iter()
-        .map(|n| {
-            let mut g2 = 0.0f32;
-            for ((&len, &s), &h) in dims.iter().zip(&strides).zip(&spacing) {
-                let x = (n / s) % len;
-                let (lo, hi) = (if x > 0 { n - s } else { n }, if x + 1 < len { n + s } else { n });
-                if lo != hi {
-                    let d = (values[hi] - values[lo]) / (((hi - lo) / s) as f64 * h) as f32;
-                    g2 += d * d;
-                }
-            }
-            g2.sqrt()
-        })
-        .collect()
+        (s > 0.0 && r > 0 && len >= 2).then(|| gauss_weights(s, r))
+    });
+    blur_rows(values, dims, kernels);
 }
 
 #[cfg(test)]
@@ -714,5 +713,150 @@ mod tests {
         assert!(dice(&Mask::from_labels(vol.dims, &ws, 1), &truth) > 0.95);
         assert_eq!(fm, truth);
         assert!(grow < 5.0, "{grow} s");
+    }
+
+    /// The queue as it was: a binary heap of (key, order number, voxel) compared by
+    /// `f32::total_cmp`, then by order number.
+    #[derive(Default)]
+    struct OldQueue {
+        heap: BinaryHeap<OldItem>,
+        seq: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct OldItem {
+        key: f32,
+        seq: u32,
+        at: u32,
+    }
+
+    impl Ord for OldItem {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            o.key.total_cmp(&self.key).then(o.seq.cmp(&self.seq))
+        }
+    }
+
+    impl PartialOrd for OldItem {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+
+    impl PartialEq for OldItem {
+        fn eq(&self, o: &Self) -> bool {
+            self.cmp(o) == std::cmp::Ordering::Equal
+        }
+    }
+
+    impl Eq for OldItem {}
+
+    impl Frontier for OldQueue {
+        fn push(&mut self, key: f32, at: usize) {
+            self.heap.push(OldItem { key, seq: self.seq, at: at as u32 });
+            self.seq = self.seq.wrapping_add(1);
+        }
+
+        fn pop(&mut self) -> Option<(f32, usize)> {
+            self.heap.pop().map(|i| (i.key, i.at as usize))
+        }
+    }
+
+    #[test]
+    fn order_bits_sort_as_total_cmp() {
+        let mut xs = vec![f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1e-45, -1e-45, f32::MAX, f32::MIN, 1.0, -1.0, 0.5, 3.25];
+        xs.extend((0..200).map(|n| (noise(n) * 1e3).powi(3)));
+        xs.push(f32::from_bits(0x7fc0_1234));
+        xs.push(f32::from_bits(0xffc0_0001));
+        for &a in &xs {
+            assert_eq!(from_order_bits(order_bits(a)).to_bits(), a.to_bits());
+            for &b in &xs {
+                assert_eq!(order_bits(a).cmp(&order_bits(b)), a.total_cmp(&b), "{a} {b}");
+            }
+        }
+    }
+
+    /// Pushes and pops as a Dijkstra search makes them (keys from the last one out up), with
+    /// many equal keys; the same of each queue.
+    fn drain(q: &mut impl Frontier, seed: usize, monotone: bool) -> Vec<(u32, usize)> {
+        let mut out = Vec::new();
+        for n in 0..20 {
+            q.push(0.0, n);
+        }
+        let mut k = seed * 100_000;
+        for step in 0..30_000 {
+            let Some((key, at)) = q.pop() else { break };
+            out.push((key.to_bits(), at));
+            for _ in 0..(step % 4) {
+                k += 1;
+                let x = noise(k);
+                let bump = (x.max(0.0) * 8.0).round() * 0.125;
+                let key = if monotone { key + bump } else { (noise(k + 7) * 10.0).round() };
+                q.push(key, k % 1000);
+            }
+        }
+        while let Some((key, at)) = q.pop() {
+            out.push((key.to_bits(), at));
+        }
+        out
+    }
+
+    #[test]
+    fn queues_take_out_what_the_old_one_did() {
+        for seed in 0..4 {
+            let old = drain(&mut OldQueue::default(), seed, true);
+            assert_eq!(old, drain(&mut Queue::default(), seed, true));
+            assert_eq!(old, drain(&mut RadixQueue::default(), seed, true));
+            // Keys in any order (as the watershed's), NaN and −0 among them.
+            let old = drain(&mut OldQueue::default(), seed, false);
+            assert_eq!(old, drain(&mut Queue::default(), seed, false));
+        }
+        let mut q = Queue::default();
+        let mut o = OldQueue::default();
+        for (n, x) in [f32::NAN, -0.0, 0.0, -f32::NAN, f32::NEG_INFINITY, 1.0, -0.0, f32::INFINITY].into_iter().enumerate() {
+            q.push(x, n);
+            o.push(x, n);
+        }
+        while let Some((a, n)) = o.pop() {
+            let (b, m) = q.pop().unwrap();
+            assert_eq!((a.to_bits(), n), (b.to_bits(), m));
+        }
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn seeded_growth_is_the_old_one() {
+        let (vol, _) = ball(30, 8.0);
+        let s = seeds(30);
+        for (locality, margin) in [(0.0, 5.0), (0.05, 2.0), (0.0, 0.0)] {
+            let inner = roi_box(&vol, &s, None, margin).unwrap();
+            let work = || Work::new(&vol, &s, inner, [0; 3], None);
+            let stencil = Stencil::new(work().b.dims, Connectivity::Six, spacing(&vol));
+            let scale = intensity_scale(&vol);
+            let (mut a, mut b, mut c) = (work(), work(), work());
+            spread(&mut OldQueue::default(), &a.values, &mut a.labels, &a.allowed, &stencil, scale, locality);
+            spread(&mut RadixQueue::default(), &b.values, &mut b.labels, &b.allowed, &stencil, scale, locality);
+            spread(&mut Queue::default(), &c.values, &mut c.labels, &c.allowed, &stencil, scale, locality);
+            assert_eq!(a.labels, b.labels);
+            assert_eq!(a.labels, c.labels);
+        }
+    }
+
+    #[test]
+    fn blur_and_gradient_are_the_old_ones() {
+        use crate::reference::{voxel_blur, voxel_gradient, DIMS, SPACINGS};
+        for &dims in &DIMS {
+            let n = dims.iter().product::<usize>();
+            let v: Vec<f32> = (0..n).map(|q| 100.0 * noise(q * 3 + dims[0])).collect();
+            for sigma in [[0.0, 0.0, 0.0], [0.5, 1.0, 2.5], [1.0, 0.3, 0.0], [7.0, f64::NAN, 1e-3], [0.01, 4.0, 0.05]] {
+                let (mut a, mut b) = (v.clone(), v.clone());
+                voxel_blur(&mut a, dims, sigma, false);
+                blur(&mut b, dims, sigma);
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{dims:?} {sigma:?}");
+                for sp in SPACINGS {
+                    let (ga, gb) = (voxel_gradient(&a, dims, sp), gradient_magnitude(&b, dims, sp));
+                    assert!(ga.iter().zip(&gb).all(|(x, y)| x.to_bits() == y.to_bits()), "{dims:?} {sp:?}");
+                }
+            }
+        }
     }
 }

@@ -11,8 +11,9 @@
 
 use crate::tube_mesh;
 use glam::DVec3;
+use mm_core::hash::FastMap;
 use mm_core::{Bvh, Mesh};
-use std::collections::HashMap;
+use rayon::prelude::*;
 
 /// How strands are rooted on the selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -165,7 +166,8 @@ impl AreaSampler {
 /// throwing against a hash grid; gives up after 40 misses per point on average).
 fn poisson_roots(mesh: &Mesh, area: &AreaSampler, n: usize, r: f64, rng: &mut Rng) -> Vec<Root> {
     let mut out: Vec<Root> = Vec::with_capacity(n);
-    let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+    // Looked up by cell only, never walked, so the hasher cannot change the result.
+    let mut grid: FastMap<[i64; 3], Vec<usize>> = FastMap::default();
     let cell = |p: DVec3| (p / r).floor().to_array().map(|x| x as i64);
     let mut tries = 0;
     while out.len() < n && tries < 40 * n + 100 {
@@ -214,15 +216,35 @@ fn keep_out(mesh: &Mesh, bvh: &Bvh, q: &mut DVec3, clearance: f64, reach: f64) -
     false
 }
 
-/// One strand from `root`.
-fn grow(mesh: &Mesh, bvh: &Bvh, root: &Root, p: &HairParams, rng: &mut Rng) -> Vec<DVec3> {
+/// Strands grown together by one parallel task: a strand without collisions costs only
+/// microseconds, too little to hand out one at a time.
+const STRANDS_PER_TASK: usize = 16;
+
+/// A strand's random start angle for its curl: the one draw it makes.
+fn phase(rng: &mut Rng) -> f64 {
+    rng.next() * std::f64::consts::TAU
+}
+
+/// Strands from `roots`, each with its curl's start angle. The random numbers are all drawn
+/// beforehand, in the order the strands used to draw them one after another, so the strands
+/// grow in parallel and come out the very same, in the same order.
+fn grow_all(mesh: &Mesh, bvh: &Bvh, roots: &[(Root, f64)], p: &HairParams) -> Vec<Vec<DVec3>> {
+    roots.par_iter().with_min_len(STRANDS_PER_TASK).map(|(r, phase)| grow(mesh, bvh, r, p, *phase)).collect()
+}
+
+/// The roots with a start angle each, drawn in their order.
+fn with_phases(roots: &[Root], rng: &mut Rng) -> Vec<(Root, f64)> {
+    roots.iter().map(|r| (*r, phase(rng))).collect()
+}
+
+/// One strand from `root`, its curl starting at angle `phase`.
+fn grow(mesh: &Mesh, bvh: &Bvh, root: &Root, p: &HairParams, phase: f64) -> Vec<DVec3> {
     let down = p.down.normalize_or(-DVec3::Y);
     let seg = p.length / (p.points - 1) as f64;
     let clearance = p.base_radius.max(p.tip_radius) * 1.5;
     let n = root.n;
     // Curl frame around the root normal, with a random start angle.
     let (u, v) = mm_core::geom::orthonormal_basis(n);
-    let phase = rng.next() * std::f64::consts::TAU;
     let mut dir = n;
     let mut spine = root.p;
     let mut pts = vec![root.p];
@@ -263,16 +285,20 @@ pub fn hair_curves(mesh: &Mesh, bvh: &Bvh, tris: &[u32], p: &HairParams) -> Vec<
     }
     let mut rng = Rng(p.seed.max(1));
     match p.mode {
-        HairMode::Count => (0..p.count)
-            .map(|_| {
-                let r = area.sample(mesh, &mut rng);
-                grow(mesh, bvh, &r, p, &mut rng)
-            })
-            .collect(),
+        HairMode::Count => {
+            // Each strand's root, then its start angle.
+            let roots: Vec<(Root, f64)> = (0..p.count)
+                .map(|_| {
+                    let r = area.sample(mesh, &mut rng);
+                    (r, phase(&mut rng))
+                })
+                .collect();
+            grow_all(mesh, bvh, &roots, p)
+        }
         HairMode::FillDensity => {
             let n = fill_count(area.total, p.density);
             let roots = poisson_roots(mesh, &area, n, fill_spacing(p.density), &mut rng);
-            roots.iter().map(|r| grow(mesh, bvh, r, p, &mut rng)).collect()
+            grow_all(mesh, bvh, &with_phases(&roots, &mut rng), p)
         }
         HairMode::HairPatch => patches(mesh, bvh, &area, p, &mut rng),
     }
@@ -287,39 +313,44 @@ fn patches(mesh: &Mesh, bvh: &Bvh, area: &AreaSampler, p: &HairParams, rng: &mut
     // Guides spread evenly: no two closer than half their mean spacing.
     let spacing = 0.5 * (area.total / n_guides as f64).sqrt();
     let roots = poisson_roots(mesh, area, n_guides, spacing, rng);
-    let guides: Vec<Vec<DVec3>> = roots.iter().map(|r| grow(mesh, bvh, r, p, rng)).collect();
+    let guides = grow_all(mesh, bvh, &with_phases(&roots, rng), p);
+    // The followers' roots are drawn in order; their strands draw nothing, so they are made in
+    // parallel.
+    let followers: Vec<Root> = (guides.len()..p.count).map(|_| area.sample(mesh, rng)).collect();
+    let strands: Vec<Vec<DVec3>> = followers.par_iter().with_min_len(STRANDS_PER_TASK).map(|r| follow(mesh, bvh, &roots, &guides, p, r)).collect();
+    let mut out = guides;
+    out.extend(strands);
+    out
+}
+
+/// A Hair Patch strand rooted at `r`, following the guides (grown from `roots`) around it.
+fn follow(mesh: &Mesh, bvh: &Bvh, roots: &[Root], guides: &[Vec<DVec3>], p: &HairParams, r: &Root) -> Vec<DVec3> {
     let clearance = p.base_radius.max(p.tip_radius) * 1.5;
     let pull = p.clumping.clamp(0.0, 1.0);
-    let mut out = guides.clone();
-    for _ in guides.len()..p.count {
-        let r = area.sample(mesh, rng);
-        let root = r.p;
-        // The strand's shape: the guides around its root, blended by inverse squared
-        // distance, so the hair flows on smoothly from one patch to the next. Guides on the
-        // far side of a thin part (facing the other way) are not "around" it.
-        let facing = |i: &usize| roots[*i].n.dot(r.n) > 0.0;
-        let pool: Vec<usize> = if (0..guides.len()).any(|i| facing(&i)) { (0..guides.len()).filter(facing).collect() } else { (0..guides.len()).collect() };
-        let mut near: Vec<(f64, usize)> = pool.into_iter().map(|i| (guides[i][0].distance_squared(root), i)).collect();
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        near.truncate(3);
-        let w: Vec<f64> = near.iter().map(|&(d2, _)| 1.0 / (d2 + 1e-12 * p.length * p.length)).collect();
-        let wsum: f64 = w.iter().sum();
-        let own = &guides[near[0].1];
-        let strand = (0..p.points)
-            .map(|k| {
-                let s = k as f64 / (p.points - 1) as f64;
-                let shape: DVec3 = near.iter().zip(&w).map(|(&(_, i), &wi)| (guides[i][k] - guides[i][0]) * (wi / wsum)).sum();
-                // Clumping: drawn toward its own guide, the more the nearer the tip.
-                let mut q = (root + shape).lerp(own[k], pull * s);
-                if p.collisions && k > 0 {
-                    keep_out(mesh, bvh, &mut q, clearance, clearance * 4.0 + p.length);
-                }
-                q
-            })
-            .collect();
-        out.push(strand);
-    }
-    out
+    let root = r.p;
+    // The strand's shape: the guides around its root, blended by inverse squared
+    // distance, so the hair flows on smoothly from one patch to the next. Guides on the
+    // far side of a thin part (facing the other way) are not "around" it.
+    let facing = |i: &usize| roots[*i].n.dot(r.n) > 0.0;
+    let pool: Vec<usize> = if (0..guides.len()).any(|i| facing(&i)) { (0..guides.len()).filter(facing).collect() } else { (0..guides.len()).collect() };
+    let mut near: Vec<(f64, usize)> = pool.into_iter().map(|i| (guides[i][0].distance_squared(root), i)).collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    near.truncate(3);
+    let w: Vec<f64> = near.iter().map(|&(d2, _)| 1.0 / (d2 + 1e-12 * p.length * p.length)).collect();
+    let wsum: f64 = w.iter().sum();
+    let own = &guides[near[0].1];
+    (0..p.points)
+        .map(|k| {
+            let s = k as f64 / (p.points - 1) as f64;
+            let shape: DVec3 = near.iter().zip(&w).map(|(&(_, i), &wi)| (guides[i][k] - guides[i][0]) * (wi / wsum)).sum();
+            // Clumping: drawn toward its own guide, the more the nearer the tip.
+            let mut q = (root + shape).lerp(own[k], pull * s);
+            if p.collisions && k > 0 {
+                keep_out(mesh, bvh, &mut q, clearance, clearance * 4.0 + p.length);
+            }
+            q
+        })
+        .collect()
 }
 
 /// Tapered tubes along the strands, as one mesh.
@@ -369,6 +400,64 @@ mod tests {
         m.check_validity().unwrap();
         assert!(m.is_closed());
         assert_eq!(mm_core::topology::connected_components(&m).len(), 50);
+    }
+
+    /// The strands made one after another, each drawing its start angle when it starts
+    /// growing and each Hair Patch follower drawing its root when it is made: the order the
+    /// random numbers were drawn in before the strands grew in parallel.
+    fn one_by_one(mesh: &Mesh, bvh: &Bvh, tris: &[u32], p: &HairParams) -> Vec<Vec<DVec3>> {
+        let area = AreaSampler::new(mesh, tris);
+        if area.tris.is_empty() || p.points < 2 || p.length.is_nan() || p.length <= 0.0 {
+            return Vec::new();
+        }
+        let mut rng = Rng(p.seed.max(1));
+        let grow_now = |r: &Root, rng: &mut Rng| {
+            let a = phase(rng);
+            grow(mesh, bvh, r, p, a)
+        };
+        match p.mode {
+            HairMode::Count => (0..p.count)
+                .map(|_| {
+                    let r = area.sample(mesh, &mut rng);
+                    grow_now(&r, &mut rng)
+                })
+                .collect(),
+            HairMode::FillDensity => {
+                let roots = poisson_roots(mesh, &area, fill_count(area.total, p.density), fill_spacing(p.density), &mut rng);
+                roots.iter().map(|r| grow_now(r, &mut rng)).collect()
+            }
+            HairMode::HairPatch => {
+                if p.count == 0 {
+                    return Vec::new();
+                }
+                let n_guides = p.clumps.clamp(1, p.count);
+                let roots = poisson_roots(mesh, &area, n_guides, 0.5 * (area.total / n_guides as f64).sqrt(), &mut rng);
+                let guides: Vec<Vec<DVec3>> = roots.iter().map(|r| grow_now(r, &mut rng)).collect();
+                let mut out = guides.clone();
+                for _ in guides.len()..p.count {
+                    let r = area.sample(mesh, &mut rng);
+                    out.push(follow(mesh, bvh, &roots, &guides, p, &r));
+                }
+                out
+            }
+        }
+    }
+
+    #[test]
+    fn strands_grown_in_parallel_are_the_ones_grown_one_by_one() {
+        let ball = primitives::icosphere(10.0, 3);
+        let bvh = Bvh::build(&ball);
+        let cap: Vec<u32> = ball.triangle_ids().filter(|&t| ball.tri_centroid(t).z > 2.0).collect();
+        let base = HairParams { count: 300, length: 8.0, curl_radius: 0.6, curl_pitch: 3.0, gravity: 0.6, down: -DVec3::X, density: 0.5, clumps: 9, seed: 99, ..Default::default() };
+        for mode in [HairMode::Count, HairMode::FillDensity, HairMode::HairPatch] {
+            for collisions in [true, false] {
+                let p = HairParams { mode, collisions, ..base };
+                let (a, b) = (hair_curves(&ball, &bvh, &cap, &p), one_by_one(&ball, &bvh, &cap, &p));
+                assert!(a.len() > 50, "{mode:?}");
+                let bits = |c: &[Vec<DVec3>]| c.iter().flatten().flat_map(|q| q.to_array().map(f64::to_bits)).collect::<Vec<u64>>();
+                assert_eq!(bits(&a), bits(&b), "{mode:?}, collisions {collisions}");
+            }
+        }
     }
 
     #[test]

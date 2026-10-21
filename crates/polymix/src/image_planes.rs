@@ -203,6 +203,8 @@ struct PlaneGpu {
     bind: wgpu::BindGroup,
     shown: Shown,
     uv_max: [f32; 2],
+    /// What `uniform` holds (written again only when it changes).
+    written: Option<PlaneUniform>,
 }
 
 /// Draws the planes of a [`PlanesFrame`] into the Mesh renderer's pass (its colour, depth
@@ -218,6 +220,8 @@ pub struct ImagePlanesGpu {
     /// Quarters (plane, quarter) to draw this frame, back to front.
     pieces: Vec<(usize, u32)>,
     blended: bool,
+    /// Changes whenever what [`Self::draw`] draws does (see [`Self::stamp`]).
+    stamp: u64,
 }
 
 impl ImagePlanesGpu {
@@ -280,7 +284,7 @@ impl ImagePlanesGpu {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        Self { opaque: pipeline(false), see_through: pipeline(true), layout, sampler, frame: None, planes: Default::default(), pieces: Vec::new(), blended: false }
+        Self { opaque: pipeline(false), see_through: pipeline(true), layout, sampler, frame: None, planes: Default::default(), pieces: Vec::new(), blended: false, stamp: 0 }
     }
 
     /// The planes to show in the next frame only (`None`: none; their textures are freed).
@@ -291,15 +295,31 @@ impl ImagePlanesGpu {
     /// Upload what this frame needs (textures only when a plane's volume, slice or window has
     /// changed) and order the pieces to draw back to front for `globals`' view.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, globals: &Globals) {
-        self.pieces.clear();
+        let (pieces, blended) = (std::mem::take(&mut self.pieces), self.blended);
+        let uploaded = self.update(device, queue, globals);
+        // How the planes blend matters only when there are any.
+        if uploaded || self.pieces != pieces || (!self.pieces.is_empty() && self.blended != blended) {
+            self.stamp += 1;
+        }
+    }
+
+    /// Changes whenever the planes drawn change: their pieces or order, blending, textures
+    /// or uniforms. The renderer compares it to know whether a frame needs drawing again.
+    pub fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// [`Self::prepare`] with no pieces yet; returns whether a texture or uniform was written.
+    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, globals: &Globals) -> bool {
         let Some(PlanesFrame { volume: vol, settings: s }) = self.frame.take() else {
             self.planes = Default::default();
-            return;
+            return false;
         };
         let opacity = s.opacity.clamp(0.0, 1.0);
         if opacity == 0.0 && !s.outline {
-            return;
+            return false;
         }
+        let mut uploaded = false;
         self.blended = opacity < 1.0;
         let view = Mat4::from_cols_array_2d(&globals.view);
         let mut pieces: Vec<(f32, usize, u32)> = Vec::new();
@@ -312,8 +332,9 @@ impl ImagePlanesGpu {
             if !self.planes[i].as_ref().is_some_and(|p| p.shown.same(&shown)) {
                 let Some(img) = plane_image(&vol, plane, &s) else { continue };
                 self.upload(device, queue, i, &img, shown);
+                uploaded = true;
             }
-            let Some(gpu) = &self.planes[i] else { continue };
+            let Some(gpu) = &mut self.planes[i] else { continue };
             let [o, a, _, d] = corners(&vol, axes, slice, s.lps).map(|p| p.as_vec3());
             let (across, down) = (a - o, d - o);
             // The other planes cut this one through the centres of the cursor's voxels.
@@ -328,7 +349,11 @@ impl ImagePlanesGpu {
                 outline: [c.r(), c.g(), c.b(), s.outline as u32 as f32],
                 misc: [opacity, 0.0, 0.0, 0.0],
             };
-            queue.write_buffer(&gpu.uniform, 0, bytemuck::bytes_of(&u));
+            if gpu.written.as_ref().is_none_or(|w| bytemuck::bytes_of(w) != bytemuck::bytes_of(&u)) {
+                queue.write_buffer(&gpu.uniform, 0, bytemuck::bytes_of(&u));
+                gpu.written = Some(u);
+                uploaded = true;
+            }
             for q in 0..4u32 {
                 let mid = |upper: bool, at: f32| if upper { (at + 1.0) * 0.5 } else { at * 0.5 };
                 let p = o + across * mid(q & 1 != 0, sx) + down * mid(q & 2 != 0, sy);
@@ -338,6 +363,7 @@ impl ImagePlanesGpu {
         // The view looks down -z: the farthest pieces have the lowest z.
         pieces.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.pieces = pieces.into_iter().map(|(_, i, q)| (i, q)).collect();
+        uploaded
     }
 
     /// Put `img` in plane `i`'s texture (re-made when its size changes).
@@ -373,7 +399,7 @@ impl ImagePlanesGpu {
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     ],
                 });
-                PlaneGpu { texture, uniform, bind, shown: Shown { volume: Weak::new(), slice: 0, window: [0; 2] }, uv_max: [1.0; 2] }
+                PlaneGpu { texture, uniform, bind, shown: Shown { volume: Weak::new(), slice: 0, window: [0; 2] }, uv_max: [1.0; 2], written: None }
             }
         };
         queue.write_texture(

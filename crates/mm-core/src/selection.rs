@@ -2,6 +2,7 @@
 //! (expand/contract, connected, invert, boundary optimisation, brush painting).
 
 use crate::bvh::Bvh;
+use crate::hash::{FastMap, FastSet};
 use crate::mesh::{Mesh, INVALID};
 use glam::DVec3;
 
@@ -28,6 +29,11 @@ impl TriSelection {
     }
     /// Resize for a mesh whose triangle id range may have grown, dropping dead ids.
     pub fn sync(&mut self, m: &Mesh) {
+        if self.count == 0 {
+            // Nothing selected, so nothing to drop: only the size changes.
+            self.grow_to(m.max_tid());
+            return;
+        }
         self.bits.resize(m.max_tid(), false);
         self.count = 0;
         for t in 0..self.bits.len() {
@@ -38,6 +44,16 @@ impl TriSelection {
                 self.count += 1;
             }
         }
+    }
+
+    /// Size the bitmap for `max_tid` triangle slots (usually growing it), without checking
+    /// which triangles are live. For an empty selection this is all [`TriSelection::sync`]
+    /// does; with triangles selected, `sync` also drops the dead ones.
+    pub fn grow_to(&mut self, max_tid: usize) {
+        if max_tid < self.bits.len() {
+            self.count -= self.bits[max_tid..].iter().filter(|&&b| b).count();
+        }
+        self.bits.resize(max_tid, false);
     }
     #[inline]
     pub fn contains(&self, t: u32) -> bool {
@@ -249,36 +265,8 @@ impl TriSelection {
     /// triangles (back faces, interior faces); the seed triangle is always eligible.
     /// Returns the number of triangles changed.
     pub fn paint_brush(&mut self, m: &Mesh, bvh: &Bvh, stamp: &BrushStamp, allow: impl Fn(u32) -> bool, deselect: bool) -> usize {
-        let BrushStamp { shape, seed, center, normal, radius, crease_cos } = *stamp;
-        let region: Vec<u32> = match shape {
-            BrushShape::Sphere => {
-                let mut out = Vec::new();
-                bvh.query_sphere(m, center, radius, |t| {
-                    if t == seed || allow(t) {
-                        out.push(t);
-                    }
-                });
-                if !out.contains(&seed) {
-                    out.push(seed);
-                }
-                out
-            }
-            BrushShape::SphereDisc => {
-                // Connected part of the sphere within a slab around the tangent plane.
-                let half = radius * 0.35;
-                let mut inside = std::collections::HashSet::new();
-                bvh.query_sphere(m, center, radius, |t| {
-                    if allow(t) && (m.tri_centroid(t) - center).dot(normal).abs() <= half {
-                        inside.insert(t);
-                    }
-                });
-                inside.insert(seed);
-                flood_across(m, seed, |t| inside.contains(&t), crease_cos)
-            }
-            BrushShape::Unwrap => geodesic_disc(m, seed, center, radius, &allow, crease_cos),
-        };
         let mut n = 0;
-        for t in region {
+        for t in brush_region(m, bvh, stamp, allow) {
             let changed = if deselect { self.remove(t) } else { self.insert(t) };
             if changed {
                 n += 1;
@@ -288,12 +276,47 @@ impl TriSelection {
     }
 }
 
+/// The triangles one brush stamp covers, in the order they are found.
+fn brush_region(m: &Mesh, bvh: &Bvh, stamp: &BrushStamp, allow: impl Fn(u32) -> bool) -> Vec<u32> {
+    let BrushStamp { shape, seed, center, normal, radius, crease_cos } = *stamp;
+    match shape {
+        BrushShape::Sphere => {
+            let mut out = Vec::new();
+            bvh.query_sphere(m, center, radius, |t| {
+                if t == seed || allow(t) {
+                    out.push(t);
+                }
+            });
+            if !out.contains(&seed) {
+                out.push(seed);
+            }
+            out
+        }
+        BrushShape::SphereDisc => {
+            // Connected part of the sphere within a slab around the tangent plane.
+            let half = radius * 0.35;
+            let mut inside = FastSet::default();
+            bvh.query_sphere(m, center, radius, |t| {
+                if allow(t) && (m.tri_centroid(t) - center).dot(normal).abs() <= half {
+                    inside.insert(t);
+                }
+            });
+            inside.insert(seed);
+            flood_across(m, seed, |t| inside.contains(&t), crease_cos, &mut FastSet::default())
+        }
+        BrushShape::Unwrap => geodesic_disc(m, seed, center, radius, &allow, crease_cos),
+    }
+}
+
 /// Magic wand: the faces edge-connected to `seed` whose normals are within `max_angle`
 /// (radians) of the seed's normal, not crossing creases sharper than `crease_cos`.
 pub fn magic_wand(m: &Mesh, seed: u32, max_angle: f64, crease_cos: Option<f64>) -> Vec<u32> {
     let n0 = m.tri_normal(seed);
     let c = max_angle.cos();
-    flood_across(m, seed, |t| m.tri_normal(t).dot(n0) >= c, crease_cos)
+    // The wand can take a whole part, so it marks a bitmap over all triangles rather than
+    // hashing each one.
+    let mut seen = vec![false; m.max_tid()];
+    flood_across(m, seed, |t| m.tri_normal(t).dot(n0) >= c, crease_cos, &mut seen)
 }
 
 /// One brush stamp for [`TriSelection::paint_brush`].
@@ -316,16 +339,45 @@ pub fn is_crease(m: &Mesh, a: u32, b: u32, crease_cos: Option<f64>) -> bool {
     crease_cos.is_some_and(|c| m.tri_normal(a).dot(m.tri_normal(b)) < c)
 }
 
+/// The triangles a flood has taken: a bitmap over all triangle ids for floods that may
+/// cover much of the mesh, a hash set for the small ones of a brush stamp.
+trait Taken {
+    fn has(&self, t: u32) -> bool;
+    fn take(&mut self, t: u32);
+}
+
+impl Taken for Vec<bool> {
+    #[inline]
+    fn has(&self, t: u32) -> bool {
+        self[t as usize]
+    }
+    #[inline]
+    fn take(&mut self, t: u32) {
+        self[t as usize] = true;
+    }
+}
+
+impl Taken for FastSet<u32> {
+    #[inline]
+    fn has(&self, t: u32) -> bool {
+        self.contains(&t)
+    }
+    #[inline]
+    fn take(&mut self, t: u32) {
+        self.insert(t);
+    }
+}
+
 /// Edge-connected flood from `seed` through triangles accepted by `accept`, not crossing
-/// creases.
-fn flood_across(m: &Mesh, seed: u32, accept: impl Fn(u32) -> bool, crease_cos: Option<f64>) -> Vec<u32> {
-    let mut seen = std::collections::HashSet::from([seed]);
+/// creases, in the order the triangles are reached. `seen` starts empty.
+fn flood_across(m: &Mesh, seed: u32, accept: impl Fn(u32) -> bool, crease_cos: Option<f64>, seen: &mut impl Taken) -> Vec<u32> {
+    seen.take(seed);
     let mut out = vec![seed];
     let mut stack = vec![seed];
     while let Some(t) = stack.pop() {
         for n in m.tri_neighbors(t) {
-            if n != INVALID && !seen.contains(&n) && accept(n) && !is_crease(m, t, n, crease_cos) {
-                seen.insert(n);
+            if n != INVALID && !seen.has(n) && accept(n) && !is_crease(m, t, n, crease_cos) {
+                seen.take(n);
                 out.push(n);
                 stack.push(n);
             }
@@ -350,7 +402,7 @@ pub enum BrushShape {
 /// seed through triangles whose corners average within the radius, accepted by `allow`, and
 /// not across creases.
 fn geodesic_disc(m: &Mesh, seed: u32, center: DVec3, radius: f64, allow: &impl Fn(u32) -> bool, crease_cos: Option<f64>) -> Vec<u32> {
-    use std::collections::{BinaryHeap, HashMap};
+    use std::collections::BinaryHeap;
     #[derive(PartialEq)]
     struct Item(f64, u32);
     impl Eq for Item {}
@@ -364,7 +416,8 @@ fn geodesic_disc(m: &Mesh, seed: u32, center: DVec3, radius: f64, allow: &impl F
             o.0.total_cmp(&self.0)
         }
     }
-    let mut dist: HashMap<u32, f64> = HashMap::new();
+    // Looked up only, never walked, so its order cannot show.
+    let mut dist: FastMap<u32, f64> = FastMap::default();
     let mut heap = BinaryHeap::new();
     for v in m.triangle(seed) {
         let d = m.vertex(v).distance(center);
@@ -388,7 +441,7 @@ fn geodesic_disc(m: &Mesh, seed: u32, center: DVec3, radius: f64, allow: &impl F
         let tv = m.triangle(t);
         tv.iter().all(|u| dist.contains_key(u)) && tv.iter().map(|u| dist[u]).sum::<f64>() / 3.0 <= radius
     };
-    flood_across(m, seed, |t| within(t) && allow(t), crease_cos)
+    flood_across(m, seed, |t| within(t) && allow(t), crease_cos, &mut FastSet::default())
 }
 
 #[cfg(test)]
@@ -514,5 +567,146 @@ mod tests {
         for t in s.iter() {
             assert!(m.tri_centroid(t).z > 0.5);
         }
+    }
+
+    /// The flood as it was, with a std `HashSet`.
+    fn flood_std(m: &Mesh, seed: u32, accept: impl Fn(u32) -> bool, crease_cos: Option<f64>) -> Vec<u32> {
+        let mut seen = std::collections::HashSet::from([seed]);
+        let mut out = vec![seed];
+        let mut stack = vec![seed];
+        while let Some(t) = stack.pop() {
+            for n in m.tri_neighbors(t) {
+                if n != INVALID && !seen.contains(&n) && accept(n) && !is_crease(m, t, n, crease_cos) {
+                    seen.insert(n);
+                    out.push(n);
+                    stack.push(n);
+                }
+            }
+        }
+        out
+    }
+
+    /// The brush region as it was, with std hash sets and maps.
+    fn region_std(m: &Mesh, bvh: &Bvh, stamp: &BrushStamp, allow: impl Fn(u32) -> bool) -> Vec<u32> {
+        let BrushStamp { shape, seed, center, normal, radius, crease_cos } = *stamp;
+        match shape {
+            BrushShape::Sphere => brush_region(m, bvh, stamp, allow),
+            BrushShape::SphereDisc => {
+                let half = radius * 0.35;
+                let mut inside = std::collections::HashSet::new();
+                bvh.query_sphere(m, center, radius, |t| {
+                    if allow(t) && (m.tri_centroid(t) - center).dot(normal).abs() <= half {
+                        inside.insert(t);
+                    }
+                });
+                inside.insert(seed);
+                flood_std(m, seed, |t| inside.contains(&t), crease_cos)
+            }
+            BrushShape::Unwrap => {
+                #[derive(PartialEq)]
+                struct Item(f64, u32);
+                impl Eq for Item {}
+                impl PartialOrd for Item {
+                    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                        Some(self.cmp(o))
+                    }
+                }
+                impl Ord for Item {
+                    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                        o.0.total_cmp(&self.0)
+                    }
+                }
+                let mut dist: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+                let mut heap = std::collections::BinaryHeap::new();
+                for v in m.triangle(seed) {
+                    let d = m.vertex(v).distance(center);
+                    dist.insert(v, d);
+                    heap.push(Item(d, v));
+                }
+                while let Some(Item(d, v)) = heap.pop() {
+                    if d > dist.get(&v).copied().unwrap_or(f64::INFINITY) || d > radius {
+                        continue;
+                    }
+                    let p = m.vertex(v);
+                    for u in m.vertex_neighbors(v) {
+                        let nd = d + p.distance(m.vertex(u));
+                        if nd < dist.get(&u).copied().unwrap_or(f64::INFINITY) {
+                            dist.insert(u, nd);
+                            heap.push(Item(nd, u));
+                        }
+                    }
+                }
+                let within = |t: u32| {
+                    let tv = m.triangle(t);
+                    tv.iter().all(|u| dist.contains_key(u)) && tv.iter().map(|u| dist[u]).sum::<f64>() / 3.0 <= radius
+                };
+                flood_std(m, seed, |t| within(t) && allow(t), crease_cos)
+            }
+        }
+    }
+
+    #[test]
+    fn floods_unchanged_by_their_sets() {
+        // A cube (creases), a lumpy sphere and a folded double plate.
+        let mut lumpy = primitives::icosphere(1.0, 4);
+        lumpy.transform(|p| p * (1.0 + 0.2 * (5.0 * p.x).sin() * (4.0 * p.y).cos()));
+        let mut plates = primitives::plane_grid(4.0, 4.0, 40, 40);
+        let mut b = primitives::plane_grid(4.0, 4.0, 40, 40);
+        b.transform(|p| p + DVec3::new(0.0, 0.0, 0.3));
+        plates.append_mesh(&b, 0);
+        for m in [primitives::cube(2.0, 10), lumpy, plates] {
+            let bvh = Bvh::build(&m);
+            let ids: Vec<u32> = m.triangle_ids().collect();
+            let diag = m.bounds().diagonal();
+            for (k, &seed) in ids.iter().step_by(ids.len() / 23).enumerate() {
+                let crease = [None, Some(20f64.to_radians().cos()), Some(60f64.to_radians().cos())][k % 3];
+                for angle in [10.0f64, 45.0, 180.0] {
+                    let n0 = m.tri_normal(seed);
+                    let c = angle.to_radians().cos();
+                    assert_eq!(magic_wand(&m, seed, angle.to_radians(), crease), flood_std(&m, seed, |t| m.tri_normal(t).dot(n0) >= c, crease));
+                }
+                let center = m.tri_centroid(seed);
+                for shape in [BrushShape::Sphere, BrushShape::SphereDisc, BrushShape::Unwrap] {
+                    for r in [0.02, 0.1, 0.3] {
+                        let stamp = BrushStamp { shape, seed, center, normal: m.tri_normal(seed), radius: r * diag, crease_cos: crease };
+                        let allow = |t: u32| t % 7 != 3;
+                        assert_eq!(brush_region(&m, &bvh, &stamp, allow), region_std(&m, &bvh, &stamp, allow), "{shape:?} r {r}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grow_to_is_sync_for_empty_selections() {
+        let mut m = primitives::icosphere(1.0, 2);
+        let mut a = TriSelection::new(&m);
+        let mut b = TriSelection::new(&m);
+        // Grow (new triangles), then shrink (a smaller mesh in its place).
+        for e in m.edge_ids().step_by(5).collect::<Vec<_>>() {
+            let _ = m.split_edge(e);
+        }
+        a.sync(&m);
+        b.grow_to(m.max_tid());
+        assert_eq!(a, b);
+        let small = primitives::icosphere(1.0, 1);
+        a.sync(&small);
+        b.grow_to(small.max_tid());
+        assert_eq!(a, b);
+        assert_eq!(b.bits().len(), small.max_tid());
+        // With triangles selected, the count follows what is cut off.
+        let mut s = TriSelection::all(&m);
+        s.grow_to(100);
+        assert_eq!(s.len(), 100);
+        assert_eq!(s.iter().count(), 100);
+        s.grow_to(m.max_tid());
+        assert_eq!(s.len(), 100);
+        // sync's shortcut for empty selections leaves the same state as its full walk.
+        let mut full = TriSelection::all(&m);
+        full.clear();
+        let mut fresh = TriSelection::new(&primitives::icosphere(1.0, 3));
+        full.sync(&small);
+        fresh.sync(&small);
+        assert_eq!(full, fresh);
     }
 }

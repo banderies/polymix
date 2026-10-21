@@ -27,7 +27,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use glam::DVec3;
 use mm_core::mesh::BuildReport;
 use mm_core::Mesh;
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
@@ -315,10 +314,15 @@ fn finish(mut raw: Raw, format: Format, opts: &ReadOptions) -> Result<ImportedMe
     // UVs by triangle id: each kept triangle is found by its corners (as given); those split
     // off at non-manifold vertices get none.
     let uvs = raw.uvs.map(|u| {
-        let by_corners: HashMap<[u32; 3], usize> = raw.triangles.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+        // Inserted in file order: of triangles with the same corners, the last one's UVs win.
+        let mut by_corners: weld::FastMap<weld::Key3<u32>, usize> = weld::FastMap::default();
+        by_corners.reserve(raw.triangles.len());
+        for (i, &t) in raw.triangles.iter().enumerate() {
+            by_corners.insert(weld::Key3(t), i);
+        }
         let mut out = vec![[[0.0f32; 2]; 3]; mesh.max_tid()];
         for t in mesh.triangle_ids() {
-            if let Some(&i) = by_corners.get(&mesh.triangle(t)) {
+            if let Some(&i) = by_corners.get(&weld::Key3(mesh.triangle(t))) {
                 out[t as usize] = u[i];
             }
         }

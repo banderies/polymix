@@ -151,7 +151,7 @@ impl OpSpec for ConvexSpec {
         let extra = hulls.iter().map(mm_core::measure::volume).sum::<f64>() / mm_core::measure::volume(mesh).max(1e-300) - 1.0;
         Ok(OpOutput {
             message: format!("{} convex pieces, {:.1}% more volume than the object", hulls.len(), extra * 100.0),
-            mesh: mesh.clone(),
+            keeps_source: true,
             preview: Some(pieces.clone()),
             new_objects: vec![("convex pieces".into(), pieces)],
             ..Default::default()
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn pattern_op_runs_with_reduction() {
         let cube = mm_core::primitives::cube(10.0, 2);
-        let info = OpInfo { mesh: &cube, selection: None, avg_edge: cube.average_edge_length(), bbox_diag: cube.bounds().diagonal(), target: None };
+        let info = OpInfo::new(&cube, None);
         let mut u = MakePatternSpec::defaults(&info);
         u.p.kind = PatternType::Edges;
         u.p.clip_to_surface = false;
@@ -183,5 +183,18 @@ mod tests {
         let half = MakePatternSpec::run(&cube, None, &u, &|_| true).unwrap().mesh;
         assert!(full.is_closed() && half.is_closed());
         assert!(half.triangle_count() < full.triangle_count() * 6 / 10);
+    }
+
+    #[test]
+    fn convex_pieces_leave_the_object_as_it_is() {
+        // An L of two boxes: the pieces are added, the object itself is kept (not copied).
+        let mut l = mm_core::primitives::cube(2.0, 1);
+        let mut arm = mm_core::primitives::cube(2.0, 1);
+        arm.transform(|p| p + glam::DVec3::new(1.9, 0.0, 0.0));
+        l.append_mesh(&arm, 0);
+        let out = ConvexSpec::run(&l, None, &ConvexSpec::defaults(&OpInfo::new(&l, None)), &|_| true).unwrap();
+        assert!(out.keeps_source && out.mesh.triangle_count() == 0);
+        assert_eq!(out.new_objects.len(), 1);
+        assert_eq!(out.preview.as_ref().map(|m| m.triangle_count()), Some(out.new_objects[0].1.triangle_count()));
     }
 }

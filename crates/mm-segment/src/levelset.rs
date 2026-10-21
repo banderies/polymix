@@ -57,12 +57,15 @@
 //!   image-based modeling framework for patient-specific computational hemodynamics", Med.
 //!   Biol. Eng. Comput. 46 (11), 2008, pp. 1097–1112.
 
+use crate::grow::{from_order_bits, order_bits};
 use crate::mask::{Connectivity, Mask};
 use crate::ops::distance_sq;
+use crate::region::Region;
+use crate::smooth::{blur_rows, gauss_weights, gradient_magnitude};
 use anyhow::{bail, Result};
 use mm_volume::load::LoadedVolume;
 use rayon::prelude::*;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 /// Parameters of [`level_set`] (and of the level set of [`guided_vessel`]). The weights are
@@ -115,15 +118,26 @@ const PATH_SHARE: f32 = 0.2;
 /// `p.range` (or where `speed`, a feature image of the volume's size with values in [0, 1], is
 /// above one half), back from the others, and settles on the edges of the image. Works on the
 /// bounding box of `init` grown by `p.max_distance_mm` (the whole volume without a limit),
-/// with about 25 bytes a voxel of it. `progress` gets the fraction done every iteration;
+/// with about 26 bytes a voxel of it. `progress` gets the fraction done every iteration;
 /// returning `false` cancels (an error). An empty `init` is an error; a segment that shrinks
 /// away comes back empty (a seed a voxel or two across can, with a curvature weight above about
 /// one half).
 pub fn level_set(vol: &LoadedVolume, init: &Mask, speed: Option<&[f32]>, p: &LevelSetParams, progress: &dyn Fn(f32) -> bool) -> Result<Mask> {
+    let same = |x: f32| x;
+    level_set_with(vol, init, speed.map(|s| (s, &same as &FeatureMap)), p, progress)
+}
+
+/// A map from an image's values to a feature image's (see [`level_set_with`]).
+pub type FeatureMap<'a> = dyn Fn(f32) -> f32 + Sync + 'a;
+
+/// [`level_set`] with the feature image given as values and a map: `speed` = (`values`, `map`)
+/// stands for the feature image `map(values[n])` (`values` of the volume's size). Only the
+/// level set's box of it is made, rather than all of it first.
+pub fn level_set_with(vol: &LoadedVolume, init: &Mask, speed: Option<(&[f32], &FeatureMap<'_>)>, p: &LevelSetParams, progress: &dyn Fn(f32) -> bool) -> Result<Mask> {
     if init.dims != vol.dims || init.len() != vol.values.len() {
         bail!("mask and volume of different sizes");
     }
-    if speed.is_some_and(|s| s.len() != vol.values.len()) {
+    if speed.is_some_and(|(s, _)| s.len() != vol.values.len()) {
         bail!("speed image and volume of different sizes");
     }
     let Some((lo, hi)) = init.bounds() else { bail!("the starting segment is empty") };
@@ -138,7 +152,7 @@ pub fn level_set(vol: &LoadedVolume, init: &Mask, speed: Option<&[f32]>, p: &Lev
     // Room for the front, its band and the Gaussian.
     let b = match limit {
         Some(d) => Region::around(lo, hi, h.map(|s| ((d + outer as f64 + 3.0 * sigma) / s).ceil() as usize + 2), vol.dims),
-        None => Region { lo: [0; 3], dims: vol.dims },
+        None => Region::all(vol.dims),
     };
     if b.len() > u32::MAX as usize {
         bail!("the region is too large ({} million voxels)", b.len() / 1_000_000);
@@ -146,7 +160,14 @@ pub fn level_set(vol: &LoadedVolume, init: &Mask, speed: Option<&[f32]>, p: &Lev
     let floor_value = vol.range.0;
     let values = b.gather(&vol.values, vol.dims, |v| if v.is_finite() { v } else { floor_value });
     let region_speed: Vec<f32> = match speed {
-        Some(s) => b.gather(s, vol.dims, |x| if x.is_finite() { (2.0 * x - 1.0).clamp(-1.0, 1.0) } else { -1.0 }),
+        Some((s, map)) => b.gather(s, vol.dims, |v| {
+            let x = map(v);
+            if x.is_finite() {
+                (2.0 * x - 1.0).clamp(-1.0, 1.0)
+            } else {
+                -1.0
+            }
+        }),
         None => {
             let w = ramp_width(p.range, vol);
             b.gather(&vol.values, vol.dims, |v| range_speed(v, p.range, w))
@@ -160,7 +181,7 @@ pub fn level_set(vol: &LoadedVolume, init: &Mask, speed: Option<&[f32]>, p: &Lev
         distance_sq(b.dims, &start, h).into_par_iter().map(|d2| (d2.sqrt() - d) as f32).collect()
     });
     let field = Field {
-        dims: b.dims,
+        faces: face_bits(b.dims),
         strides: [1, b.dims[0], b.dims[0] * b.dims[1]],
         h: h.map(|x| x as f32),
         hmin: hmin as f32,
@@ -264,86 +285,16 @@ fn range_speed(v: f32, range: (f32, f32), w: f32) -> f32 {
     1.0 - 2.0 * s * s * (3.0 - 2.0 * s)
 }
 
-/// A box of the voxel grid: its first voxel and its size.
-#[derive(Clone, Copy, Debug)]
-struct Region {
-    lo: [usize; 3],
-    dims: [usize; 3],
-}
-
-impl Region {
-    /// The voxels from `lo` to `hi` (inclusive) and `pad` more along each axis, within a grid
-    /// of `full`.
-    fn around(lo: [usize; 3], hi: [usize; 3], pad: [usize; 3], full: [usize; 3]) -> Self {
-        let a = [0, 1, 2].map(|x| lo[x].saturating_sub(pad[x]));
-        let b = [0, 1, 2].map(|x| hi[x].saturating_add(pad[x]).min(full[x] - 1));
-        Self { lo: a, dims: [0, 1, 2].map(|x| b[x] - a[x] + 1) }
-    }
-
-    fn len(&self) -> usize {
-        self.dims.iter().product()
-    }
-
-    /// The box's index of grid voxel `g` (inside the box).
-    fn local(&self, g: [usize; 3]) -> usize {
-        ((g[2] - self.lo[2]) * self.dims[1] + g[1] - self.lo[1]) * self.dims[0] + g[0] - self.lo[0]
-    }
-
-    /// Grid voxel of the box's voxel `n`.
-    fn grid(&self, n: usize) -> [usize; 3] {
-        let [nx, ny, _] = self.dims;
-        [n % nx + self.lo[0], (n / nx) % ny + self.lo[1], n / (nx * ny) + self.lo[2]]
-    }
-
-    /// `f` of each of the box's voxels of `data` (a grid of `full`), as a grid of its own.
-    fn gather<T: Copy + Sync, U: Send>(&self, data: &[T], full: [usize; 3], f: impl Fn(T) -> U + Sync) -> Vec<U> {
-        let [nx, ny, _] = self.dims;
-        let f = &f;
-        (0..ny * self.dims[2])
-            .into_par_iter()
-            .flat_map_iter(|r| {
-                let at = ((self.lo[2] + r / ny) * full[1] + self.lo[1] + r % ny) * full[0] + self.lo[0];
-                data[at..at + nx].iter().map(move |&v| f(v))
-            })
-            .collect()
-    }
-
-    /// Set the voxels of a grid mask `out` (of `full`) in the box to `f` of the box's index.
-    fn write(&self, out: &mut [u8], full: [usize; 3], f: impl Fn(usize) -> bool + Sync) {
-        let [bx, by, bz] = self.dims;
-        out.par_chunks_mut((full[0] * full[1]).max(1)).enumerate().skip(self.lo[2]).take(bz).for_each(|(k, plane)| {
-            for j in 0..by {
-                let row = &mut plane[(j + self.lo[1]) * full[0] + self.lo[0]..][..bx];
-                for (i, m) in row.iter_mut().enumerate() {
-                    *m = f(((k - self.lo[2]) * by + j) * bx + i) as u8;
-                }
-            }
-        });
-    }
-}
-
 /// Separable Gaussian blur of a box of `dims` voxels, with standard deviation `sigma` voxels
 /// along each axis (an axis is left alone below a twentieth of a voxel); the ends of each line
 /// are repeated.
 fn blur(values: &mut [f32], dims: [usize; 3], sigma: [f64; 3]) {
-    let strides = [1, dims[0], dims[0] * dims[1]];
-    let mut src = vec![0f32; values.len()];
-    for ((&s, &len), &stride) in sigma.iter().zip(&dims).zip(&strides) {
-        if s.is_nan() || s < 0.05 || len < 2 {
-            continue;
-        }
+    let kernels = [0, 1, 2].map(|a| {
+        let (s, len) = (sigma[a], dims[a]);
         // Wider than the line itself changes nothing more.
-        let r = ((3.0 * s).ceil() as usize).min(2 * len);
-        let w: Vec<f64> = (0..=2 * r).map(|t| (-((t as f64 - r as f64).powi(2)) / (2.0 * s * s)).exp()).collect();
-        let total: f64 = w.iter().sum();
-        let w: Vec<f32> = w.iter().map(|x| (x / total) as f32).collect();
-        src.copy_from_slice(values);
-        values.par_iter_mut().enumerate().for_each(|(n, v)| {
-            let x = (n / stride) % len;
-            let base = n - x * stride;
-            *v = w.iter().enumerate().map(|(t, &wt)| wt * src[base + (x + t).saturating_sub(r).min(len - 1) * stride]).sum();
-        });
-    }
+        (!(s.is_nan() || s < 0.05 || len < 2)).then(|| gauss_weights(s, ((3.0 * s).ceil() as usize).min(2 * len)))
+    });
+    blur_rows(values, dims, kernels);
 }
 
 /// The edge-stopping function g = 1 / (1 + |∇(G_σ * I)|² / k²) of a box of `dims` intensities
@@ -352,22 +303,7 @@ fn blur(values: &mut [f32], dims: [usize; 3], sigma: [f64; 3]) {
 /// is more. 1 everywhere in an even box.
 fn edge_map(mut values: Vec<f32>, dims: [usize; 3], h: [f64; 3], sigma_mm: f64) -> Vec<f32> {
     blur(&mut values, dims, h.map(|s| sigma_mm / s));
-    let strides = [1, dims[0], dims[0] * dims[1]];
-    let grad: Vec<f32> = (0..values.len())
-        .into_par_iter()
-        .map(|n| {
-            let mut g2 = 0.0f32;
-            for ((&len, &s), &hh) in dims.iter().zip(&strides).zip(&h) {
-                let x = (n / s) % len;
-                let (lo, hi) = (if x > 0 { n - s } else { n }, if x + 1 < len { n + s } else { n });
-                if lo != hi {
-                    let d = (values[hi] - values[lo]) / (((hi - lo) / s) as f64 * hh) as f32;
-                    g2 += d * d;
-                }
-            }
-            g2.sqrt()
-        })
-        .collect();
+    let grad = gradient_magnitude(&values, dims, h);
     drop(values);
     // Percentiles of at most a million evenly spread values.
     let mut sample: Vec<f32> = grad.iter().step_by((grad.len() / 1_000_000).max(1)).copied().collect();
@@ -378,6 +314,41 @@ fn edge_map(mut values: Vec<f32>, dims: [usize; 3], h: [f64; 3], sigma_mm: f64) 
         return vec![1.0; grad.len()];
     }
     grad.into_par_iter().map(|x| 1.0 / (1.0 + (x / k) * (x / k))).collect()
+}
+
+/// The first `c` of `near` in increasing order of their first value, those as near in the
+/// order they came (a stable sort of up to three by compare and swap).
+fn sort_near(near: &mut [(f32, f32); 3], c: usize) {
+    let mut order = |i: usize| {
+        if near[i].0.total_cmp(&near[i + 1].0) == Ordering::Greater {
+            near.swap(i, i + 1);
+        }
+    };
+    if c >= 2 {
+        order(0);
+    }
+    if c == 3 {
+        order(1);
+        order(0);
+    }
+}
+
+/// Per voxel of a box of `dims`, which of its six neighbours the box has: bit 2a for the one
+/// before it along axis a, bit 2a + 1 for the one after.
+fn face_bits(dims: [usize; 3]) -> Vec<u8> {
+    let [nx, ny, nz] = dims;
+    let mut out = vec![0u8; nx * ny * nz];
+    if out.is_empty() {
+        return out;
+    }
+    out.par_chunks_mut(nx).enumerate().for_each(|(r, row)| {
+        let (j, k) = (r % ny, r / ny);
+        let jk = ((j > 0) as u8) << 2 | ((j + 1 < ny) as u8) << 3 | ((k > 0) as u8) << 4 | ((k + 1 < nz) as u8) << 5;
+        for (i, f) in row.iter_mut().enumerate() {
+            *f = jk | (i > 0) as u8 | ((i + 1 < nx) as u8) << 1;
+        }
+    });
+    out
 }
 
 /// Voxels around the front: those whose distance is kept, those updated (a subset; the voxels
@@ -395,7 +366,8 @@ const KNOWN: u8 = 2;
 
 /// What moves the front, over a box of voxels.
 struct Field {
-    dims: [usize; 3],
+    /// Which neighbours each voxel has in the box ([`face_bits`]), and the index steps to them.
+    faces: Vec<u8>,
     strides: [usize; 3],
     /// Spacing (mm), its smallest and largest, and Σ 1/h².
     h: [f32; 3],
@@ -423,15 +395,15 @@ impl Field {
     /// The voxels before and after `n` along each axis (`n` itself at the box's faces).
     #[inline]
     fn around(&self, n: usize) -> ([usize; 3], [usize; 3]) {
+        let f = self.faces[n];
         let mut lo = [n; 3];
         let mut hi = [n; 3];
         for (a, (l, u)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
             let s = self.strides[a];
-            let x = (n / s) % self.dims[a];
-            if x > 0 {
+            if f & 1 << (2 * a) != 0 {
                 *l = n - s;
             }
-            if x + 1 < self.dims[a] {
+            if f & 2 << (2 * a) != 0 {
                 *u = n + s;
             }
         }
@@ -456,7 +428,7 @@ impl Field {
             back[a] = (f0 - fm) / h;
             fwd[a] = (fp - f0) / h;
             d2[a] = (fp - 2.0 * f0 + fm) / (h * h);
-            span[a] = ((hi[a] - lo[a]) / self.strides[a]) as f32 * h;
+            span[a] = (((self.faces[n] >> (2 * a)) & 1) + ((self.faces[n] >> (2 * a + 1)) & 1)) as f32 * h;
             if span[a] > 0.0 {
                 d1[a] = (fp - fm) / span[a];
                 dg[a] = (self.g[hi[a]] - self.g[lo[a]]) / span[a];
@@ -646,7 +618,7 @@ impl Field {
                 c += 1;
             }
         }
-        near[..c].sort_by(|x, y| x.0.total_cmp(&y.0));
+        sort_near(&mut near, c);
         let (mut sa, mut sb, mut sc, mut t) = (0f32, 0f32, 0f32, f32::INFINITY);
         for &(v, h) in &near[..c] {
             if t <= v {
@@ -737,47 +709,20 @@ impl Field {
 
 }
 
-/// A voxel waiting in a [`Queue`].
-#[derive(Clone, Copy)]
-struct Item {
-    key: f32,
-    at: u32,
-}
-
-impl Ord for Item {
-    /// Reversed (`BinaryHeap` pops the greatest): smallest key first.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.key.total_cmp(&self.key).then(o.at.cmp(&self.at))
-    }
-}
-
-impl PartialOrd for Item {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-
-impl PartialEq for Item {
-    fn eq(&self, o: &Self) -> bool {
-        self.cmp(o) == Ordering::Equal
-    }
-}
-
-impl Eq for Item {}
-
-/// Voxels by smallest key.
+/// Voxels by smallest key, then lowest index: a binary heap of the key's
+/// [`order_bits`] and the index, as one number.
 #[derive(Default)]
 struct Queue {
-    heap: BinaryHeap<Item>,
+    heap: BinaryHeap<Reverse<u64>>,
 }
 
 impl Queue {
     fn push(&mut self, key: f32, at: usize) {
-        self.heap.push(Item { key, at: at as u32 });
+        self.heap.push(Reverse((order_bits(key) as u64) << 32 | at as u32 as u64));
     }
 
     fn pop(&mut self) -> Option<(f32, usize)> {
-        self.heap.pop().map(|i| (i.key, i.at as usize))
+        self.heap.pop().map(|Reverse(k)| (from_order_bits((k >> 32) as u32), k as u32 as usize))
     }
 }
 
@@ -1221,5 +1166,94 @@ mod tests {
         hit.intersect(&truth);
         eprintln!("guided, 256×256×128: {:.3} s, {} voxels, {:.3} of them in the tree", t0.elapsed().as_secs_f64(), out.count(), hit.count() as f64 / out.count() as f64);
         assert!(hit.count() as f64 > 0.95 * out.count() as f64);
+    }
+
+    #[test]
+    fn face_bits_are_the_neighbours_in_the_box() {
+        for dims in crate::reference::DIMS {
+            let f = face_bits(dims);
+            let strides = [1, dims[0], dims[0] * dims[1]];
+            for (n, &bits) in f.iter().enumerate() {
+                for a in 0..3 {
+                    let x = (n / strides[a]) % dims[a];
+                    assert_eq!(bits & 1 << (2 * a) != 0, x > 0, "{dims:?} {n} {a}");
+                    assert_eq!(bits & 2 << (2 * a) != 0, x + 1 < dims[a], "{dims:?} {n} {a}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn near_axes_sort_as_a_stable_sort() {
+        let vals = [0.5f32, 1.0, -0.0, 0.0, f32::INFINITY, f32::NAN, 0.5];
+        for a in vals {
+            for b in vals {
+                for c in vals {
+                    for count in 0..=3 {
+                        let mut near = [(a, 1.0), (b, 2.0), (c, 3.0)];
+                        let mut want = near;
+                        want[..count].sort_by(|x, y| x.0.total_cmp(&y.0));
+                        sort_near(&mut near, count);
+                        assert!(near.iter().zip(&want).all(|(x, y)| x.0.to_bits() == y.0.to_bits() && x.1 == y.1), "{near:?} {want:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_map_blur_is_the_old_one() {
+        use crate::reference::{unit, voxel_blur, voxel_gradient, DIMS};
+        for &dims in &DIMS {
+            let n = dims.iter().product::<usize>();
+            let v: Vec<f32> = (0..n).map(|q| (unit(q as u64 * 13) * 300.0) as f32).collect();
+            for sigma in [[0.0, 0.0, 0.0], [0.04, 0.05, 0.6], [1.0, 2.0, 6.0], [f64::NAN, 0.5, 0.5]] {
+                let (mut a, mut b) = (v.clone(), v.clone());
+                voxel_blur(&mut a, dims, sigma, true);
+                blur(&mut b, dims, sigma);
+                assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{dims:?} {sigma:?}");
+                let (ga, gb) = (voxel_gradient(&a, dims, [0.5, 0.7, 1.3]), gradient_magnitude(&b, dims, [0.5, 0.7, 1.3]));
+                assert!(ga.iter().zip(&gb).all(|(x, y)| x.to_bits() == y.to_bits()), "{dims:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn path_queue_takes_out_smallest_then_lowest() {
+        // As the old heap of (key by `f32::total_cmp`, index) did.
+        let keys = [3.0f32, -0.0, 0.0, f32::NAN, 1.5, f32::NEG_INFINITY, 3.0, 0.0, 1e-30];
+        let mut q = Queue::default();
+        let mut want: Vec<(f32, usize)> = Vec::new();
+        for (i, &k) in keys.iter().enumerate() {
+            let at = (i * 7919) % 1000;
+            q.push(k, at);
+            want.push((k, at));
+        }
+        want.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (k, at) in want {
+            let (k2, at2) = q.pop().unwrap();
+            assert_eq!((k.to_bits(), at), (k2.to_bits(), at2));
+        }
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn a_mapped_speed_image_is_the_speed_image() {
+        let dims = [24, 20, 20];
+        let sp = [1.0; 3];
+        let truth = shape(dims, sp, |p| (p.x - 12.0).hypot(p.z - 9.5) <= 3.5);
+        let vol = image(&truth, sp, 10.0);
+        let seed = shape(dims, sp, |p| p.distance(DVec3::new(12.0, 10.0, 10.0)) <= 1.5);
+        let raw: Vec<f32> = vol.values.iter().map(|&v| v * 2.0 - 7.0).collect();
+        let map = |v: f32| (0.5 + (v as f64 - 93.0) / 60.0).clamp(0.0, 1.0) as f32;
+        let speed: Vec<f32> = raw.iter().map(|&v| map(v)).collect();
+        for limit in [0.0, 4.0] {
+            let p = LevelSetParams { range: (500.0, 600.0), iterations: 120, max_distance_mm: limit, ..Default::default() };
+            let a = level_set(&vol, &seed, Some(&speed), &p, &|_| true).unwrap();
+            let b = level_set_with(&vol, &seed, Some((&raw, &map)), &p, &|_| true).unwrap();
+            assert_eq!(a, b);
+            assert!(a.count() > seed.count());
+        }
+        assert!(level_set_with(&vol, &seed, Some((&raw[1..], &map)), &params((0.0, 1.0)), &|_| true).is_err());
     }
 }

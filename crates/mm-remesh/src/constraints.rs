@@ -6,7 +6,7 @@
 //! curve edges. Chain endpoints (corners: feature valence != 2), vertices touching a
 //! fixed edge, region-border vertices and bowties are *fixed*.
 
-use crate::region::Region;
+use crate::region::{IdVals, Region, PAR_MIN_LEN};
 use mm_core::{Mesh, INVALID};
 use rayon::prelude::*;
 
@@ -41,6 +41,89 @@ impl ECons {
     pub const NONE: ECons = ECons { kind: E_NONE, curve: INVALID };
 }
 
+/// A constraint packed into one `u64`: the kind in the low byte and `curve + 1` in the high
+/// half, so that the defaults ([`VCons::FREE`], [`ECons::NONE`]) are all-zero bits.
+pub(crate) trait Packed: Copy {
+    fn pack(self) -> u64;
+    fn unpack(bits: u64) -> Self;
+}
+
+#[inline]
+fn pack(kind: u8, curve: u32) -> u64 {
+    kind as u64 | (curve.wrapping_add(1) as u64) << 32
+}
+
+#[inline]
+fn unpack(bits: u64) -> (u8, u32) {
+    (bits as u8, ((bits >> 32) as u32).wrapping_sub(1))
+}
+
+impl Packed for VCons {
+    #[inline]
+    fn pack(self) -> u64 {
+        pack(self.kind, self.curve)
+    }
+    #[inline]
+    fn unpack(bits: u64) -> Self {
+        let (kind, curve) = unpack(bits);
+        VCons { kind, curve }
+    }
+}
+
+impl Packed for ECons {
+    #[inline]
+    fn pack(self) -> u64 {
+        pack(self.kind, self.curve)
+    }
+    #[inline]
+    fn unpack(bits: u64) -> Self {
+        let (kind, curve) = unpack(bits);
+        ECons { kind, curve }
+    }
+}
+
+/// Constraints per vertex or edge id. Every id starts at the default (free / none), stored as
+/// zero bits, so that a small region keeps only its own ids (in a hash map, see [`IdVals`]).
+pub(crate) struct ConsVec<T> {
+    bits: IdVals<u64>,
+    _kind: std::marker::PhantomData<T>,
+}
+
+impl<T: Packed> ConsVec<T> {
+    /// `n` ids, all at the default; in a hash map if `sparse`.
+    pub fn new(sparse: bool, n: usize) -> Self {
+        Self { bits: IdVals::new(sparse, n), _kind: std::marker::PhantomData }
+    }
+
+    #[inline]
+    pub fn get(&self, i: u32) -> T {
+        T::unpack(self.bits.get(i))
+    }
+
+    /// [`ConsVec::get`] compiled for one mode (see [`IdVals::at`]).
+    #[inline(always)]
+    pub fn at<const MAPS: bool>(&self, i: u32) -> T {
+        T::unpack(self.bits.at::<MAPS>(i))
+    }
+
+    #[inline]
+    pub fn set(&mut self, i: u32, c: T) {
+        self.bits.set(i, c.pack());
+    }
+
+    /// Move a hash map into an array over ids below `n` (see [`Region::densify_if_large`]).
+    pub fn densify(&mut self, n: usize) {
+        self.bits.densify(n);
+    }
+}
+
+/// Size for an array over `n` ids that leaves room for the ids a remesh adds, so that early
+/// splits do not reallocate (and copy) arrays over a whole large mesh. Setting an id past
+/// the end of an [`IdVals`] array grows it to this size too.
+pub(crate) fn with_headroom(n: usize) -> usize {
+    n + n / 8 + 1024
+}
+
 /// Can vertex `v` be removed by collapsing an edge with constraint `e`?
 #[inline]
 pub(crate) fn removable(v: VCons, e: ECons) -> bool {
@@ -72,14 +155,15 @@ pub(crate) struct ConstraintOptions {
 }
 
 pub(crate) struct Constraints {
-    pub v: Vec<VCons>,
-    pub e: Vec<ECons>,
+    pub v: ConsVec<VCons>,
+    pub e: ConsVec<ECons>,
     pub curve_count: u32,
     /// Per curve: flagged for smoothing (see `ConstraintOptions::smooth_groups`).
     pub smooth: Vec<bool>,
 }
 
-/// Classify `edges` and `verts` (the edges and vertices of the region triangles).
+/// Classify `edges` and `verts` (the edges and vertices of the region triangles). Every
+/// other id stays free / none; the arrays have room for ids a remesh adds.
 pub(crate) fn build_constraints(
     mesh: &Mesh,
     region: &Region,
@@ -87,12 +171,14 @@ pub(crate) fn build_constraints(
     verts: &[u32],
     opts: &ConstraintOptions,
 ) -> Constraints {
-    let mut ec = vec![ECons::NONE; mesh.max_eid()];
-    let mut vc = vec![VCons::FREE; mesh.max_vid()];
+    let sparse = region.is_sparse();
+    let mut ec = ConsVec::<ECons>::new(sparse, with_headroom(mesh.max_eid()));
+    let mut vc = ConsVec::<VCons>::new(sparse, with_headroom(mesh.max_vid()));
     let cos_sharp = opts.sharp_deg.map(|d| d.to_radians().cos());
 
     let kinds: Vec<u8> = edges
         .par_iter()
+        .with_min_len(PAR_MIN_LEN)
         .map(|&e| {
             let [t0, t1] = mesh.edge_triangles(e);
             if t1 == INVALID {
@@ -119,19 +205,20 @@ pub(crate) fn build_constraints(
         })
         .collect();
     for (&e, &k) in edges.iter().zip(&kinds) {
-        ec[e as usize].kind = k;
+        ec.set(e, ECons { kind: k, curve: INVALID });
     }
 
     let cos_corner = opts.corner_deg.map(|d| d.to_radians().cos());
     let ecr = &ec;
     let vkinds: Vec<u8> = verts
         .par_iter()
+        .with_min_len(PAR_MIN_LEN)
         .map(|&v| {
             let mut fixed = false;
             let mut feat = [INVALID; 2];
             let mut nfeat = 0;
             for &e in mesh.vertex_edges(v) {
-                match ecr[e as usize].kind {
+                match ecr.get(e).kind {
                     E_FIXED => fixed = true,
                     E_FEATURE => {
                         if nfeat < 2 {
@@ -168,38 +255,39 @@ pub(crate) fn build_constraints(
         })
         .collect();
     for (&v, &k) in verts.iter().zip(&vkinds) {
-        vc[v as usize].kind = k;
+        vc.set(v, VCons { kind: k, curve: INVALID });
     }
 
     // Chain feature edges into curves, walking through curve vertices.
     let mut curve_count = 0u32;
     let mut smooth = Vec::new();
     for &e in edges {
-        if ec[e as usize].kind != E_FEATURE || ec[e as usize].curve != INVALID {
+        let c = ec.get(e);
+        if c.kind != E_FEATURE || c.curve != INVALID {
             continue;
         }
         let id = curve_count;
         curve_count += 1;
         smooth.push(opts.smooth_groups.is_some_and(|split| smoothable_group_border(mesh, e, split, cos_sharp)));
-        ec[e as usize].curve = id;
+        ec.set(e, ECons { kind: E_FEATURE, curve: id });
         for start in mesh.edge_vertices(e) {
             let mut v = start;
             let mut prev = e;
             loop {
-                if vc[v as usize].kind != V_CURVE {
+                if vc.get(v).kind != V_CURVE {
                     break;
                 }
-                vc[v as usize].curve = id;
+                vc.set(v, VCons::on_curve(id));
                 let next = mesh
                     .vertex_edges(v)
                     .iter()
                     .copied()
-                    .find(|&x| x != prev && ec[x as usize].kind == E_FEATURE);
+                    .find(|&x| x != prev && ec.get(x).kind == E_FEATURE);
                 let Some(ne) = next else { break };
-                if ec[ne as usize].curve != INVALID {
+                if ec.get(ne).curve != INVALID {
                     break;
                 }
-                ec[ne as usize].curve = id;
+                ec.set(ne, ECons { kind: E_FEATURE, curve: id });
                 v = mesh.edge_other_vertex(ne, v);
                 prev = ne;
             }

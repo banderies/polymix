@@ -15,6 +15,9 @@ pub mod levelset;
 pub mod mask;
 pub mod mesh;
 pub mod ops;
+#[cfg(test)]
+mod reference;
+mod region;
 pub mod shapes;
 pub mod smooth;
 pub mod stats;
@@ -24,7 +27,7 @@ pub use centerline::{centerlines, cross_sections, stenosis, Branch, CenterlinePa
 pub use grow::{fast_march, grow_from_seeds, watershed};
 pub use interpolate::fill_between_slices;
 pub use io::{write_nifti, write_seg_nrrd, SegmentInfo};
-pub use levelset::{guided_vessel, level_set, LevelSetParams};
+pub use levelset::{guided_vessel, level_set, level_set_with, FeatureMap, LevelSetParams};
 pub use mask::{Connectivity, Mask};
 pub use mesh::{mask_to_mesh, MeshParams};
 pub use smooth::{gaussian, hollow, joint_smooth, HollowSide};

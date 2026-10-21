@@ -18,6 +18,7 @@ use crate::ui_util;
 use eframe::egui_wgpu;
 use egui::{Color32, Key, PointerButton, RichText};
 use glam::{DVec3, Vec4};
+use mm_core::hash::{FastMap, FastSet};
 use mm_core::Mesh;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -154,6 +155,57 @@ struct Autosave {
     job: Option<Job<()>>,
 }
 
+/// The Statistics panel's whole-mesh values of an object, so frames that do not change its
+/// shape (hovering, orbiting) do not walk the mesh again.
+#[derive(Default)]
+struct StatsCache {
+    /// Open-edge count per (object, topology version): it lasts through brush strokes.
+    open: Option<(ObjectId, u64, usize)>,
+    /// The rest per (object, shape version).
+    shape: Option<(ObjectId, u64, ShapeStats)>,
+}
+
+#[derive(Clone, Copy)]
+struct ShapeStats {
+    extents: DVec3,
+    open: usize,
+    /// For a closed mesh (no open edges) only.
+    volume: Option<f64>,
+    center_of_mass: DVec3,
+    area: f64,
+}
+
+impl StatsCache {
+    /// The values for `o`'s mesh as it is now: the same functions as without the cache, but
+    /// the bounds and the open-edge count are computed once.
+    fn get(&mut self, o: &crate::scene::SceneObject) -> ShapeStats {
+        let m = &*o.mesh;
+        if let Some((id, version, s)) = self.shape {
+            if (id, version) == (o.id, m.shape_version()) {
+                return s;
+            }
+        }
+        let open = match self.open {
+            Some((id, topo, n)) if (id, topo) == (o.id, m.topology_version()) => n,
+            _ => {
+                let n = m.boundary_edge_ids().count();
+                self.open = Some((o.id, m.topology_version(), n));
+                n
+            }
+        };
+        let b = m.bounds();
+        let s = ShapeStats {
+            extents: b.extents(),
+            open,
+            volume: (open == 0).then(|| mm_core::measure::volume(m)),
+            center_of_mass: mm_core::measure::center_of_mass_with(m, &b, open == 0),
+            area: mm_core::measure::surface_area(m),
+        };
+        self.shape = Some((o.id, m.shape_version(), s));
+        s
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportMode {
     Ask,
@@ -181,7 +233,9 @@ struct ImportLook {
 }
 
 struct PendingImport {
-    meshes: Vec<(String, Mesh, String)>,
+    /// Name, mesh, status note and bounding-box diagonal (measured where the mesh was made,
+    /// off the UI thread for files, so the prompts drawn every frame need not walk it).
+    meshes: Vec<(String, Mesh, String, f64)>,
     /// One per mesh.
     looks: Vec<ImportLook>,
     /// Append / Replace decided (or not needed).
@@ -189,9 +243,233 @@ struct PendingImport {
     remember: bool,
 }
 
+/// Read one file for an import: the mesh, its status note, its bounding-box diagonal and
+/// what else the file brings (UVs, texture).
+fn import_file(f: &std::path::Path, obj_groups: bool, reference: bool) -> anyhow::Result<(String, Mesh, String, f64, ImportLook)> {
+    let t0 = std::time::Instant::now();
+    let mut imported = mm_io::read_mesh(f).map_err(|e| anyhow::anyhow!("{}: {e:#}", f.display()))?;
+    if !obj_groups && imported.format == mm_io::Format::Obj {
+        for t in imported.mesh.triangle_ids().collect::<Vec<_>>() {
+            imported.mesh.set_tri_group(t, 0);
+        }
+    }
+    let rep = &imported.report;
+    let mut notes = format!("{}: {} triangles, {} vertices ({:.2}s)", imported.name, imported.mesh.triangle_count(), imported.mesh.vertex_count(), t0.elapsed().as_secs_f32());
+    if rep.nonmanifold_split + rep.degenerate + rep.duplicate > 0 {
+        notes += &format!(" — fixed on load: {} non-manifold, {} degenerate, {} duplicate triangles", rep.nonmanifold_split, rep.degenerate, rep.duplicate);
+    }
+    let texture = match &imported.texture {
+        Some(p) => match crate::scene::TextureImage::load(p) {
+            Ok(t) => {
+                notes += &format!(" — texture {}", p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()));
+                Some(std::sync::Arc::new(t))
+            }
+            Err(e) => {
+                notes += &format!(" — texture not loaded ({e})");
+                None
+            }
+        },
+        None => None,
+    };
+    if reference {
+        notes += " — as a reference";
+    }
+    let diagonal = imported.mesh.bounds().diagonal();
+    Ok((imported.name, imported.mesh, notes, diagonal, ImportLook { uvs: imported.uvs, texture, reference }))
+}
+
+/// Read the files of an import in an import job, up to `workers` at once: `progress` follows
+/// the files done and cancels. The results come in file order; the first error in file order
+/// ends the import, as when the files were read one after another.
+fn import_files(files: &[PathBuf], obj_groups: bool, reference: bool, workers: usize, progress: crate::jobs::ProgressFn) -> anyhow::Result<ImportResult> {
+    side_by_side(files.len(), workers, progress, |i| import_file(&files[i], obj_groups, reference))
+}
+
+/// A panic's message, as a job reports it.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "operation panicked".into())
+}
+
+/// `read(i)` for each `i` in `0..n`, up to `workers` at once, in a job: `progress` follows the
+/// reads done and cancels. The results come in order; the first error in that order ends it,
+/// as when read one after another (a panic is an error, "internal error: …" as in a job).
+fn side_by_side<T: Send>(n: usize, workers: usize, progress: crate::jobs::ProgressFn, read: impl Fn(usize) -> anyhow::Result<T> + Sync) -> anyhow::Result<Vec<T>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let workers = workers.clamp(1, n.max(1));
+    // One pool for all the reads, with a job's threads (one per core but one): their own
+    // parallel loops share it, rather than each read starting a pool of that size.
+    let pool = (workers > 1).then(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1));
+        rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("polymix-job-read-{i}")).build()
+    });
+    let pool = match pool {
+        Some(Ok(pool)) => pool,
+        Some(Err(e)) => {
+            log::warn!("cannot start the threads to read files side by side: {e}");
+            return side_by_side(n, 1, progress, read);
+        }
+        None => {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                if !progress(i as f32 / n as f32) {
+                    anyhow::bail!("cancelled");
+                }
+                out.push(read(i)?);
+            }
+            return Ok(out);
+        }
+    };
+    let (next, stop) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut slots: Vec<Option<anyhow::Result<T>>> = (0..n).map(|_| None).collect();
+    let cancelled = std::thread::scope(|s| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next, stop, pool, read) = (&next, &stop, &pool, &read);
+            s.spawn(move || {
+                // Reads are taken in order, so all those before a failed one are done.
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.install(|| read(i)))).unwrap_or_else(|p| Err(anyhow::anyhow!("internal error: {}", panic_message(&*p))));
+                    if r.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    if tx.send((i, r)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut done = 0;
+        loop {
+            if !progress(done as f32 / n as f32) {
+                stop.store(true, Ordering::Relaxed);
+                return true;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok((i, r)) => {
+                    slots[i] = Some(r);
+                    done += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    });
+    if cancelled {
+        anyhow::bail!("cancelled");
+    }
+    // In order: the reads done, up to the first that failed.
+    let mut out = Vec::with_capacity(n);
+    for r in slots.into_iter().map_while(|s| s) {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// What an export writes, taken from the scene without copying a mesh: the export job
+/// assembles it.
+enum ExportSource {
+    /// An object's mesh.
+    Whole(std::sync::Arc<Mesh>),
+    /// The meshes of several objects, as one.
+    Combined(Vec<std::sync::Arc<Mesh>>),
+    /// Some triangles of a mesh.
+    Part(std::sync::Arc<Mesh>, mm_core::TriSelection),
+}
+
+/// The files of an export of one file per region or per object, for its job.
+enum ExportParts {
+    /// The face groups of a mesh, with the group names.
+    Groups(std::sync::Arc<Mesh>, std::collections::HashMap<i32, String>),
+    /// Objects' names and meshes.
+    Objects(Vec<(String, std::sync::Arc<Mesh>)>),
+}
+
+/// The number of face groups `m`'s triangles belong to.
+fn distinct_groups(m: &Mesh) -> usize {
+    let mut seen: FastSet<i32> = FastSet::default();
+    let mut last = None;
+    for t in m.triangle_ids() {
+        // Neighbouring triangles mostly share their group.
+        let g = m.tri_group(t);
+        if last != Some(g) {
+            seen.insert(g);
+            last = Some(g);
+        }
+    }
+    seen.len()
+}
+
+impl ExportSource {
+    /// The mesh to write, turned back Z-up when `flip`; a whole mesh that needs no change is
+    /// written as it is.
+    fn mesh(self, flip: bool) -> std::sync::Arc<Mesh> {
+        let mut m = match self {
+            ExportSource::Whole(m) if !flip => return m,
+            ExportSource::Whole(m) => std::sync::Arc::unwrap_or_clone(m),
+            ExportSource::Combined(meshes) => {
+                let mut m = Mesh::new();
+                for o in &meshes {
+                    m.append_mesh(o, 0);
+                }
+                m
+            }
+            ExportSource::Part(m, selection) => {
+                let tris: Vec<u32> = selection.iter().collect();
+                m.submesh(&tris).0
+            }
+        };
+        if flip {
+            m.transform(flip_zy_out);
+        }
+        std::sync::Arc::new(m)
+    }
+}
+
+/// An object as a project file stores it, sharing its mesh and UVs (UVs only if they still
+/// belong to the mesh's triangles), with `group_names` in the order they are written.
+fn save_object(o: &crate::scene::SceneObject, group_names: Vec<(i32, String)>) -> crate::project::SaveObject {
+    crate::project::SaveObject {
+        name: o.name.clone(),
+        mesh: o.mesh.clone(),
+        visible: o.visible,
+        color: o.color,
+        material: o.material,
+        frame: o.frame,
+        group_names,
+        uvs: o.uvs.clone().filter(|u| u.topo == o.mesh.topology_version()),
+        pivots: o.pivots.clone(),
+        texture: o.texture.as_ref().and_then(|t| t.path.clone()),
+        reference: o.reference,
+    }
+}
+
+/// `r.on_hover_text(text())`, with the text made only when the tooltip shows or AccessKit
+/// reads it (for rows drawn every frame, hundreds of them in a long list).
+pub(crate) fn hover_text_with(r: egui::Response, text: impl FnOnce() -> String) -> egui::Response {
+    if r.ctx.has_accesskit_node(r.id) {
+        // The text also describes the widget to agents and screen readers.
+        return r.on_hover_text(text());
+    }
+    r.on_hover_ui(|ui| {
+        // As `on_hover_text` lays it out.
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.add(egui::Label::new(text()));
+    })
+}
+
 /// Size outside the plausible range for millimetre models (bounding-box diagonal).
 fn odd_size(m: &Mesh) -> bool {
-    let d = m.bounds().diagonal();
+    odd_diagonal(m.bounds().diagonal())
+}
+
+/// [`odd_size`] of a mesh whose bounding-box diagonal is `d`.
+fn odd_diagonal(d: f64) -> bool {
     d.is_finite() && (d < 1.0 || d > 10_000.0)
 }
 
@@ -257,6 +535,9 @@ impl Default for ViewOptions {
 }
 
 const DEFAULT_CREASE_DEG: f32 = 40.0;
+/// How often a view showing work in progress (a tool computing, files loading) is redrawn:
+/// about 15 times a second, like the throttled spinner.
+const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_millis(66);
 /// The object browser's width range (drag its left edge).
 const OBJECTS_WIDTH: (f32, f32) = (170.0, 520.0);
 
@@ -337,8 +618,51 @@ pub(crate) fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
     })
 }
 
-type ImportResult = Vec<(String, Mesh, String, ImportLook)>;
-type BoundaryKey = (ObjectId, u64, usize);
+/// Imported meshes: name, mesh, status note, bounding-box diagonal (for the size prompt) and
+/// what else the file brought.
+type ImportResult = Vec<(String, Mesh, String, f64, ImportLook)>;
+/// BVHs built in the background, by object.
+type BuiltBvhs = Vec<(ObjectId, std::sync::Arc<mm_core::Bvh>)>;
+
+/// A background build of BVHs (see [`MeshWorkspace::bvh_tick`]).
+struct BvhJob {
+    /// The shape version of each mesh it builds for: once one is replaced, its BVH would be
+    /// turned away.
+    shapes: FastMap<ObjectId, u64>,
+    /// Set when one is: the builds not yet begun are dropped.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    job: Job<BuiltBvhs>,
+}
+
+/// The BVHs of `meshes`, side by side, leaving out those not yet begun once `stop` is set.
+fn build_bvhs(meshes: Vec<(ObjectId, std::sync::Arc<Mesh>)>, stop: &std::sync::atomic::AtomicBool) -> BuiltBvhs {
+    use rayon::prelude::*;
+    meshes.into_par_iter().filter_map(|(id, m)| (!stop.load(std::sync::atomic::Ordering::Relaxed)).then(|| (id, std::sync::Arc::new(mm_core::Bvh::build(&m))))).collect()
+}
+
+/// A project read from its file, with each object's texture image (read there too; `None`
+/// where it has none or it cannot be read).
+type OpenedProject = (crate::project::Project, Vec<Option<std::sync::Arc<crate::scene::TextureImage>>>);
+
+/// The GPU copy of the open tool's preview mesh, with the object it previews and the mesh
+/// state (shape and topology versions) it was last synced from.
+struct PreviewGpu {
+    id: ObjectId,
+    shape: u64,
+    topo: u64,
+    gpu: GpuMesh,
+}
+
+/// An object's open-boundary lines, cached in two levels: the boundary edges of a topology
+/// (they last through brush strokes), and the line vertices drawn for one state of the mesh,
+/// rebuilt from those edges when only vertices moved.
+#[derive(Default)]
+struct BoundaryLines {
+    /// Topology version, and its boundary edge ids in `boundary_edge_ids` order.
+    edges: Option<(u64, Vec<u32>)>,
+    /// (Shape version, mesh address), and the endpoints of those edges.
+    lines: Option<((u64, usize), Vec<ColorVertex>)>,
+}
 
 pub struct MeshWorkspace {
     scene: Scene,
@@ -346,13 +670,29 @@ pub struct MeshWorkspace {
     camera: Camera,
     renderer: Option<SceneRenderer>,
     gpu: HashMap<ObjectId, GpuMesh>,
-    preview_gpu: Option<GpuMesh>,
+    preview_gpu: Option<PreviewGpu>,
+    /// Background build of the BVHs the last commits left stale (see [`Self::bvh_tick`]).
+    bvh_job: Option<BvhJob>,
+    /// History generation the BVHs were last looked at for.
+    bvh_generation: u64,
+    /// Per object, the topology version of the BVH it was last seen with: a BVH that goes
+    /// stale without a topology change is refitted where it is used, not built again.
+    bvh_topo: FastMap<ObjectId, u64>,
     view: ViewOptions,
     /// Tool stack: the top tool is active; closing a sub-tool returns to the one below.
     tools: Vec<Box<dyn Tool>>,
     category: Option<Category>,
-    /// Meshmix parts (loaded when the category opens).
+    /// Meshmix parts (loaded again in the background when the category opens; shown as they
+    /// were meanwhile).
     library: Option<crate::parts::Library>,
+    /// The library being loaded, with the count of library changes it started at (`u64::MAX`
+    /// once Reload was clicked meanwhile: its result is then out of date at once).
+    library_job: Option<(u64, Job<crate::parts::Library>)>,
+    /// The count of library changes `library` was loaded at (see `parts::library_changes`).
+    library_changes: u64,
+    /// The count of library changes a load failed at: not tried again on its own until they
+    /// change (Reload, or opening the category, tries again).
+    library_failed: Option<u64>,
     /// Tool switch waiting for the current tool to finish computing (then it is accepted).
     pending_switch: Option<SwitchTo>,
     status: String,
@@ -361,8 +701,9 @@ pub struct MeshWorkspace {
     /// Scripts normally skip the import prompts; `prompts:on` shows them (for screenshots).
     script_prompts: bool,
     export_job: Option<Job<String>>,
-    /// Project being opened, and the file the scene was last saved to / opened from.
-    project_job: Option<(PathBuf, Job<crate::project::Project>)>,
+    /// Project being opened (with its objects' textures), and the file the scene was last
+    /// saved to / opened from.
+    project_job: Option<(PathBuf, Job<OpenedProject>)>,
     project_path: Option<PathBuf>,
     autosave: Option<Autosave>,
     /// An autosave left by a session that did not exit cleanly.
@@ -377,6 +718,8 @@ pub struct MeshWorkspace {
     nav_anchor: Option<DVec3>,
     /// Centre of mass of an object, for the mesh version it was computed for.
     com_cache: Option<(ObjectId, u64, DVec3)>,
+    /// The Statistics panel's values of the active object.
+    stats_cache: StatsCache,
     /// Right-button drag owned by the active tool: press position.
     tool_rmb: Option<egui::Pos2>,
     /// Previous / Next view.
@@ -403,6 +746,8 @@ pub struct MeshWorkspace {
     pub(crate) slices: slices::ImageSlices,
     /// Width of the object browser (drag its left edge).
     objects_width: f32,
+    /// Height of an object browser row, as last drawn (rows out of view are not drawn).
+    objects_row_h: Option<f32>,
     prefs: Prefs,
     show_prefs: bool,
     prefs_tab: usize,
@@ -414,8 +759,12 @@ pub struct MeshWorkspace {
     tool_panel_width: f32,
     recent: Vec<PathBuf>,
     script: Option<Script>,
-    /// Boundary-edge line vertices per object, keyed by (object, mesh version, mesh address).
-    boundary_cache: HashMap<ObjectId, (BoundaryKey, Vec<ColorVertex>)>,
+    /// Boundary-edge lines per object (kept while the object is in the scene, shown or not).
+    boundary_cache: FastMap<ObjectId, BoundaryLines>,
+    /// History generation `boundary_cache` was last pruned at.
+    boundary_pruned: u64,
+    /// The viewport's line vertices, kept between frames so their memory is reused.
+    lines_buf: Vec<ColorVertex>,
     /// Synthetic pointer events queued by scripts (consumed one per frame).
     synthetic: std::collections::VecDeque<PointerInput>,
     /// Files an agent opened: imported without prompts, like test scripts.
@@ -447,10 +796,16 @@ impl MeshWorkspace {
             renderer,
             gpu: HashMap::new(),
             preview_gpu: None,
+            bvh_job: None,
+            bvh_generation: 0,
+            bvh_topo: FastMap::default(),
             view: ViewOptions::default(),
             tools: Vec::new(),
             category: None,
             library: None,
+            library_job: None,
+            library_changes: crate::parts::library_changes(),
+            library_failed: None,
             pending_switch: None,
             status: "Welcome to Polymix. Import a mesh to begin (Ctrl/Cmd+O, or drag a file onto the window).".into(),
             script_prompts: false,
@@ -466,6 +821,7 @@ impl MeshWorkspace {
             vp_aspect: 1.6,
             nav_anchor: None,
             com_cache: None,
+            stats_cache: StatsCache::default(),
             tool_rmb: None,
             view_history: ViewHistory::default(),
             view_anim: None,
@@ -482,6 +838,7 @@ impl MeshWorkspace {
             to_segmentation: Vec::new(),
             slices: slices::ImageSlices::new(),
             objects_width: 230.0,
+            objects_row_h: None,
             prefs: Prefs::default(),
             show_prefs: false,
             prefs_tab: 0,
@@ -491,7 +848,9 @@ impl MeshWorkspace {
             tool_panel_width: 300.0,
             recent: Vec::new(),
             synthetic: Default::default(),
-            boundary_cache: HashMap::new(),
+            boundary_cache: FastMap::default(),
+            boundary_pruned: 0,
+            lines_buf: Vec::new(),
             script: None,
             agent_import: false,
             agent_quiet_frames: 0,
@@ -611,53 +970,131 @@ impl MeshWorkspace {
 
     /// Save a changed scene to the autosave file every few minutes (in the background).
     fn autosave_tick(&mut self, ctx: &egui::Context) {
-        let minutes = self.prefs.autosave_minutes;
-        let generation = self.history.generation();
         let now = ctx.input(|i| i.time);
-        let busy = self.recovery.is_some();
-        let Some(auto) = &mut self.autosave else { return };
-        if let Some(job) = &auto.job {
-            if let Some(r) = job.poll() {
-                auto.job = None;
-                if let Err(e) = r {
-                    log::warn!("autosave failed: {e:#}");
-                }
+        if let Some(job) = self.autosave.as_ref().and_then(|a| a.job.as_ref()) {
+            // Still saving: the next save is scheduled once this one is done, below.
+            let Some(r) = job.poll() else { return };
+            if let Err(e) = r {
+                log::warn!("autosave failed: {e:#}");
             }
+            if let Some(auto) = &mut self.autosave {
+                auto.job = None;
+            }
+        }
+        match self.autosave_wait(now) {
+            None => return,
+            Some(wait) if wait > 0.0 => {
+                // Frames come only with input or work, so ask for one when the save is due.
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+                return;
+            }
+            Some(_) => {}
+        }
+        // Not in the middle of a gesture (a stroke, a drag): the save waits for the release,
+        // which brings a frame of its own.
+        if ctx.input(|i| i.pointer.any_down()) {
             return;
         }
-        if busy || minutes == 0 || generation == auto.saved_generation || self.scene.is_empty() || now - auto.last_time < minutes as f64 * 60.0 {
-            return;
-        }
+        let generation = self.history.generation();
+        let project = self.autosave_project();
+        let Some(auto) = &mut self.autosave else { return };
         auto.saved_generation = generation;
         auto.last_time = now;
         let file = auto.file.clone();
-        let project = self.autosave_project();
-        if let Some(auto) = &mut self.autosave {
-            auto.job = Some(Job::spawn("Autosave", ctx.clone(), move |_| crate::project::save(&file, &project)));
-        }
+        auto.job = Some(Job::spawn("Autosave", ctx.clone(), move |_| crate::project::save_shared(&file, &project, crate::project::Compression::Fast)));
     }
 
-    /// The scene as an autosave project.
-    fn autosave_project(&self) -> crate::project::Project {
-        let objects = self
+    /// Seconds until the unsaved changes are due for an autosave (0 once due), or `None` when
+    /// there is nothing to save, a save is running, autosave is off or recovery is asked.
+    fn autosave_wait(&self, now: f64) -> Option<f64> {
+        let auto = self.autosave.as_ref()?;
+        let minutes = self.prefs.autosave_minutes;
+        if auto.job.is_some() || self.recovery.is_some() || minutes == 0 || self.history.generation() == auto.saved_generation || self.scene.is_empty() {
+            return None;
+        }
+        let (elapsed, period) = (now - auto.last_time, minutes as f64 * 60.0);
+        Some(if elapsed < period { period - elapsed } else { 0.0 })
+    }
+
+    /// After a commit (a tool's result applied, a command, undo or redo), build in the
+    /// background the BVHs that the next orbit or pick would otherwise build on the UI thread:
+    /// those of visible objects whose BVH is missing or was made for another topology. Never
+    /// while a button is held or anything is running; a BVH that is stale by the time it is
+    /// done is turned away by `install_bvh`.
+    fn bvh_tick(&mut self, ctx: &egui::Context) {
+        // BVHs built or refitted by picks: one of the same topology is only refitted later.
+        for o in &self.scene.objects {
+            if o.bvh_if_current().is_some() {
+                self.bvh_topo.insert(o.id, o.mesh.topology_version());
+            }
+        }
+        if let Some(b) = &self.bvh_job {
+            let Some(r) = b.job.poll() else {
+                // A commit, undo or project opened since it started may have replaced meshes
+                // it builds for. What is still needed is started once it ends; a build under
+                // way cannot be stopped, but none is begun for nothing.
+                if !b.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let current = self.scene.objects.iter().filter(|o| b.shapes.get(&o.id) == Some(&o.mesh.shape_version())).count();
+                    if current < b.shapes.len() {
+                        b.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                return;
+            };
+            self.bvh_job = None;
+            match r {
+                Ok(built) => {
+                    for (id, bvh) in built {
+                        if let Some(o) = self.scene.get_mut(id) {
+                            if o.install_bvh(bvh) {
+                                self.bvh_topo.insert(id, o.mesh.topology_version());
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::warn!("background BVH build failed: {e:#}"),
+            }
+        }
+        let generation = self.history.generation();
+        if generation == self.bvh_generation {
+            return;
+        }
+        // An open tool picks on its own (brush cursors, hover), and work under way changes
+        // the meshes: wait until both are done.
+        let busy = !self.tools.is_empty()
+            || self.pending_switch.is_some()
+            || !self.synthetic.is_empty()
+            || self.import_job.is_some()
+            || self.project_job.is_some()
+            || ctx.input(|i| i.pointer.any_down());
+        if busy {
+            return;
+        }
+        self.bvh_generation = generation;
+        let ids: FastSet<ObjectId> = self.scene.objects.iter().map(|o| o.id).collect();
+        self.bvh_topo.retain(|id, _| ids.contains(id));
+        let stale: Vec<(ObjectId, std::sync::Arc<Mesh>)> = self
             .scene
             .objects
             .iter()
-            .map(|o| crate::project::ProjectObject {
-                name: o.name.clone(),
-                mesh: (*o.mesh).clone(),
-                visible: o.visible,
-                color: o.color,
-                material: o.material,
-                frame: o.frame,
-                group_names: o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect(),
-                uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
-                pivots: o.pivots.clone(),
-                texture: o.texture.as_ref().and_then(|t| t.path.clone()),
-                reference: o.reference,
-            })
+            .filter(|o| o.visible && !o.reference && o.bvh_if_current().is_none() && self.bvh_topo.get(&o.id) != Some(&o.mesh.topology_version()))
+            .map(|o| (o.id, o.mesh.clone()))
             .collect();
-        crate::project::Project { objects, active: None, target: None, view: Some(self.camera.view_state()) }
+        if stale.is_empty() {
+            return;
+        }
+        let shapes = stale.iter().map(|(id, m)| (*id, m.shape_version())).collect();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = stop.clone();
+        let job = Job::spawn("Preparing picking", ctx.clone(), move |_| Ok(build_bvhs(stale, &s)));
+        self.bvh_job = Some(BvhJob { shapes, stop, job });
+    }
+
+    /// The scene as an autosave project. It shares the scene's meshes and UVs: nothing is
+    /// copied here, on the UI thread.
+    fn autosave_project(&self) -> crate::project::SaveProject {
+        let objects = self.scene.objects.iter().map(|o| save_object(o, o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect())).collect();
+        crate::project::SaveProject { objects, active: None, target: None, view: Some(self.camera.view_state()) }
     }
 
     /// Offer to restore the autosave of a session that crashed.
@@ -726,53 +1163,10 @@ impl MeshWorkspace {
         self.recent.truncate(10);
         let n = files.len();
         let obj_groups = self.prefs.obj_import_groups;
-        self.import_job = Some(Job::spawn(format!("Importing {n} file(s)"), ctx.clone(), move |progress| {
-            let mut out = Vec::new();
-            for (i, f) in files.iter().enumerate() {
-                if !progress(i as f32 / n as f32) {
-                    anyhow::bail!("cancelled");
-                }
-                let t0 = std::time::Instant::now();
-                let mut imported = mm_io::read_mesh(f).map_err(|e| anyhow::anyhow!("{}: {e:#}", f.display()))?;
-                if !obj_groups && imported.format == mm_io::Format::Obj {
-                    for t in imported.mesh.triangle_ids().collect::<Vec<_>>() {
-                        imported.mesh.set_tri_group(t, 0);
-                    }
-                }
-                let rep = &imported.report;
-                let mut notes = format!(
-                    "{}: {} triangles, {} vertices ({:.2}s)",
-                    imported.name,
-                    imported.mesh.triangle_count(),
-                    imported.mesh.vertex_count(),
-                    t0.elapsed().as_secs_f32()
-                );
-                if rep.nonmanifold_split + rep.degenerate + rep.duplicate > 0 {
-                    notes += &format!(
-                        " — fixed on load: {} non-manifold, {} degenerate, {} duplicate triangles",
-                        rep.nonmanifold_split, rep.degenerate, rep.duplicate
-                    );
-                }
-                let texture = match &imported.texture {
-                    Some(p) => match crate::scene::TextureImage::load(p) {
-                        Ok(t) => {
-                            notes += &format!(" — texture {}", p.file_name().map_or(String::new(), |n| n.to_string_lossy().to_string()));
-                            Some(std::sync::Arc::new(t))
-                        }
-                        Err(e) => {
-                            notes += &format!(" — texture not loaded ({e})");
-                            None
-                        }
-                    },
-                    None => None,
-                };
-                if reference {
-                    notes += " — as a reference";
-                }
-                out.push((imported.name, imported.mesh, notes, ImportLook { uvs: imported.uvs, texture, reference }));
-            }
-            Ok(out)
-        }));
+        // Several files are read at once, up to half the cores (which bounds the memory of
+        // files being parsed).
+        let workers = std::thread::available_parallelism().map_or(1, |c| c.get() / 2);
+        self.import_job = Some(Job::spawn(format!("Importing {n} file(s)"), ctx.clone(), move |progress| import_files(&files, obj_groups, reference, workers, progress)));
     }
 
     /// The image the Segmentation tab shows, for the image slices (`None`: none is open).
@@ -795,11 +1189,12 @@ impl MeshWorkspace {
             self.history.by_agent = true;
             self.agent_quiet_frames = 0;
         }
-        let mut meshes: Vec<(String, Mesh, String)> = meshes
+        let mut meshes: Vec<(String, Mesh, String, f64)> = meshes
             .into_iter()
             .map(|(name, mesh)| {
                 let note = format!("{name}: {} triangles from Segmentation", mesh.triangle_count());
-                (name, mesh, note)
+                let diagonal = mesh.bounds().diagonal();
+                (name, mesh, note, diagonal)
             })
             .collect();
         if let Some(p) = &mut self.pending_import {
@@ -829,7 +1224,7 @@ impl MeshWorkspace {
                             ImportMode::Append => Some(false),
                             ImportMode::Replace => Some(true),
                         };
-                        let (meshes, looks) = imported.into_iter().map(|(n, m, note, look)| ((n, m, note), look)).unzip();
+                        let (meshes, looks) = imported.into_iter().map(|(n, m, note, d, look)| ((n, m, note, d), look)).unzip();
                         self.pending_import = Some(PendingImport { meshes, looks, placement, remember: false });
                     }
                     Err(e) => self.status = format!("Import failed: {e:#}"),
@@ -853,6 +1248,21 @@ impl MeshWorkspace {
                     Ok(msg) => msg,
                     Err(e) => format!("Export failed: {e:#}"),
                 };
+            }
+        }
+        if let Some((changes, job)) = &self.library_job {
+            if let Some(res) = job.poll() {
+                let changes = *changes;
+                self.library_job = None;
+                match res {
+                    // Newer than what is shown, but if the files changed meanwhile it is still
+                    // out of date (the panel then loads it again).
+                    Ok(lib) => (self.library, self.library_changes, self.library_failed) = (Some(lib), changes, None),
+                    Err(e) => {
+                        log::warn!("loading the parts library failed: {e:#}");
+                        self.library_failed = Some(changes);
+                    }
+                }
             }
         }
     }
@@ -895,13 +1305,13 @@ impl MeshWorkspace {
             }
             return;
         }
-        let odd = pending.meshes.iter().any(|(_, m, _)| odd_size(m));
+        let odd = pending.meshes.iter().any(|(_, _, _, d)| odd_diagonal(*d));
         let factor = match self.prefs.scale_mode {
             _ if !odd || scripted => Some(1.0),
             ScaleMode::Never => Some(1.0),
             ScaleMode::Always(k) => Some(k),
             ScaleMode::Ask => {
-                let d = pending.meshes.iter().map(|(_, m, _)| m.bounds().diagonal()).fold(0.0, f64::max);
+                let d = pending.meshes.iter().map(|(_, _, _, d)| *d).fold(0.0, f64::max);
                 let mut pick = None;
                 center(egui::Window::new("Model size")).show(ctx, |ui| {
                     ui.label(format!(
@@ -949,7 +1359,7 @@ impl MeshWorkspace {
         let first_import = self.scene.is_empty();
         let mut notes = Vec::new();
         let mut looks = pending.looks.into_iter();
-        for (name, mut mesh, mut note) in pending.meshes {
+        for (name, mut mesh, mut note, _) in pending.meshes {
             if self.prefs.flip_zy {
                 mesh.transform(flip_zy_in);
             }
@@ -990,16 +1400,27 @@ impl MeshWorkspace {
         self.recent.insert(0, path.clone());
         self.recent.truncate(10);
         let p = path.clone();
-        self.project_job = Some((path, Job::spawn("Opening project", ctx.clone(), move |_| crate::project::load(&p))));
+        self.project_job = Some((
+            path,
+            Job::spawn("Opening project", ctx.clone(), move |_| {
+                use rayon::prelude::*;
+                let project = crate::project::load(&p)?;
+                // Textures are read again from their files (missing: the object shows without).
+                let textures = project.objects.par_iter().map(|o| o.texture.as_ref().and_then(|t| crate::scene::TextureImage::load(t).ok()).map(std::sync::Arc::new)).collect();
+                Ok((project, textures))
+            }),
+        ));
     }
 
-    fn apply_project(&mut self, p: crate::project::Project, path: PathBuf) {
+    fn apply_project(&mut self, (p, textures): OpenedProject, path: PathBuf) {
         self.history.push("Open project", &self.scene);
         self.scene.objects.clear();
         self.scene.active = None;
         self.scene.target = None;
         let mut ids = Vec::new();
+        let mut textures = textures.into_iter();
         for o in p.objects {
+            let texture = textures.next().flatten();
             let id = self.scene.add(o.name, o.mesh);
             if let Some(so) = self.scene.get_mut(id) {
                 so.visible = o.visible;
@@ -1010,8 +1431,7 @@ impl MeshWorkspace {
                 so.uvs = o.uvs.map(|c| std::sync::Arc::new(crate::scene::UvSet::new(&so.mesh, c)));
                 so.pivots = o.pivots;
                 so.reference = o.reference;
-                // The texture is read again from its file (missing: the object shows without it).
-                so.texture = o.texture.and_then(|p| crate::scene::TextureImage::load(&p).ok()).map(std::sync::Arc::new);
+                so.texture = texture;
             }
             ids.push(id);
         }
@@ -1060,29 +1480,18 @@ impl MeshWorkspace {
             return Err("Nothing to save.".into());
         }
         let index = |id: Option<ObjectId>| id.and_then(|id| self.scene.objects.iter().position(|o| o.id == id));
-        let objects: Vec<crate::project::ProjectObject> = self
+        // The scene's meshes and UVs are shared with the job, not copied here.
+        let objects: Vec<crate::project::SaveObject> = self
             .scene
             .objects
             .iter()
             .map(|o| {
                 let mut groups: Vec<(i32, String)> = o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect();
                 groups.sort();
-                crate::project::ProjectObject {
-                    name: o.name.clone(),
-                    mesh: (*o.mesh).clone(),
-                    visible: o.visible,
-                    color: o.color,
-                    material: o.material,
-                    frame: o.frame,
-                    group_names: groups,
-                    uvs: o.uvs().map(|u| o.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
-                    pivots: o.pivots.clone(),
-                    texture: o.texture.as_ref().and_then(|t| t.path.clone()),
-                    reference: o.reference,
-                }
+                save_object(o, groups)
             })
             .collect();
-        let project = crate::project::Project {
+        let project = crate::project::SaveProject {
             objects,
             active: index(self.scene.active),
             target: index(self.scene.target),
@@ -1091,7 +1500,7 @@ impl MeshWorkspace {
         self.project_path = Some(path.clone());
         let msg = format!("Saving the project to {}", path.display());
         self.export_job = Some(Job::spawn("Saving", ctx.clone(), move |_| {
-            crate::project::save(&path, &project)?;
+            crate::project::save_shared(&path, &project, crate::project::Compression::Default)?;
             Ok(format!("Saved {}", path.display()))
         }));
         Ok(msg)
@@ -1151,37 +1560,29 @@ impl MeshWorkspace {
         if matches!(scope, ExportScope::PerGroup | ExportScope::PerObject) {
             return self.export_sequence(path, scope, ctx);
         }
-        let mesh: Mesh = match scope {
+        // What to write, taken from the scene without copying a mesh: the job assembles it.
+        let (source, triangles) = match scope {
             ExportScope::PerGroup | ExportScope::PerObject => unreachable!("handled above"),
             ExportScope::AllVisible => {
-                let mut m = Mesh::new();
-                for o in self.scene.objects.iter().filter(|o| o.visible && !o.reference) {
-                    m.append_mesh(&o.mesh, 0);
-                }
-                m
+                let meshes: Vec<std::sync::Arc<Mesh>> = self.scene.objects.iter().filter(|o| o.visible && !o.reference).map(|o| o.mesh.clone()).collect();
+                let triangles = meshes.iter().map(|m| m.triangle_count()).sum();
+                (ExportSource::Combined(meshes), triangles)
             }
-            ExportScope::Active => (*active.mesh).clone(),
-            ExportScope::Selection => {
-                let tris: Vec<u32> = active.selection.iter().collect();
-                active.mesh.submesh(&tris).0
-            }
+            ExportScope::Active => (ExportSource::Whole(active.mesh.clone()), active.mesh.triangle_count()),
+            ExportScope::Selection => (ExportSource::Part(active.mesh.clone(), active.selection.clone()), active.selection.len()),
         };
-        let mesh = if self.prefs.flip_zy {
-            let mut m = mesh;
-            m.transform(flip_zy_out);
-            m
-        } else {
-            mesh
-        };
+        let flip = self.prefs.flip_zy;
         let p2 = path.clone();
         // UVs go out with the active object (OBJ).
         let uvs = match scope {
-            ExportScope::Active => active.uvs().map(|u| active.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
+            ExportScope::Active => active.uvs.clone().filter(|u| u.topo == active.mesh.topology_version()),
             _ => None,
         };
-        let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, uvs, ..Default::default() };
-        let msg = format!("Exporting {} triangles to {}", mesh.triangle_count(), p2.display());
+        let mut opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, ..Default::default() };
+        let msg = format!("Exporting {triangles} triangles to {}", p2.display());
         self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |_| {
+            let mesh = source.mesh(flip);
+            opts.uvs = uvs.map(|u| mesh.triangle_ids().map(|t| u.corners[t as usize]).collect());
             mm_io::write_mesh(&p2, &mesh, &opts)?;
             Ok(format!("Exported {} triangles to {}", mesh.triangle_count(), p2.display()))
         }));
@@ -1195,54 +1596,56 @@ impl MeshWorkspace {
         let stem = path.file_stem().map_or("mesh".to_string(), |s| s.to_string_lossy().to_string());
         let ext = path.extension().map_or("stl".to_string(), |e| e.to_string_lossy().to_string());
         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let mut parts: Vec<(String, Mesh)> = Vec::new();
-        match scope {
+        // The meshes are shared with the job, which cuts the groups out (in group order) and
+        // copies what it turns, one file at a time; only the file count is needed here.
+        let (sources, n): (ExportParts, usize) = match scope {
             ExportScope::PerGroup => {
                 let o = self.scene.active().ok_or("Nothing to export.")?;
-                let mut groups: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
-                for t in o.mesh.triangle_ids() {
-                    groups.entry(o.mesh.tri_group(t)).or_default().push(t);
-                }
-                for (g, tris) in groups {
-                    let name = o.group_names.get(&g).cloned().unwrap_or_else(|| format!("group_{g}"));
-                    parts.push((name, o.mesh.submesh(&tris).0));
-                }
+                let n = distinct_groups(&o.mesh);
+                (ExportParts::Groups(o.mesh.clone(), o.group_names.clone()), n)
             }
             _ => {
-                for o in self.scene.objects.iter().filter(|o| o.visible && !o.reference) {
-                    parts.push((o.name.clone(), (*o.mesh).clone()));
-                }
+                let parts: Vec<(String, std::sync::Arc<Mesh>)> = self.scene.objects.iter().filter(|o| o.visible && !o.reference).map(|o| (o.name.clone(), o.mesh.clone())).collect();
+                let n = parts.len();
+                (ExportParts::Objects(parts), n)
             }
-        }
-        if parts.is_empty() {
+        };
+        if n == 0 {
             return Err("Nothing to export.".into());
         }
         let flip = self.prefs.flip_zy;
         let opts = mm_io::WriteOptions { stl_ascii: self.export_ascii, obj_groups: self.prefs.obj_export_groups, ..Default::default() };
-        let mut seen = std::collections::HashSet::new();
-        let files: Vec<(PathBuf, Mesh)> = parts
-            .into_iter()
-            .map(|(name, mut m)| {
-                if flip {
-                    m.transform(flip_zy_out);
-                }
-                let mut base = format!("{stem}_{}", safe(&name));
-                let mut k = 2;
-                while !seen.insert(base.clone()) {
-                    base = format!("{stem}_{}_{k}", safe(&name));
-                    k += 1;
-                }
-                (dir.join(format!("{base}.{ext}")), m)
-            })
-            .collect();
-        let n = files.len();
         let msg = format!("Exporting {n} files to {}", dir.display());
         self.export_job = Some(Job::spawn("Exporting", ctx.clone(), move |progress| {
-            for (i, (p, m)) in files.iter().enumerate() {
+            let mut seen = std::collections::HashSet::new();
+            let mut write = |i: usize, name: &str, source: ExportSource| -> anyhow::Result<()> {
                 if !progress(i as f32 / n as f32) {
                     anyhow::bail!("cancelled");
                 }
-                mm_io::write_mesh(p, m, &opts)?;
+                let mut base = format!("{stem}_{}", safe(name));
+                let mut k = 2;
+                while !seen.insert(base.clone()) {
+                    base = format!("{stem}_{}_{k}", safe(name));
+                    k += 1;
+                }
+                mm_io::write_mesh(&dir.join(format!("{base}.{ext}")), &source.mesh(flip), &opts)
+            };
+            match sources {
+                ExportParts::Groups(mesh, names) => {
+                    let mut groups: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+                    for t in mesh.triangle_ids() {
+                        groups.entry(mesh.tri_group(t)).or_default().push(t);
+                    }
+                    for (i, (g, tris)) in groups.into_iter().enumerate() {
+                        let name = names.get(&g).cloned().unwrap_or_else(|| format!("group_{g}"));
+                        write(i, &name, ExportSource::Whole(std::sync::Arc::new(mesh.submesh(&tris).0)))?;
+                    }
+                }
+                ExportParts::Objects(parts) => {
+                    for (i, (name, m)) in parts.into_iter().enumerate() {
+                        write(i, &name, ExportSource::Whole(m))?;
+                    }
+                }
             }
             Ok(format!("Exported {n} files to {}", dir.display()))
         }));
@@ -1272,8 +1675,9 @@ impl MeshWorkspace {
             SwitchTo::Tool(name) => {
                 self.category = None;
                 if keep == 0 {
-                    // `drop:<part name>` opens Drop Part with a library part.
-                    let part = name.strip_prefix("drop:").and_then(|p| self.library.get_or_insert_with(crate::parts::Library::load).find(p));
+                    // `drop:<part name>` opens Drop Part with a library part (from the library
+                    // as its files are now: loaded here if need be, for agents' calls).
+                    let part = name.strip_prefix("drop:").and_then(|p| self.current_library().find(p));
                     let mut cx = self.tool_cx(ctx, vp);
                     let tool: Option<Box<dyn Tool>> = match part {
                         Some(p) => Some(Box::new(tools::drop_part::DropPartTool::new(&mut cx, p))),
@@ -1292,12 +1696,52 @@ impl MeshWorkspace {
             }
             SwitchTo::Category(c) => {
                 if c == Some(Category::Meshmix) {
-                    // Pick up parts saved since the last look.
-                    self.library = None;
+                    // Pick up parts saved since the last look (in the background; the parts
+                    // shown last time stay until then).
+                    self.load_library(ctx);
                 }
                 self.category = c;
             }
         }
+    }
+
+    /// Start loading the parts library in the background, unless it is being loaded already.
+    fn load_library(&mut self, ctx: &egui::Context) {
+        if self.library_job.is_none() {
+            let changes = crate::parts::library_changes();
+            self.library_job = Some((changes, Job::spawn("Loading parts", ctx.clone(), |_| Ok(crate::parts::Library::load()))));
+        }
+    }
+
+    /// Reload: the library as its files are now. A load under way may have read the folders
+    /// before files were copied into them, so its result is then out of date (and loaded
+    /// again while the panel is shown).
+    fn reload_library(&mut self, ctx: &egui::Context) {
+        self.library_failed = None;
+        match &mut self.library_job {
+            Some((changes, _)) => *changes = u64::MAX,
+            None => self.load_library(ctx),
+        }
+    }
+
+    /// Whether the shown panel should load the library, its files being at `changes`: it is
+    /// missing or out of date, and a load has not failed at that count.
+    fn library_load_due(&self, changes: u64) -> bool {
+        !(self.library.is_some() && self.library_changes == changes) && self.library_failed != Some(changes)
+    }
+
+    /// Whether `library` is there and was loaded after the last change of its files.
+    fn library_is_current(&self) -> bool {
+        self.library.is_some() && self.library_changes == crate::parts::library_changes()
+    }
+
+    /// The parts library as its files are now, loaded here (on this thread) if need be.
+    fn current_library(&mut self) -> &crate::parts::Library {
+        if !self.library_is_current() {
+            self.library_changes = crate::parts::library_changes();
+            self.library = Some(crate::parts::Library::load());
+        }
+        self.library.get_or_insert_with(crate::parts::Library::load)
     }
 
     /// Accept and close tools from the top of the stack until `keep` remain. Returns false
@@ -1410,9 +1854,9 @@ impl MeshWorkspace {
                 }
                 if ui.button("Import parts folder…").on_hover_text("Add a folder of mesh files to Meshmix as parts").clicked() {
                     ui.close();
+                    // The library is loaded again when next shown (the folder list changed).
                     if let Some(msg) = crate::parts::import_parts_folder_dialog() {
                         self.status = msg;
-                        self.library = None;
                     }
                 }
                 if ui.button("Export active…").clicked() {
@@ -1680,8 +2124,25 @@ impl MeshWorkspace {
         let mut command: Option<MeshCommand> = None;
         match cat {
             Category::Meshmix => {
-                if let Some(name) = crate::parts::library_panel(ui, &mut self.library, has_obj, &mut self.status) {
-                    self.switch_to(SwitchTo::Tool(format!("drop:{name}")), &ctx, vp);
+                // A library from before its files last changed (a part saved with Convert To,
+                // a folder added or removed) is shown until the new one is loaded.
+                if self.library_load_due(crate::parts::library_changes()) {
+                    self.load_library(&ctx);
+                }
+                if self.library.is_none() && self.library_job.is_none() {
+                    // The first load failed (it is in the log).
+                    ui.label("The parts could not be loaded.");
+                    if ui.button("Try again").clicked() {
+                        self.reload_library(&ctx);
+                    }
+                } else {
+                    let r = crate::parts::library_panel(ui, self.library.as_mut(), has_obj, &mut self.status);
+                    if r.reload {
+                        self.reload_library(&ctx);
+                    }
+                    if let Some(name) = r.drop {
+                        self.switch_to(SwitchTo::Tool(format!("drop:{name}")), &ctx, vp);
+                    }
                 }
             }
             Category::Edit => {
@@ -1921,7 +2382,9 @@ impl MeshWorkspace {
         }
     }
 
-    fn objects_panel(&mut self, ui: &mut egui::Ui) {
+    /// The object browser's rows and the Statistics, in a scroll area showing `viewport` of
+    /// them (content coordinates; `None`: all).
+    fn objects_panel(&mut self, ui: &mut egui::Ui, viewport: Option<egui::Rect>) {
         let mut delete = None;
         let mut make_active = None;
         let mut solo = None;
@@ -1935,8 +2398,34 @@ impl MeshWorkspace {
         // The object being renamed, its name before (Esc puts it back) and whether its field
         // has been given the keyboard focus.
         let mut renaming: Option<(ObjectId, String, bool)> = ui.ctx().data(|d| d.get_temp(rename_id));
-        for o in self.scene.objects.iter_mut() {
-            ui.horizontal(|ui| {
+        // With many objects (hundreds after Separate Shells) only the rows in view are drawn;
+        // the others just take their room, as one block above and one below. Not while an
+        // object is renamed, as its field may make its row taller; nor while AccessKit is on
+        // (agents and screen readers find and use rows out of view through it) or a popup is
+        // open (a row's context menu or colour picker stays open only while the row is drawn).
+        let n = self.scene.objects.len();
+        let gap = ui.spacing().item_spacing.y;
+        let step = self.objects_row_h.map(|h| h + gap);
+        let draw_all = renaming.is_some() || ui.ctx().has_accesskit_node(egui::accesskit_root_id()) || egui::Popup::is_any_open(ui.ctx());
+        let rows = match (viewport, step) {
+            (Some(vp), Some(step)) if !draw_all => {
+                let first = ((vp.min.y / step).floor().max(0.0) as usize).saturating_sub(1).min(n);
+                let last = ((vp.max.y / step).ceil().max(0.0) as usize + 1).clamp(first, n);
+                first..last
+            }
+            _ => 0..n,
+        };
+        let step = step.unwrap_or(0.0);
+        // Each row takes one id of this ui (its `push_id` scope), a block one: skip ahead by the
+        // rest, so that what follows keeps its ids however far the list is scrolled.
+        if rows.start > 0 {
+            ui.allocate_space(egui::vec2(0.0, rows.start as f32 * step - gap));
+            ui.skip_ahead_auto_ids(rows.start - 1);
+        }
+        let mut row_h: Option<f32> = None;
+        for o in self.scene.objects[rows.clone()].iter_mut() {
+            let mut renamed_row = false;
+            let r = ui.push_id(o.id, |ui| ui.horizontal(|ui| {
                 ui.checkbox(&mut o.visible, "").on_hover_text("Visible");
                 let active = Some(o.id) == self.scene.active;
                 if let Some((_, before, focused)) = renaming.as_mut().filter(|r| r.0 == o.id) {
@@ -1955,6 +2444,7 @@ impl MeshWorkspace {
                         }
                         renaming = None;
                     }
+                    renamed_row = true;
                     return;
                 }
                 // The controls at the right first; the name takes the room left, cut short with
@@ -1972,7 +2462,8 @@ impl MeshWorkspace {
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         let label = RichText::new(&o.name).color(if active { ui_util::ACCENT } else { ui.visuals().text_color() });
-                        let r = ui.add(egui::Button::selectable(active, label).truncate()).on_hover_text(format!("{}\n\nClick: make active · Double-click: rename · Right-click: more", o.name));
+                        let r = ui.add(egui::Button::selectable(active, label).truncate());
+                        let r = hover_text_with(r, || format!("{}\n\nClick: make active · Double-click: rename · Right-click: more", o.name));
                         if r.clicked() {
                             make_active = Some(o.id);
                         }
@@ -2028,7 +2519,21 @@ impl MeshWorkspace {
                         });
                     });
                 });
-            });
+            }))
+            .inner
+            .response
+            .rect
+            .height();
+            if !renamed_row {
+                row_h = Some(row_h.map_or(r, |h| h.max(r)));
+            }
+        }
+        if rows.end < n {
+            ui.allocate_space(egui::vec2(0.0, (n - rows.end) as f32 * step - gap));
+            ui.skip_ahead_auto_ids(n - rows.end - 1);
+        }
+        if row_h.is_some() {
+            self.objects_row_h = row_h;
         }
         if let Some(id) = make_active {
             self.scene.active = Some(id);
@@ -2091,8 +2596,8 @@ impl MeshWorkspace {
             if let Some(o) = self.scene.active() {
                 ui_util::section(ui, "Active object");
                 let m = &o.mesh;
-                let b = m.bounds();
-                let e = b.extents();
+                let s = self.stats_cache.get(o);
+                let e = s.extents;
                 egui::Grid::new("stats").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
                     ui.label("Triangles");
                     ui.label(ui_util::format_count(m.triangle_count()));
@@ -2103,21 +2608,21 @@ impl MeshWorkspace {
                     ui.label("Size");
                     ui.label(format!("{:.2} × {:.2} × {:.2}", e.x, e.y, e.z));
                     ui.end_row();
-                    let open = m.boundary_edge_ids().count();
+                    let open = s.open;
                     ui.label("Open edges");
                     ui.label(if open == 0 { RichText::new("0 (closed)").color(Color32::from_rgb(120, 200, 120)) } else { RichText::new(open.to_string()).color(Color32::from_rgb(240, 170, 90)) });
                     ui.end_row();
-                    if open == 0 {
+                    if let Some(v) = s.volume {
                         ui.label("Volume");
-                        ui.label(format!("{:.3}", mm_core::measure::volume(m)));
+                        ui.label(format!("{v:.3}"));
                         ui.end_row();
                     }
-                    let c = mm_core::measure::center_of_mass(m);
+                    let c = s.center_of_mass;
                     ui.label("Centre of mass").on_hover_text(if open == 0 { "Of the enclosed solid (uniform density)" } else { "Of the surface (an open mesh encloses no solid)" });
                     ui.label(format!("{:.2}, {:.2}, {:.2}", c.x, c.y, c.z));
                     ui.end_row();
                     ui.label("Area");
-                    ui.label(format!("{:.3}", mm_core::measure::surface_area(m)));
+                    ui.label(format!("{:.3}", s.area));
                     ui.end_row();
                     ui.label("Selected");
                     ui.label(ui_util::format_count(o.selection.len()));
@@ -2775,27 +3280,24 @@ impl MeshWorkspace {
             }
         }
 
-        // --- boundaries overlay (cached per mesh version) ---------------------
-        let mut lines: Vec<ColorVertex> = Vec::new();
+        // --- boundaries overlay (cached per topology and mesh version) -------------
+        let mut lines = std::mem::take(&mut self.lines_buf);
+        lines.clear();
         if self.view.boundaries {
-            let blue = Vec4::new(0.25, 0.65, 1.0, 1.0);
             let preview = self.tools.last().and_then(|t| t.preview());
+            // Objects come and go with history steps: forget those no longer in the scene
+            // (hidden ones keep their lines).
+            if self.boundary_pruned != self.history.generation() {
+                self.boundary_pruned = self.history.generation();
+                let ids: FastSet<ObjectId> = self.scene.objects.iter().map(|o| o.id).collect();
+                self.boundary_cache.retain(|id, _| ids.contains(id));
+            }
             for o in self.scene.objects.iter().filter(|o| o.visible) {
-                let (key, m) = match preview.filter(|(id, _)| *id == o.id) {
-                    Some((_, pm)) => ((o.id, u64::MAX - pm.shape_version(), pm as *const Mesh as usize), pm),
-                    None => ((o.id, o.mesh.shape_version(), std::sync::Arc::as_ptr(&o.mesh) as usize), &*o.mesh),
+                let m = match preview.filter(|(id, _)| *id == o.id) {
+                    Some((_, pm)) => pm,
+                    None => &*o.mesh,
                 };
-                let cached = self.boundary_cache.entry(o.id).or_default();
-                if cached.0 != key {
-                    let mut v = Vec::new();
-                    for e in m.boundary_edge_ids() {
-                        let [a, b] = m.edge_vertices(e);
-                        v.push(ColorVertex::new(m.vertex(a).as_vec3(), blue));
-                        v.push(ColorVertex::new(m.vertex(b).as_vec3(), blue));
-                    }
-                    *cached = (key, v);
-                }
-                lines.extend_from_slice(&cached.1);
+                lines.extend_from_slice(boundary_lines(self.boundary_cache.entry(o.id).or_default(), m));
             }
         }
         if self.view.show_grid {
@@ -2829,8 +3331,8 @@ impl MeshWorkspace {
             let mut objs: Vec<(&GpuMesh, bool)> = Vec::new();
             for o in self.scene.objects.iter().filter(|o| o.visible) {
                 if Some(o.id) == preview_id {
-                    if let Some(g) = &self.preview_gpu {
-                        objs.push((g, false));
+                    if let Some(p) = &self.preview_gpu {
+                        objs.push((&p.gpu, false));
                     }
                 } else if let Some(g) = self.gpu.get(&o.id) {
                     let see_through = self.view.transparent_target && self.scene.target == Some(o.id);
@@ -2847,6 +3349,7 @@ impl MeshWorkspace {
             ui.painter().rect_filled(rect, 0.0, Color32::from_gray(30));
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "wgpu renderer unavailable", egui::FontId::proportional(16.0), Color32::WHITE);
         }
+        self.lines_buf = lines;
 
         // --- 2D overlays ------------------------------------------------------
         let painter = ui.painter_at(rect);
@@ -2874,7 +3377,9 @@ impl MeshWorkspace {
                 let r = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 28.0), egui::vec2(260.0, 30.0));
                 painter.rect_filled(r, 6.0, Color32::from_black_alpha(180));
                 painter.text(r.center(), egui::Align2::CENTER_CENTER, format!("{label}… {:.0}%", p * 100.0), egui::FontId::proportional(14.0), Color32::WHITE);
-                ctx.request_repaint();
+                // The percentage moves on its own, 15 times a second is plenty; the job's end
+                // asks for a frame itself.
+                ctx.request_repaint_after(BUSY_REPAINT);
             }
             self.tools.push(tool);
         }
@@ -2889,15 +3394,17 @@ impl MeshWorkspace {
         }
         if let Some(job) = &self.import_job {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, format!("{}…", job.label), egui::FontId::proportional(18.0), Color32::WHITE);
-            ctx.request_repaint();
+            ctx.request_repaint_after(BUSY_REPAINT);
         }
         self.axis_gizmo(&painter, rect);
         if self.view.show_view_cube {
             self.view_cube(ui, rect);
         }
         self.fit_button(ui, rect);
-        if self.nav_drag.is_some() || response.dragged() || in_rect {
-            // Keep hover-driven overlays (brush cursor) responsive.
+        if self.nav_drag.is_some() || response.dragged() || response.is_pointer_button_down_on() {
+            // Keep press-and-hold work going without pointer motion (a Flow brush held still,
+            // egui deciding between click and drag). Mere hovering needs no frames: pointer
+            // motion brings its own, so the brush cursor still follows.
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
@@ -2961,11 +3468,26 @@ impl MeshWorkspace {
     /// `cut_tint`: Some(target) when a cut preview is active (target None = all objects).
     fn sync_gpu(&mut self, rs: &egui_wgpu::RenderState, cut_tint: Option<Option<ObjectId>>) {
         let renderer = self.renderer.as_ref().unwrap();
-        let ids: Vec<ObjectId> = self.scene.objects.iter().map(|o| o.id).collect();
+        let ids: FastSet<ObjectId> = self.scene.objects.iter().map(|o| o.id).collect();
         self.gpu.retain(|id, _| ids.contains(id));
         let active = self.scene.active;
         let multiple = self.scene.objects.iter().filter(|o| o.visible).count() > 1;
         let preview = self.tools.last().and_then(|t| t.preview());
+        if preview.is_none() {
+            // The preview has ended. When the object now holds the very mesh it showed (the
+            // tool's result was accepted), its GPU copy takes over the object's: accepting
+            // then uploads nothing again. Style keys, selection and texture are checked by
+            // `sync_mesh` below as for any object (the preview was drawn without selection).
+            // Not for an object showing its texture: the object's GPU copy keeps the image,
+            // which the preview's never had (it would be uploaded again).
+            let textures = matches!(self.view.colors, ColorMode::Texture | ColorMode::TextureUnlit);
+            if let Some(p) = self.preview_gpu.take() {
+                let shows_texture = |o: &crate::scene::SceneObject| textures && o.texture.is_some() && o.uvs.as_ref().is_some_and(|u| u.topo == o.mesh.topology_version());
+                if self.scene.get(p.id).is_some_and(|o| (o.mesh.shape_version(), o.mesh.topology_version()) == (p.shape, p.topo) && !shows_texture(o)) {
+                    self.gpu.insert(p.id, p.gpu);
+                }
+            }
+        }
         let mut no_moves = Vec::new();
         let see_through = self.scene.target.filter(|_| self.view.transparent_target);
         for o in self.scene.objects.iter_mut().filter(|o| o.visible) {
@@ -2994,8 +3516,10 @@ impl MeshWorkspace {
             };
             if let Some((pid, pm)) = preview {
                 if pid == o.id {
-                    let g = self.preview_gpu.get_or_insert_with(|| renderer.create_mesh(&rs.device));
-                    renderer.sync_mesh(&rs.device, &rs.queue, g, pm, None, 0, &style, (&mut no_moves, 0), None, None, None);
+                    let p = self.preview_gpu.get_or_insert_with(|| PreviewGpu { id: pid, shape: u64::MAX, topo: u64::MAX, gpu: renderer.create_mesh(&rs.device) });
+                    renderer.sync_mesh(&rs.device, &rs.queue, &mut p.gpu, pm, None, 0, &style, (&mut no_moves, 0), None, None, None);
+                    // The GPU copy now holds exactly this state of the preview mesh.
+                    (p.id, p.shape, p.topo) = (pid, pm.shape_version(), pm.topology_version());
                     continue;
                 }
             }
@@ -3008,9 +3532,6 @@ impl MeshWorkspace {
             let uvs = o.uvs.as_deref().filter(|u| u.topo == o.mesh.topology_version()).map(|u| (u.stamp, u.corners.as_slice()));
             let texture = o.texture.as_deref().map(|t| (t.stamp, t.width, t.height, t.rgba.as_slice()));
             renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars, uvs, texture);
-        }
-        if preview.is_none() {
-            self.preview_gpu = None;
         }
     }
 
@@ -3389,6 +3910,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
             self.finish_import(ctx);
         }
         self.autosave_tick(ctx);
+        self.bvh_tick(ctx);
         if self.history.by_agent {
             self.agent_quiet_frames = if self.agent_quiet() { self.agent_quiet_frames + 1 } else { 0 };
             // An action through the panels lands a frame after the call: leave room for it.
@@ -3455,7 +3977,8 @@ impl polymix_workspace::Workspace for MeshWorkspace {
             return;
         }
         let file = auto.file.clone();
-        if let Err(e) = crate::project::save(&file, &self.autosave_project()) {
+        // Right away, on this thread: no compression.
+        if let Err(e) = crate::project::save_shared(&file, &self.autosave_project(), crate::project::Compression::Stored) {
             log::error!("emergency save failed: {e:#}");
         }
     }
@@ -3543,18 +4066,24 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         self.space_mouse(&ctx, vp_prev);
         if let Some(to) = self.pending_switch.clone() {
             self.switch_to(to, &ctx, vp_prev);
-            ctx.request_repaint();
+            if self.pending_switch.is_some() {
+                // Still waiting for the tool's result: its job's end asks for a frame, this
+                // only keeps looking now and then.
+                ctx.request_repaint_after(BUSY_REPAINT);
+            } else {
+                ctx.request_repaint();
+            }
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, vp_prev));
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(j) = &self.import_job {
-                    ui.spinner();
+                    polymix_workspace::spinner(ui);
                     ui.label(&j.label);
                 }
                 if let Some(j) = &self.export_job {
-                    ui.spinner();
+                    polymix_workspace::spinner(ui);
                     ui.label(&j.label);
                 }
                 ui.label(&self.status);
@@ -3627,7 +4156,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
                             .id_salt("objects_header")
                             .open(Some(!self.objects_folded))
                             .show(ui, |ui| {
-                                egui::ScrollArea::vertical().max_height(max_h - 28.0).show(ui, |ui| self.objects_panel(ui));
+                                egui::ScrollArea::vertical().max_height(max_h - 28.0).show_viewport(ui, |ui, viewport| self.objects_panel(ui, Some(viewport)));
                             });
                         let hint = if self.objects_folded { "Show the objects" } else { "Fold the object browser away" };
                         if header.header_response.on_hover_text(format!("{hint} (View → Object browser or Cmd+Shift+O hides it altogether)")).clicked() {
@@ -3661,7 +4190,43 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);
+        // An edit made above (a button released) is seen by the next frame's tick, which may
+        // only come when the save is due: ask for that frame now. While a button is held the
+        // save waits for its release, which brings a frame of its own.
+        if let Some(wait) = self.autosave_wait(ctx.input(|i| i.time)) {
+            if wait > 0.0 || !ctx.input(|i| i.pointer.any_down()) {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+            }
+        }
     }
+}
+
+/// The open-boundary line vertices of `m` (two per boundary edge, in `boundary_edge_ids`
+/// order), from `cache` when it holds them for this state of the mesh. When only vertices
+/// moved (a brush stroke), they are rebuilt from the cached edges instead of a walk over every
+/// edge of the mesh.
+fn boundary_lines<'a>(cache: &'a mut BoundaryLines, m: &Mesh) -> &'a [ColorVertex] {
+    const BLUE: Vec4 = Vec4::new(0.25, 0.65, 1.0, 1.0);
+    let key = (m.shape_version(), m as *const Mesh as usize);
+    if cache.lines.as_ref().is_none_or(|(k, _)| *k != key) {
+        let topo = m.topology_version();
+        if cache.edges.as_ref().is_none_or(|(t, _)| *t != topo) {
+            let mut edges = cache.edges.take().map(|(_, e)| e).unwrap_or_default();
+            edges.clear();
+            edges.extend(m.boundary_edge_ids());
+            cache.edges = Some((topo, edges));
+        }
+        let edges = cache.edges.as_ref().map_or(&[][..], |(_, e)| e.as_slice());
+        let mut v = cache.lines.take().map(|(_, v)| v).unwrap_or_default();
+        v.clear();
+        for &e in edges {
+            let [a, b] = m.edge_vertices(e);
+            v.push(ColorVertex::new(m.vertex(a).as_vec3(), BLUE));
+            v.push(ColorVertex::new(m.vertex(b).as_vec3(), BLUE));
+        }
+        cache.lines = Some((key, v));
+    }
+    cache.lines.as_ref().map_or(&[], |(_, v)| v.as_slice())
 }
 
 /// The grid's spacing: `fixed` (mm) when set, else "nice" for a scene `size` across (1, 2 or 5
@@ -3750,5 +4315,881 @@ mod flip_tests {
         assert!(!odd_size(&m), "50 mm");
         m.transform(|p| p * 1000.0);
         assert!(odd_size(&m), "50 m in millimetres");
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+    use crate::scene::SceneObject;
+
+    /// The panel's text for `o` as it was drawn before the cache: every value computed there.
+    fn uncached(o: &SceneObject) -> Vec<String> {
+        let m = &*o.mesh;
+        let e = m.bounds().extents();
+        let open = m.boundary_edge_ids().count();
+        let c = mm_core::measure::center_of_mass(m);
+        let mut rows = vec![format!("{:.2} × {:.2} × {:.2}", e.x, e.y, e.z), open.to_string()];
+        if open == 0 {
+            rows.push(format!("{:.3}", mm_core::measure::volume(m)));
+        }
+        rows.push(format!("{:.2}, {:.2}, {:.2}", c.x, c.y, c.z));
+        rows.push(format!("{:.3}", mm_core::measure::surface_area(m)));
+        rows
+    }
+
+    fn cached(cache: &mut StatsCache, o: &SceneObject) -> Vec<String> {
+        let s = cache.get(o);
+        let (e, c) = (s.extents, s.center_of_mass);
+        let mut rows = vec![format!("{:.2} × {:.2} × {:.2}", e.x, e.y, e.z), s.open.to_string()];
+        if let Some(v) = s.volume {
+            rows.push(format!("{v:.3}"));
+        }
+        rows.push(format!("{:.2}, {:.2}, {:.2}", c.x, c.y, c.z));
+        rows.push(format!("{:.3}", s.area));
+        rows
+    }
+
+    #[test]
+    fn statistics_follow_strokes_and_edits_and_objects() {
+        let mut cache = StatsCache::default();
+        let mut sphere = SceneObject::new(1, "sphere", mm_core::primitives::icosphere(3.0, 3));
+        let mut open = SceneObject::new(2, "open", mm_core::primitives::cylinder(1.0, 4.0, 24, 6, false));
+        // Exact values too, not only the text: centre of mass and volume as the old calls gave.
+        let s = cache.get(&sphere);
+        assert_eq!(s.center_of_mass.to_array().map(f64::to_bits), mm_core::measure::center_of_mass(&sphere.mesh).to_array().map(f64::to_bits));
+        assert_eq!(s.volume.map(f64::to_bits), Some(mm_core::measure::volume(&sphere.mesh).to_bits()));
+        for step in 0..12u32 {
+            // A dab moves vertices (same topology); then an edit that changes it.
+            for o in [&mut sphere, &mut open] {
+                let m = o.mesh_mut();
+                let v = (step * 31) % m.max_vid() as u32;
+                let p = m.vertex(v);
+                m.set_vertex(v, p * 1.3 + glam::DVec3::new(0.5, 0.0, -0.25));
+            }
+            assert_eq!(cached(&mut cache, &sphere), uncached(&sphere), "step {step}: sphere");
+            assert_eq!(cached(&mut cache, &open), uncached(&open), "step {step}: open");
+            if step % 4 == 3 {
+                let m = sphere.mesh_mut();
+                let t = m.triangle_ids().nth(step as usize).unwrap();
+                m.remove_triangle(t, true).unwrap();
+            }
+            assert_eq!(cached(&mut cache, &sphere), uncached(&sphere), "step {step}: after the edit");
+        }
+        assert!(cache.get(&sphere).volume.is_none(), "holes cut: no volume");
+        // A stroke on one object: the open-edge count is kept, the rest follows the shape.
+        let topo = open.mesh.topology_version();
+        for v in 0..5u32 {
+            let p = open.mesh.vertex(v);
+            open.mesh_mut().set_vertex(v, p * 0.7);
+            assert_eq!(cached(&mut cache, &open), uncached(&open), "dab {v}");
+            assert_eq!(cache.open.map(|(id, t, _)| (id, t)), Some((open.id, topo)));
+        }
+    }
+
+    /// Every value of `s`, as bits.
+    fn bits(s: &ShapeStats) -> ([u64; 3], usize, Option<u64>, [u64; 3], u64) {
+        (s.extents.to_array().map(f64::to_bits), s.open, s.volume.map(f64::to_bits), s.center_of_mass.to_array().map(f64::to_bits), s.area.to_bits())
+    }
+
+    #[test]
+    fn unchanged_frames_and_undo_use_the_right_values() {
+        let mut cache = StatsCache::default();
+        let mut sphere = SceneObject::new(1, "sphere", mm_core::primitives::icosphere(3.0, 3));
+        // Frames that change nothing get the cached values, bit for bit, under the same key.
+        let first = cache.get(&sphere);
+        let key = Some((sphere.id, sphere.mesh.shape_version()));
+        for _ in 0..3 {
+            assert_eq!(bits(&cache.get(&sphere)), bits(&first));
+            assert_eq!(cache.shape.map(|(id, v, _)| (id, v)), key);
+        }
+        // They are not computed again: positions written without a new version (which no
+        // edit does) are not seen.
+        let mut moved = sphere.clone();
+        moved.mesh_mut().positions_mut()[0] *= 2.0;
+        assert_eq!(bits(&cache.get(&moved)), bits(&first));
+        // Undo puts back the mesh the step before held, with its older version: after a cached
+        // edit, and after an edit the panel never showed.
+        let before = sphere.mesh.clone();
+        for shown in [true, false] {
+            let p = sphere.mesh.vertex(5);
+            sphere.mesh_mut().set_vertex(5, p * 1.5);
+            if shown {
+                assert_eq!(cached(&mut cache, &sphere), uncached(&sphere));
+            }
+            sphere.mesh = before.clone();
+            assert_eq!(cached(&mut cache, &sphere), uncached(&sphere), "undone (shown: {shown})");
+            assert_eq!(bits(&cache.get(&sphere)), bits(&first));
+            assert_eq!(cache.shape.map(|(id, v, _)| (id, v)), key);
+        }
+        // Undo of a cut: the open-edge count follows the topology back.
+        let t = sphere.mesh.triangle_ids().next().unwrap();
+        sphere.mesh_mut().remove_triangle(t, true).unwrap();
+        assert_eq!(cached(&mut cache, &sphere), uncached(&sphere));
+        assert!(cache.get(&sphere).open > 0);
+        sphere.mesh = before;
+        assert_eq!(cached(&mut cache, &sphere), uncached(&sphere));
+        assert_eq!(bits(&cache.get(&sphere)), bits(&first));
+    }
+}
+
+#[cfg(test)]
+mod autosave_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// One frame at input time `time` running the autosave's tick; the wait before the next
+    /// frame it asks for.
+    fn frame(ws: &mut MeshWorkspace, ctx: &egui::Context, time: f64) -> Duration {
+        let out = ctx.run_ui(egui::RawInput { time: Some(time), ..Default::default() }, |ui| ws.autosave_tick(ui.ctx()));
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    #[test]
+    fn saves_come_when_due_without_input() {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        let dir = std::env::temp_dir().join(format!("polymix-autosave-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch folder");
+        let file = dir.join(format!("autosave.{}", crate::project::EXTENSION));
+        ws.prefs.autosave_minutes = 1;
+        ws.autosave = Some(Autosave { file: file.clone(), marker: dir.join("session.lock"), saved_generation: ws.history.generation(), last_time: 0.0, job: None });
+        // Nothing to save: no frame asked for (after egui's own first frames).
+        for _ in 0..3 {
+            frame(&mut ws, &ctx, 1.0);
+        }
+        assert_eq!(frame(&mut ws, &ctx, 1.0), Duration::MAX);
+        // An edit: a frame is asked for when the save is due.
+        ws.scene.add("cube", mm_core::primitives::cube(10.0, 2));
+        ws.history.push("Add", &ws.scene);
+        assert_eq!(ws.autosave_wait(20.0), Some(40.0));
+        assert_eq!(frame(&mut ws, &ctx, 20.0), Duration::from_secs(40));
+        // A save running (held until told to finish) while another edit comes: nothing is
+        // scheduled meanwhile.
+        let (finish, held) = std::sync::mpsc::channel::<()>();
+        let job = Job::spawn("Autosave", ctx.clone(), move |_| {
+            let _ = held.recv();
+            Ok(())
+        });
+        let generation = ws.history.generation();
+        if let Some(a) = &mut ws.autosave {
+            (a.job, a.saved_generation, a.last_time) = (Some(job), generation, 20.0);
+        }
+        ws.history.push("Edit", &ws.scene);
+        assert_eq!(ws.autosave_wait(30.0), None);
+        frame(&mut ws, &ctx, 30.0);
+        // It ends after the next save is due: the frame that sees it end starts the next one,
+        // so the slot is never empty in between.
+        finish.send(()).expect("save waiting");
+        let start = Instant::now();
+        while ws.autosave.as_ref().is_some_and(|a| a.saved_generation != ws.history.generation()) {
+            assert!(start.elapsed() < Duration::from_secs(20), "the next save starts");
+            std::thread::sleep(Duration::from_millis(1));
+            frame(&mut ws, &ctx, 90.0);
+            assert!(ws.autosave.as_ref().is_some_and(|a| a.job.is_some()), "the next save starts in the same frame");
+        }
+        assert_eq!(ws.autosave.as_ref().map(|a| a.last_time), Some(90.0));
+        // That save is written, and with nothing left to save no frame is asked for.
+        while ws.autosave.as_ref().is_some_and(|a| a.job.is_some()) {
+            assert!(start.elapsed() < Duration::from_secs(20), "the save finishes");
+            std::thread::sleep(Duration::from_millis(1));
+            frame(&mut ws, &ctx, 91.0);
+        }
+        assert!(file.exists());
+        assert_eq!(ws.autosave_wait(91.0), None);
+        for _ in 0..3 {
+            frame(&mut ws, &ctx, 92.0);
+        }
+        assert_eq!(frame(&mut ws, &ctx, 92.0), Duration::MAX);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_due_save_waits_for_a_held_button() {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        let dir = std::env::temp_dir().join(format!("polymix-autosave-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch folder");
+        let file = dir.join(format!("autosave.{}", crate::project::EXTENSION));
+        ws.prefs.autosave_minutes = 1;
+        ws.autosave = Some(Autosave { file: file.clone(), marker: dir.join("session.lock"), saved_generation: ws.history.generation(), last_time: 0.0, job: None });
+        ws.scene.add("cube", mm_core::primitives::cube(10.0, 2));
+        ws.history.push("Add", &ws.scene);
+        // Due, but the primary button is down (a stroke): nothing starts, nothing is recorded.
+        let press = |down: bool| egui::RawInput {
+            time: Some(70.0),
+            events: vec![egui::Event::PointerMoved(egui::pos2(10.0, 10.0)), egui::Event::PointerButton { pos: egui::pos2(10.0, 10.0), button: PointerButton::Primary, pressed: down, modifiers: Default::default() }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(press(true), |ui| ws.autosave_tick(ui.ctx()));
+        assert!(ws.autosave.as_ref().is_some_and(|a| a.job.is_none() && a.last_time == 0.0 && a.saved_generation != ws.history.generation()));
+        // Released: the save starts.
+        let _ = ctx.run_ui(press(false), |ui| ws.autosave_tick(ui.ctx()));
+        assert!(ws.autosave.as_ref().is_some_and(|a| a.job.is_some() && a.last_time == 70.0 && a.saved_generation == ws.history.generation()));
+        let start = Instant::now();
+        while ws.autosave.as_ref().is_some_and(|a| a.job.is_some()) {
+            assert!(start.elapsed() < Duration::from_secs(20), "the save finishes");
+            std::thread::sleep(Duration::from_millis(1));
+            frame(&mut ws, &ctx, 71.0);
+        }
+        // Written (fast compression) and read back.
+        let p = crate::project::load(&file).expect("autosave readable");
+        assert_eq!(p.objects.len(), 1);
+        assert_eq!(p.objects[0].mesh.triangle_count(), ws.scene.objects[0].mesh.triangle_count());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A tool that only reports being busy or not (for tests of what the app does around tools).
+#[cfg(test)]
+struct TestTool(bool);
+
+#[cfg(test)]
+impl Tool for TestTool {
+    fn name(&self) -> &'static str {
+        "Test"
+    }
+    fn panel(&mut self, _ui: &mut egui::Ui, _cx: &mut ToolCx) -> ToolOutcome {
+        ToolOutcome::Continue
+    }
+    fn busy(&self) -> Option<(String, f32)> {
+        self.0.then(|| ("Computing".to_string(), 0.5))
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    /// The lines as drawn before the cache: from a walk over every edge of the mesh.
+    fn walked(m: &Mesh) -> Vec<u8> {
+        let blue = Vec4::new(0.25, 0.65, 1.0, 1.0);
+        let mut v = Vec::new();
+        for e in m.boundary_edge_ids() {
+            let [a, b] = m.edge_vertices(e);
+            v.push(ColorVertex::new(m.vertex(a).as_vec3(), blue));
+            v.push(ColorVertex::new(m.vertex(b).as_vec3(), blue));
+        }
+        bytemuck::cast_slice(&v).to_vec()
+    }
+
+    fn lines(cache: &mut BoundaryLines, m: &Mesh) -> Vec<u8> {
+        bytemuck::cast_slice(boundary_lines(cache, m)).to_vec()
+    }
+
+    #[test]
+    fn boundary_lines_follow_strokes_cuts_and_previews() {
+        let mut m = mm_core::primitives::cylinder(1.0, 4.0, 24, 6, false);
+        let mut cache = BoundaryLines::default();
+        assert_eq!(lines(&mut cache, &m), walked(&m));
+        let topo = m.topology_version();
+        let edges = cache.edges.as_ref().map(|(_, e)| e.clone()).expect("edges kept");
+        assert!(!edges.is_empty());
+        // Dabs move vertices and keep the topology: the same edges, the lines follow.
+        for step in 0..10u32 {
+            let v = (step * 13) % m.max_vid() as u32;
+            let p = m.vertex(v);
+            m.set_vertex(v, p * 1.1 + DVec3::new(0.0, 0.1, 0.0));
+            assert_eq!(lines(&mut cache, &m), walked(&m), "dab {step}");
+            assert_eq!(cache.edges.as_ref().map(|(t, e)| (*t, e.clone())), Some((topo, edges.clone())), "dab {step}");
+        }
+        // Holes cut: another topology, its own edges.
+        for k in 0..3 {
+            let t = m.triangle_ids().nth(5 + k * 7).expect("a triangle");
+            m.remove_triangle(t, true).expect("removed");
+            assert_eq!(lines(&mut cache, &m), walked(&m), "cut {k}");
+        }
+        assert_ne!(cache.edges.as_ref().map(|(t, _)| *t), Some(topo));
+        // A preview (another mesh, of the same topology) and back.
+        let mut preview = m.clone();
+        preview.transform(|p| p * 2.0 + DVec3::X);
+        assert_eq!(lines(&mut cache, &preview), walked(&preview));
+        assert_eq!(lines(&mut cache, &m), walked(&m));
+        // A closed mesh has none.
+        assert!(boundary_lines(&mut cache, &mm_core::primitives::icosphere(1.0, 2)).is_empty());
+        // An unchanged mesh is served from the cache, not walked again.
+        lines(&mut cache, &m);
+        if let Some((_, v)) = cache.lines.as_mut() {
+            v[0].color[0] = 9.0;
+        }
+        assert_eq!(boundary_lines(&mut cache, &m)[0].color[0], 9.0);
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Run the export job to its end; the status it leaves.
+    fn finish(ws: &mut MeshWorkspace) -> String {
+        let start = Instant::now();
+        while ws.export_job.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(60), "the export finishes");
+            std::thread::sleep(Duration::from_millis(1));
+            ws.poll_jobs();
+        }
+        ws.status.clone()
+    }
+
+    /// Export as it was done before the job made the meshes: built here, then written. The
+    /// interim message.
+    fn export_before(ws: &MeshWorkspace, path: &std::path::Path, scope: ExportScope) -> String {
+        let active = ws.scene.active().expect("active");
+        let mut mesh = match scope {
+            ExportScope::AllVisible => {
+                let mut m = Mesh::new();
+                for o in ws.scene.objects.iter().filter(|o| o.visible && !o.reference) {
+                    m.append_mesh(&o.mesh, 0);
+                }
+                m
+            }
+            ExportScope::Active => (*active.mesh).clone(),
+            ExportScope::Selection => {
+                let tris: Vec<u32> = active.selection.iter().collect();
+                active.mesh.submesh(&tris).0
+            }
+            _ => unreachable!(),
+        };
+        if ws.prefs.flip_zy {
+            mesh.transform(flip_zy_out);
+        }
+        let uvs = match scope {
+            ExportScope::Active => active.uvs().map(|u| active.mesh.triangle_ids().map(|t| u.corners[t as usize]).collect()),
+            _ => None,
+        };
+        let opts = mm_io::WriteOptions { stl_ascii: ws.export_ascii, obj_groups: ws.prefs.obj_export_groups, uvs, ..Default::default() };
+        mm_io::write_mesh(path, &mesh, &opts).expect("written");
+        format!("Exporting {} triangles to {}", mesh.triangle_count(), path.display())
+    }
+
+    /// One file per region or object, as before.
+    fn sequence_before(ws: &MeshWorkspace, path: &std::path::Path, scope: ExportScope) {
+        let safe = |s: &str| -> String { s.chars().map(|c| if c.is_alphanumeric() || "-_ ".contains(c) { c } else { '_' }).collect::<String>().trim().replace(' ', "_") };
+        let stem = path.file_stem().map_or("mesh".to_string(), |s| s.to_string_lossy().to_string());
+        let ext = path.extension().map_or("stl".to_string(), |e| e.to_string_lossy().to_string());
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut parts: Vec<(String, Mesh)> = Vec::new();
+        match scope {
+            ExportScope::PerGroup => {
+                let o = ws.scene.active().expect("active");
+                let mut groups: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+                for t in o.mesh.triangle_ids() {
+                    groups.entry(o.mesh.tri_group(t)).or_default().push(t);
+                }
+                for (g, tris) in groups {
+                    let name = o.group_names.get(&g).cloned().unwrap_or_else(|| format!("group_{g}"));
+                    parts.push((name, o.mesh.submesh(&tris).0));
+                }
+            }
+            _ => {
+                for o in ws.scene.objects.iter().filter(|o| o.visible && !o.reference) {
+                    parts.push((o.name.clone(), (*o.mesh).clone()));
+                }
+            }
+        }
+        let opts = mm_io::WriteOptions { stl_ascii: ws.export_ascii, obj_groups: ws.prefs.obj_export_groups, ..Default::default() };
+        let mut seen = std::collections::HashSet::new();
+        for (name, mut m) in parts {
+            if ws.prefs.flip_zy {
+                m.transform(flip_zy_out);
+            }
+            let mut base = format!("{stem}_{}", safe(&name));
+            let mut k = 2;
+            while !seen.insert(base.clone()) {
+                base = format!("{stem}_{}_{k}", safe(&name));
+                k += 1;
+            }
+            mm_io::write_mesh(&dir.join(format!("{base}.{ext}")), &m, &opts).expect("written");
+        }
+    }
+
+    /// The files of a folder, by name.
+    fn files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut f: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir).expect("folder").flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).expect("file"))).collect();
+        f.sort();
+        f
+    }
+
+    #[test]
+    fn exports_write_the_same_files_as_before() {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        // A coloured, grouped mesh with holes (sparse triangle ids), UVs and a selection; a
+        // second object, a hidden one and a reference.
+        let mut a = mm_core::primitives::icosphere(5.0, 3);
+        for t in a.triangle_ids().collect::<Vec<_>>() {
+            let g = (a.tri_centroid(t).z > 1.0) as i32 + 2 * (a.tri_centroid(t).x > 0.0) as i32;
+            a.set_tri_group(t, g);
+        }
+        for t in a.triangle_ids().step_by(41).collect::<Vec<_>>() {
+            a.remove_triangle(t, true).expect("removed");
+        }
+        let v = a.vertex_ids().nth(3).expect("a vertex");
+        a.set_vertex_color(v, [0.2, 0.4, 0.6]);
+        let corners: Vec<[[f32; 2]; 3]> = (0..a.max_tid()).map(|t| [[t as f32 * 0.001, 0.5], [0.25, -0.0], [1.0, (t % 7) as f32 / 7.0]]).collect();
+        let positions = a.positions().to_vec();
+        let a_id = ws.scene.add("vessel wall", a);
+        ws.scene.add("box", mm_core::primitives::cube(3.0, 3));
+        let hidden = ws.scene.add("hidden", mm_core::primitives::cube(1.0, 1));
+        let reference = ws.scene.add("guide", mm_core::primitives::icosphere(2.0, 1));
+        ws.scene.get_mut(hidden).expect("object").visible = false;
+        ws.scene.get_mut(reference).expect("object").reference = true;
+        let o = ws.scene.get_mut(a_id).expect("object");
+        o.uvs = Some(std::sync::Arc::new(crate::scene::UvSet::new(&o.mesh, corners)));
+        o.group_names.insert(1, "inlet 1".into());
+        o.group_names.insert(3, "inlet/1".into());
+        o.selection = mm_core::TriSelection::from_tris(&o.mesh, o.mesh.triangle_ids().filter(|t| t % 3 == 0).collect::<Vec<_>>());
+        ws.scene.active = Some(a_id);
+        let root = std::env::temp_dir().join(format!("polymix-export-test-{}", std::process::id()));
+        for flip in [false, true] {
+            ws.prefs.flip_zy = flip;
+            for (k, (scope, ext)) in [(ExportScope::Active, "obj"), (ExportScope::Active, "stl"), (ExportScope::AllVisible, "stl"), (ExportScope::AllVisible, "obj"), (ExportScope::Selection, "ply"), (ExportScope::PerGroup, "stl"), (ExportScope::PerObject, "off")].into_iter().enumerate() {
+                let (now, before) = (root.join(format!("{flip}-{k}-now")), root.join(format!("{flip}-{k}-before")));
+                std::fs::create_dir_all(&now).expect("folder");
+                std::fs::create_dir_all(&before).expect("folder");
+                let name = format!("part.{ext}");
+                let msg = ws.export_to(now.join(&name), scope, &ctx).expect("export starts");
+                let end = finish(&mut ws);
+                if matches!(scope, ExportScope::PerGroup | ExportScope::PerObject) {
+                    sequence_before(&ws, &before.join(&name), scope);
+                    assert!(end.starts_with("Exported "), "{end}");
+                } else {
+                    let msg_before = export_before(&ws, &before.join(&name), scope);
+                    assert_eq!(msg.replace(&now.display().to_string(), ""), msg_before.replace(&before.display().to_string(), ""), "{scope:?} {ext}");
+                    assert!(end.starts_with(&msg.replace("Exporting", "Exported")), "{end}");
+                }
+                let (a, b) = (files(&now), files(&before));
+                assert!(!a.is_empty());
+                assert_eq!(a.iter().map(|f| &f.0).collect::<Vec<_>>(), b.iter().map(|f| &f.0).collect::<Vec<_>>(), "{scope:?} {ext} flip {flip}");
+                assert!(a == b, "{scope:?} {ext} flip {flip}: the files differ");
+            }
+        }
+        // The scene's meshes are untouched (shared with the jobs, never turned in place).
+        assert_eq!(ws.scene.get(a_id).expect("object").mesh.positions(), &positions[..]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn region_counts() {
+        let mut m = mm_core::primitives::cube(2.0, 4);
+        assert_eq!(distinct_groups(&m), 1);
+        for t in m.triangle_ids().collect::<Vec<_>>() {
+            m.set_tri_group(t, (t % 5) as i32 - 2);
+        }
+        assert_eq!(distinct_groups(&m), 5);
+        assert_eq!(distinct_groups(&Mesh::new()), 0);
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    /// A note without its "(0.12s)" timing.
+    fn untimed(note: &str) -> String {
+        match (note.find(" ("), note.find("s)")) {
+            (Some(a), Some(b)) if a < b => format!("{}{}", &note[..a], &note[b + 2..]),
+            _ => note.to_string(),
+        }
+    }
+
+    type Summary = (String, (Vec<[u64; 3]>, Vec<[u32; 3]>, Vec<i32>), String, u64, Option<usize>, bool);
+
+    fn summary(r: &ImportResult) -> Vec<Summary> {
+        r.iter()
+            .map(|(name, m, note, d, look)| {
+                let (p, t, g) = m.to_arrays();
+                (name.clone(), (p.iter().map(|v| v.to_array().map(f64::to_bits)).collect(), t, g), untimed(note), d.to_bits(), look.uvs.as_ref().map(Vec::len), look.reference)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn files_are_read_side_by_side_in_file_order() {
+        let dir = std::env::temp_dir().join(format!("polymix-import-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("folder");
+        let w = mm_io::WriteOptions::default();
+        let mut grouped = mm_core::primitives::cube(4.0, 3);
+        for t in grouped.triangle_ids().collect::<Vec<_>>() {
+            grouped.set_tri_group(t, (t % 3) as i32);
+        }
+        let mut files = Vec::new();
+        for (k, (m, ext)) in [(mm_core::primitives::icosphere(2.0, 3), "stl"), (grouped, "obj"), (mm_core::primitives::cylinder(1.0, 3.0, 16, 4, true), "ply"), (mm_core::primitives::cube(0.01, 2), "off"), (mm_core::primitives::icosphere(9000.0, 2), "stl")].into_iter().enumerate() {
+            let f = dir.join(format!("m{k}.{ext}"));
+            mm_io::write_mesh(&f, &m, &mm_io::WriteOptions { obj_groups: true, ..w.clone() }).expect("written");
+            files.push(f);
+        }
+        let bad = |k: usize| {
+            let f = dir.join(format!("bad{k}.stl"));
+            std::fs::write(&f, b"solid nothing here\n").expect("written");
+            f
+        };
+        let (bad1, bad2) = (bad(1), bad(2));
+        for (groups, reference) in [(true, false), (false, true)] {
+            let one = import_files(&files, groups, reference, 1, &|_| true).expect("read");
+            assert_eq!(one.len(), files.len());
+            for (r, f) in one.iter().zip(&files) {
+                assert_eq!(r.3.to_bits(), r.1.bounds().diagonal().to_bits(), "{}", f.display());
+            }
+            for workers in [2, 3, 8] {
+                let many = import_files(&files, groups, reference, workers, &|_| true).expect("read");
+                assert!(summary(&many) == summary(&one), "{workers} workers");
+            }
+            assert_eq!(one[1].1.triangle_ids().map(|t| one[1].1.tri_group(t)).max(), Some(if groups { 2 } else { 0 }));
+        }
+        // The first failure in file order, however many read at once.
+        let mixed = vec![files[0].clone(), bad1.clone(), files[1].clone(), bad2, files[2].clone()];
+        let first = format!("{:#}", import_files(&mixed, true, false, 1, &|_| true).err().expect("fails"));
+        assert!(first.contains(&bad1.display().to_string()), "{first}");
+        for workers in [2, 5] {
+            assert_eq!(format!("{:#}", import_files(&mixed, true, false, workers, &|_| true).err().expect("fails")), first);
+        }
+        // Cancelled.
+        for workers in [1, 3] {
+            assert_eq!(import_files(&files, true, false, workers, &|_| false).err().expect("cancelled").to_string(), "cancelled");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_side_by_side_share_one_pool_and_a_panic_is_their_error() {
+        use rayon::prelude::*;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1));
+        // Each read, and its own parallel loops, in the one pool of a job's size.
+        let r = side_by_side(12, 4, &|_| true, |i| {
+            let inner: Vec<(usize, Option<String>)> = (0..64).into_par_iter().map(|_| (rayon::current_num_threads(), std::thread::current().name().map(str::to_string))).collect();
+            Ok((i, inner))
+        })
+        .expect("read");
+        for (k, (i, inner)) in r.iter().enumerate() {
+            assert_eq!(*i, k);
+            for (n, name) in inner {
+                assert_eq!(*n, threads);
+                assert!(name.as_deref().is_some_and(|n| n.starts_with("polymix-job-read-")), "{name:?}");
+            }
+        }
+        // A read that panics fails as a job that panics does, unless one before it failed.
+        let e = side_by_side(9, 3, &|_| true, |i| if i == 4 { panic!("broken file {i}") } else { Ok(i) }).expect_err("fails");
+        assert_eq!(format!("{e:#}"), "internal error: broken file 4");
+        let e = side_by_side(9, 3, &|_| true, |i| match i {
+            2 => Err(anyhow::anyhow!("bad file 2")),
+            6 => panic!("broken file 6"),
+            _ => Ok(i),
+        })
+        .expect_err("fails");
+        assert_eq!(format!("{e:#}"), "bad file 2");
+    }
+
+    #[test]
+    fn odd_sizes_from_the_diagonal() {
+        for m in [mm_core::primitives::cube(0.05, 1), mm_core::primitives::cube(50.0, 1), mm_core::primitives::cube(50_000.0, 1), Mesh::new()] {
+            assert_eq!(odd_diagonal(m.bounds().diagonal()), odd_size(&m));
+        }
+    }
+}
+
+#[cfg(test)]
+mod bvh_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn frame(ws: &mut MeshWorkspace, ctx: &egui::Context) {
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| ws.bvh_tick(ui.ctx()));
+    }
+
+    /// Frames until the background build is done and installed.
+    fn built(ws: &mut MeshWorkspace, ctx: &egui::Context) {
+        let start = Instant::now();
+        while ws.bvh_job.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(60), "the build finishes");
+            std::thread::sleep(Duration::from_millis(1));
+            frame(ws, ctx);
+        }
+    }
+
+    fn same(a: &mm_core::Bvh, b: &mm_core::Bvh) -> bool {
+        a.tris == b.tris && format!("{:?}", a.nodes) == format!("{:?}", b.nodes)
+    }
+
+    #[test]
+    fn commits_get_their_bvh_in_the_background() {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        ws.history.push("Add", &ws.scene);
+        let id = ws.scene.add("ball", mm_core::primitives::icosphere(3.0, 4));
+        let hidden = ws.scene.add("hidden", mm_core::primitives::cube(1.0, 2));
+        ws.scene.get_mut(hidden).expect("object").visible = false;
+        frame(&mut ws, &ctx);
+        assert!(ws.bvh_job.is_some(), "started after the commit");
+        built(&mut ws, &ctx);
+        let o = ws.scene.get(id).expect("object");
+        assert!(same(o.bvh_if_current().expect("installed"), &mm_core::Bvh::build(&o.mesh)), "the BVH a pick would build");
+        assert!(ws.scene.get(hidden).expect("object").bvh_if_current().is_none(), "hidden objects are not picked");
+        // Nothing committed since: nothing to do.
+        frame(&mut ws, &ctx);
+        assert!(ws.bvh_job.is_none());
+        // A stroke (vertices moved, the same topology): the BVH is refitted where it is used.
+        ws.history.push("Stroke", &ws.scene);
+        let m = ws.scene.get_mut(id).expect("object").mesh_mut();
+        let p = m.vertex(0);
+        m.set_vertex(0, p * 1.2);
+        frame(&mut ws, &ctx);
+        assert!(ws.bvh_job.is_none(), "a refit, not a build");
+        // A cut (new topology) while a tool is open: built once the tool is closed.
+        ws.history.push("Cut", &ws.scene);
+        let m = ws.scene.get_mut(id).expect("object").mesh_mut();
+        let t = m.triangle_ids().next().expect("a triangle");
+        m.remove_triangle(t, true).expect("removed");
+        ws.tools.push(Box::new(TestTool(false)));
+        frame(&mut ws, &ctx);
+        assert!(ws.bvh_job.is_none(), "not while a tool is open");
+        ws.tools.clear();
+        frame(&mut ws, &ctx);
+        assert!(ws.bvh_job.is_some());
+        built(&mut ws, &ctx);
+        let o = ws.scene.get(id).expect("object");
+        assert!(same(o.bvh_if_current().expect("installed"), &mm_core::Bvh::build(&o.mesh)));
+        // A BVH that is stale by the time it is done is turned away.
+        ws.history.push("Cut again", &ws.scene);
+        let m = ws.scene.get_mut(id).expect("object").mesh_mut();
+        let t = m.triangle_ids().nth(10).expect("a triangle");
+        m.remove_triangle(t, true).expect("removed");
+        frame(&mut ws, &ctx);
+        assert!(ws.bvh_job.is_some());
+        let m = ws.scene.get_mut(id).expect("object").mesh_mut();
+        let p = m.vertex(5);
+        m.set_vertex(5, p * 0.9);
+        built(&mut ws, &ctx);
+        assert!(ws.scene.get(id).expect("object").bvh_if_current().is_none(), "built for an earlier state");
+    }
+
+    #[test]
+    fn a_build_stops_once_its_meshes_are_replaced() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        let ball = ws.scene.add("ball", mm_core::primitives::icosphere(3.0, 3));
+        let block = ws.scene.add("block", mm_core::primitives::cube(1.0, 2));
+        let meshes = || ws.scene.objects.iter().map(|o| (o.id, o.mesh.clone())).collect::<Vec<_>>();
+        // Builds not begun once stopped are left out.
+        let built_now = build_bvhs(meshes(), &AtomicBool::new(false));
+        assert_eq!(built_now.len(), 2);
+        for (id, bvh) in &built_now {
+            assert!(same(bvh, &mm_core::Bvh::build(&ws.scene.get(*id).expect("object").mesh)));
+        }
+        assert!(build_bvhs(meshes(), &AtomicBool::new(true)).is_empty());
+        // A build under way (held until told to end), for both meshes.
+        let held = |ws: &mut MeshWorkspace| {
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let shapes = ws.scene.objects.iter().map(|o| (o.id, o.mesh.shape_version())).collect();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let job = Job::spawn("Preparing picking", ctx.clone(), move |_| {
+                let _ = wait.recv();
+                Ok(Vec::new())
+            });
+            ws.bvh_job = Some(BvhJob { shapes, stop: stop.clone(), job });
+            ws.bvh_generation = ws.history.generation();
+            (go, stop)
+        };
+        let (go, stop) = held(&mut ws);
+        frame(&mut ws, &ctx);
+        frame(&mut ws, &ctx);
+        assert!(!stop.load(Ordering::Relaxed), "nothing replaced");
+        // One of them edited (a vertex moved): the rest is not begun.
+        let m = ws.scene.get_mut(block).expect("object").mesh_mut();
+        let p = m.vertex(0);
+        m.set_vertex(0, p * 2.0);
+        frame(&mut ws, &ctx);
+        assert!(stop.load(Ordering::Relaxed), "an edited mesh");
+        go.send(()).expect("job waiting");
+        built(&mut ws, &ctx);
+        // Or removed.
+        let (go, stop) = held(&mut ws);
+        ws.scene.remove(ball);
+        frame(&mut ws, &ctx);
+        assert!(stop.load(Ordering::Relaxed), "a removed object");
+        go.send(()).expect("job waiting");
+        built(&mut ws, &ctx);
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// One whole frame of the workspace (no GPU) a second after the last; the wait before the
+    /// next frame it asks for.
+    fn frame(ws: &mut MeshWorkspace, ctx: &egui::Context) -> Duration {
+        let mut frame = eframe::Frame::_new_kittest();
+        // Time goes on, so that animations (a panel unfolding) end.
+        let time = ctx.input(|i| i.time) + 1.0;
+        let input = egui::RawInput { time: Some(time), screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), ..Default::default() };
+        let out = ctx.run_ui(input, |ui| polymix_workspace::Workspace::ui(ws, ui, &mut frame));
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    fn settled(ws: &mut MeshWorkspace, ctx: &egui::Context) -> Duration {
+        for _ in 0..6 {
+            frame(ws, ctx);
+        }
+        frame(ws, ctx)
+    }
+
+    #[test]
+    fn work_in_progress_is_redrawn_15_times_a_second() {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        ws.scene.add("cube", mm_core::primitives::cube(10.0, 2));
+        let idle = settled(&mut ws, &ctx);
+        assert!(idle > BUSY_REPAINT, "{idle:?}");
+        // A tool computing: its progress overlay.
+        ws.tools.push(Box::new(TestTool(true)));
+        assert_eq!(settled(&mut ws, &ctx), BUSY_REPAINT);
+        ws.tools.clear();
+        // Files loading: the overlay and the status bar's spinner.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        ws.import_job = Some(Job::spawn("Importing 1 file(s)", ctx.clone(), move |_| {
+            let _ = wait.recv();
+            Ok(Vec::new())
+        }));
+        assert_eq!(settled(&mut ws, &ctx), BUSY_REPAINT);
+        go.send(()).expect("job waiting");
+    }
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Poll the jobs until the library load is over.
+    fn loaded(ws: &mut MeshWorkspace) {
+        let start = Instant::now();
+        while ws.library_job.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(60), "the load ends");
+            std::thread::sleep(Duration::from_millis(1));
+            ws.poll_jobs();
+        }
+    }
+
+    #[test]
+    fn reloads_meanwhile_and_failed_loads_are_minded() {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        let changes = crate::parts::library_changes();
+        // Reload clicked while a load runs (held until told to end): no second load meanwhile,
+        // and its result is shown but out of date (loaded again while the panel is shown).
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        ws.library_job = Some((changes, Job::spawn("Loading parts", ctx.clone(), move |_| {
+            let _ = wait.recv();
+            Ok(crate::parts::Library::default())
+        })));
+        ws.reload_library(&ctx);
+        assert!(ws.library_job.as_ref().is_some_and(|(c, _)| *c == u64::MAX));
+        go.send(()).expect("job waiting");
+        loaded(&mut ws);
+        assert!(ws.library.is_some());
+        assert!(ws.library_load_due(changes));
+        // A load that fails: not tried again frame after frame, only once the files change
+        // (or on Reload).
+        ws.library_job = Some((changes, Job::spawn("Loading parts", ctx.clone(), |_| -> anyhow::Result<crate::parts::Library> { panic!("unreadable parts") })));
+        loaded(&mut ws);
+        assert_eq!(ws.library_failed, Some(changes));
+        assert!(!ws.library_load_due(changes));
+        assert!(ws.library_load_due(changes + 1));
+        // Its next load, held, fails after Reload was clicked: tried once more.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        ws.library_job = Some((changes, Job::spawn("Loading parts", ctx.clone(), move |_| -> anyhow::Result<crate::parts::Library> {
+            let _ = wait.recv();
+            panic!("unreadable parts")
+        })));
+        ws.reload_library(&ctx);
+        go.send(()).expect("job waiting");
+        loaded(&mut ws);
+        assert!(ws.library_load_due(changes));
+        // Loaded at last.
+        ws.library_job = Some((changes, Job::spawn("Loading parts", ctx.clone(), |_| Ok(crate::parts::Library::default()))));
+        loaded(&mut ws);
+        assert_eq!(ws.library_failed, None);
+        assert!(!ws.library_load_due(changes));
+    }
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+
+    /// The object browser in a scroll area 300 points high scrolled to `offset`, drawn with only
+    /// the rows in view or `all` of them, given `events`: the content's size, the number of
+    /// widgets made (widgets out of view paint nothing, but are laid out and sensed) and the
+    /// number of checkboxes in the AccessKit tree.
+    fn draw(ws: &mut MeshWorkspace, ctx: &egui::Context, offset: f32, all: bool, events: Vec<egui::Event>) -> (egui::Vec2, usize, usize) {
+        let mut size = egui::Vec2::ZERO;
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 800.0))), events, ..Default::default() };
+        let out = ctx.run_ui(input, |ui| {
+            let area = egui::ScrollArea::vertical().max_height(300.0).vertical_scroll_offset(offset);
+            size = area.show_viewport(ui, |ui, viewport| ws.objects_panel(ui, (!all).then_some(viewport))).content_size;
+        });
+        let widgets = ctx.viewport(|v| v.prev_pass.widgets.layers().map(|(_, w)| w.len()).sum());
+        let checkboxes = out.platform_output.accesskit_update.map_or(0, |u| u.nodes.iter().filter(|(_, n)| n.role() == egui::accesskit::Role::CheckBox).count());
+        (size, widgets, checkboxes)
+    }
+
+    fn many() -> (MeshWorkspace, egui::Context) {
+        let (mut ws, ctx, _) = super::command::tests::workspace();
+        for k in 0..500 {
+            ws.scene.add(format!("shell {k}"), mm_core::primitives::cube(1.0, 1));
+        }
+        ws.scene.get_mut(ws.scene.objects[3].id).expect("object").reference = true;
+        ws.scene.target = Some(ws.scene.objects[7].id);
+        (ws, ctx)
+    }
+
+    #[test]
+    fn rows_out_of_view_take_their_room_undrawn() {
+        let (mut ws, ctx) = many();
+        let (full, full_widgets, _) = draw(&mut ws, &ctx, 0.0, true, Vec::new());
+        assert!(ws.objects_row_h.is_some());
+        let ends = [0.0, 1.0, 2000.0, 5555.5, full.y - 300.0, full.y];
+        for offset in ends {
+            let (size, widgets, _) = draw(&mut ws, &ctx, offset, false, Vec::new());
+            assert_eq!(size, full, "offset {offset}");
+            assert!(widgets * 5 < full_widgets, "offset {offset}: {widgets} of {full_widgets} widgets");
+            assert_eq!(draw(&mut ws, &ctx, offset, true, Vec::new()).0, full);
+        }
+        // With AccessKit on (an agent reading the panels, a screen reader) every row is there,
+        // wherever the list is scrolled.
+        ctx.enable_accesskit();
+        for offset in ends {
+            let (size, widgets, checkboxes) = draw(&mut ws, &ctx, offset, false, Vec::new());
+            assert_eq!((size, widgets, checkboxes), (full, full_widgets, ws.scene.objects.len()), "offset {offset}");
+        }
+        ctx.disable_accesskit();
+        // While a name is edited every row is drawn.
+        let id = ws.scene.objects[250].id;
+        ctx.data_mut(|d| d.insert_temp(egui::Id::NULL.with("renaming"), (id, "shell 250".to_string(), true)));
+        let (size, widgets, _) = draw(&mut ws, &ctx, 3000.0, false, Vec::new());
+        assert!(widgets * 2 > full_widgets, "{widgets} of {full_widgets}");
+        assert!((size.y - full.y).abs() < 30.0, "{size:?} {full:?}");
+    }
+
+    #[test]
+    fn a_context_menu_stays_open_while_its_row_is_scrolled_away() {
+        let (mut ws, ctx) = many();
+        let (full, full_widgets, _) = draw(&mut ws, &ctx, 0.0, true, Vec::new());
+        // Right-click the third row's name (just right of its checkbox).
+        let step = ws.objects_row_h.expect("rows measured") + ctx.global_style().spacing.item_spacing.y;
+        let at = egui::pos2(40.0, 2.5 * step);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: Default::default() };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
+            draw(&mut ws, &ctx, 0.0, false, events);
+        }
+        assert!(egui::Popup::is_any_open(&ctx), "the menu opened");
+        for offset in [1000.0, 3000.0, full.y - 300.0] {
+            let (size, widgets, _) = draw(&mut ws, &ctx, offset, false, Vec::new());
+            assert!(egui::Popup::is_any_open(&ctx), "offset {offset}: the menu is still open");
+            assert_eq!(size, full);
+            assert!(widgets >= full_widgets, "all rows drawn: {widgets} of {full_widgets}");
+        }
+        // Closed (Esc): back to the rows in view.
+        draw(&mut ws, &ctx, 3000.0, false, vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert!(!egui::Popup::is_any_open(&ctx));
+        let (_, widgets, _) = draw(&mut ws, &ctx, 3000.0, false, Vec::new());
+        assert!(widgets * 5 < full_widgets, "{widgets} of {full_widgets}");
     }
 }

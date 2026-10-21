@@ -53,19 +53,25 @@ fn snap(d: f64, eps: f64) -> f64 {
 /// Interval of the triangle on the intersection line, from projected vertices `p` and
 /// signed distances `d` to the other triangle's plane.
 fn interval(p: [f64; 3], d: [f64; 3]) -> Option<(f64, f64)> {
-    let mut ts = Vec::with_capacity(3);
+    // Each vertex adds at most one value: itself when on the plane, or else the crossing on
+    // its edge to the next vertex (an on-plane vertex has no sign change), so three fit.
+    let mut ts = [0.0f64; 3];
+    let mut n = 0;
     for i in 0..3 {
         let j = (i + 1) % 3;
         if d[i] == 0.0 {
-            ts.push(p[i]);
+            ts[n] = p[i];
+            n += 1;
         }
         if (d[i] > 0.0 && d[j] < 0.0) || (d[i] < 0.0 && d[j] > 0.0) {
-            ts.push(p[i] + (p[j] - p[i]) * d[i] / (d[i] - d[j]));
+            ts[n] = p[i] + (p[j] - p[i]) * d[i] / (d[i] - d[j]);
+            n += 1;
         }
     }
-    if ts.is_empty() {
+    if n == 0 {
         return None;
     }
+    let ts = &ts[..n];
     let lo = ts.iter().copied().fold(f64::INFINITY, f64::min);
     let hi = ts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     Some((lo, hi))
@@ -79,8 +85,8 @@ fn coplanar_intersect(n: DVec3, t1: [DVec3; 3], t2: [DVec3; 3]) -> bool {
         1 => (0, 2),
         _ => (0, 1),
     };
-    let a: Vec<(f64, f64)> = t1.iter().map(|p| (p[i], p[j])).collect();
-    let b: Vec<(f64, f64)> = t2.iter().map(|p| (p[i], p[j])).collect();
+    let a: [(f64, f64); 3] = t1.map(|p| (p[i], p[j]));
+    let b: [(f64, f64); 3] = t2.map(|p| (p[i], p[j]));
     let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
     let on_seg = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
         r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
@@ -178,5 +184,122 @@ mod tests {
         for (t, o) in hits {
             assert_ne!(two.tri_group(t), two.tri_group(o));
         }
+    }
+
+    /// `interval` as it was, collecting into a Vec.
+    fn interval_vec(p: [f64; 3], d: [f64; 3]) -> Option<(f64, f64)> {
+        let mut ts = Vec::with_capacity(3);
+        for i in 0..3 {
+            let j = (i + 1) % 3;
+            if d[i] == 0.0 {
+                ts.push(p[i]);
+            }
+            if (d[i] > 0.0 && d[j] < 0.0) || (d[i] < 0.0 && d[j] > 0.0) {
+                ts.push(p[i] + (p[j] - p[i]) * d[i] / (d[i] - d[j]));
+            }
+        }
+        if ts.is_empty() {
+            return None;
+        }
+        let lo = ts.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = ts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        Some((lo, hi))
+    }
+
+    #[test]
+    fn interval_and_coplanar_tests_unchanged() {
+        let mut s = 12345u64;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as f64 / (1u64 << 31) as f64
+        };
+        // Signed distances drawn from a few exact values (zeros of both signs, NaN) and noise.
+        let pick = |x: f64| match (x * 8.0) as u32 {
+            0 => 0.0,
+            1 => -0.0,
+            2 => f64::NAN,
+            3 => 1.0,
+            4 => -1.0,
+            _ => x - 0.75,
+        };
+        for _ in 0..200_000 {
+            let p = [next() * 4.0 - 2.0, next() * 4.0 - 2.0, next() * 4.0 - 2.0];
+            let d = [pick(next()), pick(next()), pick(next())];
+            let (a, b) = (interval(p, d), interval_vec(p, d));
+            assert_eq!(a.map(|(l, h)| (l.to_bits(), h.to_bits())), b.map(|(l, h)| (l.to_bits(), h.to_bits())), "{p:?} {d:?}");
+        }
+        // The coplanar test against its Vec version, on triangles snapped to a coarse grid so
+        // that shared corners, touching edges and containment come up often.
+        let mut hits = 0;
+        for k in 0..200_000 {
+            let mut q = || DVec3::new((next() * 4.0).floor(), (next() * 4.0).floor(), 0.0);
+            let (t1, t2) = ([q(), q(), q()], [q(), q(), q()]);
+            let n = [DVec3::Z, DVec3::X, DVec3::Y][k % 3];
+            let (t1, t2) = match k % 3 {
+                0 => (t1, t2),
+                1 => (t1.map(|p| DVec3::new(p.z, p.x, p.y)), t2.map(|p| DVec3::new(p.z, p.x, p.y))),
+                _ => (t1.map(|p| DVec3::new(p.x, p.z, p.y)), t2.map(|p| DVec3::new(p.x, p.z, p.y))),
+            };
+            let got = coplanar_intersect(n, t1, t2);
+            assert_eq!(got, coplanar_vec(n, t1, t2), "{t1:?} {t2:?}");
+            hits += got as usize;
+        }
+        assert!(hits > 10_000 && hits < 190_000, "{hits}");
+    }
+
+    /// `coplanar_intersect` as it was, with the projected corners in Vecs.
+    fn coplanar_vec(n: DVec3, t1: [DVec3; 3], t2: [DVec3; 3]) -> bool {
+        let drop = n.abs().max_position();
+        let (i, j) = match drop {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        let a: Vec<(f64, f64)> = t1.iter().map(|p| (p[i], p[j])).collect();
+        let b: Vec<(f64, f64)> = t2.iter().map(|p| (p[i], p[j])).collect();
+        let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
+        let on_seg = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+            r.0 >= p.0.min(q.0) && r.0 <= p.0.max(q.0) && r.1 >= p.1.min(q.1) && r.1 <= p.1.max(q.1)
+        };
+        let seg = |p1: (f64, f64), p2: (f64, f64), q1: (f64, f64), q2: (f64, f64)| {
+            let d1 = orient(q1, q2, p1);
+            let d2 = orient(q1, q2, p2);
+            let d3 = orient(p1, p2, q1);
+            let d4 = orient(p1, p2, q2);
+            if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0)) {
+                return true;
+            }
+            (d1 == 0.0 && on_seg(q1, q2, p1)) || (d2 == 0.0 && on_seg(q1, q2, p2)) || (d3 == 0.0 && on_seg(p1, p2, q1)) || (d4 == 0.0 && on_seg(p1, p2, q2))
+        };
+        for k in 0..3 {
+            for l in 0..3 {
+                if seg(a[k], a[(k + 1) % 3], b[l], b[(l + 1) % 3]) {
+                    return true;
+                }
+            }
+        }
+        let inside = |p: (f64, f64), t: &[(f64, f64)]| {
+            let s0 = orient(t[0], t[1], p);
+            let s1 = orient(t[1], t[2], p);
+            let s2 = orient(t[2], t[0], p);
+            (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) || (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0)
+        };
+        inside(a[0], &b) || inside(b[0], &a)
+    }
+
+    #[test]
+    fn coplanar_cases() {
+        let t = [DVec3::ZERO, DVec3::X * 2.0, DVec3::Y * 2.0];
+        // Overlapping, touching at a vertex, along an edge, containing, and apart.
+        assert!(coplanar_intersect(DVec3::Z, t, t.map(|p| p * 0.5 + DVec3::new(0.3, 0.3, 0.0))));
+        assert!(coplanar_intersect(DVec3::Z, t, [DVec3::X * 2.0, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 1.0, 0.0)]));
+        assert!(coplanar_intersect(DVec3::Z, t, [DVec3::X, DVec3::new(1.0, -1.0, 0.0), DVec3::new(2.0, -1.0, 0.0)]));
+        assert!(coplanar_intersect(DVec3::Z, t, t.map(|p| p * 3.0 - DVec3::new(1.0, 1.0, 0.0))));
+        assert!(!coplanar_intersect(DVec3::Z, t, t.map(|p| p + DVec3::new(5.0, 0.0, 0.0))));
+        // Projected along x and y as well.
+        let tx = t.map(|p| DVec3::new(0.0, p.x, p.y));
+        assert!(coplanar_intersect(DVec3::X, tx, tx.map(|p| p + DVec3::new(0.0, 0.5, 0.5))));
+        let ty = t.map(|p| DVec3::new(p.x, 0.0, p.y));
+        assert!(!coplanar_intersect(DVec3::Y, ty, ty.map(|p| p + DVec3::new(0.0, 0.0, 9.0))));
     }
 }

@@ -10,8 +10,8 @@
 
 use crate::{EditError, EditResult};
 use glam::{DVec2, DVec3};
+use mm_core::hash::FastSet;
 use mm_core::Mesh;
-use std::collections::HashSet;
 
 /// Crossings this close to an end of a mesh edge (as a fraction of it) snap to the vertex;
 /// corners this close to an edge or vertex (barycentric) land on it.
@@ -139,7 +139,8 @@ pub fn stamp_polygon(mesh: &mut Mesh, seed: u32, frame: &StampFrame, poly: &[DVe
     }
     let poly = ccw(poly.to_vec());
     let reach = poly.iter().map(|p| p.length()).fold(0.0, f64::max);
-    let mut w = Walker { mesh, frame: *frame, region: HashSet::new() };
+    let region = vec![false; mesh.max_tid()];
+    let mut w = Walker { mesh, frame: *frame, region, grid: Grid::default() };
     w.grow_region(seed, reach);
 
     // Corners first (each lands on a vertex), then the edges between them.
@@ -164,11 +165,85 @@ pub fn stamp_polygon(mesh: &mut Mesh, seed: u32, frame: &StampFrame, poly: &[DVe
     Ok(StampResult { inside, outline })
 }
 
+/// Triangles bucketed by the cells of a uniform grid over the stencil plane that their boxes
+/// there overlap (each box a little widened). A point lies only in triangles of its own
+/// cell, so the triangle under a stencil corner is looked for among a few, not the whole
+/// region.
+#[derive(Default)]
+struct Grid {
+    min: DVec2,
+    cell: f64,
+    nx: usize,
+    ny: usize,
+    cells: Vec<Vec<u32>>,
+    /// Widening of every box beyond its own share, for rounding in the stencil plane.
+    pad: f64,
+}
+
+impl Grid {
+    /// A grid over `boxes` (triangle, box corners), with a few triangles to a cell.
+    fn new(boxes: &[(u32, DVec2, DVec2)]) -> Self {
+        let (mut lo, mut hi, mut size) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY), 0.0);
+        for (_, a, b) in boxes {
+            lo = lo.min(*a);
+            hi = hi.max(*b);
+            size += (*b - *a).max_element();
+        }
+        let ext = hi - lo;
+        if !(ext.is_finite() && ext.max_element() > 0.0) {
+            // Nothing to spread out: one cell holds every triangle.
+            let mut g = Self { min: DVec2::ZERO, cell: 1.0, nx: 1, ny: 1, cells: vec![Vec::new()], pad: 0.0 };
+            for &(t, a, b) in boxes {
+                g.insert(t, a, b);
+            }
+            return g;
+        }
+        // Cells the size of an average triangle, but no more of them than half the triangles.
+        let n = boxes.len().max(1) as f64;
+        let mut cell = (size / n).max(ext.max_element() / 4096.0);
+        while (ext.x / cell + 1.0) * (ext.y / cell + 1.0) > 0.5 * n + 4.0 {
+            cell *= 1.25;
+        }
+        let (nx, ny) = ((ext.x / cell) as usize + 1, (ext.y / cell) as usize + 1);
+        let mut g = Self { min: lo, cell, nx, ny, cells: vec![Vec::new(); nx * ny], pad: ext.max_element() * 1e-9 };
+        for &(t, a, b) in boxes {
+            g.insert(t, a, b);
+        }
+        g
+    }
+
+    /// The cell holding `p` (points beyond the grid go to the cells at its border).
+    fn cell_of(&self, p: DVec2) -> (usize, usize) {
+        let q = (p - self.min) / self.cell;
+        ((q.x.floor().max(0.0) as usize).min(self.nx - 1), (q.y.floor().max(0.0) as usize).min(self.ny - 1))
+    }
+
+    /// File triangle `t` under every cell its box `a`..`b` (widened by about a millionth of
+    /// its size) overlaps.
+    fn insert(&mut self, t: u32, a: DVec2, b: DVec2) {
+        let pad = DVec2::splat((b - a).max_element() * 1e-6 + self.pad);
+        let ((x0, y0), (x1, y1)) = (self.cell_of(a - pad), self.cell_of(b + pad));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.cells[y * self.nx + x].push(t);
+            }
+        }
+    }
+
+    /// The triangles filed where `p` is.
+    fn at(&self, p: DVec2) -> &[u32] {
+        let (x, y) = self.cell_of(p);
+        &self.cells[y * self.nx + x]
+    }
+}
+
 struct Walker<'a> {
     mesh: &'a mut Mesh,
     frame: StampFrame,
-    /// Triangles the stamp may cut (front-facing, connected to the seed).
-    region: HashSet<u32>,
+    /// Triangles the stamp may cut (front-facing, connected to the seed), by triangle id.
+    region: Vec<bool>,
+    /// The region's triangles by where they lie in the stencil plane.
+    grid: Grid,
 }
 
 impl Walker<'_> {
@@ -176,31 +251,60 @@ impl Walker<'_> {
         self.frame.project(self.mesh.vertex(v))
     }
 
+    fn in_region(&self, t: u32) -> bool {
+        self.region.get(t as usize).copied().unwrap_or(false)
+    }
+
+    /// Triangle `t`'s box in the stencil plane.
+    fn tri_box(&self, t: u32) -> (DVec2, DVec2) {
+        let [a, b, c] = self.mesh.triangle(t).map(|v| self.p2(v));
+        (a.min(b).min(c), a.max(b).max(c))
+    }
+
+    /// Add a triangle made by a split or poke of a region triangle to the region.
+    fn add(&mut self, t: u32) {
+        let i = t as usize;
+        if i >= self.region.len() {
+            self.region.resize(i + 1, false);
+        }
+        self.region[i] = true;
+        let (a, b) = self.tri_box(t);
+        self.grid.insert(t, a, b);
+    }
+
     fn grow_region(&mut self, seed: u32, reach: f64) {
         let m = &*self.mesh;
         let limit = reach * 1.5 + m.triangle(seed).iter().map(|&v| m.vertex(v).distance(m.tri_centroid(seed))).fold(0.0, f64::max) * 2.0;
         let mut stack = vec![seed];
-        self.region.insert(seed);
+        self.region[seed as usize] = true;
         while let Some(t) = stack.pop() {
             for e in m.tri_edges(t) {
                 let o = m.edge_other_triangle(e, t);
-                if o == mm_core::INVALID || self.region.contains(&o) {
+                if o == mm_core::INVALID || self.region[o as usize] {
                     continue;
                 }
                 let near = m.triangle(o).iter().any(|&v| self.frame.project(m.vertex(v)).length() < limit);
                 if near && m.tri_normal(o).dot(self.frame.n) > 0.08 {
-                    self.region.insert(o);
+                    self.region[o as usize] = true;
                     stack.push(o);
                 }
             }
         }
+        let boxes: Vec<(u32, DVec2, DVec2)> = (0..self.region.len() as u32)
+            .filter(|&t| self.region[t as usize])
+            .map(|t| {
+                let (a, b) = self.tri_box(t);
+                (t, a, b)
+            })
+            .collect();
+        self.grid = Grid::new(&boxes);
     }
 
     /// Track triangles created by splitting region triangles.
     fn adopt(&mut self, orig: [u32; 2], new: [u32; 2]) {
         for k in 0..2 {
-            if orig[k] != mm_core::INVALID && self.region.contains(&orig[k]) && new[k] != mm_core::INVALID {
-                self.region.insert(new[k]);
+            if orig[k] != mm_core::INVALID && self.in_region(orig[k]) && new[k] != mm_core::INVALID {
+                self.add(new[k]);
             }
         }
     }
@@ -226,10 +330,22 @@ impl Walker<'_> {
         Some(DVec3::new(1.0 - wb - wc, wb, wc))
     }
 
+    /// The triangle of `tris` (ascending ids) whose projection holds `p` best: the largest
+    /// smallest barycentric coordinate, the last one on a tie. None if `p` is in none of them.
+    fn holding(&self, tris: impl Iterator<Item = u32>, p: DVec2) -> Option<(u32, DVec3)> {
+        let found = tris.filter_map(|t| self.bary(t, p).map(|b| (t, b))).max_by(|x, y| x.1.min_element().total_cmp(&y.1.min_element()));
+        found.filter(|(_, b)| b.min_element() > -1e-9)
+    }
+
     /// Put a vertex at stencil point `p`: an existing vertex, a split edge, or a poked triangle.
     fn insert_point(&mut self, p: DVec2) -> EditResult<u32> {
-        let found = self.region.iter().filter_map(|&t| self.bary(t, p).map(|b| (t, b))).max_by(|x, y| x.1.min_element().total_cmp(&y.1.min_element()));
-        let Some((t, b)) = found.filter(|(_, b)| b.min_element() > -1e-9) else {
+        // The triangles filed where `p` is; any region triangle holding it is among them,
+        // unless it is too thin to say where it is, so then the whole region is asked.
+        let mut near = self.grid.at(p).to_vec();
+        near.sort_unstable();
+        near.dedup();
+        let found = self.holding(near.into_iter(), p).or_else(|| self.holding((0..self.region.len() as u32).filter(|&t| self.region[t as usize]), p));
+        let Some((t, b)) = found else {
             return Err(EditError::Failed("the stamp reaches past the surface facing it".into()));
         };
         let tv = self.mesh.triangle(t);
@@ -237,7 +353,9 @@ impl Walker<'_> {
         match small.len() {
             0 => {
                 let info = self.mesh.poke_triangle(t, b)?;
-                self.region.extend(info.t_new);
+                for n in info.t_new {
+                    self.add(n);
+                }
                 Ok(info.v_new)
             }
             1 => {
@@ -266,7 +384,7 @@ impl Walker<'_> {
             // The triangle around `cur` whose wedge holds the direction.
             let mut step = None;
             for t in self.mesh.vertex_triangles(cur) {
-                if !self.region.contains(&t) {
+                if !self.in_region(t) {
                     continue;
                 }
                 let tv = self.mesh.triangle(t);
@@ -310,7 +428,8 @@ impl Walker<'_> {
     /// Triangles on the left of the (counter-clockwise) outline.
     fn fill_inside(&self, outline: &[u32]) -> EditResult<Vec<u32>> {
         let m = &*self.mesh;
-        let mut wall = HashSet::new();
+        // Both sets are only asked, never walked: the result is sorted below.
+        let mut wall = FastSet::default();
         for i in 0..outline.len() {
             let (a, b) = (outline[i], outline[(i + 1) % outline.len()]);
             let e = m.find_edge(a, b).ok_or_else(|| EditError::Failed("stamp outline is not a closed loop of edges".into()))?;
@@ -325,10 +444,11 @@ impl Walker<'_> {
             }
         });
         let Some(start) = start else { return Err(EditError::Failed("stamp outline has no inside".into())) };
-        let mut seen = HashSet::from([start]);
+        let mut seen: FastSet<u32> = FastSet::default();
+        seen.insert(start);
         let mut stack = vec![start];
         while let Some(t) = stack.pop() {
-            if !self.region.contains(&t) {
+            if !self.in_region(t) {
                 return Err(EditError::Failed("the stamp outline does not close on the surface".into()));
             }
             for e in m.tri_edges(t) {
@@ -348,6 +468,7 @@ impl Walker<'_> {
 mod tests {
     use super::*;
     use mm_core::primitives;
+    use std::collections::HashSet;
 
     fn area(m: &Mesh, tris: &[u32]) -> f64 {
         tris.iter().map(|&t| m.tri_area(t)).sum()
@@ -441,6 +562,44 @@ mod tests {
             assert!(m.is_closed());
         }
         assert!(ok >= 36, "{ok} of 40 stamps went through");
+    }
+
+    #[test]
+    fn the_grid_finds_the_triangle_a_scan_of_the_whole_region_finds() {
+        let mut seed = 99u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut m = primitives::icosphere(1.0, 4);
+        let frame = StampFrame::new(DVec3::Z, DVec3::new(0.1, 0.05, 1.0), DVec3::Y);
+        let top = m.triangle_ids().max_by(|&a, &b| m.tri_centroid(a).z.total_cmp(&m.tri_centroid(b).z)).unwrap();
+        let region = vec![false; m.max_tid()];
+        let mut w = Walker { mesh: &mut m, frame, region, grid: Grid::default() };
+        w.grow_region(top, 0.5);
+        // Random points (some off the region), the region's vertices and edge midpoints (on
+        // several triangles at once); every few points one is put in, which splits or pokes
+        // triangles that the grid then holds too.
+        let mut points: Vec<DVec2> = (0..300).map(|_| DVec2::new(rnd() * 1.8 - 0.9, rnd() * 1.8 - 0.9)).collect();
+        for t in (0..w.region.len() as u32).filter(|&t| w.region[t as usize]).step_by(7) {
+            let [a, b, _] = w.mesh.triangle(t).map(|v| w.p2(v));
+            points.extend([a, (a + b) * 0.5]);
+        }
+        let (mut found, mut inserted) = (0, 0);
+        for (i, p) in points.into_iter().enumerate() {
+            let mut near = w.grid.at(p).to_vec();
+            near.sort_unstable();
+            near.dedup();
+            let by_grid = w.holding(near.into_iter(), p);
+            let by_scan = w.holding((0..w.region.len() as u32).filter(|&t| w.region[t as usize]), p);
+            assert_eq!(by_grid, by_scan, "{p:?}");
+            found += by_scan.is_some() as usize;
+            if by_scan.is_some() && i % 4 == 0 && w.insert_point(p).is_ok() {
+                inserted += 1;
+            }
+        }
+        assert!(found > 150 && inserted > 30, "{found} found, {inserted} put in");
+        w.mesh.check_validity().unwrap();
     }
 
     #[test]

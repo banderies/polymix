@@ -8,6 +8,7 @@
 //! (see [`mm_edit::complex`]).
 
 use super::*;
+use crate::commands::ComplexInput;
 use crate::jobs::Job;
 use crate::ui_util;
 use mm_edit::complex::{cell_label, complex_cells, input_letter, ComplexInfo};
@@ -215,7 +216,7 @@ impl Tool for FilterComplexTool {
         }
         if let Some((_, j)) = &self.job {
             ui.horizontal(|ui| {
-                ui.spinner();
+                polymix_workspace::spinner(ui);
                 ui.label("Joining cells…");
             });
             cx.egui.request_repaint_after(std::time::Duration::from_millis(50));
@@ -358,6 +359,75 @@ impl Tool for FilterComplexTool {
     }
 }
 
+/// Generate Complex (Edit > Generate Complex) computing in the background: its exact booleans
+/// take seconds on large inputs. When they are done the cells become a new object (as
+/// [`crate::commands::generate_complex`] makes it) and the tool closes; Esc stops them.
+pub struct GenerateComplexTool {
+    inputs: Vec<ComplexInput>,
+    job: Option<Job<mm_edit::EditResult<Vec<mm_edit::ComplexCell>>>>,
+}
+
+impl GenerateComplexTool {
+    /// Start on `inputs` (see [`crate::commands::complex_inputs`]).
+    pub fn new(inputs: Vec<ComplexInput>, egui: &egui::Context) -> Self {
+        let solids = inputs.clone();
+        let job = Job::spawn("Generate Complex", egui.clone(), move |progress| Ok(crate::commands::complex_cells(&solids, Some(progress))));
+        Self { inputs, job: Some(job) }
+    }
+}
+
+impl Tool for GenerateComplexTool {
+    fn name(&self) -> &'static str {
+        "Generate Complex"
+    }
+
+    fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
+        ui_util::section(ui, "Generate Complex");
+        let Some(j) = &self.job else { return ToolOutcome::Close };
+        if let Some(r) = j.poll() {
+            self.job = None;
+            match r {
+                // Only onto the objects as they were: the cells are made of their meshes.
+                Ok(cells) if self.inputs.iter().all(|(id, _, m)| cx.scene.get(*id).is_some_and(|o| Arc::ptr_eq(&o.mesh, m))) => {
+                    crate::commands::apply_complex(&mut crate::commands::CmdCx { scene: cx.scene, history: cx.history, status: cx.status }, &self.inputs, cells);
+                }
+                Ok(_) => *cx.status = "Generate Complex: the objects changed meanwhile; nothing was made.".into(),
+                Err(e) => *cx.status = format!("Generate Complex: {e:#}"),
+            }
+            return ToolOutcome::Close;
+        }
+        let names: Vec<&str> = self.inputs.iter().map(|i| i.1.as_str()).collect();
+        ui.label(format!("Cells of {}…", names.join(", ")));
+        ui.horizontal(|ui| {
+            polymix_workspace::spinner(ui);
+            ui.add(egui::ProgressBar::new(j.progress()).show_percentage());
+        });
+        if ui.button("Cancel").clicked() && self.cancel(cx) {
+            return ToolOutcome::Close;
+        }
+        ToolOutcome::Continue
+    }
+
+    fn busy(&self) -> Option<(String, f32)> {
+        self.job.as_ref().map(|j| ("Generate Complex".to_string(), j.progress()))
+    }
+
+    fn cancel(&mut self, cx: &mut ToolCx) -> bool {
+        // Dropping the job stops its booleans.
+        self.job = None;
+        *cx.status = "Generate Complex cancelled".into();
+        true
+    }
+
+    fn state(&self, _scene: &Scene) -> serde_json::Value {
+        serde_json::json!({
+            "inputs": self.inputs.iter().map(|i| i.0).collect::<Vec<_>>(),
+            "computing": self.job.as_ref().map(|j| polymix_workspace::agent::round(j.progress() as f64, 2)),
+            "next": "app_wait: the cells become a new object named Complex",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +503,57 @@ mod tests {
         cx.scene.active = Some(cx.scene.add("ball", primitives::icosphere(1.0, 1)));
         let tool = FilterComplexTool::new(&mut cx);
         assert!(tool.info.is_err());
+    }
+
+    #[test]
+    fn generate_complex_in_the_background_makes_the_same_complex() {
+        let scene_of = || {
+            let mut scene = Scene::default();
+            let mut b = primitives::icosphere(1.0, 2);
+            b.transform(|p| p + DVec3::new(0.9, 0.1, 0.0));
+            let mut c = primitives::icosphere(0.8, 2);
+            c.transform(|p| p + DVec3::new(0.4, 0.8, 0.1));
+            scene.add("a", primitives::icosphere(1.0, 2));
+            scene.add("b", b);
+            scene.add("c", c);
+            scene
+        };
+        // At once, as tests and scripts make it.
+        let mut direct = scene_of();
+        let (mut history, mut status) = (History::default(), String::new());
+        generate_complex(&mut CmdCx { scene: &mut direct, history: &mut history, status: &mut status });
+        // In the background, as the menu now makes it.
+        let mut scene = scene_of();
+        let (mut history2, mut camera, mut status2) = (History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history2, camera: &mut camera, status: &mut status2, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let inputs = crate::commands::complex_inputs(cx.scene).unwrap();
+        let mut tool = GenerateComplexTool::new(inputs, &ctx);
+        assert!(tool.busy().is_some());
+        let t0 = Instant::now();
+        let mut closed = false;
+        while !closed && t0.elapsed() < Duration::from_secs(60) {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 900.0))), ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| closed = matches!(tool.panel(ui, &mut cx), ToolOutcome::Close));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(closed && tool.busy().is_none());
+        assert_eq!(*cx.status, status);
+        let (a, b) = (direct.active().unwrap(), cx.scene.active().unwrap());
+        assert_eq!((a.name.as_str(), b.name.as_str()), ("Complex", "Complex"));
+        assert_eq!(a.mesh.to_arrays().1, b.mesh.to_arrays().1);
+        assert!(a.mesh.to_arrays().0.iter().zip(&b.mesh.to_arrays().0).all(|(p, q)| p.to_array().map(f64::to_bits) == q.to_array().map(f64::to_bits)));
+        assert_eq!(a.mesh.to_arrays().2, b.mesh.to_arrays().2);
+        assert_eq!(a.group_names, b.group_names);
+        assert_eq!(cx.scene.objects.iter().filter(|o| o.visible).count(), 1, "the inputs are hidden");
+        assert!(cx.history.can_undo());
+        // Esc stops it, leaving the scene as it was.
+        let mut scene = scene_of();
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history2, camera: &mut camera, status: &mut status2, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = GenerateComplexTool::new(crate::commands::complex_inputs(cx.scene).unwrap(), &ctx);
+        assert!(tool.cancel(&mut cx));
+        assert!(tool.busy().is_none());
+        assert_eq!(cx.scene.objects.len(), 3);
     }
 }
