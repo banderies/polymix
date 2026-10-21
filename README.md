@@ -12,6 +12,27 @@ cleaning up medical segmentations (e.g. cerebral vessels from 3D Slicer) for CFD
   analysis against the original segmentation, and named boundary patches with multi-solid STL
   export.
 
+> **Not a medical device.** Polymix is research software. It is not cleared or approved for
+> clinical use and must not be used for diagnosis, treatment planning or any other clinical
+> decision. Check every result yourself.
+
+## Download
+
+**[Polymix for macOS (Apple Silicon)](https://github.com/banderies/polymix/releases/latest/download/Polymix-macos-arm64.zip)**:
+the latest build. Earlier versions and release notes are under
+[Releases](https://github.com/banderies/polymix/releases).
+
+Unzip it and move `Polymix.app` to Applications. It needs macOS 11 or later on an Apple
+Silicon Mac; on anything else, build it from source (see [Build & run](#build--run)).
+
+The app is not signed with an Apple Developer ID, so macOS blocks it the first time: open it
+once, then go to System Settings → Privacy & Security and click **Open Anyway**. Or, in
+Terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Polymix.app
+```
+
 ## Workspaces
 
 Polymix has three workspaces, shown as tabs at the top of the window (⌘1 / ⌘2 / ⌘3):
@@ -122,6 +143,7 @@ Requires Rust (<https://rustup.rs>).
 cargo run -p polymix --release                 # start the app
 cargo run -p polymix --release -- vessel.stl   # open a file directly
 scripts/make_app.sh                            # build dist/Polymix.app (double-clickable)
+scripts/release.sh                             # build it and publish it as a GitHub release
 cargo test --workspace --release               # run the test suite
 ```
 
@@ -233,4 +255,8 @@ Polymix's algorithms are independent implementations of published methods (refer
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT),
+at your option.
+
+Polymix is not affiliated with or endorsed by Autodesk. Meshmixer is a trademark of
+Autodesk, Inc.
