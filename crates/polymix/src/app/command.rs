@@ -843,6 +843,58 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn the_3d_mouse_turns_about_what_is_in_view_once_zoomed_in() {
+        use crate::spacemouse::Centre;
+        let (mut ws, ctx, vp) = workspace();
+        // A cylinder of radius 12.5 along y, from y = −12.5 to 12.5.
+        ws.execute(MeshCommand::AddShape(Shape::Cylinder), &ctx, vp).unwrap();
+        ws.execute(MeshCommand::Focus, &ctx, vp).unwrap();
+        let com = ws.center_of_mass().unwrap();
+        assert_eq!(ws.space_cfg.centre, Centre::View, "the default");
+        // All of it in view: its centre of mass.
+        assert!(ws.space_move_centre(vp).distance(com) < 1e-9);
+        // Close in on the side wall, away from the centre: the wall there.
+        let wall = DVec3::new(12.5, 8.0, 0.0);
+        ws.camera.look_along(-DVec3::X);
+        (ws.camera.target, ws.camera.distance) = (wall, 6.0);
+        let c = ws.space_move_centre(vp);
+        assert!(c.distance(wall) < 1.0 && c.distance(com) > 10.0, "{c}");
+        // Turning about it keeps it where it is on the screen.
+        let before = ws.camera.project(c, vp.aspect()).unwrap();
+        let turn = crate::spacemouse::Motion { t: [0.0; 3], r: [0.4, 0.6, 0.2] };
+        crate::spacemouse::apply(&mut ws.camera, turn, &ws.space_cfg, 0.2, 600.0, c);
+        let after = ws.camera.project(c, vp.aspect()).unwrap();
+        assert!((after - before).truncate().length() < 1e-6 && ws.camera.forward().dot(-DVec3::X) < 0.99, "{before} → {after}");
+        // Looking at empty space just beside the cylinder: the wall nearest the middle.
+        ws.camera.look_along(-DVec3::Z);
+        (ws.camera.target, ws.camera.distance) = (DVec3::new(16.5, 8.0, 0.0), 10.0);
+        let c = ws.space_move_centre(vp);
+        let off_axis = (c.x * c.x + c.z * c.z).sqrt();
+        assert!(c.x > 9.0 && (off_axis - 12.5).abs() < 0.1 && (c.y - 8.0).abs() < 2.0, "{c}");
+        // The object's centre, whatever is in view.
+        ws.space_cfg.centre = Centre::Object;
+        assert!(ws.space_move_centre(vp).distance(com) < 1e-9);
+    }
+
+    #[test]
+    fn a_near_part_a_little_off_the_middle_wins_over_what_lies_far_behind_the_middle() {
+        let (mut ws, _ctx, vp) = workspace();
+        // A big box far off, filling the view, and a small ball near the camera, just off the
+        // middle (the middle of the view looks past it, onto the box).
+        let mut far = mm_core::primitives::cube(100.0, 4);
+        far.transform(|p| p + DVec3::new(0.0, 0.0, -120.0));
+        let mut near = mm_core::primitives::icosphere(1.0, 3);
+        near.transform(|p| p + DVec3::new(1.5, 0.0, -12.0));
+        ws.scene.add("far", far);
+        ws.scene.add("near", near);
+        ws.camera.look_along(-DVec3::Z);
+        (ws.camera.target, ws.camera.distance) = (DVec3::new(0.0, 0.0, -60.0), 60.0);
+        let c = ws.space_move_centre(vp);
+        assert!(c.distance(DVec3::new(1.5, 0.0, -12.0)) < 1.0 + 1e-6, "the ball's nearest vertex, not the box: {c}");
+        assert!(c.z > -11.5, "its side facing the camera: {c}");
+    }
+
+    #[test]
     fn faced_clicks_queue_pointer_events() {
         let (mut ws, ctx, vp) = workspace();
         ws.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();

@@ -56,11 +56,39 @@ pub struct Settings {
     pub invert: [bool; 6],
     pub lock_rotation: bool,
     pub lock_translation: bool,
+    /// What the view turns about.
+    pub centre: Centre,
+    /// Show the centre of rotation while the 3D mouse moves the view.
+    pub show_centre: bool,
+}
+
+/// What the 3D mouse turns the view about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Centre {
+    /// The object's centre of mass.
+    Object,
+    /// What is in view, chosen again at the start of every move (as Fusion 360 does): the
+    /// object's centre while all of it is in view; zoomed in, the surface at the middle of the
+    /// view, or the surface nearest the middle.
+    View,
+}
+
+impl Centre {
+    pub fn key(self) -> &'static str {
+        match self {
+            Centre::Object => "object",
+            Centre::View => "view",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Self> {
+        [Centre::Object, Centre::View].into_iter().find(|c| c.key() == s)
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, orbit_speed: 1.0, pan_speed: 1.0, zoom_speed: 1.0, invert: [false; 6], lock_rotation: false, lock_translation: false }
+        Self { enabled: true, orbit_speed: 1.0, pan_speed: 1.0, zoom_speed: 1.0, invert: [false; 6], lock_rotation: false, lock_translation: false, centre: Centre::View, show_centre: true }
     }
 }
 
@@ -68,25 +96,36 @@ impl Settings {
     pub const AXIS_NAMES: [&'static str; 6] = ["Pan left/right", "Pan up/down", "Zoom", "Tilt", "Spin", "Roll"];
 
     /// Compact text form for the preferences store: enabled, orbit, pan and zoom speeds,
-    /// inverted axes, locks.
+    /// inverted axes, locks, centre of rotation and whether it is shown.
     pub fn to_pref(&self) -> String {
         let inv: String = self.invert.iter().map(|b| if *b { '1' } else { '0' }).collect();
         format!(
-            "{} {} {} {} {} {} {}",
-            self.enabled as u8, self.orbit_speed, self.pan_speed, self.zoom_speed, inv, self.lock_rotation as u8, self.lock_translation as u8
+            "{} {} {} {} {} {} {} {} {}",
+            self.enabled as u8,
+            self.orbit_speed,
+            self.pan_speed,
+            self.zoom_speed,
+            inv,
+            self.lock_rotation as u8,
+            self.lock_translation as u8,
+            self.centre.key(),
+            self.show_centre as u8
         )
     }
 
-    /// Reads [`Self::to_pref`]'s form, and the earlier one with an overall speed in front of
-    /// pan, zoom and rotate speeds (folded into each).
+    /// Reads [`Self::to_pref`]'s form, the one before it without the centre of rotation
+    /// (taken as the default's), and the first one, with an overall speed in front of pan,
+    /// zoom and rotate speeds (folded into each).
     pub fn from_pref(s: &str) -> Option<Self> {
         let f: Vec<&str> = s.split_whitespace().collect();
         let num = |i: usize| f[i].parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
-        let (orbit, pan, zoom, rest) = match f.len() {
-            7 => (num(1)?, num(2)?, num(3)?, &f[4..]),
+        let defaults = Self::default();
+        let (orbit, pan, zoom, rest, centre, show_centre) = match f.len() {
+            9 => (num(1)?, num(2)?, num(3)?, &f[4..7], Centre::from_key(f[7])?, f[8] == "1"),
+            7 => (num(1)?, num(2)?, num(3)?, &f[4..], defaults.centre, defaults.show_centre),
             8 => {
                 let overall = num(1)?;
-                (overall * num(4)?, overall * num(2)?, overall * num(3)?, &f[5..])
+                (overall * num(4)?, overall * num(2)?, overall * num(3)?, &f[5..], defaults.centre, defaults.show_centre)
             }
             _ => return None,
         };
@@ -106,6 +145,8 @@ impl Settings {
             invert,
             lock_rotation: rest[1] == "1",
             lock_translation: rest[2] == "1",
+            centre,
+            show_centre,
         })
     }
 }
@@ -683,8 +724,12 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let s = Settings { enabled: false, orbit_speed: 7.5, pan_speed: 0.25, zoom_speed: 3.0, invert: [true, false, true, false, false, true], lock_rotation: true, ..Default::default() };
+        let s = Settings { enabled: false, orbit_speed: 7.5, pan_speed: 0.25, zoom_speed: 3.0, invert: [true, false, true, false, false, true], lock_rotation: true, centre: Centre::Object, show_centre: false, ..Default::default() };
         assert_eq!(Settings::from_pref(&s.to_pref()), Some(s));
+        // Saved before the centre of rotation was a setting: the default's.
+        let before = Settings::from_pref("0 7.5 0.25 3 101001 1 0").unwrap();
+        assert_eq!((before.orbit_speed, before.centre, before.show_centre), (7.5, Centre::View, true));
+        assert_eq!(Settings::from_pref("1 1 1 1 000000 0 0 sideways 1"), None);
         assert_eq!(Settings::from_pref("garbage"), None);
         assert_eq!(Settings::from_pref("1 1 1 1 0000 0 0"), None);
         // Out of range or not a positive number.

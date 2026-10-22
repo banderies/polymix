@@ -542,6 +542,9 @@ const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_millis(66);
 const OBJECTS_WIDTH: (f32, f32) = (170.0, 520.0);
 /// The Preferences window's 3D mouse tab (also `prefs:4` in scripts).
 const PREFS_TAB_3D_MOUSE: usize = 4;
+/// The circle in the middle of the view the 3D mouse's centre of rotation is looked for in:
+/// its diameter as a share of the view's smaller side (half the field of view).
+const CENTRE_CIRCLE: f64 = 0.5;
 
 /// Destination of a tool switch.
 #[derive(Clone, Debug)]
@@ -553,6 +556,17 @@ enum SwitchTo {
     /// The S hotkey: Select with nothing selected, whatever was selected before (e.g. the
     /// patch Erase & Fill just made).
     ClearSelect,
+}
+
+/// The 3D mouse's centre of rotation at `at`: a small translucent green ball, `a` its opacity
+/// (0..1, fading out after a move).
+fn paint_centre_marker(painter: &egui::Painter, at: egui::Pos2, a: f32) {
+    let green = |alpha: f32| Color32::from_rgba_unmultiplied(80, 210, 110, (alpha * a * 255.0) as u8);
+    painter.circle_filled(at, 4.5, green(0.32));
+    painter.circle_stroke(at, 4.5, egui::Stroke::new(1.0, green(0.7)));
+    // A highlight up and to the left makes it read as a ball.
+    painter.circle_filled(at + egui::vec2(-1.5, -1.5), 1.5, Color32::from_rgba_unmultiplied(255, 255, 255, (0.3 * a * 255.0) as u8));
+    painter.circle_filled(at, 1.0, green(0.9));
 }
 
 /// What a 3D mouse button's action is called in the settings.
@@ -808,6 +822,10 @@ pub struct MeshWorkspace {
     /// The brush size every brush tool shares (see [`tools::BrushSize`]), kept with the
     /// preferences.
     brush: tools::BrushSize,
+    /// What the 3D mouse's move going on turns about (chosen as it started).
+    space_centre: Option<DVec3>,
+    /// Where to show that centre, and when the 3D mouse last moved the view (it fades after).
+    space_marker: Option<(DVec3, std::time::Instant)>,
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
     hotbox: Option<egui::Pos2>,
     show_objects: bool,
@@ -909,6 +927,8 @@ impl MeshWorkspace {
             space_last_button: None,
             space_key_capture: None,
             brush: tools::BrushSize::default(),
+            space_centre: None,
+            space_marker: None,
             hotbox: None,
             show_objects: true,
             objects_folded: false,
@@ -3086,13 +3106,17 @@ impl MeshWorkspace {
         let moving = !motion.is_zero();
         if moving && !self.space_moving {
             self.remember_view();
+            // A move turns about one centre, chosen as it starts.
+            self.space_centre = Some(self.space_move_centre(vp));
         }
         self.space_moving = moving;
-        // The 3D mouse turns the object about its centre of mass, wherever panning has put it.
-        let pivot = if motion.r.iter().any(|r| *r != 0.0) { self.center_of_mass().unwrap_or(self.camera.target) } else { self.camera.target };
+        let pivot = self.space_centre.unwrap_or(self.camera.target);
         if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64, pivot) {
             // Keep animating while the cap is deflected.
             ctx.request_repaint();
+        }
+        if moving && self.space_cfg.show_centre && !self.space_cfg.lock_rotation {
+            self.space_marker = Some((pivot, std::time::Instant::now()));
         }
         // Capturing a button for the settings stops when they are put away.
         if !(self.show_prefs && self.prefs_tab == PREFS_TAB_3D_MOUSE) {
@@ -3102,6 +3126,73 @@ impl MeshWorkspace {
         for b in pressed {
             self.space_button(b, ctx, vp);
         }
+    }
+
+    /// What a 3D mouse move starting now turns about (see [`spacemouse::Centre`]).
+    fn space_move_centre(&mut self, vp: Viewport) -> DVec3 {
+        let in_view = match self.space_cfg.centre {
+            spacemouse::Centre::View => self.centre_in_view(vp),
+            spacemouse::Centre::Object => None,
+        };
+        in_view.or_else(|| self.center_of_mass()).unwrap_or(self.camera.target)
+    }
+
+    /// What is in view to turn about: `None` while the visible objects are all in view (their
+    /// centre of mass then). Zoomed in: of the vertices seen within a circle in the middle of
+    /// the view, half the field of view across, the one nearest the camera, so a near part a
+    /// little off the middle wins over what lies far behind the middle; with none in the
+    /// circle, the vertex seen nearest the middle.
+    fn centre_in_view(&mut self, vp: Viewport) -> Option<DVec3> {
+        use rayon::prelude::*;
+        let aspect = vp.aspect();
+        let b = self.scene.bounds();
+        if b.is_empty() {
+            return None;
+        }
+        let corner = |k: usize| DVec3::new([b.min.x, b.max.x][k & 1], [b.min.y, b.max.y][(k >> 1) & 1], [b.min.z, b.max.z][k >> 2]);
+        let shown = |p: DVec3| self.camera.project(p, aspect).is_some_and(|n| n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z));
+        if (0..8).all(|k| shown(corner(k))) {
+            return None;
+        }
+        // Screen offsets from the middle of the view, in points.
+        let (w, h) = (vp.rect.width().max(1.0) as f64, vp.rect.height().max(1.0) as f64);
+        let (eye, fwd, right, up) = (self.camera.eye(), self.camera.forward(), self.camera.right(), self.camera.up());
+        let (ortho, per_point) = (self.camera.orthographic, self.camera.pixel_size_at_target(h));
+        let focal = h / 2.0 / (self.camera.fov_y / 2.0).tan();
+        let radius = CENTRE_CIRCLE * 0.5 * w.min(h);
+        // Per vertex: (distance from the eye, in the circle) and (squared offset, in view);
+        // the smallest of each over every vertex.
+        type Best = (Option<(f64, DVec3)>, Option<(f64, DVec3)>);
+        let least = |a: Option<(f64, DVec3)>, b: Option<(f64, DVec3)>| match (a, b) {
+            (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
+            (x, y) => x.or(y),
+        };
+        let mut best: Best = (None, None);
+        for o in self.scene.objects.iter().filter(|o| o.visible && !o.reference) {
+            let m = &o.mesh;
+            let found: Best = m
+                .positions()
+                .par_iter()
+                .enumerate()
+                .filter(|(i, _)| m.is_vertex(*i as u32))
+                .map(|(_, &p)| {
+                    let v = p - eye;
+                    let z = v.dot(fwd);
+                    if z <= 1e-9 && !ortho {
+                        return (None, None);
+                    }
+                    let scale = if ortho { 1.0 / per_point } else { focal / z };
+                    let (sx, sy) = (v.dot(right) * scale, v.dot(up) * scale);
+                    if sx.abs() > w / 2.0 || sy.abs() > h / 2.0 {
+                        return (None, None);
+                    }
+                    let off = sx * sx + sy * sy;
+                    ((off <= radius * radius).then(|| (v.length(), p)), Some((off, p)))
+                })
+                .reduce(|| (None, None), |a, b| (least(a.0, b.0), least(a.1, b.1)));
+            best = (least(best.0, found.0), least(best.1, found.1));
+        }
+        best.0.or(best.1).map(|(_, p)| p)
     }
 
     /// Every brush tool open takes the one brush size: none keeps a size of its own.
@@ -3209,6 +3300,11 @@ impl MeshWorkspace {
             ui.checkbox(&mut c.lock_rotation, "Lock rotation");
             ui.checkbox(&mut c.lock_translation, "Lock pan/zoom");
         });
+        ui_util::section(ui, "Centre of rotation");
+        ui.radio_value(&mut c.centre, spacemouse::Centre::View, "What you look at")
+            .on_hover_text("Chosen again as each move starts, as in Fusion 360: the object's centre while all of it is in view; zoomed in, the surface at the middle of the view, or the visible surface nearest it");
+        ui.radio_value(&mut c.centre, spacemouse::Centre::Object, "The object's centre (centre of mass)");
+        ui.checkbox(&mut c.show_centre, "Show it while moving").on_hover_text("A small green ball where the view turns about, while the 3D mouse moves it");
         ui_util::section(ui, "Invert");
         ui.horizontal_wrapped(|ui| {
             for (i, name) in spacemouse::Settings::AXIS_NAMES.iter().enumerate() {
@@ -3566,6 +3662,19 @@ impl MeshWorkspace {
                     let c = vp.to_screen(n);
                     painter.circle(c, 4.0, ui_util::ACCENT, egui::Stroke::new(1.5, Color32::from_gray(20)));
                 }
+            }
+        }
+        // The 3D mouse's centre of rotation: while it moves the view, then fading out.
+        if let Some((p, last)) = self.space_marker {
+            const FADE: f32 = 0.1;
+            let age = if self.space_moving { 0.0 } else { last.elapsed().as_secs_f32() };
+            if age < FADE {
+                if let Some(n) = self.camera.project(p, vp.aspect()).filter(|n| (0.0..=1.0).contains(&n.z)) {
+                    paint_centre_marker(&painter, vp.to_screen(n), 1.0 - age / FADE);
+                }
+                ctx.request_repaint();
+            } else {
+                self.space_marker = None;
             }
         }
         if self.view.show_pivots {
