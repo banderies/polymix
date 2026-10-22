@@ -470,27 +470,13 @@ impl Segmentation {
         n
     }
 
-    /// Put back labels a drag changed: (voxel, label it had). Like a brush dab, the slice
-    /// views follow it (`version`); the drag's end is [`Segmentation::stroke_finished`].
-    pub fn restore_voxels(&mut self, voxels: &[(usize, u8)]) -> usize {
-        let mut counts = self.counts.take().filter(|(v, _)| *v == self.version).map(|(_, c)| c);
-        let mut n = 0;
-        for &(i, label) in voxels {
-            let old = self.labels[i];
-            if old != label {
-                self.labels[i] = label;
-                n += 1;
-                if let Some(c) = &mut counts {
-                    c[old as usize] -= 1;
-                    c[label as usize] += 1;
-                }
-            }
+    /// What [`Segmentation::paint`] of `voxels` into segment `label` would leave them, written
+    /// into `out` (a copy of the labels) at those voxels only.
+    pub fn preview_paint(&self, vol: &LoadedVolume, voxels: &[usize], label: u8, masking: &Masking, out: &mut [u8]) {
+        let rules = self.rules(masking);
+        for &i in voxels {
+            out[i] = rules.result(self.labels[i], vol.values[i], label, true, false);
         }
-        if n > 0 {
-            self.changed(false);
-        }
-        self.counts = counts.map(|c| (self.version, c));
-        n
     }
 
     /// Give the voxels listed (by index) label `to`, whatever they had, as one finished edit.

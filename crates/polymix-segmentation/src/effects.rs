@@ -68,6 +68,35 @@ impl Effect {
         Effect::SelectPart,
     ];
 
+    /// The order the effects list shows them in, group by group (`ALL`'s order is the keys').
+    pub const LISTED: [Effect; 25] = [
+        Effect::Threshold,
+        Effect::ThresholdGrow,
+        Effect::FloodFill,
+        Effect::LevelTracing,
+        Effect::GrowFromSeeds,
+        Effect::Watershed,
+        Effect::FastMarching,
+        Effect::LevelSet,
+        Effect::GuidedVessel,
+        Effect::Paint,
+        Effect::Erase,
+        Effect::Draw,
+        Effect::Scissors,
+        Effect::DrawTube,
+        Effect::SurfaceCut,
+        Effect::SelectPart,
+        Effect::Islands,
+        Effect::Margin,
+        Effect::Smoothing,
+        Effect::Hollow,
+        Effect::Logical,
+        Effect::FillBetweenSlices,
+        Effect::Engrave,
+        Effect::MaskVolume,
+        Effect::SplitVolume,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Effect::Threshold => "Threshold",
@@ -103,9 +132,74 @@ impl Effect {
         matches!(self, Effect::GrowFromSeeds | Effect::Watershed | Effect::FillBetweenSlices)
     }
 
-    /// Works on points clicked in the views.
+    /// Works on points clicked in the views (Threshold grow's and Select part's are seeds).
     pub fn takes_points(self) -> bool {
-        matches!(self, Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel)
+        matches!(self, Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel | Effect::ThresholdGrow | Effect::SelectPart)
+    }
+
+    /// The group the effects list shows it in.
+    pub fn group(self) -> Group {
+        match self {
+            Effect::Threshold | Effect::ThresholdGrow | Effect::FloodFill | Effect::LevelTracing | Effect::GrowFromSeeds | Effect::Watershed | Effect::FastMarching | Effect::LevelSet | Effect::GuidedVessel => Group::Image,
+            Effect::Paint | Effect::Draw | Effect::Erase | Effect::Scissors | Effect::DrawTube | Effect::SurfaceCut => Group::Hand,
+            Effect::SelectPart | Effect::Islands | Effect::Margin | Effect::Smoothing | Effect::Hollow | Effect::Logical | Effect::FillBetweenSlices | Effect::Engrave => Group::Segments,
+            Effect::MaskVolume | Effect::SplitVolume => Group::Images,
+        }
+    }
+
+    /// What it does, in a line: the subtitle of its card.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Effect::Threshold => "Make the segment the voxels whose values lie in a range.",
+            Effect::ThresholdGrow => "Grow the segment from seed points over connected voxels in a range of values, as far as you drag.",
+            Effect::Paint => "Paint voxels into the segment with a brush.",
+            Effect::Draw => "Outline a region in a slice and fill it into the segment.",
+            Effect::Erase => "Erase voxels from the segment with a brush.",
+            Effect::LevelTracing => "Outline the region as bright as the pointer (or darker) in a slice, and add it.",
+            Effect::FloodFill => "Click a structure: its connected voxels of similar value are added.",
+            Effect::Scissors => "Cut or fill inside or outside a shape you draw, through a range of slices.",
+            Effect::Islands => "Keep, remove or split the separate pieces of a segment.",
+            Effect::Margin => "Grow or shrink a segment by a distance.",
+            Effect::Smoothing => "Remove bumps and fill gaps in a segment.",
+            Effect::Hollow => "Turn a segment into a shell of a thickness: a wall around a lumen.",
+            Effect::Logical => "Combine a segment with another (add, subtract, intersect), or invert, clear or fill it.",
+            Effect::GrowFromSeeds => "Seeds painted in two or more segments each grow over the voxels most like their own.",
+            Effect::Watershed => "Seeds painted in two or more segments flood the image until they meet at its edges.",
+            Effect::FastMarching => "Grow a segment over the most similar voxels nearest to it, to a size.",
+            Effect::DrawTube => "A tube of a radius through points you click (vessel, catheter, nerve).",
+            Effect::SurfaceCut => "The closed shape through points you click on a structure's surface.",
+            Effect::FillBetweenSlices => "Fill the slices between segmented ones by blending their shapes.",
+            Effect::MaskVolume => "Save a copy of the volume with a value filled inside or outside a segment.",
+            Effect::SplitVolume => "Save one cropped image per visible segment.",
+            Effect::LevelSet => "Grow or shrink a rough segment to the vessel's wall, staying smooth.",
+            Effect::GuidedVessel => "Click points along a vessel: it is segmented from the first to the last.",
+            Effect::Engrave => "Cut text into a segment, or raise it from it (labels for printed models).",
+            Effect::SelectPart => "Pick part of a segment by its distance from seed points, then erase, keep, move or measure it.",
+        }
+    }
+
+    /// The mouse in the slice views while it is in use, for the status bar (`None`: the views'
+    /// own controls only).
+    pub fn mouse(self) -> Option<&'static str> {
+        Some(match self {
+            Effect::ThresholdGrow => "Click: add a seed · ⌘ right drag anywhere: grow → / shrink ← · Right drag: pan · Wheel: slices · Esc: clear the seeds",
+            Effect::SelectPart => "Click in a segment: add a seed · ⌘ right drag anywhere: more → / less ← · Right drag: pan · Wheel: slices · Esc: clear the seeds",
+            Effect::Paint => "Left drag: paint · ⇧ wheel: brush size · 3D view: ⌘ drag · Right drag: pan · Wheel: slices",
+            Effect::Erase => "Left drag: erase · ⇧ wheel: brush size · 3D view: ⌘ drag · Right drag: pan · Wheel: slices",
+            Effect::Draw => "Click: add a point · Drag: draw a line · Double-click or Enter: fill · x: take back a point · Esc: start again",
+            Effect::LevelTracing => "Point at a structure: its outline shows · Click: add it · Wheel: slices",
+            Effect::FloodFill => "Click a structure (a slice or the 3D view): fill it · Right drag: pan · Wheel: slices",
+            Effect::Scissors => "Left drag: draw the shape; it cuts when you let go · 3D view: ⌘ drag · Wheel: slices",
+            Effect::Islands => "Click an island (Keep or Remove selected, Split) · Right drag: pan · Wheel: slices",
+            Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel => "Click: add a point (a slice or the 3D surface) · Right drag: pan · Wheel: slices",
+            Effect::Engrave => "Click where the text goes · Right drag: pan · Wheel: slices",
+            _ => return None,
+        })
+    }
+
+    /// Masking (the card's Limits) decides what it may change.
+    pub fn uses_masking(self) -> bool {
+        !matches!(self, Effect::MaskVolume | Effect::SplitVolume | Effect::SelectPart)
     }
 
     /// Name in test scripts.
@@ -164,8 +258,43 @@ impl Effect {
             Effect::LevelSet => "Grow (or shrink) the segment to the vessel's wall: a geodesic active contour that stays smooth, within the threshold range or following the overlay (e.g. vesselness)",
             Effect::GuidedVessel => "Click points along a vessel: it is segmented from the first to the last, following the vessel between them (within the threshold range)",
             Effect::Engrave => "Text cut into the segment or raised from it, where you click in a slice view (labels for printed models)",
-            Effect::ThresholdGrow => "⌘ / Ctrl + right drag from a voxel in the threshold range: the segment grows over the connected voxels in the range, nearest first, as far as you drag right; drag back to take it back",
-            Effect::SelectPart => "⌘ / Ctrl + right drag from a voxel of a segment: the part of it within reach along the segment is selected, to erase, keep, move to another segment or measure",
+            Effect::ThresholdGrow => "Click seed points in the structure (values in the threshold range), then ⌘ / Ctrl + right drag anywhere in a slice view: right grows the segment over the connected voxels in the range, nearest the seeds first; left takes it back. Each drag goes on from the last; Apply keeps it",
+            Effect::SelectPart => "Click seed points in a segment, then ⌘ / Ctrl + right drag anywhere in a slice view: right selects more of the segment around the seeds, left less. Then erase the part, keep only it, move it to another segment or read its size",
+        }
+    }
+}
+
+/// Where effects work from: the groups of the effects list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    /// They read the volume's values.
+    Image,
+    /// Drawn in the views; the image's values play no part.
+    Hand,
+    /// They change segments already made, by their shapes only.
+    Segments,
+    /// New images from the volume, cut by segments.
+    Images,
+}
+
+impl Group {
+    pub const ALL: [Group; 4] = [Group::Image, Group::Hand, Group::Segments, Group::Images];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::Image => "From the image",
+            Group::Hand => "Draw by hand",
+            Group::Segments => "Change segments",
+            Group::Images => "Make new images",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Group::Image => "Segment by the volume's values: what is bright (or dark) and connected",
+            Group::Hand => "Paint, draw and cut in the views; the image's values play no part (unless Limits says so)",
+            Group::Segments => "Change segments already made, by their shapes only: the image's values play no part",
+            Group::Images => "Save new images from the volume, cut out or blanked by segments (they appear in the Volume tab)",
         }
     }
 }
@@ -719,7 +848,7 @@ impl Settings {
     /// Effects that take the left button in the slice views (a click or a stroke).
     pub fn takes_left_button(&self, e: Effect) -> bool {
         match e {
-            Effect::Paint | Effect::Erase | Effect::FloodFill | Effect::Draw | Effect::LevelTracing | Effect::Scissors | Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel | Effect::Engrave => true,
+            Effect::Paint | Effect::Erase | Effect::FloodFill | Effect::Draw | Effect::LevelTracing | Effect::Scissors | Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel | Effect::Engrave | Effect::ThresholdGrow | Effect::SelectPart => true,
             Effect::Islands => self.islands.by_click(),
             _ => false,
         }
@@ -1229,6 +1358,18 @@ pub fn meshes(labels: &[u8], dims: [usize; 3], segments: &[(String, u8)], geomet
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_list_shows_every_effect_once_group_by_group() {
+        let mut listed = Effect::LISTED.to_vec();
+        let groups: Vec<Group> = listed.iter().map(|e| e.group()).collect();
+        let mut order = groups.clone();
+        order.dedup();
+        assert_eq!(order, Group::ALL, "each group's effects together, in the groups' order");
+        listed.sort_by_key(|e| Effect::ALL.iter().position(|x| x == e));
+        assert_eq!(listed, Effect::ALL);
+        assert!(Effect::ALL.iter().all(|e| !e.summary().is_empty() && e.summary().ends_with('.')));
+    }
 
     #[test]
     fn brush_dabs() {

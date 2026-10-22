@@ -44,11 +44,18 @@ impl DragGrow {
     /// A search from voxel `seed` (an index into a grid of `dims`, voxel size `spacing` mm),
     /// which the test given to [`DragGrow::reach`] must allow.
     pub fn new(dims: [usize; 3], spacing: [f64; 3], seed: usize) -> Self {
+        Self::with_seeds(dims, spacing, &[seed])
+    }
+
+    /// A search from several voxels at once: each voxel's path length is from the nearest.
+    pub fn with_seeds(dims: [usize; 3], spacing: [f64; 3], seeds: &[usize]) -> Self {
         let mut best = vec![0.0f32; dims.iter().product()];
         let mut heap = BinaryHeap::new();
-        if seed < best.len() {
-            best[seed] = 1.0;
-            heap.push(Item(0.0, seed));
+        for &seed in seeds {
+            if seed < best.len() && best[seed] == 0.0 {
+                best[seed] = 1.0;
+                heap.push(Item(0.0, seed));
+            }
         }
         Self { dims, spacing, best, heap, settled: Vec::new() }
     }
@@ -171,6 +178,18 @@ mod tests {
             let want: Vec<usize> = (0..n).filter(|&v| d[v] as f64 <= r).collect();
             assert_eq!(got, want, "reach {r}");
         }
+    }
+
+    #[test]
+    fn several_seeds_grow_from_the_nearest() {
+        let dims = [40, 10, 10];
+        let at = |x: usize| x + 5 * 40 + 5 * 400;
+        let mut g = DragGrow::with_seeds(dims, [1.0; 3], &[at(5), at(30), at(5)]);
+        let k = g.reach(3.0, |_| true);
+        let xs: Vec<usize> = g.settled()[..k].iter().filter(|s| s.1 / 40 == 55).map(|s| s.1 % 40).collect();
+        // Along the line through both seeds: three voxels either side of each.
+        assert!((2..=8).chain(27..=33).all(|x| xs.contains(&x)) && xs.iter().all(|x| (2..=8).contains(x) || (27..=33).contains(x)), "{xs:?}");
+        assert_eq!(g.settled()[..k].iter().filter(|s| s.0 == 0.0).count(), 2, "a seed given twice counts once");
     }
 
     #[test]

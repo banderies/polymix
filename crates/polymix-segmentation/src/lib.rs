@@ -10,6 +10,7 @@
 //! [`SegmentationWorkspace::take_meshes`].
 
 mod agent;
+mod card;
 mod drag;
 mod effects;
 mod import;
@@ -135,8 +136,8 @@ struct PreviewKey {
 enum OverlayKey {
     Labels(u64, u64),
     Preview(u64, u64),
-    /// Select part's part over the labels: (part id, its version, style).
-    Part(u64, u64, u64),
+    /// Threshold grow's or Select part's region over the labels: (region id, its version, style).
+    Region(u64, u64, u64),
 }
 
 /// The last brush dab of the stroke going on: where, how, and the label map's version after
@@ -255,10 +256,10 @@ pub struct SegmentationWorkspace {
     local: Option<sketch::LocalRegion>,
     /// Segment statistics last measured (label, measures), for the label map at a version.
     stats: Option<(u64, Vec<(u8, mm_segment::SegmentStats)>)>,
-    /// Threshold grow's ⌘ / Ctrl + right drag in progress.
-    grow: Option<drag::Grow>,
-    /// Select part's part: being dragged out, or waiting to be used.
-    part: Option<drag::Part>,
+    /// Threshold grow's region: from the seeds (`markers`) as far as the drags have reached.
+    grow: Option<drag::Reach>,
+    /// Select part's part: the same, in the seeds' segment.
+    part: Option<drag::Reach>,
 }
 
 /// The image the Segmentation tab shows: its name, the crosshair (voxel coordinates) and the
@@ -841,15 +842,9 @@ impl SegmentationWorkspace {
             }
             _ => self.end_stroke(),
         }
-        match effect {
-            Some(e @ (Effect::ThresholdGrow | Effect::SelectPart)) => {
-                if let Some((map, (d, pressed))) = responses.iter().find_map(|(_, r)| r.tool_drag.map(|t| (r.map, t))) {
-                    self.tool_drag(vol, e, d, pressed, map);
-                }
-            }
-            _ => {
-                self.grow = None;
-                self.part = None;
+        if let Some(e @ (Effect::ThresholdGrow | Effect::SelectPart)) = effect {
+            if let Some((map, (d, _))) = responses.iter().find_map(|(_, r)| r.tool_drag.map(|t| (r.map, t))) {
+                self.tool_drag(vol, e, d, map, ctx);
             }
         }
         if !matches!(effect, Some(Effect::Draw | Effect::Scissors | Effect::Threshold)) {
@@ -866,55 +861,54 @@ impl SegmentationWorkspace {
         }
     }
 
-    /// Threshold grow's or Select part's ⌘ / Ctrl + right drag in a slice view: `pressed` is the
-    /// voxel pressed, `map` the view's (its zoom sets how far a point of drag reaches).
-    fn tool_drag(&mut self, vol: &LoadedVolume, effect: Effect, d: polymix_imaging::ToolDrag, pressed: Option<DVec3>, map: polymix_imaging::ViewMap) {
-        use polymix_imaging::DragPhase;
-        let Some(seg) = &mut self.seg else { return };
-        if d.phase == DragPhase::Start {
-            self.grow = None;
-            self.part = None;
-            let Some(v) = pressed else {
-                self.message = Some(("Press on the image".into(), true));
-                return;
-            };
-            let seed = drag::voxel_index(vol.dims, v);
-            let mm_per_point = 1.0 / map.points_per_mm(vol.geometry.spacing).max(1e-6) as f64;
-            let started = match effect {
-                Effect::ThresholdGrow => {
-                    if seg.selected.is_none() && seg.add_segment(None).is_none() {
-                        return;
-                    }
-                    let (Some(label), Some(range)) = (seg.selected_segment().map(|s| s.label), self.settings.as_ref().map(|s| s.threshold)) else { return };
-                    drag::Grow::start(vol, seg, seed, label, range, mm_per_point).map(|g| self.grow = Some(g))
-                }
-                _ => {
-                    self.previews_made += 1;
-                    drag::Part::start(vol, seg, seed, mm_per_point, self.previews_made).map(|p| self.part = Some(p))
-                }
-            };
-            if let Err(e) = started {
-                self.message = Some((e, true));
-                return;
+    /// Threshold grow's or Select part's ⌘ / Ctrl + right drag in a slice view: it moves the
+    /// reach of the region from the seeds, wherever it starts. `map` is the view's: its zoom
+    /// sets how far a point of drag reaches.
+    fn tool_drag(&mut self, vol: &LoadedVolume, effect: Effect, d: polymix_imaging::ToolDrag, map: polymix_imaging::ViewMap, ctx: &egui::Context) {
+        let region = if effect == Effect::ThresholdGrow { &mut self.grow } else { &mut self.part };
+        match region {
+            Some(r) => {
+                r.drag(&d, 1.0 / map.points_per_mm(vol.geometry.spacing).max(1e-6) as f64);
+                // The region follows on the next frame.
+                ctx.request_repaint();
             }
-        }
-        if let Some(g) = &mut self.grow {
-            let n = g.drag(vol, seg, d.total.x, &self.masking);
-            self.message = Some((format!("Grow {:.1} mm · {n} voxels", g.reach), false));
-            if d.phase == DragPhase::End {
-                self.grow = None;
-                seg.stroke_finished();
+            None if d.phase == polymix_imaging::DragPhase::Start => {
+                let what = if effect == Effect::ThresholdGrow { "Click a seed point in the structure first (a voxel in the threshold range)" } else { "Click a seed point in a segment first" };
+                self.message = Some((what.into(), true));
             }
-        }
-        if let Some(p) = &mut self.part {
-            if !p.done {
-                p.drag(seg, d.total.x);
-                p.done = d.phase == DragPhase::End;
-            }
+            None => {}
         }
     }
 
-    /// Do `action` to Select part's part, and drop it.
+    /// Keep Threshold grow's and Select part's regions those of their seeds, reach, segment,
+    /// range and limits; neither while its effect is not in use.
+    fn sync_regions(&mut self, vol: &LoadedVolume) {
+        let (Some(seg), Some(st)) = (&self.seg, &self.settings) else {
+            (self.grow, self.part) = (None, None);
+            return;
+        };
+        if self.effect == Some(Effect::ThresholdGrow) {
+            let label = seg.selected_segment().map(|s| s.label);
+            drag::Reach::sync_grow(&mut self.grow, vol, seg, &self.markers, label, st.threshold, &self.masking, &mut self.previews_made);
+        } else {
+            self.grow = None;
+        }
+        if self.effect == Some(Effect::SelectPart) {
+            drag::Reach::sync_part(&mut self.part, vol, seg, &self.markers, &mut self.previews_made);
+        } else {
+            self.part = None;
+        }
+    }
+
+    /// Keep Threshold grow's region in its segment (one undo step).
+    fn apply_grow(&mut self, vol: &LoadedVolume) {
+        let (Some(seg), Some(r)) = (&mut self.seg, &self.grow) else { return };
+        let message = r.apply_grow(vol, seg);
+        self.message = Some((message, false));
+    }
+
+    /// Do `action` to Select part's part. The seeds stay: the part is made again over the
+    /// labels as they are now.
     fn use_part(&mut self, vol: &LoadedVolume, action: drag::PartAction) {
         let (Some(seg), Some(part)) = (&mut self.seg, self.part.take()) else { return };
         let message = drag::use_part(&part, vol, seg, action);
@@ -1089,6 +1083,8 @@ impl SegmentationWorkspace {
     fn keys(&mut self, ctx: &egui::Context) {
         if self.effect != self.effects_seen.1 {
             self.effects_seen = (self.effects_seen.1, self.effect);
+            // Points (seeds) belong to the effect they were placed for.
+            self.markers.clear();
         }
         if ctx.egui_wants_keyboard_input() || self.running.is_some() {
             return;
@@ -1211,8 +1207,6 @@ impl SegmentationWorkspace {
             if !self.measure.cancel_pending() {
                 self.measure.tool = None;
             }
-        } else if k.escape && self.part.take().is_some() {
-            // The part selected first, then the effect.
         } else if k.escape && self.sketch.take().is_none() {
             if self.markers.is_empty() {
                 self.effect = None;
@@ -1249,9 +1243,23 @@ impl SegmentationWorkspace {
                 }
             }
             "seg.effect" => self.effect = Effect::ALL.into_iter().find(|e| e.key() == arg),
-            "seg.apply" => {
-                if let Some(e) = self.effect {
-                    self.start_op(e, None, ctx);
+            "seg.apply" => match (self.effect, self.volume.clone()) {
+                (Some(Effect::ThresholdGrow), Some(vol)) => self.apply_grow(&vol),
+                (Some(e), _) => self.start_op(e, None, ctx),
+                _ => {}
+            },
+            // seg.seed:i,j,k — a point (a seed) for the effect in use; seg.reach:mm — how far
+            // Threshold grow's or Select part's region reaches from its seeds.
+            "seg.seed" => {
+                if let [i, j, k] = nums(arg).as_slice() {
+                    self.markers.push(DVec3::new(*i, *j, *k));
+                }
+            }
+            "seg.reach" => {
+                if let Ok(mm) = arg.parse::<f64>() {
+                    for r in [&mut self.grow, &mut self.part].into_iter().flatten() {
+                        r.mm = mm;
+                    }
                 }
             }
             // seg.click:i,j,k — a click effect at a voxel.
@@ -1566,9 +1574,12 @@ impl SegmentationWorkspace {
             }
             let over_3d = ui.ctx().pointer_hover_pos().is_some_and(|p| self.rects[1].contains(p));
             let tool = self.effect.is_some_and(|e| self.settings.as_ref().is_some_and(|s| s.takes_left_button(e)));
+            let mouse = self.effect.and_then(|e| e.mouse()).filter(|_| tool || matches!(self.effect, Some(Effect::Islands)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(if over_3d {
                     "Left drag: rotate · Right drag: pan · Middle drag or wheel: zoom · Double-click: fill the view area / back to four views"
+                } else if let Some(m) = mouse {
+                    m
                 } else if tool {
                     "Left: the effect · Right drag: pan · Middle drag: zoom · Left + right drag: window / level · Wheel: slices · Esc: put the effect away"
                 } else {
@@ -1592,13 +1603,10 @@ impl SegmentationWorkspace {
             return;
         };
         let ctx = ui.ctx().clone();
-        // A part an edit has made stale (undo, another effect) is dropped.
-        if self.part.as_ref().is_some_and(|p| self.seg.as_ref().is_none_or(|s| s.version != p.seg_version)) {
-            self.part = None;
-        }
+        self.sync_regions(&vol);
         let mut colours = self.seg.as_ref().map(|s| s.colours()).unwrap_or_default();
-        if let (Some(p), true) = (&self.part, colours.len() == 256) {
-            colours[p.mark as usize] = drag::PART_COLOUR;
+        if let (Some(mark), true) = (self.part.as_ref().and_then(|p| p.mark()), colours.len() == 256) {
+            colours[mark as usize] = drag::PART_COLOUR;
         }
         let has_segments = self.seg.as_ref().is_some_and(|s| !s.segments.is_empty());
         let effect = self.effect.filter(|_| self.running.is_none() && self.measure.tool.is_none() && !self.vessels.placing);
@@ -1612,8 +1620,8 @@ impl SegmentationWorkspace {
         // Slice views: the labels (or the threshold preview) under a version of their own.
         self.update_preview(&vol);
         let style = self.seg.as_ref().map_or(0, |s| s.style_version);
-        let shown: Option<(OverlayKey, &[u8])> = match (&self.part, &self.preview, &self.seg) {
-            (Some(p), _, _) => Some((OverlayKey::Part(p.id, p.version, style), &p.overlay)),
+        let shown: Option<(OverlayKey, &[u8])> = match (self.part.as_ref().or(self.grow.as_ref().filter(|g| g.count() > 0)), &self.preview, &self.seg) {
+            (Some(r), _, _) => Some((OverlayKey::Region(r.id, r.version, style), &r.overlay)),
             (None, Some((_, id, labels)), _) => Some((OverlayKey::Preview(*id, style), labels)),
             (None, None, Some(seg)) => Some((OverlayKey::Labels(seg.version, style), &seg.labels)),
             _ => None,
@@ -1773,7 +1781,7 @@ impl Workspace for SegmentationWorkspace {
         self.keys(&ctx);
         egui::Panel::top("segmentation.toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("segmentation.status").show(ui, |ui| self.status(ui));
-        egui::Panel::left("segmentation.editor").resizable(true).default_size(300.0).show(ui, |ui| self.editor(ui));
+        egui::Panel::left("segmentation.editor").resizable(true).default_size(340.0).show(ui, |ui| self.editor(ui));
         let render_state = frame.wgpu_render_state();
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BACKDROP)).show(ui, |ui| self.views_ui(ui, render_state));
         self.switch_prompt(&ctx);
@@ -2067,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn command_right_drag_grows_a_segment_and_selects_a_part_in_a_slice_view() {
+    fn seeds_then_command_right_drags_from_anywhere_grow_a_preview_and_select_a_part() {
         let mut ws = painting_ws();
         let vol = ws.volume.clone().unwrap();
         // Values rise along i by 4 a voxel: the range takes i ≥ 10.
@@ -2075,13 +2083,14 @@ mod tests {
         ws.effect = Some(Effect::ThresholdGrow);
         let ctx = egui::Context::default();
         let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
-        let command = egui::Modifiers::COMMAND;
         let mut frame = |ws: &mut SegmentationWorkspace, events: Vec<egui::Event>| {
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| ws.views_ui(ui, None));
+            let _ = ctx.run_ui(input, |ui| {
+                ws.keys(ui.ctx());
+                ws.views_ui(ui, None)
+            });
         };
-        // ⌘ / Ctrl held from here on.
-        frame(&mut ws, vec![egui::Event::ModifiersChanged(command)]);
+        frame(&mut ws, Vec::new());
         // A point of the axial view over a voxel well inside the range.
         let axial = ws.rects[0];
         let at = (1..20)
@@ -2091,42 +2100,67 @@ mod tests {
                 ws.hover.is_some_and(|(_, v)| v.x >= 15.0)
             })
             .expect("a voxel in range under the axial view");
-        let drag = |ws: &mut SegmentationWorkspace, frame: &mut dyn FnMut(&mut SegmentationWorkspace, Vec<egui::Event>), dx: f32| {
+        let click = |ws: &mut SegmentationWorkspace, frame: &mut dyn FnMut(&mut SegmentationWorkspace, Vec<egui::Event>), p: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(ws, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE), egui::Event::PointerMoved(p)]);
+            frame(ws, vec![button(true)]);
+            frame(ws, vec![button(false)]);
+            frame(ws, Vec::new());
+        };
+        // ⌘ / Ctrl + right drag of `dx` points from `from`.
+        let drag = |ws: &mut SegmentationWorkspace, frame: &mut dyn FnMut(&mut SegmentationWorkspace, Vec<egui::Event>), from: egui::Pos2, dx: f32| {
+            let command = egui::Modifiers::COMMAND;
             let button = |p, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed, modifiers: command };
-            frame(ws, vec![egui::Event::PointerMoved(at)]);
-            frame(ws, vec![button(at, true)]);
+            frame(ws, vec![egui::Event::ModifiersChanged(command), egui::Event::PointerMoved(from)]);
+            frame(ws, vec![button(from, true)]);
             for k in 1..=4 {
-                frame(ws, vec![egui::Event::PointerMoved(at + egui::vec2(dx * k as f32 / 4.0, 0.0))]);
+                frame(ws, vec![egui::Event::PointerMoved(from + egui::vec2(dx * k as f32 / 4.0, 0.0))]);
             }
-            frame(ws, vec![button(at + egui::vec2(dx, 0.0), false)]);
+            frame(ws, vec![button(from + egui::vec2(dx, 0.0), false)]);
+            frame(ws, Vec::new());
             frame(ws, Vec::new());
         };
         let label = ws.seg.as_ref().unwrap().selected_segment().unwrap().label;
         let count = |ws: &SegmentationWorkspace| ws.seg.as_ref().unwrap().labels.iter().filter(|&&l| l == label).count();
-        assert_eq!(count(&ws), 0);
-        drag(&mut ws, &mut frame, 120.0);
-        let grown = count(&ws);
-        assert!(grown > 50, "the segment grew: {grown} voxels, {:?}", ws.message);
-        let seg = ws.seg.as_ref().unwrap();
-        assert!(seg.labels.iter().zip(&vol.values).all(|(&l, &v)| l != label || (40.0..=100.0).contains(&v)), "only voxels in the range");
-        // The view did not pan.
-        assert!(ws.views.iter().all(|v| v.nav.pan == egui::Vec2::ZERO));
-        // Select part: a short drag from the same voxel takes part of the segment; Erase.
+        // No seed yet: a drag only says so.
+        drag(&mut ws, &mut frame, at, 60.0);
+        assert!(ws.grow.is_none() && ws.message.as_ref().is_some_and(|m| m.1), "{:?}", ws.message);
+        click(&mut ws, &mut frame, at);
+        assert_eq!(ws.markers.len(), 1, "a click places a seed");
+        // A drag from elsewhere in the view grows a preview; the segment is unchanged.
+        let elsewhere = axial.center() + egui::vec2(-axial.width() * 0.3, axial.height() * 0.2);
+        drag(&mut ws, &mut frame, elsewhere, 60.0);
+        let first = ws.grow.as_ref().map_or(0, |g| g.count());
+        assert!(first > 10, "the preview grew: {first}, {:?}", ws.message);
+        assert_eq!(count(&ws), 0, "nothing kept before Apply");
+        // A second drag, from yet another place, goes on from there.
+        drag(&mut ws, &mut frame, axial.center(), 60.0);
+        let second = ws.grow.as_ref().unwrap().count();
+        assert!(second > first, "{second} > {first}");
+        assert!(ws.views.iter().all(|v| v.nav.pan == egui::Vec2::ZERO), "no pan meanwhile");
+        // Apply keeps exactly the preview, in range only, as one undo step.
+        ws.apply_grow(&vol);
+        assert_eq!(count(&ws), second);
+        assert!(ws.seg.as_ref().unwrap().labels.iter().zip(&vol.values).all(|(&l, &v)| l != label || (40.0..=100.0).contains(&v)), "only voxels in the range");
+        // Select part: switching effects clears the seeds; a seed in the segment, a drag,
+        // and the part is erased.
         ws.effect = Some(Effect::SelectPart);
-        drag(&mut ws, &mut frame, 30.0);
-        let part = ws.part.as_ref().expect("a part is selected");
-        assert!(part.done && part.voxels > 0 && part.voxels < grown, "{} of {grown}", part.voxels);
-        let n = part.voxels;
+        frame(&mut ws, Vec::new());
+        assert!(ws.markers.is_empty(), "seeds belong to their effect");
+        click(&mut ws, &mut frame, at);
+        drag(&mut ws, &mut frame, elsewhere, 30.0);
+        let n = ws.part.as_ref().expect("a part is selected").count();
+        assert!(n > 0 && n < second, "{n} of {second}");
         ws.use_part(&vol, drag::PartAction::Erase);
-        assert_eq!(count(&ws), grown - n);
+        assert_eq!(count(&ws), second - n);
         // Undo: the part comes back; again: the growth goes, as one step.
         assert!(ws.seg.as_mut().unwrap().undo());
-        assert_eq!(count(&ws), grown);
+        assert_eq!(count(&ws), second);
         assert!(ws.seg.as_mut().unwrap().undo());
         assert_eq!(count(&ws), 0);
         // With another effect, ⌘ / Ctrl + right drag pans as a right drag does.
         ws.effect = Some(Effect::Paint);
-        drag(&mut ws, &mut frame, 40.0);
+        drag(&mut ws, &mut frame, at, 40.0);
         assert!(ws.views[0].nav.pan.x > 30.0, "{:?}", ws.views[0].nav.pan);
         assert_eq!(count(&ws), 0);
     }

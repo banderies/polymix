@@ -1,9 +1,10 @@
 //! The editor panel on the left, as in 3D Slicer's Segment Editor: the segments, the effects
 //! and their options, masking, and saving / meshing.
 
+use crate::card::{self, Card, Ready};
 use crate::drag;
-use crate::effects::{local_range, AutoMode, Effect, Histogram, IslandOp, LocalPick, LocalShape, LogicalOp, MaskFill, Refine, ScissorsOp, ScissorsRange, ScissorsShape, SmoothMethod, HOLLOW_SIDES};
-use crate::segmentation::{EditableArea, Overwrite, Status};
+use crate::effects::{local_range, AutoMode, Effect, Group, Histogram, IslandOp, LocalPick, LocalShape, LogicalOp, MaskFill, Refine, ScissorsOp, ScissorsRange, ScissorsShape, SmoothMethod, HOLLOW_SIDES};
+use crate::segmentation::{EditableArea, Masking, Overwrite, Status};
 use crate::SegmentationWorkspace;
 use egui::{Color32, RichText};
 use mm_volume::load::LoadedVolume;
@@ -21,7 +22,6 @@ impl SegmentationWorkspace {
             self.history_row(ui);
             self.segments_section(ui, &vol);
             self.effects_section(ui, &vol);
-            self.masking_section(ui);
             self.statistics_section(ui);
             self.vessels_section(ui);
             let n = self.measure.items.len();
@@ -77,8 +77,14 @@ impl SegmentationWorkspace {
                     seg.remove_segment(k);
                 }
             }
-            ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false).text("fill")).on_hover_text("Opacity of the segments' fill in the slice views");
         });
+        ui.horizontal(|ui| {
+            ui.label("Opacity").on_hover_text("How solid the segments' colours are in the slice views (0: hidden)");
+            ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+        });
+        if !seg.segments.is_empty() {
+            ui.weak("☑ shown · ● status (click: next) · colour · name (double-click: rename) · volume");
+        }
         let ml_per_voxel = vol.geometry.spacing.iter().product::<f64>() / 1000.0;
         let counts = seg.counts().to_vec();
         // Showing or hiding a segment changes what edits may do and what the 3D view shows; a
@@ -162,507 +168,621 @@ impl SegmentationWorkspace {
 
     fn effects_section(&mut self, ui: &mut egui::Ui, vol: &Arc<LoadedVolume>) {
         section(ui, "Effects");
-        egui::Grid::new("segmentation.effects").num_columns(4).spacing([4.0, 4.0]).show(ui, |ui| {
-            for (i, e) in Effect::ALL.into_iter().enumerate() {
-                if ui.selectable_label(self.effect == Some(e), e.label()).on_hover_text(e.hint()).clicked() {
-                    self.effect = if self.effect == Some(e) { None } else { Some(e) };
+        // The list, by group; folded to a line once an effect is chosen, so its card sits
+        // right below.
+        let list_id = egui::Id::NULL.with("segmentation.effects_list");
+        let mut open = self.effect.is_none() || ui.data(|d| d.get_temp::<bool>(list_id).unwrap_or(false));
+        if let (Some(e), false) = (self.effect, open) {
+            ui.horizontal(|ui| {
+                if ui.small_button("◀ All effects").on_hover_text("Show every effect, to choose another").clicked() {
+                    open = true;
                 }
-                if i % 4 == 3 {
-                    ui.end_row();
-                }
-            }
-        });
-        ui.weak("Keys: 1–0 / ⇧1–⇧0 effects · Space the one before · i intensity masking · q / w segments · ← → slices · − / + brush").on_hover_text("As in 3D Slicer's Segment Editor. Esc drops a shape being drawn, then the effect.");
-        let Some(effect) = self.effect else {
-            ui.weak("Choose an effect. Esc puts it away.");
-            return;
-        };
-        ui.add_space(4.0);
-        ui.label(RichText::new(effect.hint()).italics());
-        let idle = self.running.is_none();
-        let segments: Vec<(u8, String)> = self.seg.as_ref().map(|s| s.segments.iter().map(|x| (x.label, x.name.clone())).collect()).unwrap_or_default();
-        let colour = self.seg.as_ref().and_then(|s| s.selected_segment()).map_or(Color32::from_rgb(128, 174, 128), |s| s.colour);
-        let (Some(st), Some(hist)) = (&mut self.settings, &self.hist) else { return };
-        let mut apply = false;
-        let mut part_action = None;
-        match effect {
-            Effect::ThresholdGrow => {
-                histogram(ui, hist, &mut st.threshold, colour);
-                let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
-                ui.horizontal(|ui| {
-                    ui.label("Range");
-                    ui.add(egui::DragValue::new(&mut st.threshold.0).speed(speed));
-                    ui.label("–");
-                    ui.add(egui::DragValue::new(&mut st.threshold.1).speed(speed));
-                })
-                .response
-                .on_hover_text("Threshold's range: set it there with its preview, or here");
-                ui.weak("In a slice view, ⌘ / Ctrl + right drag from a voxel in the range: drag right to grow the selected segment over the connected voxels in the range, nearest first; drag back to take it back. Each drag is one undo step. Masking applies.");
-            }
-            Effect::SelectPart => match &self.part {
-                Some(part) => {
-                    let s = part.stats(vol);
-                    let name = |l: u8| segments.iter().find(|x| x.0 == l).map_or("?".to_string(), |x| x.1.clone());
-                    ui.label(format!("Part of {}: {} voxels · {:.1} mm³ ({:.2} mL)", name(part.label), s.voxels, s.volume_mm3, s.volume_mm3 / 1000.0));
-                    ui.label(format!("Reaches {:.1} mm along the segment from where you pressed · box {:.1} × {:.1} × {:.1} mm", s.reach_mm, s.extent_mm[0], s.extent_mm[1], s.extent_mm[2]));
-                    let ready = part.done && s.voxels > 0;
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(ready, egui::Button::new("Erase")).on_hover_text("Remove the part from the segment").clicked() {
-                            part_action = Some(drag::PartAction::Erase);
-                        }
-                        if ui.add_enabled(ready, egui::Button::new("Keep only")).on_hover_text("Remove the rest of the segment").clicked() {
-                            part_action = Some(drag::PartAction::KeepOnly);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if st.part_target.is_some_and(|l| l == part.label || !segments.iter().any(|x| x.0 == l)) {
-                            st.part_target = None;
-                        }
-                        let target = st.part_target.map_or("a new segment".to_string(), name);
-                        if ui.add_enabled(ready, egui::Button::new("Move to")).on_hover_text("Split the part off into another segment").clicked() {
-                            part_action = Some(drag::PartAction::MoveTo(st.part_target));
-                        }
-                        egui::ComboBox::from_id_salt("segmentation.part_target").selected_text(target).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut st.part_target, None, "a new segment");
-                            for (l, n) in segments.iter().filter(|x| x.0 != part.label) {
-                                ui.selectable_value(&mut st.part_target, Some(*l), n);
-                            }
-                        });
-                    });
-                    ui.weak("Drag again to select another part; Esc drops this one.");
-                }
-                None => {
-                    ui.weak("In a slice view, ⌘ / Ctrl + right drag from a voxel of a segment: drag right to select the part of the segment within reach, along the segment (as far as the drag goes). Then erase it, keep only it, move it to another segment, or read its size.");
-                }
-            },
-            Effect::Threshold => {
-                histogram(ui, hist, &mut st.threshold, colour);
-                let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
-                ui.horizontal(|ui| {
-                    ui.label("Range");
-                    ui.add(egui::DragValue::new(&mut st.threshold.0).speed(speed));
-                    ui.label("–");
-                    ui.add(egui::DragValue::new(&mut st.threshold.1).speed(speed));
-                });
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("segmentation.auto_method").selected_text(st.auto_method.label()).width(150.0).show_ui(ui, |ui| {
-                        for m in mm_segment::AutoThreshold::ALL {
-                            ui.selectable_value(&mut st.auto_method, m, m.label());
-                        }
-                    });
-                    ui.selectable_value(&mut st.auto_mode, AutoMode::Lower, "↑").on_hover_text("From the threshold up (brighter structures)");
-                    ui.selectable_value(&mut st.auto_mode, AutoMode::Upper, "↓").on_hover_text("Up to the threshold (darker structures)");
-                    if ui.button("Auto").on_hover_text("Set the range from the automatic threshold of the method chosen").clicked() {
-                        if let Some(r) = hist.auto_range(st.auto_method, st.auto_mode) {
-                            st.threshold = r;
+                ui.label(RichText::new(e.group().label()).small().color(ui.visuals().weak_text_color()));
+            });
+        } else {
+            for g in Group::ALL {
+                ui.add_space(2.0);
+                ui.label(RichText::new(g.label()).small().strong().color(ui.visuals().weak_text_color())).on_hover_text(g.hint());
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for e in Effect::LISTED.into_iter().filter(|e| e.group() == g) {
+                        if ui.selectable_label(self.effect == Some(e), e.label()).on_hover_text(e.summary()).clicked() {
+                            self.effect = if self.effect == Some(e) { None } else { Some(e) };
+                            open = false;
                         }
                     }
                 });
-                ui.checkbox(&mut st.local_histogram, "Local histogram").on_hover_text("Drag a box, circle or line over the structure in a slice view: the range is set from the values in it");
-                if st.local_histogram {
-                    ui.horizontal(|ui| {
-                        for s in LocalShape::ALL {
-                            ui.selectable_value(&mut st.local_shape, s, s.label());
-                        }
-                    });
-                    let (lower, upper) = (st.local_lower, st.local_upper);
-                    ui.horizontal(|ui| {
-                        ui.label("Lower");
-                        for p in LocalPick::ALL {
-                            ui.selectable_value(&mut st.local_lower, p, p.label(false));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Upper");
-                        for p in [LocalPick::Average, LocalPick::Percentile, LocalPick::Extreme] {
-                            ui.selectable_value(&mut st.local_upper, p, p.label(true));
-                        }
-                    });
-                    match &self.local {
-                        Some(l) => {
-                            if (lower, upper) != (st.local_lower, st.local_upper) {
-                                if let Some(r) = local_range(&l.values, st.local_lower, st.local_upper) {
+            }
+        }
+        // Open on request only: the next effect chosen (by click or key) folds it again.
+        ui.data_mut(|d| d.insert_temp(list_id, open && self.effect.is_some()));
+        let Some(effect) = self.effect else {
+            ui.add_space(4.0);
+            ui.weak("Choose an effect: its card opens here, with its steps in order.");
+            return;
+        };
+        ui.add_space(6.0);
+        let ctx = ui.ctx().clone();
+        let idle = self.running.is_none();
+        let Some(seg) = &mut self.seg else { return };
+        let counts = seg.counts().to_vec();
+        let rows: Vec<SegRow> = seg.segments.iter().map(|s| SegRow { label: s.label, name: s.name.clone(), colour: s.colour, visible: s.visible, voxels: counts[s.label as usize] }).collect();
+        let selected = seg.selected;
+        let colour = seg.selected_segment().map_or(Color32::from_rgb(128, 174, 128), |s| s.colour);
+        let visible_with_voxels = rows.iter().filter(|r| r.visible && r.voxels > 0).count();
+        let markers = self.markers.len();
+        let sketch_points = self.sketch.as_ref().map_or(0, |s| s.points.len());
+        let previewing = self.seeded.as_ref().is_some_and(|s| s.effect == effect);
+        let region = match effect {
+            Effect::ThresholdGrow => self.grow.as_ref(),
+            Effect::SelectPart => self.part.as_ref(),
+            _ => None,
+        }
+        .map(|r| Region { mm: r.mm, stats: r.stats(vol), ignored: r.ignored, label: r.label(), dragging: r.dragging() });
+        let (Some(st), Some(hist)) = (&mut self.settings, &self.hist) else { return };
+        let local = &self.local;
+        let masking = &mut self.masking;
+        let ml = |mm3: f64| mm3 / 1000.0;
+        let mut acts: Vec<Act> = Vec::new();
+        let mut close = false;
+        let help = format!(
+            "{}.\n\nKeys: 1–0 and ⇧1–⇧0 choose effects · Space: the effect before · i: limit to the threshold range on / off · q / w: previous / next segment · ← →: slices · − / +: brush size · Esc: drop what is being drawn or the points, then the effect.",
+            effect.hint()
+        );
+        card::show(ui, effect.key(), effect.label(), effect.summary(), &help, &mut close, |ui, card| {
+            match effect {
+                Effect::Threshold => {
+                    segment_step(card, ui, "Segment to fill", &rows, selected, None, &mut acts);
+                    card.step(ui, "Range of values", Ready::Either, |ui| {
+                        range_ui(ui, hist, &mut st.threshold, colour, vol);
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("segmentation.auto_method").selected_text(st.auto_method.label()).width(130.0).show_ui(ui, |ui| {
+                                for m in mm_segment::AutoThreshold::ALL {
+                                    ui.selectable_value(&mut st.auto_method, m, m.label());
+                                }
+                            });
+                            ui.selectable_value(&mut st.auto_mode, AutoMode::Lower, "↑").on_hover_text("From the threshold up (brighter structures)");
+                            ui.selectable_value(&mut st.auto_mode, AutoMode::Upper, "↓").on_hover_text("Up to the threshold (darker structures)");
+                            if ui.button("Auto").on_hover_text("Set the range from the automatic threshold of the method chosen").clicked() {
+                                if let Some(r) = hist.auto_range(st.auto_method, st.auto_mode) {
                                     st.threshold = r;
                                 }
                             }
-                            let mut range = st.threshold;
-                            histogram(ui, &l.hist, &mut range, colour);
-                            st.threshold = range;
-                            let n = l.values.len() as f64;
-                            let mean = l.values.iter().map(|&v| v as f64).sum::<f64>() / n;
-                            let sd = (l.values.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
-                            ui.weak(format!("{} voxels: {:.4} ± {:.3}, {:.4} – {:.4}", l.values.len(), mean, sd, l.values[0], l.values[l.values.len() - 1]));
+                        });
+                        ui.checkbox(&mut st.local_histogram, "From a region of the image").on_hover_text("Drag a box, circle or line over the structure in a slice view: the range is set from the values in it");
+                        if st.local_histogram {
+                            local_histogram_ui(ui, st, local, colour);
                         }
-                        None => {
-                            ui.weak("Drag over the structure in a slice view.");
+                    });
+                    card.step(ui, "Check the preview", Ready::Either, |ui| {
+                        ui.weak("The views show the segment as Apply will leave it: the voxels in the range in it, the rest out.");
+                    });
+                    card.step(ui, "Apply", Ready::Todo, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(idle, egui::Button::new("Apply")).clicked() {
+                                acts.push(Act::Apply);
+                            }
+                            if ui.button("Use as a limit").on_hover_text("Other effects then only change voxels in this range (Limits)").clicked() {
+                                masking.intensity = Some(st.threshold);
+                            }
+                        });
+                    });
+                }
+                Effect::ThresholdGrow => {
+                    segment_step(card, ui, "Segment to grow", &rows, selected, None, &mut acts);
+                    card.step(ui, "Range of values", Ready::Either, |ui| {
+                        range_ui(ui, hist, &mut st.threshold, colour, vol);
+                        ui.weak("The same range as Threshold's. Growth only passes through voxels in it.");
+                    });
+                    card.step(ui, "Seeds", Ready::when(region.is_some()), |ui| {
+                        ui.weak("Click in the structure in a slice view (or on the 3D surface): each click adds a seed. Seeds must be in the range.");
+                        points_row(ui, markers, &mut acts);
+                        if let Some(r) = region.as_ref().filter(|r| r.ignored > 0) {
+                            ui.colored_label(crate::WARN, format!("{} seed(s) outside the range are left out", r.ignored));
+                        } else if markers > 0 && region.is_none() {
+                            ui.colored_label(crate::WARN, "No seed is in the range");
                         }
-                    }
+                    });
+                    card.step(ui, "Grow", Ready::when(region.as_ref().is_some_and(|r| r.stats.voxels > 0)), |ui| {
+                        ui.weak("⌘ / Ctrl + right drag anywhere in a slice view: right grows from the seeds, left shrinks. Each drag goes on from the last, so scroll to other slices to check and drag again.");
+                        reach_row(ui, region.as_ref(), &mut acts);
+                        if let Some(r) = &region {
+                            ui.label(format!("{} voxels · {:.2} mL", r.stats.voxels, ml(r.stats.volume_mm3)));
+                        }
+                    });
+                    card.step(ui, "Apply", Ready::Todo, |ui| {
+                        let ready = idle && region.as_ref().is_some_and(|r| r.stats.voxels > 0 && !r.dragging);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(ready, egui::Button::new("Apply")).on_hover_text("Keep the growth in the segment (one undo step)").clicked() {
+                                acts.push(Act::ApplyGrow);
+                            }
+                            if ui.add_enabled(ready, egui::Button::new("Cancel")).on_hover_text("Drop the growth (the seeds stay)").clicked() {
+                                acts.push(Act::SetReach(0.0));
+                            }
+                        });
+                        ui.weak("Until then the segment is unchanged: the views show a preview.");
+                    });
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("Use for masking").on_hover_text("Edits then only change voxels in this range").clicked() {
-                        self.masking.intensity = Some(st.threshold);
-                    }
-                    apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-                });
-                ui.weak("The preview shows the segment after Apply.");
-            }
-            Effect::Paint | Effect::Erase => {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut st.brush_relative, false, "mm");
-                    ui.selectable_value(&mut st.brush_relative, true, "% of view").on_hover_text("The brush keeps its size on screen as you zoom: its diameter is a share of the view's smaller side");
-                });
-                if st.brush_relative {
-                    ui.add(egui::Slider::new(&mut st.brush_percent, 0.5..=50.0).logarithmic(true).suffix(" %").text(format!("diameter ({:.1} mm radius)", st.brush_mm)));
-                } else {
-                    ui.add(egui::Slider::new(&mut st.brush_mm, 0.2..=50.0).logarithmic(true).text("radius (mm)"));
+                Effect::SelectPart => {
+                    card.step(ui, "Seeds", Ready::when(region.is_some()), |ui| {
+                        ui.weak("Click in the segment to take a part of (in a slice view, or on the 3D surface): each click adds a seed.");
+                        points_row(ui, markers, &mut acts);
+                        if let Some(r) = region.as_ref().filter(|r| r.ignored > 0) {
+                            ui.colored_label(crate::WARN, format!("{} seed(s) in other segments are left out", r.ignored));
+                        } else if markers > 0 && region.is_none() {
+                            ui.colored_label(crate::WARN, "The first seed is not in a segment");
+                        }
+                    });
+                    card.step(ui, "Select", Ready::when(region.as_ref().is_some_and(|r| r.stats.voxels > 0)), |ui| {
+                        ui.weak("⌘ / Ctrl + right drag anywhere in a slice view: right takes more of the segment around the seeds, left less. The part shows in yellow.");
+                        reach_row(ui, region.as_ref(), &mut acts);
+                        if let Some(r) = region.as_ref().filter(|r| r.stats.voxels > 0) {
+                            let s = &r.stats;
+                            ui.label(format!("Part of {}: {} voxels · {:.2} mL", name_of(&rows, r.label), s.voxels, ml(s.volume_mm3)));
+                            ui.weak(format!("Reaches {:.1} mm along the segment · box {:.1} × {:.1} × {:.1} mm", s.reach_mm, s.extent_mm[0], s.extent_mm[1], s.extent_mm[2]));
+                        }
+                    });
+                    card.step(ui, "Use the part", Ready::Todo, |ui| {
+                        let ready = region.as_ref().is_some_and(|r| r.stats.voxels > 0 && !r.dragging);
+                        let label = region.as_ref().map_or(0, |r| r.label);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(ready, egui::Button::new("Erase")).on_hover_text("Remove the part from the segment").clicked() {
+                                acts.push(Act::UsePart(drag::PartAction::Erase));
+                            }
+                            if ui.add_enabled(ready, egui::Button::new("Keep only")).on_hover_text("Remove the rest of the segment").clicked() {
+                                acts.push(Act::UsePart(drag::PartAction::KeepOnly));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if st.part_target.is_some_and(|l| l == label || !rows.iter().any(|x| x.label == l)) {
+                                st.part_target = None;
+                            }
+                            if ui.add_enabled(ready, egui::Button::new("Move to")).on_hover_text("Split the part off into another segment").clicked() {
+                                acts.push(Act::UsePart(drag::PartAction::MoveTo(st.part_target)));
+                            }
+                            let target = st.part_target.map_or("a new segment".to_string(), |l| name_of(&rows, l));
+                            egui::ComboBox::from_id_salt("segmentation.part_target").selected_text(target).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut st.part_target, None, "a new segment");
+                                for r in rows.iter().filter(|x| x.label != label) {
+                                    ui.selectable_value(&mut st.part_target, Some(r.label), &r.name);
+                                }
+                            });
+                        });
+                    });
                 }
-                ui.checkbox(&mut st.sphere, "Sphere brush").on_hover_text("Paint a ball across slices, not a disc in this slice");
-                ui.checkbox(&mut st.pixel_mode, "Pixel mode").on_hover_text("Single voxels: only the voxels the pointer passes over");
-                ui.weak("Left drag in a slice view. Shift + wheel: brush size.");
-                ui.weak("3D view: ⌘ / Ctrl + drag paints a ball on the surface under the pointer; a click adds one.");
-            }
-            Effect::Draw => {
-                let points = self.sketch.as_ref().map_or(0, |s| s.points.len());
-                ui.weak("In a slice view: click points, or drag a line, around the region.");
-                ui.weak("Double-click or Enter fills it into the segment in that slice; x takes back the last point; Esc starts again.");
-                ui.horizontal(|ui| {
-                    ui.label(format!("{points} point{}", if points == 1 { "" } else { "s" }));
-                    if ui.add_enabled(points >= 3, egui::Button::new("Fill")).clicked() {
-                        let vol = vol.clone();
-                        self.finish_draw(&vol);
-                    }
-                    if ui.add_enabled(points > 0, egui::Button::new("Clear")).clicked() {
-                        self.sketch = None;
-                    }
-                });
-            }
-            Effect::LevelTracing => {
-                ui.radio_value(&mut st.trace_darker, false, "Brighter: values at least the pointer's");
-                ui.radio_value(&mut st.trace_darker, true, "Darker: values at most the pointer's");
-                ui.weak("Move the pointer over a slice view: the connected region in that slice is outlined. Click to add it to the segment.");
-            }
-            Effect::Scissors => {
-                ui.horizontal_wrapped(|ui| {
-                    for op in ScissorsOp::ALL {
-                        ui.selectable_value(&mut st.scissors_op, op, op.label());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Shape");
-                    for sh in ScissorsShape::ALL {
-                        ui.selectable_value(&mut st.scissors_shape, sh, sh.label());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Slices");
-                    egui::ComboBox::from_id_salt("segmentation.scissors_range").selected_text(st.scissors_range.label()).show_ui(ui, |ui| {
-                        for r in ScissorsRange::ALL {
-                            ui.selectable_value(&mut st.scissors_range, r, r.label()).on_hover_text(match r {
-                                ScissorsRange::Unlimited => "Every slice",
-                                ScissorsRange::Positive => "This slice and those towards the patient's superior, anterior or right",
-                                ScissorsRange::Negative => "This slice and those towards the patient's inferior, posterior or left",
-                                ScissorsRange::Symmetric => "A slab of the thickness, centred on this slice",
+                Effect::Paint | Effect::Erase => {
+                    let erase = effect == Effect::Erase;
+                    segment_step(card, ui, if erase { "Segment to erase from" } else { "Segment to paint" }, &rows, selected, None, &mut acts);
+                    card.step(ui, "Brush", Ready::Either, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut st.brush_relative, false, "mm");
+                            ui.selectable_value(&mut st.brush_relative, true, "% of view").on_hover_text("The brush keeps its size on screen as you zoom: its diameter is a share of the view's smaller side");
+                        });
+                        if st.brush_relative {
+                            ui.add(egui::Slider::new(&mut st.brush_percent, 0.5..=50.0).logarithmic(true).suffix(" %").text(format!("diameter ({:.1} mm radius)", st.brush_mm)));
+                        } else {
+                            ui.add(egui::Slider::new(&mut st.brush_mm, 0.2..=50.0).logarithmic(true).text("radius (mm)"));
+                        }
+                        ui.checkbox(&mut st.sphere, "Sphere brush").on_hover_text("A ball across slices, not a disc in this slice");
+                        ui.checkbox(&mut st.pixel_mode, "Pixel mode").on_hover_text("Single voxels: only the voxels the pointer passes over");
+                    });
+                    card.step(ui, if erase { "Erase" } else { "Paint" }, Ready::Todo, |ui| {
+                        ui.weak("Left drag in a slice view (⇧ + wheel: brush size). In the 3D view, ⌘ / Ctrl + drag on the surface; a click adds one ball. Each stroke is one undo step.");
+                    });
+                }
+                Effect::Draw => {
+                    segment_step(card, ui, "Segment to fill", &rows, selected, None, &mut acts);
+                    card.step(ui, "Outline", Ready::when(sketch_points >= 3), |ui| {
+                        ui.weak("In a slice view, click points around the region, or drag a line. x takes back the last point.");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{sketch_points} point{}", if sketch_points == 1 { "" } else { "s" }));
+                            if ui.add_enabled(sketch_points > 0, egui::Button::new("Clear")).clicked() {
+                                acts.push(Act::ClearSketch);
+                            }
+                        });
+                    });
+                    card.step(ui, "Fill", Ready::Todo, |ui| {
+                        if ui.add_enabled(sketch_points >= 3, egui::Button::new("Fill")).clicked() {
+                            acts.push(Act::FinishDraw);
+                        }
+                        ui.weak("Or double-click, or press Enter: the outline is filled into the segment in that slice.");
+                    });
+                }
+                Effect::LevelTracing => {
+                    segment_step(card, ui, "Segment to fill", &rows, selected, None, &mut acts);
+                    card.step(ui, "Brighter or darker", Ready::Either, |ui| {
+                        ui.radio_value(&mut st.trace_darker, false, "Brighter: values at least the pointer's");
+                        ui.radio_value(&mut st.trace_darker, true, "Darker: values at most the pointer's");
+                    });
+                    card.step(ui, "Trace", Ready::Todo, |ui| {
+                        ui.weak("Point at a structure in a slice view: the connected region in that slice is outlined. Click to add it.");
+                    });
+                }
+                Effect::FloodFill => {
+                    segment_step(card, ui, "Segment to fill", &rows, selected, None, &mut acts);
+                    card.step(ui, "Which values", Ready::Either, |ui| {
+                        ui.radio_value(&mut st.flood_use_threshold, false, "Similar to the clicked voxel, within");
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.add(egui::DragValue::new(&mut st.flood_tolerance).speed(((vol.range.1 - vol.range.0) / 500.0).max(1e-3)).range(0.0..=f32::MAX));
+                        });
+                        ui.radio_value(&mut st.flood_use_threshold, true, format!("In the threshold range ({:.0} – {:.0})", st.threshold.0, st.threshold.1));
+                    });
+                    card.step(ui, "Leaks and edges", Ready::Either, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut st.flood_min_diameter_mm).speed(0.1).range(0.0..=50.0).suffix(" mm"));
+                            ui.label("narrowest gap it passes").on_hover_text("Stops the fill from leaking through gaps narrower than this (0: no limit)");
+                        });
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("segmentation.flood_refine")
+                                .selected_text(st.flood_refine.label())
+                                .show_ui(ui, |ui| {
+                                    for r in Refine::ALL {
+                                        ui.selectable_value(&mut st.flood_refine, r, r.label());
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Edges: as the values leave them, or decided again near them by Grow from seeds or Watershed (smoother on noisy images)");
+                            if st.flood_refine != Refine::None {
+                                ui.add(egui::DragValue::new(&mut st.flood_feature_mm).speed(0.05).range(0.1..=20.0).suffix(" mm")).on_hover_text("Feature size: how far from the first edge the edge may move");
+                            }
+                        });
+                    });
+                    card.step(ui, "Fill", Ready::Todo, |ui| {
+                        ui.weak("Click the structure in a slice view or in the 3D view.");
+                    });
+                }
+                Effect::Scissors => {
+                    segment_step(card, ui, "Segment to cut or fill", &rows, selected, None, &mut acts);
+                    card.step(ui, "What the shape does", Ready::Either, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for op in ScissorsOp::ALL {
+                                ui.selectable_value(&mut st.scissors_op, op, op.label());
+                            }
+                        });
+                    });
+                    card.step(ui, "Shape and depth", Ready::Either, |ui| {
+                        ui.horizontal(|ui| {
+                            for sh in ScissorsShape::ALL {
+                                ui.selectable_value(&mut st.scissors_shape, sh, sh.label());
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Through");
+                            egui::ComboBox::from_id_salt("segmentation.scissors_range").selected_text(st.scissors_range.label()).show_ui(ui, |ui| {
+                                for r in ScissorsRange::ALL {
+                                    ui.selectable_value(&mut st.scissors_range, r, r.label()).on_hover_text(match r {
+                                        ScissorsRange::Unlimited => "Every slice",
+                                        ScissorsRange::Positive => "This slice and those towards the patient's superior, anterior or right",
+                                        ScissorsRange::Negative => "This slice and those towards the patient's inferior, posterior or left",
+                                        ScissorsRange::Symmetric => "A slab of the thickness, centred on this slice",
+                                    });
+                                }
+                            });
+                            if st.scissors_range == ScissorsRange::Symmetric {
+                                ui.add(egui::DragValue::new(&mut st.scissors_mm).speed(0.2).range(0.1..=500.0).suffix(" mm"));
+                            }
+                        });
+                    });
+                    card.step(ui, "Cut", Ready::Todo, |ui| {
+                        ui.weak("Drag the shape in a slice view; it cuts when you let go. In the 3D view, ⌘ / Ctrl + drag cuts through the whole depth.");
+                    });
+                }
+                Effect::Islands => {
+                    segment_step(card, ui, "Segment", &rows, selected, Some("It has no voxels yet: make it first."), &mut acts);
+                    card.step(ui, "What to do with its pieces", Ready::Either, |ui| {
+                        for op in IslandOp::ALL {
+                            ui.radio_value(&mut st.islands, op, op.label());
+                        }
+                        if matches!(st.islands, IslandOp::RemoveSmall | IslandOp::Split) {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::DragValue::new(&mut st.min_island).speed(10.0).range(1..=usize::MAX));
+                                ui.label("voxels minimum size");
                             });
                         }
                     });
-                    if st.scissors_range == ScissorsRange::Symmetric {
-                        ui.add(egui::DragValue::new(&mut st.scissors_mm).speed(0.2).range(0.1..=500.0).suffix(" mm"));
+                    if st.islands.by_click() {
+                        card.step(ui, "Pick the island", Ready::Todo, |ui| {
+                            ui.weak("Click an island in a slice view or in the 3D view.");
+                        });
+                    } else {
+                        apply_step(card, ui, "Apply", idle, &mut acts);
                     }
-                });
-                ui.weak("Drag the shape in a slice view; it cuts when you let go. In the 3D view: ⌘ / Ctrl + drag, and it cuts through the whole depth.");
-            }
-            Effect::GrowFromSeeds | Effect::Watershed | Effect::FillBetweenSlices => {
-                if effect == Effect::FillBetweenSlices {
-                    ui.horizontal(|ui| {
-                        ui.label("Between slices of");
-                        for p in crate::PLANES {
-                            ui.selectable_value(&mut st.fill_plane, p, p.label());
-                        }
+                }
+                Effect::Margin => {
+                    segment_step(card, ui, "Segment", &rows, selected, Some("It has no voxels yet: make it first."), &mut acts);
+                    card.step(ui, "Distance", Ready::Either, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut st.margin_mm).speed(0.1).range(-100.0..=100.0).suffix(" mm"));
+                            ui.label(if st.margin_mm >= 0.0 { "grow (positive)" } else { "shrink (negative)" });
+                        });
+                        ui.checkbox(&mut st.apply_visible, "Every visible segment, not just this one");
                     });
-                } else if effect == Effect::GrowFromSeeds {
-                    ui.add(egui::Slider::new(&mut st.seed_locality, 0.0..=10.0).text("seed locality")).on_hover_text("0: only likeness counts; higher: nearer seeds win more easily");
-                } else {
-                    ui.add(egui::Slider::new(&mut st.watershed_mm, 0.0..=5.0).suffix(" mm").text("object scale")).on_hover_text("Smoothing before the edges are found: higher gives smoother boundaries but rounds small structures");
+                    apply_step(card, ui, "Apply", idle, &mut acts);
                 }
-                if effect != Effect::FillBetweenSlices {
-                    ui.add(egui::Slider::new(&mut st.seed_margin_mm, 1.0..=100.0).logarithmic(true).suffix(" mm").text("margin")).on_hover_text("Works within this far of the seeds");
-                }
-                ui.checkbox(&mut st.auto_update, "Auto-update").on_hover_text("Update the result after every edit of the seeds");
-                let previewing = self.seeded.as_ref().is_some_and(|s| s.effect == effect);
-                ui.horizontal(|ui| {
-                    let start = ui.add_enabled(idle, egui::Button::new(if previewing { "Update" } else { "Initialize" })).on_hover_text("Grow from the visible segments (at least two: the structure and its surroundings)").clicked();
-                    let keep = ui.add_enabled(idle && previewing, egui::Button::new("Apply")).clicked();
-                    let drop = ui.add_enabled(previewing, egui::Button::new("Cancel")).clicked();
-                    let ctx = ui.ctx().clone();
-                    if start {
-                        self.start_seeded(effect, &ctx);
-                    }
-                    if keep {
-                        self.apply_seeded();
-                    }
-                    if drop {
-                        self.seeded = None;
-                        self.preview = None;
-                    }
-                });
-                ui.weak(if effect == Effect::FillBetweenSlices {
-                    "Segment the structure on every few slices (Paint, Draw, Level tracing…); the empty slices between are filled by interpolating the shapes of the visible segments. The preview shows the result; Apply keeps it."
-                } else {
-                    "Paint seeds into two or more visible segments: the structure, and what surrounds it. The preview shows the result; Apply keeps it."
-                });
-            }
-            Effect::MaskVolume => {
-                egui::ComboBox::from_id_salt("segmentation.mask_fill").selected_text(st.mask_fill.label()).show_ui(ui, |ui| {
-                    for f in MaskFill::ALL {
-                        ui.selectable_value(&mut st.mask_fill, f, f.label());
-                    }
-                });
-                let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
-                ui.horizontal(|ui| {
-                    if st.mask_fill != MaskFill::Outside {
-                        ui.label("inside");
-                        ui.add(egui::DragValue::new(&mut st.mask_inside).speed(speed));
-                    }
-                    if st.mask_fill != MaskFill::Inside {
-                        ui.label("outside");
-                        ui.add(egui::DragValue::new(&mut st.mask_outside).speed(speed));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut st.mask_soft_mm).speed(0.05).range(0.0..=20.0).suffix(" mm"));
-                    ui.label("soft edge").on_hover_text("Blend across the segment's boundary over a Gaussian of this size (0: sharp)");
-                });
-                ui.weak("Saves a new image among the derived images: it appears in the Volume tab, where it can be selected.");
-                apply = ui.add_enabled(idle, egui::Button::new("Save masked volume")).clicked();
-            }
-            Effect::Engrave => {
-                ui.horizontal(|ui| {
-                    ui.label("Text");
-                    ui.add(egui::TextEdit::singleline(&mut st.engrave_text).desired_width(140.0));
-                });
-                ui.add(egui::Slider::new(&mut st.engrave_mm, 1.0..=50.0).logarithmic(true).suffix(" mm").text("letter height"));
-                ui.add(egui::Slider::new(&mut st.engrave_depth_mm, 0.2..=20.0).logarithmic(true).suffix(" mm").text("depth"));
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut st.engrave_raise, false, "Engrave (cut in)");
-                    ui.radio_value(&mut st.engrave_raise, true, "Emboss (raise)");
-                });
-                ui.weak("Click where the text goes in a slice view: it reads left to right there, through the depth around that slice. Letters A–Z, digits and - . + / :");
-            }
-            Effect::LevelSet => {
-                ui.label(format!("Vessel values {:.0} – {:.0} (Threshold's range)", st.threshold.0, st.threshold.1));
-                ui.add(egui::Slider::new(&mut st.ls_iterations, 10..=3000).logarithmic(true).text("iterations"));
-                ui.add(egui::Slider::new(&mut st.ls_max_mm, 0.5..=100.0).logarithmic(true).suffix(" mm").text("moves at most"));
-                ui.add(egui::Slider::new(&mut st.ls_curvature, 0.0..=2.0).text("smoothness"));
-                ui.checkbox(&mut st.ls_overlay, "Follow the overlay (e.g. vesselness)").on_hover_text("The overlay's window decides: above its centre the front moves out, below it moves back. Show it with Overlay ▾ in the toolbar");
-                ui.weak("Start from a rough segment inside the vessel (painted or thresholded).");
-                apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-            }
-            Effect::SplitVolume => {
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut st.split_pad_mm).speed(0.1).range(0.0..=100.0).suffix(" mm"));
-                    ui.label("margin around each segment");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut st.split_blank, "Fill outside the segment with");
-                    let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
-                    ui.add_enabled(st.split_blank, egui::DragValue::new(&mut st.mask_outside).speed(speed));
-                });
-                ui.weak("One image per visible segment, saved among the derived images (Volume tab).");
-                apply = ui.add_enabled(idle, egui::Button::new("Split")).clicked();
-            }
-            Effect::FastMarching => {
-                ui.add(egui::Slider::new(&mut st.march_percent, 0.01..=20.0).logarithmic(true).suffix(" %").text("of the volume")).on_hover_text("The segment grows over the most similar voxels nearest to it until it is this big");
-                ui.weak("Paint a few voxels of the structure into the segment first.");
-                apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-            }
-            Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel => {
-                if effect == Effect::DrawTube {
-                    ui.add(egui::Slider::new(&mut st.tube_mm, 0.1..=20.0).logarithmic(true).suffix(" mm").text("radius"));
-                    ui.weak("Click points along the structure in the slice views (any view, any slice) or on the 3D view's surface: the tube runs smoothly through them in order.");
-                } else if effect == Effect::GuidedVessel {
-                    ui.add(egui::Slider::new(&mut st.tube_mm, 0.2..=20.0).logarithmic(true).suffix(" mm").text("about the vessel's radius"));
-                    ui.label(format!("Vessel values {:.0} – {:.0} (Threshold's range)", st.threshold.0, st.threshold.1));
-                    ui.weak("Click points along the vessel in order (its ends and a few between, in any view): the path between them follows the vessel, then a level set grows to its wall.");
-                } else {
-                    ui.weak("Click points on the structure's surface in the slice views (several slices) or in the 3D view: the closed shape through them is added.");
-                }
-                let n = self.markers.len();
-                ui.horizontal(|ui| {
-                    ui.label(format!("{n} point{}", if n == 1 { "" } else { "s" }));
-                    if ui.add_enabled(n > 0, egui::Button::new("Remove last")).clicked() {
-                        self.markers.pop();
-                    }
-                    if ui.add_enabled(n > 0, egui::Button::new("Clear")).clicked() {
-                        self.markers.clear();
-                    }
-                    if ui.add_enabled(n > 0 && idle, egui::Button::new("Apply")).clicked() {
-                        if effect == Effect::GuidedVessel {
-                            let ctx = ui.ctx().clone();
-                            self.start_guided(&ctx);
+                Effect::Smoothing => {
+                    segment_step(card, ui, "Segment", &rows, selected, Some("It has no voxels yet: make it first."), &mut acts);
+                    card.step(ui, "Method and size", Ready::Either, |ui| {
+                        egui::ComboBox::from_id_salt("segmentation.smoothing").selected_text(st.smoothing.label()).show_ui(ui, |ui| {
+                            for m in SmoothMethod::ALL {
+                                ui.selectable_value(&mut st.smoothing, m, m.label());
+                            }
+                        });
+                        if st.smoothing != SmoothMethod::FillHoles {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::DragValue::new(&mut st.smoothing_mm).speed(0.1).range(0.1..=50.0).suffix(" mm"));
+                                ui.label(if st.smoothing.sigma() { "standard deviation" } else { "kernel size" });
+                            });
+                        }
+                        if st.smoothing == SmoothMethod::Joint {
+                            ui.weak("Every visible segment is smoothed together: no gaps or overlaps open where they touch.");
                         } else {
-                            self.apply_markers(effect);
-                        }
-                    }
-                });
-            }
-            Effect::FloodFill => {
-                ui.radio_value(&mut st.flood_use_threshold, false, "Similar to the clicked voxel, within");
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0);
-                    ui.add(egui::DragValue::new(&mut st.flood_tolerance).speed(((vol.range.1 - vol.range.0) / 500.0).max(1e-3)).range(0.0..=f32::MAX));
-                });
-                ui.radio_value(&mut st.flood_use_threshold, true, format!("In the threshold range ({:.0} – {:.0})", st.threshold.0, st.threshold.1));
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut st.flood_min_diameter_mm).speed(0.1).range(0.0..=50.0).suffix(" mm"));
-                    ui.label("minimum diameter").on_hover_text("Stops the fill from leaking through gaps narrower than this (0: no limit)");
-                });
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("segmentation.flood_refine").selected_text(st.flood_refine.label()).show_ui(ui, |ui| {
-                        for r in Refine::ALL {
-                            ui.selectable_value(&mut st.flood_refine, r, r.label());
-                        }
-                    }).response.on_hover_text("Edges: as the threshold leaves them, or decided again near them by Grow from seeds or Watershed (smoother on noisy images)");
-                    if st.flood_refine != Refine::None {
-                        ui.add(egui::DragValue::new(&mut st.flood_feature_mm).speed(0.05).range(0.1..=20.0).suffix(" mm")).on_hover_text("Feature size: how far from the thresholded edge the edge may move");
-                    }
-                });
-                ui.weak("Click a structure in a slice view or in the 3D view.");
-            }
-            Effect::Islands => {
-                for op in IslandOp::ALL {
-                    ui.radio_value(&mut st.islands, op, op.label());
-                }
-                if matches!(st.islands, IslandOp::RemoveSmall | IslandOp::Split) {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut st.min_island).speed(10.0).range(1..=usize::MAX));
-                        ui.label("voxels minimum size");
-                    });
-                }
-                if st.islands.by_click() {
-                    ui.weak("Click an island in a slice view or in the 3D view.");
-                } else {
-                    apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-                }
-            }
-            Effect::Margin => {
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut st.margin_mm).speed(0.1).range(-100.0..=100.0).suffix(" mm"));
-                    ui.label(if st.margin_mm >= 0.0 { "grow" } else { "shrink" });
-                });
-                ui.checkbox(&mut st.apply_visible, "Apply to visible segments");
-                apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-            }
-            Effect::Smoothing => {
-                egui::ComboBox::from_id_salt("segmentation.smoothing").selected_text(st.smoothing.label()).show_ui(ui, |ui| {
-                    for m in SmoothMethod::ALL {
-                        ui.selectable_value(&mut st.smoothing, m, m.label());
-                    }
-                });
-                if st.smoothing != SmoothMethod::FillHoles {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut st.smoothing_mm).speed(0.1).range(0.1..=50.0).suffix(" mm"));
-                        ui.label(if st.smoothing.sigma() { "standard deviation" } else { "kernel size" });
-                    });
-                }
-                if st.smoothing == SmoothMethod::Joint {
-                    ui.weak("Every visible segment is smoothed together: no gaps or overlaps open where they touch.");
-                } else {
-                    ui.checkbox(&mut st.apply_visible, "Apply to visible segments");
-                }
-                apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-            }
-            Effect::Hollow => {
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut st.hollow_mm).speed(0.05).range(0.05..=50.0).suffix(" mm"));
-                    ui.label("shell thickness");
-                });
-                let side = HOLLOW_SIDES.iter().find(|h| h.0 == st.hollow_side).map_or("", |h| h.1);
-                egui::ComboBox::from_id_salt("segmentation.hollow").selected_text(side).show_ui(ui, |ui| {
-                    for (s, label, _) in HOLLOW_SIDES {
-                        ui.selectable_value(&mut st.hollow_side, s, label);
-                    }
-                });
-                ui.weak("For a printable wall, Thicken in the Mesh tab gives an exact thickness on the mesh.");
-                ui.checkbox(&mut st.apply_visible, "Apply to visible segments");
-                apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-            }
-            Effect::Logical => {
-                egui::ComboBox::from_id_salt("segmentation.logical").selected_text(st.logical.label()).show_ui(ui, |ui| {
-                    for op in LogicalOp::ALL {
-                        ui.selectable_value(&mut st.logical, op, op.label());
-                    }
-                });
-                if st.logical.needs_other() {
-                    let name = st.logical_other.and_then(|l| segments.iter().find(|s| s.0 == l)).map_or("(choose)", |s| s.1.as_str()).to_string();
-                    egui::ComboBox::from_id_salt("segmentation.logical_other").selected_text(name).show_ui(ui, |ui| {
-                        for (l, n) in &segments {
-                            ui.selectable_value(&mut st.logical_other, Some(*l), n);
+                            ui.checkbox(&mut st.apply_visible, "Every visible segment, not just this one");
                         }
                     });
+                    apply_step(card, ui, "Apply", idle, &mut acts);
                 }
-                ui.checkbox(&mut st.bypass_masking, "Bypass masking").on_hover_text("Ignore the editable area, intensity range and overwrite settings for this operation");
-                apply = ui.add_enabled(idle, egui::Button::new("Apply")).clicked();
-            }
-        }
-        if apply {
-            let ctx = ui.ctx().clone();
-            self.start_op(effect, None, &ctx);
-        }
-        if let Some(action) = part_action {
-            self.use_part(vol, action);
-        }
-    }
-
-    fn masking_section(&mut self, ui: &mut egui::Ui) {
-        let Some(seg) = &self.seg else { return };
-        let active = self.masking != Default::default();
-        let title = if active { "Masking (on)" } else { "Masking" };
-        egui::CollapsingHeader::new(RichText::new(title).strong()).id_salt("segmentation.masking").default_open(false).show(ui, |ui| {
-            let name = |l: u8| seg.segments.iter().find(|s| s.label == l).map_or("?".to_string(), |s| s.name.clone());
-            let area_label = |a: EditableArea| match a {
-                EditableArea::Everywhere => "Everywhere".to_string(),
-                EditableArea::InsideAll => "Inside all segments".into(),
-                EditableArea::InsideVisible => "Inside visible segments".into(),
-                EditableArea::OutsideAll => "Outside all segments".into(),
-                EditableArea::OutsideVisible => "Outside visible segments".into(),
-                EditableArea::Inside(l) => format!("Inside {}", name(l)),
-                EditableArea::Outside(l) => format!("Outside {}", name(l)),
-            };
-            ui.label("Editable area");
-            egui::ComboBox::from_id_salt("segmentation.area").selected_text(area_label(self.masking.area)).width(220.0).show_ui(ui, |ui| {
-                let mut areas = vec![EditableArea::Everywhere, EditableArea::InsideAll, EditableArea::InsideVisible, EditableArea::OutsideAll, EditableArea::OutsideVisible];
-                areas.extend(seg.segments.iter().map(|s| EditableArea::Inside(s.label)));
-                areas.extend(seg.segments.iter().map(|s| EditableArea::Outside(s.label)));
-                for a in areas {
-                    ui.selectable_value(&mut self.masking.area, a, area_label(a));
+                Effect::Hollow => {
+                    segment_step(card, ui, "Segment", &rows, selected, Some("It has no voxels yet: make it first."), &mut acts);
+                    card.step(ui, "Shell", Ready::Either, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut st.hollow_mm).speed(0.05).range(0.05..=50.0).suffix(" mm"));
+                            ui.label("thick");
+                        });
+                        let side = HOLLOW_SIDES.iter().find(|h| h.0 == st.hollow_side).map_or("", |h| h.1);
+                        egui::ComboBox::from_id_salt("segmentation.hollow").selected_text(side).show_ui(ui, |ui| {
+                            for (s, label, _) in HOLLOW_SIDES {
+                                ui.selectable_value(&mut st.hollow_side, s, label);
+                            }
+                        });
+                        ui.checkbox(&mut st.apply_visible, "Every visible segment, not just this one");
+                        ui.weak("For a printable wall, Thicken in the Mesh tab gives an exact thickness on the mesh.");
+                    });
+                    apply_step(card, ui, "Apply", idle, &mut acts);
                 }
-            });
-            let mut on = self.masking.intensity.is_some();
-            if ui.checkbox(&mut on, "Editable intensity range").changed() {
-                self.masking.intensity = on.then(|| self.settings.as_ref().map_or((0.0, 1.0), |s| s.threshold));
-            }
-            if let Some((lo, hi)) = &mut self.masking.intensity {
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(lo));
-                    ui.label("–");
-                    ui.add(egui::DragValue::new(hi));
-                });
-            }
-            ui.label("Modify other segments");
-            let ow_label = |o: Overwrite| match o {
-                Overwrite::All => "Overwrite all",
-                Overwrite::Visible => "Overwrite visible",
-                Overwrite::None => "Keep other segments",
-            };
-            egui::ComboBox::from_id_salt("segmentation.overwrite").selected_text(ow_label(self.masking.overwrite)).width(220.0).show_ui(ui, |ui| {
-                for o in [Overwrite::All, Overwrite::Visible, Overwrite::None] {
-                    ui.selectable_value(&mut self.masking.overwrite, o, ow_label(o));
+                Effect::Logical => {
+                    segment_step(card, ui, "Segment to change", &rows, selected, None, &mut acts);
+                    card.step(ui, "Operation", Ready::Either, |ui| {
+                        egui::ComboBox::from_id_salt("segmentation.logical").selected_text(st.logical.label()).show_ui(ui, |ui| {
+                            for op in LogicalOp::ALL {
+                                ui.selectable_value(&mut st.logical, op, op.label());
+                            }
+                        });
+                    });
+                    if st.logical.needs_other() {
+                        card.step(ui, "With segment", Ready::when(st.logical_other.is_some()), |ui| {
+                            let name = st.logical_other.map_or("(choose)".to_string(), |l| name_of(&rows, l));
+                            egui::ComboBox::from_id_salt("segmentation.logical_other").selected_text(name).show_ui(ui, |ui| {
+                                for r in &rows {
+                                    ui.selectable_value(&mut st.logical_other, Some(r.label), &r.name);
+                                }
+                            });
+                        });
+                    }
+                    card.step(ui, "Apply", Ready::Todo, |ui| {
+                        if ui.add_enabled(idle, egui::Button::new("Apply")).clicked() {
+                            acts.push(Act::Apply);
+                        }
+                        ui.checkbox(&mut st.bypass_masking, "Ignore the limits").on_hover_text("This operation changes voxels wherever it says, whatever Limits are set");
+                    });
                 }
-            });
-            if active && ui.small_button("Reset").clicked() {
-                self.masking = Default::default();
+                Effect::GrowFromSeeds | Effect::Watershed | Effect::FillBetweenSlices => {
+                    if effect == Effect::FillBetweenSlices {
+                        card.step(ui, "Segment some slices", Ready::when(visible_with_voxels >= 1), |ui| {
+                            ui.weak("Segment the structure on every few slices (Paint, Draw, Level tracing…): the slices between are filled from the visible segments.");
+                        });
+                        card.step(ui, "Slices of", Ready::Either, |ui| {
+                            ui.horizontal(|ui| {
+                                for p in crate::PLANES {
+                                    ui.selectable_value(&mut st.fill_plane, p, p.label());
+                                }
+                            });
+                        });
+                    } else {
+                        card.step(ui, "Seeds", Ready::when(visible_with_voxels >= 2), |ui| {
+                            ui.weak("With Paint, mark a few strokes in two or more visible segments: the structure in one, what surrounds it in another.");
+                            ui.label(format!("{visible_with_voxels} visible segment{} with voxels", if visible_with_voxels == 1 { "" } else { "s" }));
+                        });
+                        card.step(ui, "Options", Ready::Either, |ui| {
+                            if effect == Effect::GrowFromSeeds {
+                                ui.add(egui::Slider::new(&mut st.seed_locality, 0.0..=10.0).text("seed locality")).on_hover_text("0: only likeness counts; higher: nearer seeds win more easily");
+                            } else {
+                                ui.add(egui::Slider::new(&mut st.watershed_mm, 0.0..=5.0).suffix(" mm").text("object scale")).on_hover_text("Smoothing before the edges are found: higher gives smoother boundaries but rounds small structures");
+                            }
+                            ui.add(egui::Slider::new(&mut st.seed_margin_mm, 1.0..=100.0).logarithmic(true).suffix(" mm").text("margin")).on_hover_text("Works within this far of the seeds");
+                        });
+                    }
+                    card.step(ui, "Preview", Ready::when(previewing), |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(idle, egui::Button::new(if previewing { "Update" } else { "Initialize" })).clicked() {
+                                acts.push(Act::StartSeeded);
+                            }
+                            ui.checkbox(&mut st.auto_update, "Auto-update").on_hover_text("Update the preview after every change of the seeds");
+                        });
+                        ui.weak("The views show the result before it is kept.");
+                    });
+                    card.step(ui, "Apply", Ready::Todo, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(idle && previewing, egui::Button::new("Apply")).clicked() {
+                                acts.push(Act::ApplySeeded);
+                            }
+                            if ui.add_enabled(previewing, egui::Button::new("Cancel")).clicked() {
+                                acts.push(Act::CancelSeeded);
+                            }
+                        });
+                    });
+                }
+                Effect::FastMarching => {
+                    segment_step(card, ui, "Start", &rows, selected, Some("Paint a few voxels of the structure into it first."), &mut acts);
+                    card.step(ui, "Size", Ready::Either, |ui| {
+                        ui.add(egui::Slider::new(&mut st.march_percent, 0.01..=20.0).logarithmic(true).suffix(" %").text("of the volume")).on_hover_text("The segment grows over the most similar voxels nearest to it until it is this big");
+                    });
+                    apply_step(card, ui, "Apply", idle, &mut acts);
+                }
+                Effect::LevelSet => {
+                    segment_step(card, ui, "Rough segment", &rows, selected, Some("Start from a rough segment inside the vessel (painted or thresholded)."), &mut acts);
+                    card.step(ui, "Vessel values", Ready::Either, |ui| {
+                        range_values(ui, &mut st.threshold, vol);
+                        ui.weak("Threshold's range: inside it the front moves out, outside it moves back.");
+                    });
+                    card.step(ui, "Options", Ready::Either, |ui| {
+                        ui.add(egui::Slider::new(&mut st.ls_iterations, 10..=3000).logarithmic(true).text("iterations"));
+                        ui.add(egui::Slider::new(&mut st.ls_max_mm, 0.5..=100.0).logarithmic(true).suffix(" mm").text("moves at most"));
+                        ui.add(egui::Slider::new(&mut st.ls_curvature, 0.0..=2.0).text("smoothness"));
+                        ui.checkbox(&mut st.ls_overlay, "Follow the overlay (e.g. vesselness)").on_hover_text("The overlay's window decides: above its centre the front moves out, below it moves back. Show it with Overlay ▾ in the toolbar");
+                    });
+                    apply_step(card, ui, "Apply", idle, &mut acts);
+                }
+                Effect::DrawTube | Effect::SurfaceCut | Effect::GuidedVessel => {
+                    segment_step(card, ui, "Segment to fill", &rows, selected, None, &mut acts);
+                    if effect == Effect::DrawTube {
+                        card.step(ui, "Radius", Ready::Either, |ui| {
+                            ui.add(egui::Slider::new(&mut st.tube_mm, 0.1..=20.0).logarithmic(true).suffix(" mm").text("radius"));
+                        });
+                    } else if effect == Effect::GuidedVessel {
+                        card.step(ui, "Vessel", Ready::Either, |ui| {
+                            range_values(ui, &mut st.threshold, vol);
+                            ui.add(egui::Slider::new(&mut st.tube_mm, 0.2..=20.0).logarithmic(true).suffix(" mm").text("about its radius"));
+                        });
+                    }
+                    let (min, what) = match effect {
+                        Effect::DrawTube => (1, "Click points along the structure in the slice views (any view, any slice) or on the 3D surface: the tube runs smoothly through them in order."),
+                        Effect::GuidedVessel => (2, "Click points along the vessel in order: its two ends and a few between, in any view. The path between them follows the vessel."),
+                        _ => (4, "Click points on the structure's surface in several slices, or on the 3D surface: the closed shape through them is filled."),
+                    };
+                    card.step(ui, "Points", Ready::when(markers >= min), |ui| {
+                        ui.weak(what);
+                        points_row(ui, markers, &mut acts);
+                    });
+                    card.step(ui, "Apply", Ready::Todo, |ui| {
+                        if ui.add_enabled(idle && markers >= min, egui::Button::new("Apply")).clicked() {
+                            acts.push(Act::ApplyMarkers);
+                        }
+                    });
+                }
+                Effect::Engrave => {
+                    segment_step(card, ui, "Segment", &rows, selected, Some("It has no voxels yet: the text is cut into (or raised from) it."), &mut acts);
+                    card.step(ui, "Text", Ready::when(!st.engrave_text.trim().is_empty()), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut st.engrave_text).desired_width(160.0));
+                        ui.weak("Letters A–Z, digits and - . + / :");
+                    });
+                    card.step(ui, "Size and depth", Ready::Either, |ui| {
+                        ui.add(egui::Slider::new(&mut st.engrave_mm, 1.0..=50.0).logarithmic(true).suffix(" mm").text("letter height"));
+                        ui.add(egui::Slider::new(&mut st.engrave_depth_mm, 0.2..=20.0).logarithmic(true).suffix(" mm").text("depth"));
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut st.engrave_raise, false, "Cut in");
+                            ui.radio_value(&mut st.engrave_raise, true, "Raise");
+                        });
+                    });
+                    card.step(ui, "Place it", Ready::Todo, |ui| {
+                        ui.weak("Click where the text goes in a slice view: it reads left to right there, through the depth around that slice.");
+                    });
+                }
+                Effect::MaskVolume => {
+                    segment_step(card, ui, "Segment to mask by", &rows, selected, Some("It has no voxels yet: make it first."), &mut acts);
+                    card.step(ui, "Fill", Ready::Either, |ui| {
+                        egui::ComboBox::from_id_salt("segmentation.mask_fill").selected_text(st.mask_fill.label()).show_ui(ui, |ui| {
+                            for f in MaskFill::ALL {
+                                ui.selectable_value(&mut st.mask_fill, f, f.label());
+                            }
+                        });
+                        let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
+                        ui.horizontal(|ui| {
+                            if st.mask_fill != MaskFill::Outside {
+                                ui.label("inside");
+                                ui.add(egui::DragValue::new(&mut st.mask_inside).speed(speed));
+                            }
+                            if st.mask_fill != MaskFill::Inside {
+                                ui.label("outside");
+                                ui.add(egui::DragValue::new(&mut st.mask_outside).speed(speed));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut st.mask_soft_mm).speed(0.05).range(0.0..=20.0).suffix(" mm"));
+                            ui.label("soft edge").on_hover_text("Blend across the segment's boundary over a Gaussian of this size (0: sharp)");
+                        });
+                    });
+                    card.step(ui, "Save", Ready::Todo, |ui| {
+                        if ui.add_enabled(idle, egui::Button::new("Save masked volume")).clicked() {
+                            acts.push(Act::Apply);
+                        }
+                        ui.weak("A new image among the derived images: it appears in the Volume tab.");
+                    });
+                }
+                Effect::SplitVolume => {
+                    card.step(ui, "Segments", Ready::when(visible_with_voxels >= 1), |ui| {
+                        ui.weak("One image per visible segment with voxels: show the ones to split out.");
+                        ui.label(format!("{visible_with_voxels} visible segment{} with voxels", if visible_with_voxels == 1 { "" } else { "s" }));
+                    });
+                    card.step(ui, "Crop and fill", Ready::Either, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut st.split_pad_mm).speed(0.1).range(0.0..=100.0).suffix(" mm"));
+                            ui.label("margin around each segment");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut st.split_blank, "Fill outside the segment with");
+                            let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
+                            ui.add_enabled(st.split_blank, egui::DragValue::new(&mut st.mask_outside).speed(speed));
+                        });
+                    });
+                    card.step(ui, "Save", Ready::Todo, |ui| {
+                        if ui.add_enabled(idle, egui::Button::new("Split")).clicked() {
+                            acts.push(Act::Apply);
+                        }
+                        ui.weak("The images are saved among the derived images (Volume tab).");
+                    });
+                }
+            }
+            if effect.uses_masking() {
+                let on = *masking != Masking::default();
+                let summary = limits_summary(masking, &rows);
+                card.limits(ui, on, &summary, |ui| limits_ui(ui, masking, &rows, st.threshold));
             }
         });
+        if close {
+            self.effect = None;
+        }
+        for act in acts {
+            match act {
+                Act::Apply => self.start_op(effect, None, &ctx),
+                Act::Select(k) => {
+                    if let Some(seg) = &mut self.seg {
+                        seg.selected = Some(k);
+                    }
+                }
+                Act::NewSegment => {
+                    if self.seg.as_mut().is_some_and(|s| s.add_segment(None).is_none()) {
+                        self.message = Some(("All 255 segment labels are in use".into(), true));
+                    }
+                }
+                Act::FinishDraw => self.finish_draw(vol),
+                Act::ClearSketch => self.sketch = None,
+                Act::StartSeeded => self.start_seeded(effect, &ctx),
+                Act::ApplySeeded => self.apply_seeded(),
+                Act::CancelSeeded => {
+                    self.seeded = None;
+                    self.preview = None;
+                }
+                Act::PopMarker => {
+                    self.markers.pop();
+                }
+                Act::ClearMarkers => self.markers.clear(),
+                Act::ApplyMarkers => {
+                    if effect == Effect::GuidedVessel {
+                        self.start_guided(&ctx);
+                    } else {
+                        self.apply_markers(effect);
+                    }
+                }
+                Act::UsePart(a) => self.use_part(vol, a),
+                Act::ApplyGrow => self.apply_grow(vol),
+                Act::SetReach(mm) => {
+                    if let Some(r) = if effect == Effect::ThresholdGrow { &mut self.grow } else { &mut self.part } {
+                        r.mm = mm;
+                    }
+                }
+            }
+        }
     }
 
     /// Segment statistics: volume, surface, intensities and shape of every segment.
@@ -753,6 +873,233 @@ impl SegmentationWorkspace {
         }
     }
 }
+
+/// A segment as the effect cards list it.
+struct SegRow {
+    label: u8,
+    name: String,
+    colour: Color32,
+    visible: bool,
+    voxels: usize,
+}
+
+fn name_of(rows: &[SegRow], label: u8) -> String {
+    rows.iter().find(|r| r.label == label).map_or("?".to_string(), |r| r.name.clone())
+}
+
+/// Threshold grow's or Select part's region, as its card shows it.
+struct Region {
+    mm: f64,
+    stats: drag::RegionStats,
+    ignored: usize,
+    label: u8,
+    dragging: bool,
+}
+
+/// What an effect card asked for, done once it is drawn.
+enum Act {
+    Apply,
+    Select(usize),
+    NewSegment,
+    FinishDraw,
+    ClearSketch,
+    StartSeeded,
+    ApplySeeded,
+    CancelSeeded,
+    PopMarker,
+    ClearMarkers,
+    ApplyMarkers,
+    UsePart(drag::PartAction),
+    ApplyGrow,
+    SetReach(f64),
+}
+
+/// The step that picks the segment an effect works on (`needs_voxels`: it must have some,
+/// and this says how to get them).
+fn segment_step(card: &mut Card, ui: &mut egui::Ui, title: &str, rows: &[SegRow], selected: Option<usize>, needs_voxels: Option<&str>, acts: &mut Vec<Act>) {
+    let has = selected.is_some_and(|k| rows[k].voxels > 0);
+    card.step(ui, title, Ready::when(selected.is_some() && (needs_voxels.is_none() || has)), |ui| {
+        ui.horizontal(|ui| {
+            let text = selected.map_or(RichText::new("(choose)"), |k| RichText::new(format!("● {}", rows[k].name)).color(rows[k].colour));
+            egui::ComboBox::from_id_salt("segmentation.card_segment").selected_text(text).width(150.0).show_ui(ui, |ui| {
+                for (k, r) in rows.iter().enumerate() {
+                    if ui.selectable_label(selected == Some(k), RichText::new(format!("● {}", r.name)).color(r.colour)).clicked() {
+                        acts.push(Act::Select(k));
+                    }
+                }
+            });
+            if ui.button("+ New").on_hover_text("Add a segment and use it").clicked() {
+                acts.push(Act::NewSegment);
+            }
+        });
+        if let (Some(why), true, false) = (needs_voxels, selected.is_some(), has) {
+            ui.colored_label(crate::WARN, why);
+        }
+    });
+}
+
+/// A final step with an Apply button.
+fn apply_step(card: &mut Card, ui: &mut egui::Ui, title: &str, idle: bool, acts: &mut Vec<Act>) {
+    card.step(ui, title, Ready::Todo, |ui| {
+        if ui.add_enabled(idle, egui::Button::new("Apply")).clicked() {
+            acts.push(Act::Apply);
+        }
+    });
+}
+
+/// The intensity histogram with the range on it, and the range's ends.
+fn range_ui(ui: &mut egui::Ui, hist: &Histogram, range: &mut (f32, f32), colour: Color32, vol: &LoadedVolume) {
+    histogram(ui, hist, range, colour);
+    range_values(ui, range, vol);
+    ui.weak("Drag on the histogram to move the nearer end.");
+}
+
+fn range_values(ui: &mut egui::Ui, range: &mut (f32, f32), vol: &LoadedVolume) {
+    let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
+    ui.horizontal(|ui| {
+        ui.label("From");
+        ui.add(egui::DragValue::new(&mut range.0).speed(speed));
+        ui.label("to");
+        ui.add(egui::DragValue::new(&mut range.1).speed(speed));
+    });
+}
+
+/// Threshold's range from a region of the image: how its ends are picked from the region's
+/// values, and their histogram.
+fn local_histogram_ui(ui: &mut egui::Ui, st: &mut crate::effects::Settings, local: &Option<crate::sketch::LocalRegion>, colour: Color32) {
+    ui.horizontal(|ui| {
+        for s in LocalShape::ALL {
+            ui.selectable_value(&mut st.local_shape, s, s.label());
+        }
+    });
+    let (lower, upper) = (st.local_lower, st.local_upper);
+    ui.horizontal(|ui| {
+        ui.label("Lower");
+        for p in LocalPick::ALL {
+            ui.selectable_value(&mut st.local_lower, p, p.label(false));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Upper");
+        for p in [LocalPick::Average, LocalPick::Percentile, LocalPick::Extreme] {
+            ui.selectable_value(&mut st.local_upper, p, p.label(true));
+        }
+    });
+    match local {
+        Some(l) => {
+            if (lower, upper) != (st.local_lower, st.local_upper) {
+                if let Some(r) = local_range(&l.values, st.local_lower, st.local_upper) {
+                    st.threshold = r;
+                }
+            }
+            let mut range = st.threshold;
+            histogram(ui, &l.hist, &mut range, colour);
+            st.threshold = range;
+            let n = l.values.len() as f64;
+            let mean = l.values.iter().map(|&v| v as f64).sum::<f64>() / n;
+            let sd = (l.values.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+            ui.weak(format!("{} voxels: {:.4} ± {:.3}, {:.4} – {:.4}", l.values.len(), mean, sd, l.values[0], l.values[l.values.len() - 1]));
+        }
+        None => {
+            ui.weak("Drag over the structure in a slice view.");
+        }
+    }
+}
+
+/// The points placed (seeds): how many, and taking them back.
+fn points_row(ui: &mut egui::Ui, n: usize, acts: &mut Vec<Act>) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{n} point{}", if n == 1 { "" } else { "s" }));
+        if ui.add_enabled(n > 0, egui::Button::new("Remove last")).clicked() {
+            acts.push(Act::PopMarker);
+        }
+        if ui.add_enabled(n > 0, egui::Button::new("Clear")).on_hover_text("Esc").clicked() {
+            acts.push(Act::ClearMarkers);
+        }
+    });
+}
+
+/// How far the region reaches from its seeds: the drags set it, and so does this slider.
+fn reach_row(ui: &mut egui::Ui, region: Option<&Region>, acts: &mut Vec<Act>) {
+    let mut mm = region.map_or(0.0, |r| r.mm);
+    let top = (mm * 1.5).max(50.0);
+    let r = ui.add_enabled(region.is_some(), egui::Slider::new(&mut mm, 0.0..=top).suffix(" mm").text("reach").fixed_decimals(1));
+    if r.changed() {
+        acts.push(Act::SetReach(mm));
+    }
+}
+
+fn limits_summary(m: &Masking, rows: &[SegRow]) -> String {
+    let mut parts = Vec::new();
+    if m.area != EditableArea::Everywhere {
+        parts.push(area_label(m.area, rows).to_lowercase());
+    }
+    if let Some((lo, hi)) = m.intensity {
+        parts.push(format!("values {lo:.0}–{hi:.0}"));
+    }
+    match m.overwrite {
+        Overwrite::All => {}
+        Overwrite::Visible => parts.push("takes over visible segments only".into()),
+        Overwrite::None => parts.push("leaves other segments alone".into()),
+    }
+    parts.join(" · ")
+}
+
+fn area_label(a: EditableArea, rows: &[SegRow]) -> String {
+    match a {
+        EditableArea::Everywhere => "Everywhere".to_string(),
+        EditableArea::InsideAll => "Inside any segment".into(),
+        EditableArea::InsideVisible => "Inside visible segments".into(),
+        EditableArea::OutsideAll => "Outside every segment".into(),
+        EditableArea::OutsideVisible => "Outside visible segments".into(),
+        EditableArea::Inside(l) => format!("Inside {}", name_of(rows, l)),
+        EditableArea::Outside(l) => format!("Outside {}", name_of(rows, l)),
+    }
+}
+
+/// The limits on where effects may change voxels (masking).
+fn limits_ui(ui: &mut egui::Ui, m: &mut Masking, rows: &[SegRow], threshold: (f32, f32)) {
+    ui.horizontal(|ui| {
+        ui.label("Where");
+        egui::ComboBox::from_id_salt("segmentation.area").selected_text(area_label(m.area, rows)).width(180.0).show_ui(ui, |ui| {
+            let mut areas = vec![EditableArea::Everywhere, EditableArea::InsideAll, EditableArea::InsideVisible, EditableArea::OutsideAll, EditableArea::OutsideVisible];
+            areas.extend(rows.iter().map(|r| EditableArea::Inside(r.label)));
+            areas.extend(rows.iter().map(|r| EditableArea::Outside(r.label)));
+            for a in areas {
+                ui.selectable_value(&mut m.area, a, area_label(a, rows));
+            }
+        });
+    });
+    let mut on = m.intensity.is_some();
+    if ui.checkbox(&mut on, "Only voxels with values from").on_hover_text("i turns this on and off, with the threshold range").changed() {
+        m.intensity = on.then_some(threshold);
+    }
+    if let Some((lo, hi)) = &mut m.intensity {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            ui.add(egui::DragValue::new(lo));
+            ui.label("to");
+            ui.add(egui::DragValue::new(hi));
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.label("Other segments' voxels");
+        let label = |o: Overwrite| match o {
+            Overwrite::All => "taken over",
+            Overwrite::Visible => "taken over if visible",
+            Overwrite::None => "left alone",
+        };
+        egui::ComboBox::from_id_salt("segmentation.overwrite").selected_text(label(m.overwrite)).show_ui(ui, |ui| {
+            for o in [Overwrite::All, Overwrite::Visible, Overwrite::None] {
+                ui.selectable_value(&mut m.overwrite, o, label(o));
+            }
+        });
+    });
+    if *m != Masking::default() && ui.small_button("No limits").clicked() {
+        *m = Masking::default();
+    }
+}
+
 
 /// The intensity histogram (log scale) with the range in the segment's colour; dragging
 /// moves the nearer end of the range.
