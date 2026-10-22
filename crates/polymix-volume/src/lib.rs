@@ -512,6 +512,7 @@ impl VolumeWorkspace {
         }
         let r = ui.selectable_label(selected, text);
         let r = if v.warnings.is_empty() { r } else { r.on_hover_text(v.warnings.join("\n")) };
+        file_menu(&r, v.files.first().map(PathBuf::as_path));
         if r.clicked() {
             self.selection = Selection::Volume(k);
             self.select_volume(k, ui.ctx());
@@ -582,6 +583,7 @@ impl VolumeWorkspace {
                                     self.series_rows(ui, &c, (pi, si, sei));
                                 }
                             });
+                            file_menu(&r.header_response, s.series.iter().find_map(|se| series_file(&c, se)));
                             if r.header_response.clicked() {
                                 self.selection = Selection::Study(pi, si);
                             }
@@ -595,6 +597,7 @@ impl VolumeWorkspace {
                             }
                         }
                     });
+                    file_menu(&r.header_response, p.studies.iter().flat_map(|s| &s.series).find_map(|se| series_file(&c, se)));
                     if r.header_response.clicked() {
                         self.selection = Selection::Patient(pi);
                     }
@@ -617,11 +620,12 @@ impl VolumeWorkspace {
                 }
                 let open = folders.len() <= 12;
                 for (dir, ks) in &folders {
-                    egui::CollapsingHeader::new(format!("{}   ({})", self.privacy.path(dir), ks.len())).id_salt(("volume.folder", dir)).default_open(open).show(ui, |ui| {
+                    let r = egui::CollapsingHeader::new(format!("{}   ({})", self.privacy.path(dir), ks.len())).id_salt(("volume.folder", dir)).default_open(open).show(ui, |ui| {
                         for &k in ks {
                             self.volume_row(ui, &c, k, None);
                         }
                     });
+                    file_menu(&r.header_response, c.volumes[ks[0]].files.first().and_then(|f| f.parent()));
                 }
             });
             if !c.recognised.is_empty() {
@@ -663,7 +667,9 @@ impl VolumeWorkspace {
         }
         let selected = self.selection == Selection::Series(pi, si, sei);
         let extra = if se.volumes.is_empty() { format!("{} object(s)", se.objects.len()) } else { format!("{} volumes", se.volumes.len()) };
-        if ui.selectable_label(selected, format!("{number:>4}  {desc}   · {} · {} files · {extra}", se.modality, se.instances)).clicked() {
+        let r = ui.selectable_label(selected, format!("{number:>4}  {desc}   · {} · {} files · {extra}", se.modality, se.instances));
+        file_menu(&r, series_file(c, se));
+        if r.clicked() {
             self.selection = Selection::Series(pi, si, sei);
             if let Some(&k) = se.volumes.iter().find(|&&k| self.kind_shown(c.volumes[k].kind)).or(se.volumes.first()) {
                 self.select_volume(k, ui.ctx());
@@ -792,6 +798,26 @@ impl VolumeWorkspace {
 
 fn kind_label(k: Kind) -> &'static str {
     k.label()
+}
+
+/// Right-click menu of a catalog row: show its file (or folder) in Finder, copy its path.
+fn file_menu(r: &egui::Response, path: Option<&Path>) {
+    let Some(path) = path else { return };
+    r.context_menu(|ui| {
+        if ui.button("Show in Finder").clicked() {
+            polymix_workspace::guard::reveal(path);
+            ui.close();
+        }
+        if ui.button("Copy path").clicked() {
+            ui.ctx().copy_text(path.display().to_string());
+            ui.close();
+        }
+    });
+}
+
+/// A file of a DICOM series: its first volume's first file, or its first other object.
+fn series_file<'a>(c: &'a Catalog, se: &'a mm_volume::model::Series) -> Option<&'a Path> {
+    se.volumes.iter().find_map(|&k| c.volumes[k].files.first()).or_else(|| se.objects.first().map(|o| &o.path)).map(PathBuf::as_path)
 }
 
 /// Whether two catalog entries (of two scans) are the same image: the same name, files and
@@ -1004,6 +1030,38 @@ mod tests {
         let mut into = Vec::new();
         out.shapes.iter().for_each(|c| walk(&c.shape, &mut into));
         into
+    }
+
+    #[test]
+    fn right_clicking_a_row_offers_show_in_finder() {
+        let mut c = Catalog::default();
+        c.volumes.push(entry("brain", PathBuf::from("/nonexistent/polymix-menu-test/brain.nii"), Kind::Image, None));
+        c.files.push(0);
+        let ctx = egui::Context::default();
+        let mut ws = VolumeWorkspace::new(&ctx, None);
+        ws.catalog = Some(Arc::new(c));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            ctx.run_ui(input, |ui| ws.browser(ui))
+        };
+        // Where the row's name is drawn.
+        fn find(s: &egui::Shape, pos: egui::Pos2, text: &str) -> Option<egui::Pos2> {
+            match s {
+                egui::Shape::Text(t) if t.galley.text().starts_with(text) => Some(pos + t.pos.to_vec2() + egui::vec2(4.0, t.galley.rect.height() / 2.0)),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, pos, text)),
+                _ => None,
+            }
+        }
+        let out = frame(Vec::new());
+        let at = out.shapes.iter().find_map(|c| find(&c.shape, egui::Pos2::ZERO, "brain")).expect("the row is drawn");
+        assert!(!texts(&out).iter().any(|t| t == "Show in Finder"));
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
+            frame(events);
+        }
+        let shown = texts(&frame(Vec::new()));
+        assert!(shown.iter().any(|t| t == "Show in Finder") && shown.iter().any(|t| t == "Copy path"), "{shown:?}");
     }
 
     #[test]
