@@ -470,6 +470,43 @@ impl Segmentation {
         n
     }
 
+    /// Put back labels a drag changed: (voxel, label it had). Like a brush dab, the slice
+    /// views follow it (`version`); the drag's end is [`Segmentation::stroke_finished`].
+    pub fn restore_voxels(&mut self, voxels: &[(usize, u8)]) -> usize {
+        let mut counts = self.counts.take().filter(|(v, _)| *v == self.version).map(|(_, c)| c);
+        let mut n = 0;
+        for &(i, label) in voxels {
+            let old = self.labels[i];
+            if old != label {
+                self.labels[i] = label;
+                n += 1;
+                if let Some(c) = &mut counts {
+                    c[old as usize] -= 1;
+                    c[label as usize] += 1;
+                }
+            }
+        }
+        if n > 0 {
+            self.changed(false);
+        }
+        self.counts = counts.map(|c| (self.version, c));
+        n
+    }
+
+    /// Give the voxels listed (by index) label `to`, whatever they had, as one finished edit.
+    /// Returns the voxels changed. (No undo step: call [`Segmentation::checkpoint`] first.)
+    pub fn relabel(&mut self, voxels: &[usize], to: u8) -> usize {
+        let mut n = 0;
+        for &i in voxels {
+            n += (self.labels[i] != to) as usize;
+            self.labels[i] = to;
+        }
+        if n > 0 {
+            self.changed(true);
+        }
+        n
+    }
+
     /// The mask of one label.
     pub fn mask_of(&self, label: u8) -> Mask {
         Mask { dims: self.dims, data: self.labels.par_iter().map(|&l| (l == label) as u8).collect() }

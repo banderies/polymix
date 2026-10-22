@@ -8,6 +8,7 @@
 
 pub mod autothreshold;
 pub mod centerline;
+pub mod drag;
 pub mod grow;
 pub mod interpolate;
 pub mod io;
@@ -24,6 +25,7 @@ pub mod stats;
 
 pub use autothreshold::{auto_threshold, auto_threshold_values, AutoThreshold};
 pub use centerline::{centerlines, cross_sections, stenosis, Branch, CenterlineParams, CenterlinePoint, Centerlines, CrossSection};
+pub use drag::DragGrow;
 pub use grow::{fast_march, grow_from_seeds, watershed};
 pub use interpolate::fill_between_slices;
 pub use io::{write_nifti, write_seg_nrrd, SegmentInfo};

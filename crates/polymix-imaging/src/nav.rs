@@ -7,6 +7,7 @@
 //! | middle drag | zoom (up = in, about where the drag started) |
 //! | left + right drag | window (across) and level (up / down) |
 //! | ⌥ / Alt + left drag | turn the other two planes about this view's normal (oblique planes) |
+//! | ⌘ / Ctrl + right drag | a tool's, where the view gives it one ([`Nav::tool_secondary`]); otherwise pan |
 //! | wheel | scroll through slices, one per notch; ⌘ / Ctrl + wheel or pinch zooms |
 //! | left click | point at a spot (e.g. move the crosshair) |
 //! | double-click | the view fills the layout, and back (a view on its own: back to the automatic view) |
@@ -28,6 +29,28 @@ enum Gesture {
     Zoom,
     Window,
     Rotate,
+    /// A tool's ⌘ / Ctrl + right drag.
+    Tool,
+}
+
+/// Where a tool's drag is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragPhase {
+    /// The first frame (the pointer has just moved far enough to count as a drag).
+    Start,
+    Move,
+    /// The button was let go (or the drag turned into another gesture).
+    End,
+}
+
+/// A tool's ⌘ / Ctrl + right drag this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToolDrag {
+    pub phase: DragPhase,
+    /// Where the button went down.
+    pub press: Pos2,
+    /// From the press to the pointer now, in points.
+    pub total: Vec2,
 }
 
 /// Zoom and pan of one image view, and the state of the gesture in progress.
@@ -37,17 +60,21 @@ pub struct Nav {
     pub zoom: f32,
     /// Offset of the image centre from the view centre, in points.
     pub pan: Vec2,
+    /// ⌘ / Ctrl + right drag is a tool's ([`NavEvents::tool_drag`]) rather than a pan.
+    pub tool_secondary: bool,
     gesture: Option<Gesture>,
     /// Drag and scroll not yet turned into whole slices.
     slice_drag: f32,
     wheel: f32,
     /// Slices moved by the current left drag (undone if it turns into window / level).
     gesture_slices: i32,
+    /// The tool's drag in progress: where it was pressed, and the latest total.
+    tool: Option<(Pos2, Vec2)>,
 }
 
 impl Default for Nav {
     fn default() -> Self {
-        Self { zoom: 1.0, pan: Vec2::ZERO, gesture: None, slice_drag: 0.0, wheel: 0.0, gesture_slices: 0 }
+        Self { zoom: 1.0, pan: Vec2::ZERO, tool_secondary: false, gesture: None, slice_drag: 0.0, wheel: 0.0, gesture_slices: 0, tool: None }
     }
 }
 
@@ -60,6 +87,8 @@ pub struct NavEvents {
     pub window: Option<Vec2>,
     /// An ⌥ / Alt + left drag: the pointer before and after this frame's movement.
     pub rotate: Option<(Pos2, Pos2)>,
+    /// A tool's ⌘ / Ctrl + right drag (with [`Nav::tool_secondary`]).
+    pub tool_drag: Option<ToolDrag>,
     /// A left click (no drag), where.
     pub clicked: Option<Pos2>,
     pub double_clicked: bool,
@@ -104,13 +133,21 @@ impl Nav {
         let view = r.rect;
         let (primary, secondary, middle, mut delta, press, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.delta(), i.pointer.press_origin(), i.pointer.latest_pos()));
         let active = r.is_pointer_button_down_on() || r.dragged();
+        // The tool's drag ends when its button is let go, or when it turns into another gesture.
+        let end_tool = |nav: &mut Self, ev: &mut NavEvents| {
+            if let Some((press, total)) = nav.tool.take() {
+                ev.tool_drag = Some(ToolDrag { phase: DragPhase::End, press, total });
+            }
+        };
         if !(primary || secondary || middle) {
+            end_tool(self, &mut ev);
             self.gesture = None;
             self.slice_drag = 0.0;
             self.gesture_slices = 0;
         } else if active {
             if primary && secondary {
                 if self.gesture != Some(Gesture::Window) {
+                    end_tool(self, &mut ev);
                     // Undo the slices scrolled before the second button went down.
                     ev.slices -= self.gesture_slices;
                     self.gesture_slices = 0;
@@ -122,10 +159,17 @@ impl Nav {
                 if let (Some(a), Some(b)) = (press, pos) {
                     delta = b - a;
                 }
+                let tool = ui.input(|i| i.modifiers.command && !i.modifiers.alt && !i.modifiers.shift);
                 self.gesture = if r.dragged_by(PointerButton::Primary) && ui.input(|i| i.modifiers.alt) {
                     Some(Gesture::Rotate)
                 } else if r.dragged_by(PointerButton::Primary) {
                     Some(Gesture::Slices)
+                } else if r.dragged_by(PointerButton::Secondary) && self.tool_secondary && tool {
+                    if let (Some(a), Some(b)) = (press, pos) {
+                        self.tool = Some((a, b - a));
+                        ev.tool_drag = Some(ToolDrag { phase: DragPhase::Start, press: a, total: b - a });
+                    }
+                    Some(Gesture::Tool)
                 } else if r.dragged_by(PointerButton::Secondary) {
                     Some(Gesture::Pan)
                 } else if r.dragged_by(PointerButton::Middle) {
@@ -133,6 +177,11 @@ impl Nav {
                 } else {
                     None
                 };
+            } else if let (Some(Gesture::Tool), Some((a, total)), Some(b)) = (self.gesture, &mut self.tool, pos) {
+                if b - *a != *total {
+                    *total = b - *a;
+                    ev.tool_drag = Some(ToolDrag { phase: DragPhase::Move, press: *a, total: *total });
+                }
             }
             match self.gesture {
                 Some(Gesture::Window) => {

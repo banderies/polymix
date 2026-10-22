@@ -255,7 +255,7 @@ impl Viewer {
         }
         let full = ui.available_rect_before_wrap();
         let rects = Layout::Row.rects(full, 2.0);
-        let opts = SliceOptions { left_drag_scrolls: self.measure.tool.is_none(), crosshair: self.crosshair, smooth: self.smooth, brush_mm: None };
+        let opts = SliceOptions { left_drag_scrolls: self.measure.tool.is_none(), crosshair: self.crosshair, smooth: self.smooth, brush_mm: None, tool_secondary_drag: false };
         let mut responses = Vec::new();
         for (view, rect) in self.views.iter_mut().zip([rects[0], rects[2], rects[3]]) {
             let r = ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| view.ui(ui, &vol, state, None, &opts)).inner;

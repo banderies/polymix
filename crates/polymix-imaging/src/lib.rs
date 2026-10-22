@@ -15,6 +15,6 @@ pub mod render3d;
 
 pub use layers::{ColourMap, Compare, Fusion, Layout, Slab, SlabMode};
 pub use measure::{MeasureTool, Measurements};
-pub use nav::{drag_window, Nav, NavEvents};
+pub use nav::{drag_window, DragPhase, Nav, NavEvents, ToolDrag};
 pub use render3d::{Mode3d, VolumeView3d};
 pub use slice_view::{plane_colour, LabelOverlay, SliceOptions, SliceResponse, SliceView, ViewMap, ViewState, PLANES};

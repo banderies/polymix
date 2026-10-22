@@ -1,6 +1,7 @@
 //! The editor panel on the left, as in 3D Slicer's Segment Editor: the segments, the effects
 //! and their options, masking, and saving / meshing.
 
+use crate::drag;
 use crate::effects::{local_range, AutoMode, Effect, Histogram, IslandOp, LocalPick, LocalShape, LogicalOp, MaskFill, Refine, ScissorsOp, ScissorsRange, ScissorsShape, SmoothMethod, HOLLOW_SIDES};
 use crate::segmentation::{EditableArea, Overwrite, Status};
 use crate::SegmentationWorkspace;
@@ -183,7 +184,57 @@ impl SegmentationWorkspace {
         let colour = self.seg.as_ref().and_then(|s| s.selected_segment()).map_or(Color32::from_rgb(128, 174, 128), |s| s.colour);
         let (Some(st), Some(hist)) = (&mut self.settings, &self.hist) else { return };
         let mut apply = false;
+        let mut part_action = None;
         match effect {
+            Effect::ThresholdGrow => {
+                histogram(ui, hist, &mut st.threshold, colour);
+                let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
+                ui.horizontal(|ui| {
+                    ui.label("Range");
+                    ui.add(egui::DragValue::new(&mut st.threshold.0).speed(speed));
+                    ui.label("–");
+                    ui.add(egui::DragValue::new(&mut st.threshold.1).speed(speed));
+                })
+                .response
+                .on_hover_text("Threshold's range: set it there with its preview, or here");
+                ui.weak("In a slice view, ⌘ / Ctrl + right drag from a voxel in the range: drag right to grow the selected segment over the connected voxels in the range, nearest first; drag back to take it back. Each drag is one undo step. Masking applies.");
+            }
+            Effect::SelectPart => match &self.part {
+                Some(part) => {
+                    let s = part.stats(vol);
+                    let name = |l: u8| segments.iter().find(|x| x.0 == l).map_or("?".to_string(), |x| x.1.clone());
+                    ui.label(format!("Part of {}: {} voxels · {:.1} mm³ ({:.2} mL)", name(part.label), s.voxels, s.volume_mm3, s.volume_mm3 / 1000.0));
+                    ui.label(format!("Reaches {:.1} mm along the segment from where you pressed · box {:.1} × {:.1} × {:.1} mm", s.reach_mm, s.extent_mm[0], s.extent_mm[1], s.extent_mm[2]));
+                    let ready = part.done && s.voxels > 0;
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(ready, egui::Button::new("Erase")).on_hover_text("Remove the part from the segment").clicked() {
+                            part_action = Some(drag::PartAction::Erase);
+                        }
+                        if ui.add_enabled(ready, egui::Button::new("Keep only")).on_hover_text("Remove the rest of the segment").clicked() {
+                            part_action = Some(drag::PartAction::KeepOnly);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if st.part_target.is_some_and(|l| l == part.label || !segments.iter().any(|x| x.0 == l)) {
+                            st.part_target = None;
+                        }
+                        let target = st.part_target.map_or("a new segment".to_string(), name);
+                        if ui.add_enabled(ready, egui::Button::new("Move to")).on_hover_text("Split the part off into another segment").clicked() {
+                            part_action = Some(drag::PartAction::MoveTo(st.part_target));
+                        }
+                        egui::ComboBox::from_id_salt("segmentation.part_target").selected_text(target).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut st.part_target, None, "a new segment");
+                            for (l, n) in segments.iter().filter(|x| x.0 != part.label) {
+                                ui.selectable_value(&mut st.part_target, Some(*l), n);
+                            }
+                        });
+                    });
+                    ui.weak("Drag again to select another part; Esc drops this one.");
+                }
+                None => {
+                    ui.weak("In a slice view, ⌘ / Ctrl + right drag from a voxel of a segment: drag right to select the part of the segment within reach, along the segment (as far as the drag goes). Then erase it, keep only it, move it to another segment, or read its size.");
+                }
+            },
             Effect::Threshold => {
                 histogram(ui, hist, &mut st.threshold, colour);
                 let speed = ((vol.range.1 - vol.range.0) / 500.0).max(1e-3);
@@ -556,6 +607,9 @@ impl SegmentationWorkspace {
         if apply {
             let ctx = ui.ctx().clone();
             self.start_op(effect, None, &ctx);
+        }
+        if let Some(action) = part_action {
+            self.use_part(vol, action);
         }
     }
 

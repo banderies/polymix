@@ -85,11 +85,13 @@ pub struct SliceOptions {
     /// A brush of this radius (mm) follows the pointer, and Shift + wheel sizes it
     /// ([`SliceResponse::brush_wheel`]) instead of scrolling slices.
     pub brush_mm: Option<f32>,
+    /// ⌘ / Ctrl + right drag is a tool's ([`SliceResponse::tool_drag`]) instead of a pan.
+    pub tool_secondary_drag: bool,
 }
 
 impl Default for SliceOptions {
     fn default() -> Self {
-        Self { left_drag_scrolls: true, crosshair: true, smooth: true, brush_mm: None }
+        Self { left_drag_scrolls: true, crosshair: true, smooth: true, brush_mm: None, tool_secondary_drag: false }
     }
 }
 
@@ -105,6 +107,9 @@ pub struct SliceResponse {
     pub left_drag_voxel: Option<DVec3>,
     /// Shift + wheel over the view while a brush is shown, in notches (positive = up).
     pub brush_wheel: f32,
+    /// A tool's ⌘ / Ctrl + right drag (`tool_secondary_drag` on), with the voxel it was
+    /// pressed on (over the image only).
+    pub tool_drag: Option<(crate::ToolDrag, Option<DVec3>)>,
     /// Double-clicked (the layout around the view decides what that does).
     pub double_clicked: bool,
     /// Where voxels of the slice shown were drawn this frame (to draw over the view).
@@ -702,6 +707,7 @@ impl SliceView {
         let (primary, secondary) = ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
         let tool_drag = !opts.left_drag_scrolls && primary && !secondary && response.is_pointer_button_down_on();
         let brush_wheel = if opts.brush_mm.is_some() && response.hovered() && ui.input(|i| i.modifiers.shift) { take_wheel(ui.ctx()) } else { 0.0 };
+        self.nav.tool_secondary = opts.tool_secondary_drag;
         let ev = self.nav.handle(ui, &response);
         let index = crate::PLANES.iter().position(|p| *p == self.plane).unwrap_or(0);
 
@@ -753,13 +759,14 @@ impl SliceView {
         }
         let hover_voxel = ev.hover.and_then(at);
         let left_drag_voxel = if tool_drag { response.interact_pointer_pos().and_then(at) } else { None };
+        let tool_drag = ev.tool_drag.map(|d| (d, at(d.press)));
 
         self.update_texture(ui.ctx(), vol, &grid, &map, state, overlay, opts.smooth);
         self.paint(ui, &map, vol, &grid, state, opts, ev.hover);
         // Above the slice position in the bottom left corner.
         let key = (volume_id(vol), vol.range.0.to_bits(), vol.range.1.to_bits());
         histogram::show(ui, response.id, rect, rect.bottom() - 24.0, key, &vol.values, state.window, vol.invert, self.nav.windowing());
-        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel, double_clicked: ev.double_clicked, map }
+        SliceResponse { response, hover_voxel, clicked_voxel, left_drag_voxel, brush_wheel, tool_drag, double_clicked: ev.double_clicked, map }
     }
 
     /// Re-make the texture when what it shows has changed: only the part a dirty box covers

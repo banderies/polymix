@@ -35,10 +35,12 @@ pub enum Effect {
     LevelSet,
     GuidedVessel,
     Engrave,
+    ThresholdGrow,
+    SelectPart,
 }
 
 impl Effect {
-    pub const ALL: [Effect; 23] = [
+    pub const ALL: [Effect; 25] = [
         Effect::Threshold,
         Effect::Paint,
         Effect::Draw,
@@ -62,6 +64,8 @@ impl Effect {
         Effect::LevelSet,
         Effect::GuidedVessel,
         Effect::Engrave,
+        Effect::ThresholdGrow,
+        Effect::SelectPart,
     ];
 
     pub fn label(self) -> &'static str {
@@ -89,6 +93,8 @@ impl Effect {
             Effect::LevelSet => "Level set",
             Effect::GuidedVessel => "Guided vessel",
             Effect::Engrave => "Engrave",
+            Effect::ThresholdGrow => "Threshold grow",
+            Effect::SelectPart => "Select part",
         }
     }
 
@@ -128,6 +134,8 @@ impl Effect {
             Effect::LevelSet => "levelset",
             Effect::GuidedVessel => "guided",
             Effect::Engrave => "engrave",
+            Effect::ThresholdGrow => "tgrow",
+            Effect::SelectPart => "part",
         }
     }
 
@@ -156,6 +164,8 @@ impl Effect {
             Effect::LevelSet => "Grow (or shrink) the segment to the vessel's wall: a geodesic active contour that stays smooth, within the threshold range or following the overlay (e.g. vesselness)",
             Effect::GuidedVessel => "Click points along a vessel: it is segmented from the first to the last, following the vessel between them (within the threshold range)",
             Effect::Engrave => "Text cut into the segment or raised from it, where you click in a slice view (labels for printed models)",
+            Effect::ThresholdGrow => "⌘ / Ctrl + right drag from a voxel in the threshold range: the segment grows over the connected voxels in the range, nearest first, as far as you drag right; drag back to take it back",
+            Effect::SelectPart => "⌘ / Ctrl + right drag from a voxel of a segment: the part of it within reach along the segment is selected, to erase, keep, move to another segment or measure",
         }
     }
 }
@@ -561,6 +571,8 @@ pub struct Settings {
     pub flood_min_diameter_mm: f32,
     /// Grow (> 0) or shrink (< 0).
     pub margin_mm: f32,
+    /// Select part's Move: into this segment (label), or a new one.
+    pub part_target: Option<u8>,
     pub smoothing: SmoothMethod,
     pub smoothing_mm: f32,
     /// Hollow's shell thickness, mm, and where it lies.
@@ -655,6 +667,7 @@ impl Settings {
             flood_use_threshold: false,
             flood_min_diameter_mm: 0.0,
             margin_mm: 1.0,
+            part_target: None,
             smoothing: SmoothMethod::Median,
             smoothing_mm: 3.0,
             hollow_mm: 2.0,
@@ -1022,6 +1035,7 @@ pub fn run(effect: Effect, s: &Settings, vol: &Arc<LoadedVolume>, op: Op) -> any
         }
         Effect::GuidedVessel => anyhow::bail!("Guided vessel works on points clicked along the vessel"),
         Effect::Engrave => anyhow::bail!("Engrave works where you click in a slice view"),
+        Effect::ThresholdGrow | Effect::SelectPart => anyhow::bail!("{} works by ⌘ / Ctrl + right drag in a slice view", effect.label()),
         Effect::MaskVolume => {
             if segment.count() == 0 {
                 anyhow::bail!("the segment is empty");
