@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "mm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "mm-edit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "mm-image"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "mm-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "mm-remesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "mm-repair"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "mm-segment"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "mm-solid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glam 0.34.1",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "mm-volume"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dicom-core",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "polymix"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "polymix-imaging"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "eframe",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "polymix-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2875,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "polymix-segmentation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2897,7 +2897,7 @@ dependencies = [
 
 [[package]]
 name = "polymix-volume"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "polymix-workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
