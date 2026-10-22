@@ -720,6 +720,129 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn mapped_3d_mouse_buttons_open_tools_and_run_commands() {
+        use crate::spacemouse::ButtonAction as A;
+        let (mut ws, ctx, vp) = workspace();
+        ws.execute(MeshCommand::AddShape(Shape::Sphere), &ctx, vp).unwrap();
+        ws.space_buttons = vec![(3, A::Tool("erasefill".into())), (7, A::Cancel), (12, A::Tool("remesh".into())), (13, A::Nothing), (20, A::View(4))];
+        // A button with no action, and one set to Nothing, do nothing.
+        ws.space_button(9, &ctx, vp);
+        ws.space_button(13, &ctx, vp);
+        assert!(ws.tools.is_empty());
+        ws.space_button(12, &ctx, vp);
+        assert_eq!(ws.tools.last().map(|t| t.name()), Some("Remesh"), "{}", ws.status);
+        assert!(ws.status.starts_with("3D mouse button 12: "), "{}", ws.status);
+        ws.space_button(7, &ctx, vp);
+        assert!(ws.tools.is_empty(), "Cancel closes the open tool: {}", ws.status);
+        ws.space_button(3, &ctx, vp);
+        assert_eq!(ws.tools.last().map(|t| t.name()), Some("Erase & Fill"), "{}", ws.status);
+        ws.space_button(20, &ctx, vp);
+        assert!(ws.status.contains("Top view"), "{}", ws.status);
+        // Select works as the S key: open with nothing selected, and pressed again in Select,
+        // the selection goes.
+        ws.execute(MeshCommand::CancelTool, &ctx, vp).ok();
+        ws.space_buttons = vec![(4, A::Tool("select".into()))];
+        let id = ws.scene.active.unwrap();
+        let select_some = |ws: &mut MeshWorkspace| {
+            ws.execute(MeshCommand::SelectNear { at: DVec3::new(12.5, 0.0, 0.0), radius: 4.0, add: false }, &ctx, vp).unwrap();
+            assert!(!ws.scene.get(id).unwrap().selection.is_empty());
+        };
+        select_some(&mut ws);
+        ws.space_button(4, &ctx, vp);
+        assert_eq!(ws.tools.iter().map(|t| t.name()).collect::<Vec<_>>(), ["Select"]);
+        assert!(ws.scene.get(id).unwrap().selection.is_empty(), "opened with nothing selected");
+        select_some(&mut ws);
+        ws.space_button(4, &ctx, vp);
+        assert_eq!(ws.tools.iter().map(|t| t.name()).collect::<Vec<_>>(), ["Select"], "still one Select");
+        assert!(ws.scene.get(id).unwrap().selection.is_empty(), "pressed again: cleared");
+        assert_eq!(ws.status, "3D mouse button 4: Select, nothing selected");
+        // Every tool in the list opens from a button.
+        for t in TOOLS {
+            ws.execute(MeshCommand::CancelTool, &ctx, vp).ok();
+            ws.space_buttons = vec![(5, A::Tool(t.name.into()))];
+            ws.space_button(5, &ctx, vp);
+            assert!(!ws.tools.is_empty(), "{}: {}", t.name, ws.status);
+        }
+        // While the settings wait for a button, the next press joins the list (no action yet)
+        // and does nothing else.
+        ws.execute(MeshCommand::CancelTool, &ctx, vp).ok();
+        ws.space_capture = true;
+        ws.space_button(14, &ctx, vp);
+        assert!(!ws.space_capture && ws.tools.is_empty());
+        assert_eq!(ws.space_buttons, vec![(5, A::Tool(TOOLS.last().unwrap().name.into())), (14, A::Nothing)]);
+        assert_eq!(ws.space_last_button, Some(14));
+    }
+
+    #[test]
+    fn buttons_pressing_e_i_and_x_work_the_select_tool_as_the_keys_do() {
+        use crate::spacemouse::ButtonAction as A;
+        use egui::{Key, Modifiers};
+        let (mut ws, ctx, vp) = workspace();
+        ws.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();
+        let id = ws.scene.active.unwrap();
+        let total = ws.scene.get(id).unwrap().mesh.triangle_count();
+        let key = |key| A::Key { key, modifiers: Modifiers::NONE };
+        ws.space_buttons = vec![(21, key(Key::E)), (22, key(Key::I)), (23, key(Key::X))];
+        ws.execute(MeshCommand::OpenTool("select".into()), &ctx, vp).unwrap();
+        // A button press goes in as the key: down one frame, up the next, through the app's
+        // key handling (the open tool's keys included).
+        let mut up = Vec::new();
+        let mut press = |ws: &mut MeshWorkspace, b: u32| {
+            ws.space_button(b, &ctx, vp);
+            for _ in 0..2 {
+                let mut events = Vec::new();
+                crate::spacemouse::key_events(&mut events, &mut up, crate::spacemouse::take_keys(), Modifiers::NONE);
+                let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| ws.handle_keys(ui.ctx(), vp));
+            }
+        };
+        let selected = |ws: &MeshWorkspace| ws.scene.get(id).unwrap().selection.len();
+        ws.execute(MeshCommand::SelectNear { at: DVec3::new(12.5, 0.0, 0.0), radius: 4.0, add: false }, &ctx, vp).unwrap();
+        let n = selected(&ws);
+        assert!(n > 0 && n < total);
+        // I inverts the selection…
+        press(&mut ws, 22);
+        assert_eq!(selected(&ws), total - n, "{}", ws.status);
+        assert_eq!(ws.status, format!("{} triangles selected", total - n), "the key's own outcome");
+        // …X discards it, leaving the patch…
+        press(&mut ws, 23);
+        assert_eq!(ws.scene.get(id).unwrap().mesh.triangle_count(), n);
+        // …and E selects what is connected to a triangle of it: all of the patch.
+        ws.execute(MeshCommand::SelectNear { at: DVec3::new(12.5, 0.0, 0.0), radius: 0.5, add: false }, &ctx, vp).unwrap();
+        assert!(selected(&ws) < n);
+        press(&mut ws, 21);
+        assert_eq!(selected(&ws), n);
+    }
+
+    #[test]
+    fn one_brush_size_carries_across_tools_and_reopening() {
+        let (mut ws, ctx, vp) = workspace();
+        ws.execute(MeshCommand::AddShape(Shape::Sphere), &ctx, vp).unwrap();
+        let size = |ws: &MeshWorkspace| ws.tools.last().and_then(|t| t.brush_size()).map(|b| b.get());
+        ws.execute(MeshCommand::OpenTool("select".into()), &ctx, vp).unwrap();
+        // The size set in Select…
+        ws.execute(MeshCommand::ToolSettings(json!({"size_percent": 7.0})), &ctx, vp).unwrap();
+        assert_eq!(size(&ws), Some(7.0));
+        // …is still there after Erase & Fill and back to Select (as with S), …
+        ws.execute(MeshCommand::SelectNear { at: DVec3::new(12.5, 0.0, 0.0), radius: 3.0, add: false }, &ctx, vp).unwrap();
+        ws.execute(MeshCommand::OpenTool("erasefill".into()), &ctx, vp).unwrap();
+        ws.execute(MeshCommand::CancelTool, &ctx, vp).ok();
+        ws.execute(MeshCommand::CancelTool, &ctx, vp).ok();
+        assert!(ws.tools.is_empty());
+        ws.switch_to(SwitchTo::ClearSelect, &ctx, vp);
+        assert_eq!(size(&ws), Some(7.0), "Select opened again keeps the size");
+        // …in Sculpt, every kind of it…
+        for name in ["sculpt", "sculptvolume", "sculptsmooth"] {
+            ws.execute(MeshCommand::OpenTool(name.into()), &ctx, vp).unwrap();
+            assert_eq!(size(&ws), Some(7.0), "{name}");
+        }
+        // …and a change there is Select's too, which keeps it with the preferences.
+        ws.execute(MeshCommand::ToolSettings(json!({"size_percent": 3.0})), &ctx, vp).unwrap();
+        ws.execute(MeshCommand::OpenTool("select".into()), &ctx, vp).unwrap();
+        assert_eq!(size(&ws), Some(3.0));
+        assert_eq!(ws.brush.get(), 3.0);
+    }
+
+    #[test]
     fn faced_clicks_queue_pointer_events() {
         let (mut ws, ctx, vp) = workspace();
         ws.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();

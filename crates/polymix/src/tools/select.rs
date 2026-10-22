@@ -26,8 +26,9 @@ pub enum SelectMode {
 
 pub struct SelectTool {
     pub mode: SelectMode,
-    /// Brush radius in percent of the model size.
-    pub size_pct: f32,
+    /// Brush radius in percent of the model size: the workspace's, shared with the other
+    /// brush tools.
+    pub brush: BrushSize,
     /// Lasso / laser select through the model (occluded and back-facing faces too).
     pub through: bool,
     /// Brush shape (Meshmixer's Brush Mode); Unwrap measures along the surface.
@@ -233,7 +234,7 @@ impl Default for SelectTool {
     fn default() -> Self {
         Self {
             mode: SelectMode::Brush,
-            size_pct: 2.5,
+            brush: BrushSize::default(),
             through: true,
             brush_shape: mm_core::BrushShape::Unwrap,
             visible_side_only: false,
@@ -329,7 +330,7 @@ impl SelectTool {
             return;
         };
         let object = stroke.object;
-        let r = brush_radius(cx.scene, object, self.size_pct);
+        let r = brush_radius(cx.scene, object, self.brush.get());
         let Some(stroke) = &mut self.stroke else { return };
         let deselect = stroke.deselect;
         let last = stroke.last.replace(hit.point);
@@ -581,8 +582,14 @@ impl SelectTool {
 }
 
 impl Tool for SelectTool {
-    fn brush_size(&mut self) -> Option<&mut f32> {
-        Some(&mut self.size_pct)
+    fn brush_size(&self) -> Option<&BrushSize> {
+        Some(&self.brush)
+    }
+
+    fn share_brush(&mut self, size: &BrushSize) {
+        if !self.brush.same(size) {
+            self.brush = size.clone();
+        }
     }
 
     fn settings(&self) -> Option<serde_json::Value> {
@@ -592,7 +599,7 @@ impl Tool for SelectTool {
             SelectMode::Wand => "wand",
         };
         let mut v = serde_json::json!({
-            "mode": mode, "size_percent": self.size_pct, "visible_side_only": self.visible_side_only, "restrict_exterior": self.restrict_exterior,
+            "mode": mode, "size_percent": self.brush.get(), "visible_side_only": self.visible_side_only, "restrict_exterior": self.restrict_exterior,
             "crease_deg": self.crease_deg, "wand_deg": self.wand_deg, "lasso_through": self.through,
         });
         if let Some(o) = v.as_object_mut() {
@@ -626,7 +633,7 @@ impl Tool for SelectTool {
             Some("wand") => SelectMode::Wand,
             _ => SelectMode::Brush,
         };
-        self.size_pct = (a.f64("size_percent")? as f32).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        self.brush.set(a.f64("size_percent")? as f32);
         self.visible_side_only = a.opt_bool("visible_side_only").unwrap_or(self.visible_side_only);
         self.restrict_exterior = a.opt_bool("restrict_exterior").unwrap_or(self.restrict_exterior);
         self.crease_deg = (a.f64("crease_deg")? as f32).clamp(0.0, 180.0);
@@ -687,7 +694,7 @@ impl Tool for SelectTool {
             "backfaces" => self.visible_side_only = false,
             "visibleside" => self.visible_side_only = true,
             // `size:8` (percent of the model).
-            c if c.starts_with("size:") => self.size_pct = c[5..].parse().unwrap_or(self.size_pct),
+            c if c.starts_with("size:") => self.brush.set(c[5..].parse().unwrap_or(self.brush.get())),
             _ => {}
         }
     }
@@ -720,8 +727,8 @@ impl Tool for SelectTool {
                         });
                     }
                 });
-                let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size_pct));
-                brush_size_ui(ui, &mut self.size_pct, r);
+                let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.brush.get()));
+                brush_size_ui(ui, &self.brush, r);
                 self.symmetry.ui(ui, cx, "Symmetry");
                 ui_util::section(ui, "Filters");
                 egui::ComboBox::from_label("Expand mode (Cmd+right-drag)")
@@ -989,7 +996,7 @@ impl Tool for SelectTool {
         }
         // Hover cursor (brush mode, not while drawing a curve).
         self.hover_brush = match (self.mode, &self.curve) {
-            (SelectMode::Brush, None) => cx.pick(pos, cx.scene.active).map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.size_pct))),
+            (SelectMode::Brush, None) => cx.pick(pos, cx.scene.active).map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.brush.get()))),
             _ => None,
         };
     }
@@ -998,7 +1005,7 @@ impl Tool for SelectTool {
         if self.mode != SelectMode::Brush {
             return false;
         }
-        self.size_pct = (self.size_pct * (delta * 0.004).exp()).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        self.brush.set(self.brush.get() * (delta * 0.004).exp());
         true
     }
 
@@ -1109,9 +1116,9 @@ impl Tool for SelectTool {
         } else if i.key_pressed(Key::X) || i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) {
             run(&mut commands::discard_selection);
         } else if i.key_pressed(Key::OpenBracket) {
-            step_brush_size(&mut self.size_pct, false);
+            step_brush_size(&self.brush, false);
         } else if i.key_pressed(Key::CloseBracket) {
-            step_brush_size(&mut self.size_pct, true);
+            step_brush_size(&self.brush, true);
         } else if i.key_pressed(Key::F) && !cmd {
             self.request = Some(Box::new(ops::EraseFillTool::new(cx)));
         } else if i.key_pressed(Key::D) && !cmd && !shift {
@@ -1267,7 +1274,7 @@ mod tests {
         let ctx = egui::Context::default();
         let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
         let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
-        let mut tool = SelectTool { size_pct: 10.0, ..Default::default() };
+        let mut tool = SelectTool { brush: BrushSize::new(10.0), ..Default::default() };
         assert!(!tool.visible_side_only);
         let c = vp.rect.center();
         tool.pointer(&PointerInput { pos: Some(c), pressed: true, down: true, ..Default::default() }, &mut cx);
@@ -1301,7 +1308,7 @@ mod tests {
             let ctx = egui::Context::default();
             let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
             let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
-            let mut tool = SelectTool { size_pct: 40.0, visible_side_only, ..Default::default() };
+            let mut tool = SelectTool { brush: BrushSize::new(40.0), visible_side_only, ..Default::default() };
             let at = cx.project(base * 1.75).unwrap();
             tool.pointer(&PointerInput { pos: Some(at), pressed: true, down: true, ..Default::default() }, &mut cx);
             tool.pointer(&PointerInput { pos: Some(at), released: true, ..Default::default() }, &mut cx);
@@ -1506,7 +1513,7 @@ mod tests {
         let ctx = egui::Context::default();
         let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
         let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
-        let mut tool = SelectTool { size_pct: 4.0, ..Default::default() };
+        let mut tool = SelectTool { brush: BrushSize::new(4.0), ..Default::default() };
         let n = plane.normal;
         tool.set_settings(&serde_json::json!({"symmetry": true, "symmetry_plane": {"point_mm": [0.0, 0.0, 0.0], "normal": [n.x, n.y, n.z]}}), &mut cx).unwrap();
         assert_eq!(tool.settings().unwrap()["symmetry_axis"], "free");

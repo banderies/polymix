@@ -555,6 +555,67 @@ enum SwitchTo {
     ClearSelect,
 }
 
+/// What a 3D mouse button's action is called in the settings.
+fn button_action_label(a: &spacemouse::ButtonAction) -> String {
+    use spacemouse::ButtonAction as A;
+    match a {
+        A::Hotbox => "Hotbox".into(),
+        A::Fit => "Fit the view".into(),
+        A::View(k) => STANDARD_VIEWS.get(*k).map_or("A view".into(), |v| format!("{} view", v.0)),
+        A::Undo => "Undo".into(),
+        A::Redo => "Redo".into(),
+        A::Accept => "Accept the open tool".into(),
+        A::Cancel => "Cancel the open tool".into(),
+        A::Tool(name) => command::TOOLS.iter().find(|t| t.name == name).map_or(format!("Tool {name}"), |t| t.title.to_string()),
+        A::Hold(k) => format!("Hold {}", k.label()),
+        A::Key { key, modifiers } => format!("Key {}", spacemouse::key_label(*key, *modifiers)),
+        A::Nothing => "Nothing".into(),
+    }
+}
+
+/// The menu choosing what 3D mouse button `button` does: view and edit commands, a held
+/// modifier, a keyboard key, or any tool. True when "Press a key…" was chosen: the key typed
+/// next is the button's.
+fn button_action_menu(ui: &mut egui::Ui, button: u32, action: &mut spacemouse::ButtonAction) -> bool {
+    use spacemouse::ButtonAction as A;
+    let mut capture = false;
+    let is_key = matches!(action, A::Key { .. });
+    egui::ComboBox::from_id_salt(("space_button", button)).selected_text(button_action_label(action)).width(190.0).height(420.0).show_ui(ui, |ui| {
+        let mut choice = |ui: &mut egui::Ui, a: A| {
+            let label = button_action_label(&a);
+            ui.selectable_value(action, a, label);
+        };
+        ui.weak("View");
+        choice(ui, A::Hotbox);
+        choice(ui, A::Fit);
+        for k in 0..STANDARD_VIEWS.len() {
+            choice(ui, A::View(k));
+        }
+        ui.separator();
+        ui.weak("Keyboard");
+        if ui.selectable_label(is_key, "Press a key…").on_hover_text("Then type the key (with ⌘ ⇧ ⌥ ⌃ if you like): the button presses it, so it does what the key does where you are").clicked() {
+            capture = true;
+        }
+        ui.weak("Hold as a key").on_hover_text("While the button is held, Polymix acts as if the key were held: e.g. ⌘ for the selection's ⌘ + right drag, or for brush size");
+        for k in spacemouse::HeldKey::ALL {
+            choice(ui, A::Hold(k));
+        }
+        ui.separator();
+        ui.weak("Edit");
+        for a in [A::Undo, A::Redo, A::Accept, A::Cancel] {
+            choice(ui, a);
+        }
+        ui.separator();
+        ui.weak("Tools");
+        for t in command::TOOLS {
+            choice(ui, A::Tool(t.name.into()));
+        }
+        ui.separator();
+        choice(ui, A::Nothing);
+    });
+    capture
+}
+
 /// Create a tool by name. Shared by the palette, hotkeys, menus and test scripts.
 pub(crate) fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
     Some(match name {
@@ -736,6 +797,17 @@ pub struct MeshWorkspace {
     /// 3D mouse (3Dconnexion) input and its settings (Preferences → 3D mouse).
     space: SpaceMouse,
     space_cfg: spacemouse::Settings,
+    /// What each 3D mouse button does (by button number).
+    space_buttons: Vec<(u32, spacemouse::ButtonAction)>,
+    /// The next button pressed is added to `space_buttons` (Preferences → 3D mouse).
+    space_capture: bool,
+    /// The last 3D mouse button pressed, for the settings.
+    space_last_button: Option<u32>,
+    /// The button whose key the settings wait for (the next key typed).
+    space_key_capture: Option<u32>,
+    /// The brush size every brush tool shares (see [`tools::BrushSize`]), kept with the
+    /// preferences.
+    brush: tools::BrushSize,
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
     hotbox: Option<egui::Pos2>,
     show_objects: bool,
@@ -832,6 +904,11 @@ impl MeshWorkspace {
             show_help: false,
             space: SpaceMouse::start(ctx),
             space_cfg: spacemouse::Settings::default(),
+            space_buttons: spacemouse::default_buttons(),
+            space_capture: false,
+            space_last_button: None,
+            space_key_capture: None,
+            brush: tools::BrushSize::default(),
             hotbox: None,
             show_objects: true,
             objects_folded: false,
@@ -889,12 +966,19 @@ impl MeshWorkspace {
             app.view.nav_mode = st.get_string("nav_mode").and_then(|k| NavMode::from_key(&k)).unwrap_or(NavMode::Fusion360);
             app.view.nav_custom = st.get_string("nav_custom").and_then(|v| NavBindings::from_pref(&v)).unwrap_or(NavBindings::FUSION360);
             app.view.brush_scroll = st.get_string("brush_scroll").and_then(|k| BrushScroll::from_key(&k)).unwrap_or(BrushScroll::Shift);
+            if let Some(pct) = st.get_string("brush_size").and_then(|v| v.parse::<f32>().ok()) {
+                app.brush.set(pct);
+            }
             app.view.zoom_speed = st.get_string("zoom_speed").and_then(|v| v.parse().ok()).filter(|x: &f32| x.is_finite() && *x > 0.0).unwrap_or(1.0);
             app.view.zoom_near = flag("zoom_near", true);
             app.view.zoom_to_cursor = flag("zoom_to_cursor", true);
             if let Some(cfg) = st.get_string("spacemouse").and_then(|v| spacemouse::Settings::from_pref(&v)) {
                 app.space_cfg = cfg;
             }
+            if let Some(v) = st.get_string("spacemouse_buttons") {
+                app.space_buttons = spacemouse::buttons_from_pref(&v);
+            }
+            app.sync_held_keys();
             app.view.crease_deg = st.get_string("crease_deg").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CREASE_DEG);
             app.show_objects = flag("show_objects", true);
             app.objects_folded = flag("objects_folded", false);
@@ -1686,6 +1770,7 @@ impl MeshWorkspace {
                     };
                     if let Some(t) = tool {
                         self.tools.push(t);
+                        self.share_brush();
                     }
                 }
             }
@@ -2708,8 +2793,11 @@ impl MeshWorkspace {
                     if has_size || has_strength {
                         ui.strong("Brushes");
                         ui.horizontal(|ui| {
-                            if let Some(s) = t.brush_size() {
-                                ui.add(egui::Slider::new(s, tools::BRUSH_SIZE_RANGE.0..=tools::BRUSH_SIZE_RANGE.1).logarithmic(true).text("size"));
+                            if let Some(b) = t.brush_size() {
+                                let mut pct = b.get();
+                                if ui.add(egui::Slider::new(&mut pct, tools::BRUSH_SIZE_RANGE.0..=tools::BRUSH_SIZE_RANGE.1).logarithmic(true).text("size")).changed() {
+                                    b.set(pct);
+                                }
                             }
                             if let Some(s) = t.brush_strength() {
                                 ui.add(egui::Slider::new(s, 0.0..=1.0).text("strength"));
@@ -3006,19 +3094,74 @@ impl MeshWorkspace {
             // Keep animating while the cap is deflected.
             ctx.request_repaint();
         }
-        use std::f64::consts::FRAC_PI_2;
-        for b in pressed {
-            match spacemouse::button_action(b) {
-                Some(spacemouse::ButtonAction::Menu) => {
-                    self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) };
-                }
-                Some(spacemouse::ButtonAction::Fit) => self.focus_scene(),
-                Some(spacemouse::ButtonAction::Top) => self.standard_view(0.0, FRAC_PI_2),
-                Some(spacemouse::ButtonAction::Right) => self.standard_view(FRAC_PI_2, 0.0),
-                Some(spacemouse::ButtonAction::Front) => self.standard_view(0.0, 0.0),
-                None => {}
-            }
+        // Capturing a button for the settings stops when they are put away.
+        if !(self.show_prefs && self.prefs_tab == PREFS_TAB_3D_MOUSE) {
+            self.space_capture = false;
+            self.space_key_capture = None;
         }
+        for b in pressed {
+            self.space_button(b, ctx, vp);
+        }
+    }
+
+    /// Every brush tool open takes the one brush size: none keeps a size of its own.
+    fn share_brush(&mut self) {
+        for t in &mut self.tools {
+            t.share_brush(&self.brush);
+        }
+    }
+
+    /// Hand the app's input hook the buttons that stand for held modifier keys.
+    fn sync_held_keys(&self) {
+        let keys = self.space_buttons.iter().filter_map(|(b, a)| if let spacemouse::ButtonAction::Hold(k) = a { Some((*b, *k)) } else { None });
+        spacemouse::set_held_keys(if self.space_cfg.enabled { keys.collect() } else { Vec::new() });
+    }
+
+    /// 3D mouse button `b` was pressed: its action, or, while the settings wait for a button,
+    /// it joins the list there.
+    fn space_button(&mut self, b: u32, ctx: &egui::Context, vp: Viewport) {
+        self.space_last_button = Some(b);
+        if self.space_capture {
+            if !self.space_buttons.iter().any(|(x, _)| *x == b) {
+                self.space_buttons.push((b, spacemouse::ButtonAction::Nothing));
+                self.space_buttons.sort_by_key(|(x, _)| *x);
+            }
+            self.space_capture = false;
+            return;
+        }
+        let Some(action) = self.space_buttons.iter().find(|(x, _)| *x == b).map(|(_, a)| a.clone()) else { return };
+        use spacemouse::ButtonAction as A;
+        // The same commands as the menus and hotkeys.
+        let cmd = match action {
+            A::Hotbox => {
+                self.hotbox = if self.hotbox.is_some() { None } else { Some(vp.rect.center()) };
+                return;
+            }
+            // Held keys act while held, in the app's input (see `spacemouse::with_held_keys`).
+            A::Nothing | A::Hold(_) => return,
+            // The key goes into the app's input, so it does what it does wherever it is pressed.
+            A::Key { key, modifiers } => {
+                spacemouse::press_key(key, modifiers);
+                self.status = format!("3D mouse button {b}: key {}", spacemouse::key_label(key, modifiers));
+                return;
+            }
+            // Select as the S key opens it: with nothing selected, again and again.
+            A::Tool(name) if name == "select" && self.scene.active().is_some() => {
+                self.switch_to(SwitchTo::ClearSelect, ctx, vp);
+                let done = if self.pending_switch.is_some() { "Select opens when the open tool has finished computing" } else { "Select, nothing selected" };
+                self.status = format!("3D mouse button {b}: {done}");
+                return;
+            }
+            A::Fit => MeshCommand::Focus,
+            A::View(k) => MeshCommand::StandardView(k),
+            A::Undo => MeshCommand::Undo,
+            A::Redo => MeshCommand::Redo,
+            A::Accept => MeshCommand::AcceptTool,
+            A::Cancel => MeshCommand::CancelTool,
+            A::Tool(name) => MeshCommand::OpenTool(name),
+        };
+        let (Ok(m) | Err(m)) = self.execute(cmd, ctx, vp);
+        self.status = format!("3D mouse button {b}: {m}");
     }
 
     /// Preferences → 3D mouse: connection, orbit / pan / zoom speeds, locks, inverted axes and
@@ -3072,8 +3215,63 @@ impl MeshWorkspace {
                 ui.checkbox(&mut c.invert[i], *name);
             }
         });
-        ui_util::section(ui, "Live input");
         let (axis, buttons) = self.space.raw();
+        ui_util::section(ui, "Buttons");
+        ui.small("Polymix takes the device's buttons over from 3DxWare, so the button settings in 3Dconnexion's own app do not apply here: give the buttons actions below.");
+        let pressed = |b: u32| b < 32 && buttons & (1 << b) != 0;
+        // The key for a button: the next one typed, with the modifiers held.
+        if let Some(b) = self.space_key_capture {
+            let typed = ui.input(|i| i.events.iter().find_map(|e| if let egui::Event::Key { key, pressed: true, modifiers, .. } = e { Some((*key, *modifiers)) } else { None }));
+            if let Some((key, modifiers)) = typed {
+                if let Some((_, a)) = self.space_buttons.iter_mut().find(|(x, _)| *x == b) {
+                    *a = spacemouse::ButtonAction::Key { key, modifiers };
+                }
+                self.space_key_capture = None;
+            }
+        }
+        let mut remove = None;
+        let mut capture = None;
+        egui::Grid::new("space_buttons").num_columns(3).show(ui, |ui| {
+            for (k, (b, action)) in self.space_buttons.iter_mut().enumerate() {
+                let name = egui::RichText::new(format!("Button {b}"));
+                ui.label(if pressed(*b) { name.strong().color(ui.visuals().selection.bg_fill) } else { name });
+                if self.space_key_capture == Some(*b) {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Type the key…").color(ui.visuals().selection.bg_fill));
+                        if ui.small_button("Cancel").clicked() {
+                            capture = Some(None);
+                        }
+                    });
+                } else if button_action_menu(ui, *b, action) {
+                    capture = Some(Some(*b));
+                }
+                if ui.small_button("×").on_hover_text("Remove this button").clicked() {
+                    remove = Some(k);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(c) = capture {
+            self.space_key_capture = c;
+        }
+        if let Some(k) = remove {
+            self.space_buttons.remove(k);
+        }
+        ui.horizontal(|ui| {
+            let label = if self.space_capture { "Press a button on the 3D mouse…" } else { "+ Add a button" };
+            if ui.selectable_label(self.space_capture, label).on_hover_text("Then press the button on the 3D mouse: it is added to the list").clicked() {
+                self.space_capture = !self.space_capture;
+            }
+            if ui.small_button("Defaults").on_hover_text("Menu: Hotbox, Fit: fit the view, Top / Right / Front: views").clicked() {
+                self.space_buttons = spacemouse::default_buttons();
+            }
+        });
+        if let Some(b) = self.space_last_button {
+            let action = self.space_buttons.iter().find(|(x, _)| *x == b).map_or("no action".to_string(), |(_, a)| button_action_label(a));
+            ui.weak(format!("Last pressed: button {b} ({action})"));
+        }
+        self.sync_held_keys();
+        ui_util::section(ui, "Live input");
         let m = spacemouse::to_view(axis);
         egui::Grid::new("space_live").num_columns(2).show(ui, |ui| {
             for (name, v) in spacemouse::Settings::AXIS_NAMES.iter().zip(m.t.iter().chain(m.r.iter())) {
@@ -3085,7 +3283,6 @@ impl MeshWorkspace {
             ui.monospace(if buttons == 0 { "–".to_string() } else { (0..32).filter(|b| buttons & (1 << b) != 0).map(|b| b.to_string()).collect::<Vec<_>>().join(" ") });
             ui.end_row();
         });
-        ui.small("Buttons: Menu = Hotbox, Fit = focus, Top / Right / Front = views.");
         // Keep the live readout moving.
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -3766,7 +3963,8 @@ impl MeshWorkspace {
     // ------------------------------------------------------------------
 
     fn handle_keys(&mut self, ctx: &egui::Context, vp: Viewport) {
-        if ctx.egui_wants_keyboard_input() {
+        // A key typed for a 3D mouse button (Preferences → 3D mouse) does nothing else.
+        if ctx.egui_wants_keyboard_input() || self.space_key_capture.is_some() {
             return;
         }
         let i = ctx.input(|i| i.clone());
@@ -4025,10 +4223,12 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         st.set_string("nav_mode", self.view.nav_mode.key().to_string());
         st.set_string("nav_custom", self.view.nav_custom.to_pref());
         st.set_string("brush_scroll", self.view.brush_scroll.key().to_string());
+        st.set_string("brush_size", self.brush.get().to_string());
         st.set_string("zoom_speed", self.view.zoom_speed.to_string());
         st.set_string("zoom_near", b(self.view.zoom_near));
         st.set_string("zoom_to_cursor", b(self.view.zoom_to_cursor));
         st.set_string("spacemouse", self.space_cfg.to_pref());
+        st.set_string("spacemouse_buttons", spacemouse::buttons_to_pref(&self.space_buttons));
         st.set_string("crease_deg", self.view.crease_deg.to_string());
         st.set_string("show_objects", b(self.show_objects));
         st.set_string("objects_folded", b(self.objects_folded));
@@ -4069,6 +4269,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.share_brush();
 
         // The viewport rect is only known after the side panels are laid out; tools that need it
         // during panel drawing use the previous frame's value.

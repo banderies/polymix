@@ -110,26 +110,244 @@ impl Settings {
     }
 }
 
-/// What the app should do for a device button.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a device button does (Preferences → 3D mouse → Buttons).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ButtonAction {
-    Menu,
+    /// The Space hotbox.
+    Hotbox,
+    /// Fit the view to the visible objects.
     Fit,
-    Top,
-    Right,
-    Front,
+    /// A standard view: its index in the View menu's list (Front, Back, Left, Right, Top,
+    /// Bottom).
+    View(usize),
+    Undo,
+    Redo,
+    /// Accept the open tool (as Enter does).
+    Accept,
+    /// Cancel the open tool (as Esc does).
+    Cancel,
+    /// Open a mesh tool by its name (the palette's, hotkeys' and scripts').
+    Tool(String),
+    /// While held, the app acts as if this modifier key were held (see [`with_held_keys`]).
+    Hold(HeldKey),
+    /// Press a keyboard key (with modifiers): whatever the key does where it is pressed.
+    Key { key: egui::Key, modifiers: egui::Modifiers },
+    /// Nothing (a button captured but not given an action yet).
+    Nothing,
 }
 
-/// Default button assignments (3Dconnexion's standard button numbering: 0 Menu, 1 Fit,
-/// 2 Top, 4 Right, 5 Front on models that have them).
-pub fn button_action(index: u32) -> Option<ButtonAction> {
-    match index {
-        0 => Some(ButtonAction::Menu),
-        1 => Some(ButtonAction::Fit),
-        2 => Some(ButtonAction::Top),
-        4 => Some(ButtonAction::Right),
-        5 => Some(ButtonAction::Front),
-        _ => None,
+/// Whether `m` holds modifier key `k` (⌘ and Ctrl both set egui's `command` off a Mac).
+pub fn holds(m: egui::Modifiers, k: HeldKey) -> bool {
+    let mac = cfg!(target_os = "macos");
+    match k {
+        HeldKey::Command => m.command && (mac || !m.ctrl),
+        HeldKey::Shift => m.shift,
+        HeldKey::Option => m.alt,
+        HeldKey::Control => m.ctrl,
+    }
+}
+
+/// How the keyboard shows key `key` with `modifiers`: ⌘⇧I.
+pub fn key_label(key: egui::Key, modifiers: egui::Modifiers) -> String {
+    let symbols = [(HeldKey::Control, "⌃"), (HeldKey::Option, "⌥"), (HeldKey::Shift, "⇧"), (HeldKey::Command, "⌘")];
+    symbols.iter().filter(|(k, _)| holds(modifiers, *k)).map(|(_, s)| *s).chain([key.symbol_or_name()]).collect()
+}
+
+/// A modifier key a 3D mouse button can stand for while it is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldKey {
+    Command,
+    Shift,
+    Option,
+    Control,
+}
+
+impl HeldKey {
+    pub const ALL: [HeldKey; 4] = [HeldKey::Command, HeldKey::Shift, HeldKey::Option, HeldKey::Control];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            HeldKey::Command => "command",
+            HeldKey::Shift => "shift",
+            HeldKey::Option => "option",
+            HeldKey::Control => "control",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HeldKey::Command => "⌘ Command",
+            HeldKey::Shift => "⇧ Shift",
+            HeldKey::Option => "⌥ Option",
+            HeldKey::Control => "⌃ Control",
+        }
+    }
+
+    /// The modifiers the keyboard reports for the key: ⌘ is egui's `command` on a Mac, Ctrl
+    /// elsewhere.
+    pub fn modifiers(self) -> egui::Modifiers {
+        let mac = cfg!(target_os = "macos");
+        match self {
+            HeldKey::Command => egui::Modifiers { mac_cmd: mac, command: true, ..Default::default() },
+            HeldKey::Shift => egui::Modifiers::SHIFT,
+            HeldKey::Option => egui::Modifiers::ALT,
+            HeldKey::Control => egui::Modifiers { ctrl: true, command: !mac, ..Default::default() },
+        }
+    }
+}
+
+impl ButtonAction {
+    /// The form kept in the preferences.
+    pub fn key(&self) -> String {
+        match self {
+            ButtonAction::Hotbox => "hotbox".into(),
+            ButtonAction::Fit => "fit".into(),
+            ButtonAction::View(k) => format!("view:{k}"),
+            ButtonAction::Undo => "undo".into(),
+            ButtonAction::Redo => "redo".into(),
+            ButtonAction::Accept => "accept".into(),
+            ButtonAction::Cancel => "cancel".into(),
+            ButtonAction::Tool(name) => format!("tool:{name}"),
+            ButtonAction::Hold(k) => format!("hold:{}", k.key()),
+            ButtonAction::Key { key, modifiers } => {
+                let held: Vec<&str> = HeldKey::ALL.into_iter().filter(|h| holds(*modifiers, *h)).map(HeldKey::key).collect();
+                format!("key:{}", held.into_iter().chain([key.name()]).collect::<Vec<_>>().join("+"))
+            }
+            ButtonAction::Nothing => "nothing".into(),
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "hotbox" => ButtonAction::Hotbox,
+            "fit" => ButtonAction::Fit,
+            "undo" => ButtonAction::Undo,
+            "redo" => ButtonAction::Redo,
+            "accept" => ButtonAction::Accept,
+            "cancel" => ButtonAction::Cancel,
+            "nothing" => ButtonAction::Nothing,
+            _ => match s.split_once(':')? {
+                ("view", k) => ButtonAction::View(k.parse().ok()?),
+                ("tool", name) if !name.is_empty() => ButtonAction::Tool(name.into()),
+                ("hold", k) => ButtonAction::Hold(HeldKey::ALL.into_iter().find(|h| h.key() == k)?),
+                ("key", k) => {
+                    let mut parts: Vec<&str> = k.split('+').collect();
+                    let key = egui::Key::from_name(parts.pop()?)?;
+                    let modifiers = parts.into_iter().map(|p| HeldKey::ALL.into_iter().find(|h| h.key() == p).map(HeldKey::modifiers)).collect::<Option<Vec<_>>>()?;
+                    ButtonAction::Key { key, modifiers: modifiers.into_iter().fold(egui::Modifiers::NONE, |a, b| a | b) }
+                }
+                _ => return None,
+            },
+        })
+    }
+}
+
+/// The buttons' actions unless the user maps them: 3Dconnexion's standard numbering (0 Menu,
+/// 1 Fit, 2 Top, 4 Right, 5 Front on models that have them).
+pub fn default_buttons() -> Vec<(u32, ButtonAction)> {
+    vec![(0, ButtonAction::Hotbox), (1, ButtonAction::Fit), (2, ButtonAction::View(4)), (4, ButtonAction::View(3)), (5, ButtonAction::View(0))]
+}
+
+/// Button mappings in the preferences' form: `button=action` pairs separated by `;`.
+pub fn buttons_to_pref(buttons: &[(u32, ButtonAction)]) -> String {
+    buttons.iter().map(|(b, a)| format!("{b}={}", a.key())).collect::<Vec<_>>().join(";")
+}
+
+/// The mappings of [`buttons_to_pref`]'s form; pairs it cannot read are left out.
+pub fn buttons_from_pref(s: &str) -> Vec<(u32, ButtonAction)> {
+    let mut v: Vec<(u32, ButtonAction)> = s.split(';').filter_map(|p| p.split_once('=')).filter_map(|(b, a)| Some((b.trim().parse().ok()?, ButtonAction::from_key(a.trim())?))).collect();
+    v.sort_by_key(|(b, _)| *b);
+    v.dedup_by_key(|(b, _)| *b);
+    v
+}
+
+/// The buttons standing for modifier keys while held, as the settings last gave them. The
+/// app's input hook reads them in every tab.
+static HELD_KEYS: Mutex<Vec<(u32, HeldKey)>> = Mutex::new(Vec::new());
+
+/// Set the buttons that stand for modifier keys (none while the 3D mouse is off).
+pub fn set_held_keys(keys: Vec<(u32, HeldKey)>) {
+    if let Ok(mut k) = HELD_KEYS.lock() {
+        *k = keys;
+    }
+}
+
+/// The modifier keys the 3D mouse's buttons hold down now.
+pub fn held_modifiers() -> egui::Modifiers {
+    let buttons = shared().lock().map_or(0, |s| s.buttons);
+    let Ok(keys) = HELD_KEYS.lock() else { return egui::Modifiers::default() };
+    keys.iter().filter(|(b, _)| *b < 32 && buttons & (1 << b) != 0).fold(egui::Modifiers::default(), |m, (_, k)| m | k.modifiers())
+}
+
+/// Keys buttons have pressed, for the app's input hook to send in (see [`key_events`]).
+static PRESSED_KEYS: Mutex<Vec<(egui::Key, egui::Modifiers)>> = Mutex::new(Vec::new());
+
+/// Press keyboard key `key` with `modifiers`, as a button does.
+pub fn press_key(key: egui::Key, modifiers: egui::Modifiers) {
+    if let Ok(mut k) = PRESSED_KEYS.lock() {
+        k.push((key, modifiers));
+    }
+    wake();
+}
+
+/// The keys buttons have pressed since the last call.
+pub fn take_keys() -> Vec<(egui::Key, egui::Modifiers)> {
+    PRESSED_KEYS.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default()
+}
+
+/// Send the keys buttons pressed (`down`) into a frame's input: each goes down this frame,
+/// with its own modifiers held as well as `held` (what the keyboard and the 3D mouse hold),
+/// and comes up the next (`up`: the keys still down from the last frame), the modifiers back
+/// to `held`. Code that asks whether Shift is held, not just which key went down, sees it.
+pub fn key_events(events: &mut Vec<egui::Event>, up: &mut Vec<egui::Key>, down: Vec<(egui::Key, egui::Modifiers)>, held: egui::Modifiers) {
+    use egui::Event;
+    if !up.is_empty() {
+        events.extend(up.drain(..).map(|key| Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: held }));
+        events.push(Event::ModifiersChanged(held));
+    }
+    for (key, m) in down {
+        if m != egui::Modifiers::NONE {
+            events.push(Event::ModifiersChanged(held | m));
+        }
+        events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: held | m });
+        up.push(key);
+    }
+}
+
+/// Forget which buttons are down: the window lost the focus, and the driver does not report
+/// a button let go meanwhile, so a held key would stick.
+pub fn release_buttons() {
+    if let Ok(mut s) = shared().lock() {
+        s.buttons = 0;
+    }
+}
+
+/// Drop the presses not yet acted on (the Mesh tab, which acts on them, is not shown).
+pub fn drop_presses() {
+    if let Ok(mut s) = shared().lock() {
+        s.pressed.clear();
+    }
+}
+
+/// Make a frame's input as if the modifier keys the 3D mouse holds (`held`) were held on the
+/// keyboard too: added to every key, button and wheel event, and to the held modifiers the
+/// keyboard reports (`keyboard`, kept up to date from the events). `last` is what was held
+/// last frame; when it changed, the new state is announced before the frame's other events.
+pub fn with_held_keys(events: &mut Vec<egui::Event>, keyboard: &mut egui::Modifiers, held: egui::Modifiers, last: egui::Modifiers) {
+    use egui::Event;
+    for e in events.iter_mut() {
+        match e {
+            Event::ModifiersChanged(m) => {
+                *keyboard = *m;
+                *m |= held;
+            }
+            Event::WindowFocused(false) => *keyboard = egui::Modifiers::default(),
+            Event::Key { modifiers, .. } | Event::PointerButton { modifiers, .. } | Event::MouseWheel { modifiers, .. } => *modifiers |= held,
+            _ => {}
+        }
+    }
+    if held != last {
+        events.insert(0, Event::ModifiersChanged(*keyboard | held));
     }
 }
 
@@ -472,6 +690,105 @@ mod tests {
         // Out of range or not a positive number.
         assert_eq!(Settings::from_pref("1 50 1 1 000000 0 0").map(|s| s.orbit_speed), Some(10.0));
         assert_eq!(Settings::from_pref("1 -2 1 1 000000 0 0"), None);
+    }
+
+    #[test]
+    fn button_mappings_round_trip_and_default_to_the_standard_buttons() {
+        let defaults = default_buttons();
+        assert_eq!(buttons_from_pref(&buttons_to_pref(&defaults)), defaults);
+        // Every kind of action, and things the preferences may hold that cannot be read.
+        let all = vec![
+            (0, ButtonAction::Hotbox),
+            (1, ButtonAction::Fit),
+            (3, ButtonAction::View(5)),
+            (6, ButtonAction::Undo),
+            (7, ButtonAction::Redo),
+            (8, ButtonAction::Accept),
+            (9, ButtonAction::Cancel),
+            (12, ButtonAction::Tool("erasefill".into())),
+            (21, ButtonAction::Key { key: egui::Key::E, modifiers: egui::Modifiers::NONE }),
+            (22, ButtonAction::Key { key: egui::Key::I, modifiers: egui::Modifiers::SHIFT }),
+            (23, ButtonAction::Key { key: egui::Key::OpenBracket, modifiers: HeldKey::Command.modifiers() | egui::Modifiers::SHIFT }),
+            (25, ButtonAction::Hold(HeldKey::Command)),
+            (26, ButtonAction::Hold(HeldKey::Shift)),
+            (27, ButtonAction::Hold(HeldKey::Option)),
+            (28, ButtonAction::Hold(HeldKey::Control)),
+            (30, ButtonAction::Nothing),
+        ];
+        assert_eq!(buttons_from_pref(&buttons_to_pref(&all)), all);
+        assert_eq!(buttons_from_pref("x=fit;4=;5=view:abc;6=tool:;7=bogus;8=hold:meta;2=redo;2=undo"), vec![(2, ButtonAction::Redo)], "unreadable pairs and repeats left out");
+        assert_eq!(buttons_from_pref(""), vec![]);
+        // The defaults are the buttons' old fixed actions: Menu, Fit, Top, Right, Front.
+        let views: Vec<&str> = defaults.iter().filter_map(|(_, a)| if let ButtonAction::View(k) = a { Some(crate::app::STANDARD_VIEWS[*k].0) } else { None }).collect();
+        assert_eq!(views, ["Top", "Right", "Front"]);
+    }
+
+    #[test]
+    fn held_buttons_act_as_modifier_keys_in_every_event() {
+        use egui::{Event, Key, Modifiers, PointerButton};
+        let cmd = HeldKey::Command.modifiers();
+        assert!(cmd.command && cmd.mac_cmd == cfg!(target_os = "macos"));
+        let click = |m| Event::PointerButton { pos: egui::pos2(1.0, 2.0), button: PointerButton::Secondary, pressed: true, modifiers: m };
+        let key = |m| Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: m };
+        let mut keyboard = Modifiers::default();
+        // The button goes down: the new state comes first, then every event carries ⌘.
+        let mut events = vec![click(Modifiers::NONE), key(Modifiers::NONE)];
+        with_held_keys(&mut events, &mut keyboard, cmd, Modifiers::NONE);
+        assert_eq!(events, vec![Event::ModifiersChanged(cmd), click(cmd), key(cmd)]);
+        // Held on: Shift pressed on the keyboard meanwhile adds to it, and is remembered.
+        let mut events = vec![Event::ModifiersChanged(Modifiers::SHIFT), click(Modifiers::SHIFT)];
+        with_held_keys(&mut events, &mut keyboard, cmd, cmd);
+        assert_eq!(events, vec![Event::ModifiersChanged(Modifiers::SHIFT | cmd), click(Modifiers::SHIFT | cmd)]);
+        assert_eq!(keyboard, Modifiers::SHIFT);
+        // The button let go: back to the keyboard's own.
+        let mut events = Vec::new();
+        with_held_keys(&mut events, &mut keyboard, Modifiers::NONE, cmd);
+        assert_eq!(events, vec![Event::ModifiersChanged(Modifiers::SHIFT)]);
+        // Nothing held and nothing changed: the events are left as they are.
+        let mut events = vec![click(Modifiers::ALT)];
+        with_held_keys(&mut events, &mut keyboard, Modifiers::NONE, Modifiers::NONE);
+        assert_eq!(events, vec![click(Modifiers::ALT)]);
+        // And egui then sees the key held, as the app reads it.
+        let ctx = egui::Context::default();
+        let mut keyboard = Modifiers::default();
+        for (held, last) in [(cmd, Modifiers::NONE), (cmd, cmd)] {
+            let mut events = Vec::new();
+            with_held_keys(&mut events, &mut keyboard, held, last);
+            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |_| {});
+            assert!(ctx.input(|i| i.modifiers.command), "held across frames");
+        }
+        let mut events = Vec::new();
+        with_held_keys(&mut events, &mut keyboard, Modifiers::NONE, cmd);
+        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |_| {});
+        assert!(!ctx.input(|i| i.modifiers.command), "let go");
+    }
+
+    #[test]
+    fn a_button_presses_a_key_with_its_modifiers_for_a_frame() {
+        use egui::{Event, Key, Modifiers};
+        assert_eq!(key_label(Key::I, Modifiers::SHIFT | HeldKey::Command.modifiers()), "⇧⌘I");
+        assert_eq!(key_label(Key::X, Modifiers::NONE), "X");
+        let ctx = egui::Context::default();
+        let mut up = Vec::new();
+        let frame = |events: Vec<Event>| {
+            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |_| {});
+            ctx.input(|i| (i.key_pressed(Key::I), i.key_down(Key::I), i.modifiers.shift))
+        };
+        // Shift + I: down with Shift held, as the app reads it (the keyboard holds nothing)…
+        let mut events = Vec::new();
+        key_events(&mut events, &mut up, vec![(Key::I, Modifiers::SHIFT)], Modifiers::NONE);
+        assert_eq!(frame(events), (true, true, true));
+        // …and up the next frame, Shift let go.
+        let mut events = Vec::new();
+        key_events(&mut events, &mut up, Vec::new(), Modifiers::NONE);
+        assert_eq!(frame(events), (false, false, false));
+        assert!(up.is_empty());
+        // A plain key adds to what is held (here a 3D mouse ⌘), and changes no modifiers.
+        let cmd = HeldKey::Command.modifiers();
+        let mut events = Vec::new();
+        key_events(&mut events, &mut up, vec![(Key::E, Modifiers::NONE)], cmd);
+        assert_eq!(events, vec![Event::Key { key: Key::E, physical_key: None, pressed: true, repeat: false, modifiers: cmd }]);
+        assert_eq!(up, vec![Key::E]);
     }
 
     #[test]

@@ -80,6 +80,12 @@ pub struct PolymixApp {
     mesh: Slot<MeshWorkspace>,
     /// Paths from the command line, opened on the first frame.
     pending_open: Vec<PathBuf>,
+    /// The modifier keys the keyboard holds, and those the 3D mouse's buttons held last frame
+    /// (see `spacemouse::with_held_keys`).
+    keyboard_modifiers: egui::Modifiers,
+    held_modifiers: egui::Modifiers,
+    /// Keys 3D mouse buttons pressed last frame, to let go this one.
+    keys_down: Vec<egui::Key>,
     script: Option<Script>,
     /// Frames drawn (`frames:` script step).
     frames: u64,
@@ -184,7 +190,7 @@ impl PolymixApp {
         let mut agents = AgentAccess::new(storage, agents::all_tools());
         agents.start_if_enabled(ctx);
         let ui_access = crate::ui_access::UiAccess::new(ctx);
-        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None, overlay_key: None }
+        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None, overlay_key: None, keyboard_modifiers: egui::Modifiers::NONE, held_modifiers: egui::Modifiers::NONE, keys_down: Vec::new() }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -735,7 +741,24 @@ impl eframe::App for PolymixApp {
         self.mesh.call(|w| w.on_exit());
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // 3D mouse buttons held as modifier keys (Preferences → 3D mouse → Buttons), in every
+        // tab. Out of focus none counts as held: the driver would not report one let go.
+        if !raw_input.focused {
+            crate::spacemouse::release_buttons();
+        }
+        let held = crate::spacemouse::held_modifiers();
+        crate::spacemouse::with_held_keys(&mut raw_input.events, &mut self.keyboard_modifiers, held, self.held_modifiers);
+        self.held_modifiers = held;
+        // Keys 3D mouse buttons press: down this frame, up the next.
+        crate::spacemouse::key_events(&mut raw_input.events, &mut self.keys_down, crate::spacemouse::take_keys(), self.keyboard_modifiers | held);
+        if !self.keys_down.is_empty() {
+            ctx.request_repaint();
+        }
+        // Only the Mesh tab acts on button presses: elsewhere they are not kept for later.
+        if self.active != Tab::Mesh {
+            crate::spacemouse::drop_presses();
+        }
         if let Some(script) = &mut self.script {
             for key in script.keys.drain(..) {
                 for pressed in [true, false] {

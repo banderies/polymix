@@ -151,12 +151,52 @@ pub fn brush_radius(scene: &mut Scene, id: ObjectId, size_pct: f32) -> f64 {
     scene.get_mut(id).map(|o| o.bvh().bounds().diagonal() * size_pct as f64 / 100.0).unwrap_or(0.0)
 }
 
+/// A brush's size in percent of the object's size. The workspace's is shared by every brush
+/// tool (Select, Sculpt): they hold it rather than a size of their own, so one size carries
+/// across tools and from one use of a tool to the next.
+#[derive(Clone, Debug)]
+pub struct BrushSize(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl BrushSize {
+    pub fn new(pct: f32) -> Self {
+        let b = Self(Default::default());
+        b.set(pct);
+        b
+    }
+
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Set it, within [`BRUSH_SIZE_RANGE`].
+    pub fn set(&self, pct: f32) {
+        let pct = if pct.is_finite() { pct.clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1) } else { self.get() };
+        self.0.store(pct.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `self` and `other` are the same size (not just equal).
+    pub fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for BrushSize {
+    fn default() -> Self {
+        Self::new(2.5)
+    }
+}
+
 /// Brush size slider shared by the selection and sculpt brushes (percent of model size).
-pub fn brush_size_ui(ui: &mut egui::Ui, size_pct: &mut f32, radius: Option<f64>) {
+pub fn brush_size_ui(ui: &mut egui::Ui, size: &BrushSize, radius: Option<f64>) {
     ui.horizontal(|ui| {
         ui.label("Size");
-        ui.add(egui::Slider::new(size_pct, BRUSH_SIZE_RANGE.0..=BRUSH_SIZE_RANGE.1).logarithmic(true).suffix("%"))
-            .on_hover_text("Brush radius as a percentage of the model size. [ ] change it.");
+        let mut pct = size.get();
+        if ui.add(egui::Slider::new(&mut pct, BRUSH_SIZE_RANGE.0..=BRUSH_SIZE_RANGE.1).logarithmic(true).suffix("%"))
+            .on_hover_text("Brush radius as a percentage of the model size, the same in every brush tool. [ ] change it.")
+            .changed()
+        {
+            size.set(pct);
+        }
     });
     if let Some(r) = radius {
         ui.small(format!("Radius {r:.3} (model units)"));
@@ -166,9 +206,9 @@ pub fn brush_size_ui(ui: &mut egui::Ui, size_pct: &mut f32, radius: Option<f64>)
 pub const BRUSH_SIZE_RANGE: (f32, f32) = (0.1, 25.0);
 
 /// Step the brush size for the [ and ] keys.
-pub fn step_brush_size(size_pct: &mut f32, grow: bool) {
+pub fn step_brush_size(size: &BrushSize, grow: bool) {
     let f = if grow { 1.15 } else { 1.0 / 1.15 };
-    *size_pct = (*size_pct * f).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+    size.set(size.get() * f);
 }
 
 pub fn pick_ray(scene: &mut Scene, ray: &Ray, only: Option<ObjectId>) -> Option<(ObjectId, RayHit)> {
@@ -271,10 +311,12 @@ pub trait Tool {
     fn copy_text(&self) -> Option<String> {
         None
     }
-    /// Brush size in percent of the object size (for the hotbox), for tools with a brush.
-    fn brush_size(&mut self) -> Option<&mut f32> {
+    /// The brush size, for tools with a brush (the hotbox and ⌘ + middle drag size it).
+    fn brush_size(&self) -> Option<&BrushSize> {
         None
     }
+    /// Take the workspace's brush size in place of the tool's own (see [`BrushSize`]).
+    fn share_brush(&mut self, _size: &BrushSize) {}
     /// Brush strength in 0..1 (for the hotbox).
     fn brush_strength(&mut self) -> Option<&mut f64> {
         None

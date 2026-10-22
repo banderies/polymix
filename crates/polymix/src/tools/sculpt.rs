@@ -412,8 +412,9 @@ pub struct SculptTool {
     /// PaintVertex colour.
     paint: [f32; 3],
     refinement: Refinement,
-    /// Brush radius in percent of the model size.
-    size_pct: f32,
+    /// Brush radius in percent of the model size: the workspace's, shared with the other
+    /// brush tools.
+    size: BrushSize,
     strength: f64,
     stroke: Option<SculptStroke>,
     armed: bool,
@@ -515,7 +516,7 @@ impl SculptTool {
             stencil_drag: None,
             paint: [0.85, 0.25, 0.2],
             refinement: Refinement { enabled: volume, ..Refinement::default() },
-            size_pct: 4.0,
+            size: BrushSize::default(),
             strength: 0.5,
             stroke: None,
             armed: false,
@@ -898,7 +899,7 @@ impl SculptTool {
     /// with the current brush, as one stroke: what dragging the brush along it does.
     fn stroke_along(&mut self, cx: &mut ToolCx, path: &[DVec3], invert: bool) -> Result<usize, String> {
         let id = cx.scene.active.ok_or("no active object")?;
-        let r = brush_radius(cx.scene, id, self.size_pct);
+        let r = brush_radius(cx.scene, id, self.size.get());
         if r <= 0.0 {
             return Err("the brush has no size".into());
         }
@@ -922,7 +923,7 @@ impl SculptTool {
     /// mirror image with symmetry on), as dragging it does.
     fn drag_from_to(&mut self, cx: &mut ToolCx, from: DVec3, to: DVec3) -> Result<usize, String> {
         let id = cx.scene.active.ok_or("no active object")?;
-        let r = brush_radius(cx.scene, id, self.size_pct);
+        let r = brush_radius(cx.scene, id, self.size.get());
         let fp = self.footprint();
         if let Some(o) = cx.scene.get(id) {
             self.symmetry.place_with(id, || o.bounds());
@@ -973,7 +974,7 @@ impl SculptTool {
         if brush.grabs() {
             if stroke.drag_origin.is_none() {
                 let Some((_, h)) = hover else { return };
-                let r = brush_radius(cx.scene, stroke.object, self.size_pct);
+                let r = brush_radius(cx.scene, stroke.object, self.size.get());
                 let Some(o) = cx.scene.get_mut(stroke.object) else { return };
                 let bvh = o.bvh();
                 stroke.drag_verts = brush_vertices(&o.mesh, &bvh, h.point, r, Some(h.tid), &fp);
@@ -1024,7 +1025,7 @@ impl SculptTool {
             return;
         }
         let Some((_, h)) = hover else { return };
-        let r = brush_radius(cx.scene, stroke.object, self.size_pct);
+        let r = brush_radius(cx.scene, stroke.object, self.size.get());
         // Lazyness lets the brush trail the pointer.
         let mut p = h.point;
         if let Some(prev) = stroke.lazy {
@@ -1076,8 +1077,14 @@ impl SculptTool {
 }
 
 impl Tool for SculptTool {
-    fn brush_size(&mut self) -> Option<&mut f32> {
-        Some(&mut self.size_pct)
+    fn brush_size(&self) -> Option<&BrushSize> {
+        Some(&self.size)
+    }
+
+    fn share_brush(&mut self, size: &BrushSize) {
+        if !self.size.same(size) {
+            self.size = size.clone();
+        }
     }
 
     fn settings(&self) -> Option<serde_json::Value> {
@@ -1086,7 +1093,7 @@ impl Tool for SculptTool {
         let (m, st) = (self.alpha_map, self.screen_stencil);
         let mut v = serde_json::json!({
             "brush": brush_key(self.brush),
-            "size_percent": self.size_pct,
+            "size_percent": self.size.get(),
             "strength": self.strength,
             "depth": self.depth,
             "hold_boundary": self.hold_boundary,
@@ -1150,7 +1157,7 @@ impl Tool for SculptTool {
         let image = |k: &str| changes.get(k).and_then(|x| x.get("image")).map(|x| x.as_str().ok_or(format!("{k}.image is a name or path")).and_then(Alpha::find)).transpose();
         let (alpha, stencil) = (image("alpha")?, image("stencil")?);
         self.brush = Brush::ALL.into_iter().find(|b| a.opt_str("brush") == Some(brush_key(*b).as_str())).ok_or("unknown brush")?;
-        self.size_pct = (a.f64("size_percent")? as f32).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        self.size.set(a.f64("size_percent")? as f32);
         self.strength = a.f64("strength")?.clamp(0.0, 1.0);
         self.depth = a.f64("depth")?.clamp(-100.0, 100.0);
         self.hold_boundary = a.opt_bool("hold_boundary").unwrap_or(self.hold_boundary);
@@ -1182,7 +1189,7 @@ impl Tool for SculptTool {
     }
 
     fn state(&self, scene: &Scene) -> serde_json::Value {
-        let radius = scene.active().map(|o| o.bounds().diagonal() * self.size_pct as f64 / 100.0);
+        let radius = scene.active().map(|o| o.bounds().diagonal() * self.size.get() as f64 / 100.0);
         serde_json::json!({
             "object": scene.active,
             "brush": brush_key(self.brush),
@@ -1278,8 +1285,8 @@ impl Tool for SculptTool {
         if self.brush == Brush::Attract && cx.scene.target.is_none() {
             ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Attract needs a target surface (Edit → Set as target).");
         }
-        let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size_pct));
-        brush_size_ui(ui, &mut self.size_pct, r);
+        let r = cx.scene.active.map(|id| brush_radius(cx.scene, id, self.size.get()));
+        brush_size_ui(ui, &self.size, r);
         ui.horizontal(|ui| {
             ui.label("Strength");
             ui.add(egui::Slider::new(&mut self.strength, 0.01..=1.0));
@@ -1377,7 +1384,7 @@ impl Tool for SculptTool {
         }
         let Some(pos) = input.pos else { return };
         let hover = cx.pick(pos, cx.scene.active);
-        self.hover = hover.map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.size_pct)));
+        self.hover = hover.map(|(id, h)| (h.point, brush_radius(cx.scene, id, self.size.get())));
         if let Some(n) = hover.and_then(|(id, h)| cx.scene.get(id).map(|o| o.mesh.tri_normal(h.tid))) {
             self.hover_normal = n;
         }
@@ -1391,7 +1398,7 @@ impl Tool for SculptTool {
                 if let Some(o) = cx.scene.get(id) {
                     self.symmetry.place_with(id, || o.bounds());
                 }
-                let r = brush_radius(cx.scene, id, self.size_pct);
+                let r = brush_radius(cx.scene, id, self.size.get());
                 self.stroke = Some(SculptStroke::new(id, input.command, self.spacing * r));
             }
         }
@@ -1472,7 +1479,7 @@ impl Tool for SculptTool {
     }
 
     fn wheel(&mut self, delta: f32, _cx: &mut ToolCx) -> bool {
-        self.size_pct = (self.size_pct * (delta * 0.004).exp()).clamp(BRUSH_SIZE_RANGE.0, BRUSH_SIZE_RANGE.1);
+        self.size.set(self.size.get() * (delta * 0.004).exp());
         true
     }
 
@@ -1481,7 +1488,7 @@ impl Tool for SculptTool {
         // `alpha:noise`, `stencil:rings`, `align:on`.
         match cmd.split_once(':') {
             Some(("brush", name)) => self.brush = Brush::ALL.into_iter().find(|b| b.label().eq_ignore_ascii_case(name)).unwrap_or(self.brush),
-            Some(("size", pct)) => self.size_pct = pct.parse().unwrap_or(self.size_pct),
+            Some(("size", pct)) => self.size.set(pct.parse().unwrap_or(self.size.get())),
             Some(("color", hex)) => {
                 if let Ok(x) = u32::from_str_radix(hex.trim_start_matches('#'), 16) {
                     self.paint = [(x >> 16) & 255, (x >> 8) & 255, x & 255].map(|c| c as f32 / 255.0);
@@ -1558,11 +1565,11 @@ impl Tool for SculptTool {
             return toggle(&mut self.symmetry.enabled, "Symmetry", cx.status);
         }
         if i.key_pressed(egui::Key::OpenBracket) {
-            step_brush_size(&mut self.size_pct, false);
+            step_brush_size(&self.size, false);
             return true;
         }
         if i.key_pressed(egui::Key::CloseBracket) {
-            step_brush_size(&mut self.size_pct, true);
+            step_brush_size(&self.size, true);
             return true;
         }
         false
@@ -1862,7 +1869,7 @@ mod tests {
             let mut tool = SculptTool::new(&mut cx);
             tool.brush = Brush::Draw;
             tool.set_settings(&serde_json::json!({"spacing_percent": spacing}), &mut cx).unwrap();
-            let r = brush_radius(cx.scene, cx.scene.active.unwrap(), tool.size_pct);
+            let r = brush_radius(cx.scene, cx.scene.active.unwrap(), tool.size.get());
             let path = serde_json::json!({"path": [[-1.0, 0.0, 0.0], [-1.0 + r, 0.0, 0.0], [-1.0 + 2.0 * r, 0.0, 0.0]]});
             assert_eq!(tool.act("stroke", &path, &mut cx).unwrap(), want);
         }
@@ -1878,6 +1885,7 @@ mod tests {
             let mut tool = SculptTool::new(&mut cx);
             tool.brush = Brush::Draw;
             tool.flow = false;
+            tool.size.set(4.0);
             let (a, b) = (cx.project(DVec3::new(-0.6, 0.1, 0.0)).unwrap(), cx.project(DVec3::new(0.6, -0.1, 0.0)).unwrap());
             tool.pointer(&PointerInput { pos: Some(a), pressed: true, down: true, ..Default::default() }, &mut cx);
             for k in 1..=moves {
