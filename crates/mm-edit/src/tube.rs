@@ -114,13 +114,14 @@ pub fn tube_path(mesh: &Mesh, bvh: &Bvh, a: TubeEnd, b: TubeEnd, p: &TubeParams)
     }
 }
 
-/// Closed tube around `path`, radius going linearly from `r0` to `r1`.
+/// Closed tube around `path`, radius going linearly from `r0` to `r1`. The wall is face group
+/// 0, the cap at the start of the path group 1 and the one at its end group 2.
 pub fn tube_mesh(path: &[DVec3], r0: f64, r1: f64, slices: usize) -> Mesh {
     let n = path.len().max(2);
     let radii: Vec<f64> = (0..n).map(|i| r0 + (r1 - r0) * i as f64 / (n - 1) as f64).collect();
     let mut m = primitives::tube_along(path, &radii, slices.max(3));
     // Cap both ends with a fan at the end point.
-    for &end in &[0usize, n - 1] {
+    for (group, end) in [(1, 0usize), (2, n - 1)] {
         let loops = mm_core::topology::boundary_loops(&m);
         let Some(lp) = loops.into_iter().min_by(|x, y| {
             let c = |l: &mm_core::topology::EdgeLoop| l.positions(&m).iter().sum::<DVec3>() / l.vertices.len() as f64;
@@ -132,7 +133,7 @@ pub fn tube_mesh(path: &[DVec3], r0: f64, r1: f64, slices: usize) -> Mesh {
         let vs = &lp.vertices;
         for i in 0..vs.len() {
             // Boundary loops run opposite to the faces next to them.
-            let _ = m.append_triangle([vs[(i + 1) % vs.len()], vs[i], centre], 0);
+            let _ = m.append_triangle([vs[(i + 1) % vs.len()], vs[i], centre], group);
         }
     }
     if mm_core::measure::volume(&m) < 0.0 {
@@ -191,6 +192,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_end_caps_are_face_groups_of_their_own() {
+        let path: Vec<DVec3> = (0..=10).map(|i| DVec3::new(0.0, 0.0, i as f64 * 0.3)).collect();
+        let tube = tube_mesh(&path, 0.4, 0.2, 16);
+        let group = |g: i32| tube.triangle_ids().filter(|&t| tube.tri_group(t) == g).collect::<Vec<_>>();
+        let (wall, start, end) = (group(0), group(1), group(2));
+        assert_eq!(wall.len() + start.len() + end.len(), tube.triangle_count());
+        assert_eq!((start.len(), end.len()), (16, 16), "one fan per end");
+        // Each cap is flat, at its end of the path.
+        for (cap, at) in [(&start, path[0]), (&end, path[10])] {
+            assert!(cap.iter().all(|&t| tube.tri_centroid(t).distance(at) < 0.4));
+            assert!(cap.iter().all(|&t| tube.tri_normal(t).z.abs() > 0.999));
+        }
+        // Hair strands stay one group each.
+        let hair = crate::hair_mesh(std::slice::from_ref(&path), 0.1, 0.02, 6);
+        assert!(hair.triangle_ids().all(|t| hair.tri_group(t) == 0));
     }
 
     #[test]

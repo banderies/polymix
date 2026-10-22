@@ -61,10 +61,16 @@ fn a_tube_thickens_into_a_wall_each_way() {
             assert!(lo > at - 0.1 && hi < at + 0.1, "{side:?}: new side at {lo:.3}..{hi:.3}, want {at}");
         }
         assert!((res.measured[1] - 2.0).abs() < 0.1 && res.measured[0] > 1.8, "{side:?}: measured {:?}", res.measured);
-        // Flat rims just in front of the end planes (a twentieth of the thickness).
-        let rim: Vec<DVec3> = m.triangle_ids().filter(|&t| m.tri_group(t) == res.rim_group).flat_map(|t| m.tri_positions(t)).collect();
-        let off = rim.iter().map(|p| (p.z + 0.1).abs().min((p.z - 30.1).abs())).fold(0.0, f64::max);
-        assert!(!rim.is_empty() && off < 1e-6, "{side:?}: rims at the ends ({off:.2e} off)");
+        // Flat rims just in front of the end planes (a twentieth of the thickness), a group each.
+        assert_eq!(res.rim_groups.len(), 2, "{side:?}");
+        assert_ne!(res.rim_groups[0], res.rim_groups[1], "{side:?}: a group per rim");
+        for (opening, &g) in res.openings.iter().zip(&res.rim_groups) {
+            assert!(g != res.wall_group && g > 0, "{side:?}: rim group {g}");
+            let rim: Vec<DVec3> = m.triangle_ids().filter(|&t| m.tri_group(t) == g).flat_map(|t| m.tri_positions(t)).collect();
+            let end = if opening.centre.z < 15.0 { -0.1 } else { 30.1 };
+            let off = rim.iter().map(|p| (p.z - end).abs()).fold(0.0, f64::max);
+            assert!(!rim.is_empty() && off < 1e-6, "{side:?}: the rim of the opening at z {:.1} lies at its end ({off:.2e} off)", opening.centre.z);
+        }
         // The kept surface is the input, untouched.
         if side != ThickenSide::Centered {
             let (lo, hi) = radii(m, |g| g < res.wall_group);

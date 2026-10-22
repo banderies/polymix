@@ -74,7 +74,9 @@ fn vessel_to_cfd_pipeline() {
     let caps: Vec<i32> = ends.iter().filter_map(|e| if let EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
     assert_eq!(caps.len(), 3, "three flat caps after trimming: {ends:?}");
 
-    // 3. Flow extension on each cap (remove cap, extrude 3 diameters, re-cap with same group).
+    // 3. Flow extension on each cap (remove cap, extrude 3 diameters, re-cap with same group;
+    // the extension's wall keeps a group of its own, as the tool does).
+    let mut extension_walls = Vec::new();
     for e in ends.iter().filter(|e| matches!(e.kind, EndKind::Cap(_))) {
         let EndKind::Cap(g) = e.kind else { unreachable!() };
         let tris: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_group(t) == g).collect();
@@ -94,9 +96,14 @@ fn vessel_to_cfd_pipeline() {
         for &t in &r.cap_triangles {
             m.set_tri_group(t, g);
         }
-        for &t in &r.wall_triangles {
-            m.set_tri_group(t, 0);
+        let mut wall = r.wall_group;
+        if wall == g {
+            wall = m.max_group_id() + 1;
+            for &t in &r.wall_triangles {
+                m.set_tri_group(t, wall);
+            }
         }
+        extension_walls.push(wall);
         assert!(r.direction.dot(e.normal) > 0.9, "extension points outward");
         m.check_validity().unwrap();
         assert!(m.is_closed());
@@ -110,19 +117,22 @@ fn vessel_to_cfd_pipeline() {
     assert!(m.is_consistently_oriented());
     assert!(mm_core::measure::volume(&m) > 0.0);
 
-    // 5. Patches: wall + 3 caps, exported as a multi-solid STL.
+    // 5. Patches: wall + 3 extension walls + 3 caps, exported as a multi-solid STL.
     let mut obj = SceneObject::new(1, "vessel", m);
     let stats = crate::tools::patches::group_stats(&obj.mesh);
-    assert_eq!(stats.len(), 4, "wall + 3 caps: {stats:?}");
+    assert_eq!(stats.len(), 7, "wall + 3 extension walls + 3 caps: {stats:?}");
     obj.group_names.insert(0, "wall".into());
+    for (k, g) in extension_walls.iter().enumerate() {
+        obj.group_names.insert(*g, format!("extension_{}", k + 1));
+    }
     let dir = std::env::temp_dir().join(format!("polymix_pipeline_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("vessel_patches.stl");
     let n = crate::tools::patches::write_multisolid_stl(&path, &obj).unwrap();
-    assert_eq!(n, 4);
+    assert_eq!(n, 7);
     let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(text.matches("endsolid").count(), 4);
-    assert!(text.contains("solid wall"));
+    assert_eq!(text.matches("endsolid").count(), 7);
+    assert!(text.contains("solid wall") && text.contains("solid extension_3"));
     // Plain STL round trip stays closed.
     let stl = dir.join("vessel.stl");
     mm_io::write_mesh(&stl, &obj.mesh, &mm_io::WriteOptions::default()).unwrap();

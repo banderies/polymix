@@ -82,9 +82,10 @@ pub struct ThickenResult {
     /// The shell: closed, the input surface (when kept) one side of its wall.
     pub mesh: Mesh,
     pub openings: Vec<Opening>,
-    /// Face groups of the new wall and of the rims (the kept surface keeps its groups).
+    /// Face group of the new wall (the kept surface keeps its groups).
     pub wall_group: i32,
-    pub rim_group: i32,
+    /// Face group of each opening's rim, in the order of `openings`.
+    pub rim_groups: Vec<i32>,
     /// The wall's thickness, measured from the new wall's vertices to the other side: least,
     /// mean and most.
     pub measured: [f64; 3],
@@ -151,7 +152,8 @@ pub struct ThickenShell {
     /// The shell: closed, the input surface (when kept) one side of its wall.
     pub mesh: Mesh,
     pub openings: Vec<Opening>,
-    /// Face groups of the new wall and of the rims.
+    /// Face groups of the new wall and of the rims (all of them, until the result gives each
+    /// its own).
     pub wall_group: i32,
     pub rim_group: i32,
     /// The wall's thickness: least, mean and most (see [`ThickenResult::measured`]).
@@ -170,8 +172,9 @@ impl ThickenShell {
     /// The shell as a finished result without the remesh (what [`thicken`] gives with
     /// `remesh` off).
     pub fn into_result(self) -> ThickenResult {
-        let ThickenShell { mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt, .. } = self;
-        ThickenResult { mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt }
+        let ThickenShell { mut mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt, .. } = self;
+        let rim_groups = split_rims(&mut mesh, rim_group, &openings);
+        ThickenResult { mesh, openings, wall_group, rim_groups, measured, cell_size, rebuilt }
     }
 }
 
@@ -427,7 +430,58 @@ fn finish(shell: ThickenShell, remesh: bool, report: &dyn Fn(f32) -> bool) -> Ed
         }
     }
     report(1.0);
-    Ok(ThickenResult { mesh: out, openings, wall_group, rim_group, measured, cell_size, rebuilt })
+    let rim_groups = split_rims(&mut out, rim_group, &openings);
+    Ok(ThickenResult { mesh: out, openings, wall_group, rim_groups, measured, cell_size, rebuilt })
+}
+
+/// Give each opening's rim a face group of its own (a patch each, like the caps of a vessel's
+/// ends): the first keeps `rim_group`, the others get new ones. Returns them in the order of
+/// `openings`.
+fn split_rims(mesh: &mut Mesh, rim_group: i32, openings: &[Opening]) -> Vec<i32> {
+    if openings.is_empty() {
+        return Vec::new();
+    }
+    // The rims, each a band of connected rim triangles, with the opening nearest its centre.
+    let mut seen = vec![false; mesh.max_tid()];
+    let mut rims: Vec<(usize, Vec<u32>)> = Vec::new();
+    for start in mesh.triangle_ids() {
+        if mesh.tri_group(start) != rim_group || seen[start as usize] {
+            continue;
+        }
+        seen[start as usize] = true;
+        let mut part = vec![start];
+        let mut i = 0;
+        while i < part.len() {
+            for n in mesh.tri_neighbors(part[i]) {
+                if n != mm_core::INVALID && !seen[n as usize] && mesh.tri_group(n) == rim_group {
+                    seen[n as usize] = true;
+                    part.push(n);
+                }
+            }
+            i += 1;
+        }
+        let centre = part.iter().map(|&t| mesh.tri_centroid(t)).sum::<DVec3>() / part.len() as f64;
+        let nearest = (0..openings.len()).min_by(|&a, &b| openings[a].centre.distance(centre).total_cmp(&openings[b].centre.distance(centre))).unwrap();
+        rims.push((nearest, part));
+    }
+    rims.sort_by_key(|r| r.0);
+    let mut groups: Vec<Option<i32>> = vec![None; openings.len()];
+    let mut next = mesh.max_group_id().max(rim_group) + 1;
+    let mut first = true;
+    for (i, part) in rims {
+        let g = *groups[i].get_or_insert_with(|| {
+            if std::mem::take(&mut first) {
+                rim_group
+            } else {
+                next += 1;
+                next - 1
+            }
+        });
+        for t in part {
+            mesh.set_tri_group(t, g);
+        }
+    }
+    groups.into_iter().map(|g| g.unwrap_or(rim_group)).collect()
 }
 
 /// The booleans of step 3, with what they share.
@@ -711,7 +765,7 @@ mod tests {
             && x.triangle_ids().all(|t| x.triangle(t) == y.triangle(t) && x.tri_group(t) == y.tri_group(t))
             && a.measured.map(f64::to_bits) == b.measured.map(f64::to_bits)
             && a.openings == b.openings
-            && (a.wall_group, a.rim_group, a.cell_size.to_bits(), a.rebuilt) == (b.wall_group, b.rim_group, b.cell_size.to_bits(), b.rebuilt)
+            && (a.wall_group, &a.rim_groups, a.cell_size.to_bits(), a.rebuilt) == (b.wall_group, &b.rim_groups, b.cell_size.to_bits(), b.rebuilt)
     }
 
     fn tube(x: f64, r: f64) -> Mesh {

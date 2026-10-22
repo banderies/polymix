@@ -303,7 +303,7 @@ impl Tool for PatchesTool {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
         };
-        ui.small("Each face group becomes a named boundary patch. Caps made by Trim / Cap / Flow extension get their own groups automatically. Turn on View > Face group colors to see them.");
+        ui.small("Each face group becomes a named boundary patch. Caps made by Trim / Cap / Flow extension, and flow extension walls (extension_N), get their own groups automatically. Turn on View > Face group colors to see them.");
         let stats = self.stats.get(&cx.scene.get(id).unwrap().mesh);
         let mut select_group = None;
         let mut renames: Vec<(i32, String)> = Vec::new();

@@ -358,7 +358,12 @@ pub fn hair_mesh(curves: &[Vec<DVec3>], base_radius: f64, tip_radius: f64, slice
     let mut m = Mesh::new();
     let tip = tip_radius.max(base_radius * 0.05).max(1e-9);
     for c in curves.iter().filter(|c| c.len() >= 2) {
-        m.append_mesh(&tube_mesh(c, base_radius.max(1e-9), tip, slices), 0);
+        // A strand is one group, its ends included.
+        let mut strand = tube_mesh(c, base_radius.max(1e-9), tip, slices);
+        for t in strand.triangle_ids().collect::<Vec<_>>() {
+            strand.set_tri_group(t, 0);
+        }
+        m.append_mesh(&strand, 0);
     }
     m
 }

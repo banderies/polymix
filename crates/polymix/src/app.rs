@@ -912,6 +912,7 @@ impl MeshWorkspace {
             app.prefs.obj_import_groups = flag("obj_import_groups", true);
             app.prefs.flip_zy = flag("flip_zy", true);
             app.prefs.autosave_minutes = st.get_string("autosave_minutes").and_then(|v| v.parse().ok()).unwrap_or(5);
+            crate::tools::ops::FILL_NEW_GROUPS.store(flag("fill_new_groups", false), std::sync::atomic::Ordering::Relaxed);
             app.prefs.import_mode = match st.get_string("import_mode").as_deref() {
                 Some("append") => ImportMode::Append,
                 Some("replace") => ImportMode::Replace,
@@ -4033,6 +4034,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         st.set_string("obj_import_groups", b(self.prefs.obj_import_groups));
         st.set_string("flip_zy", b(self.prefs.flip_zy));
         st.set_string("autosave_minutes", self.prefs.autosave_minutes.to_string());
+        st.set_string("fill_new_groups", b(crate::tools::ops::FILL_NEW_GROUPS.load(std::sync::atomic::Ordering::Relaxed)));
         st.set_string(
             "import_mode",
             match self.prefs.import_mode {

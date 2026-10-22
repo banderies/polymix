@@ -45,6 +45,12 @@ fn flow_extension_on_cut_tube() {
     for &t in &r.cap_triangles {
         assert!(m.tri_normal(t).dot(DVec3::Z) > 0.999);
     }
+    // The wall and the cap (the outlet) are face groups of their own, new to the mesh.
+    let cap_group = r.cap_group.expect("capped");
+    assert!(r.wall_group != cap_group && r.wall_group > 0 && cap_group > 0);
+    assert!(r.wall_triangles.iter().all(|&t| m.tri_group(t) == r.wall_group));
+    assert!(r.cap_triangles.iter().all(|&t| m.tri_group(t) == cap_group));
+    assert_eq!(m.triangle_ids().filter(|&t| m.tri_group(t) == r.wall_group).count(), r.wall_triangles.len());
     // Close the other end and check the volume of the extended cylinder.
     let other: Vec<Vec<u32>> = boundary_loops(&m).into_iter().map(|l| l.vertices).collect();
     cap_planar_loops(&mut m, &other, None, CutFill::Flat).unwrap();

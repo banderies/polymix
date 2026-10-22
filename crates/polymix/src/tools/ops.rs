@@ -2271,6 +2271,21 @@ pub struct EraseFillUi {
     pub loft: LoftUi,
 }
 
+/// Erase & Fill's "Create new groups" as last set in its panel: the next fill starts with it,
+/// and the app keeps it with its preferences.
+pub static FILL_NEW_GROUPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The "Create new groups" checkbox of Erase & Fill (fills and Loft alike), remembered for the
+/// next fill.
+fn new_groups_ui(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let hint = "On: the patch becomes a face group of its own (its own patch, e.g. for CFD). Off: it joins the surrounding group. Kept for the next fill.";
+    let r = ui.checkbox(on, "Create new groups").on_hover_text(hint);
+    if r.changed() {
+        FILL_NEW_GROUPS.store(*on, std::sync::atomic::Ordering::Relaxed);
+    }
+    r
+}
+
 /// Whether `sel` is the edge rings of two holes: two separate parts, each touching an open
 /// edge of the mesh (what double-clicking an open edge selects).
 fn is_two_hole_rings(mesh: &Mesh, sel: &[u32]) -> bool {
@@ -2335,7 +2350,7 @@ impl OpSpec for EraseFillSpec {
             smooth: 100.0,
             scale: 1.0,
             bulge: 0.0,
-            create_new_groups: false,
+            create_new_groups: FILL_NEW_GROUPS.load(std::sync::atomic::Ordering::Relaxed),
             project_to_target: false,
             loft: LoftUi::default(),
         }
@@ -2348,7 +2363,7 @@ impl OpSpec for EraseFillSpec {
         });
         if p.kind == FillKind::Loft {
             p.loft.ui(ui, &mut p.refine, &mut p.bulge);
-            ui.checkbox(&mut p.create_new_groups, "Create new groups");
+            new_groups_ui(ui, &mut p.create_new_groups);
             ui.small("Deletes the selection and joins the two openings it leaves with a tube.");
             if info.selection.is_none() {
                 ui.colored_label(egui::Color32::from_rgb(240, 170, 90), "Select the edge rings of two holes first (double-click an open edge).");
@@ -2360,7 +2375,7 @@ impl OpSpec for EraseFillSpec {
         ui.add_enabled(p.kind == FillKind::SmoothMvc, egui::Slider::new(&mut p.smooth, 0.0..=100.0).text("Smooth"));
         ui.add_enabled(patch, egui::Slider::new(&mut p.scale, 0.0..=4.0).text("Scale"));
         ui.add_enabled(patch, egui::Slider::new(&mut p.bulge, -100.0..=100.0).text("Bulge"));
-        ui.checkbox(&mut p.create_new_groups, "Create new groups");
+        new_groups_ui(ui, &mut p.create_new_groups);
         project_to_target_ui(ui, &mut p.project_to_target, info);
         ui.small("Deletes the selection and fills the opening so it blends into the surrounding surface.");
         if info.selection.is_none() {
@@ -3481,6 +3496,31 @@ mod tests {
         let patch = grouped.selection.unwrap();
         let g = grouped.mesh.tri_group(patch[0]);
         assert!(g != 0 && patch.iter().all(|&t| grouped.mesh.tri_group(t) == g));
+    }
+
+    #[test]
+    fn erase_fill_remembers_create_new_groups() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = mm_core::primitives::icosphere(1.0, 2);
+        let info = OpInfo::new(&m, None);
+        let ctx = egui::Context::default();
+        let mut on = EraseFillSpec::defaults(&info).create_new_groups;
+        let frame = |events: Vec<egui::Event>, on: &mut bool| {
+            let mut rect = egui::Rect::NOTHING;
+            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| rect = new_groups_ui(ui, on).rect);
+            rect
+        };
+        // Clicking the checkbox turns it on, and the next fill starts with it on; again, off.
+        for want in [!on, on] {
+            let at = frame(Vec::new(), &mut on).center();
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
+                frame(events, &mut on);
+            }
+            assert_eq!(on, want);
+            assert_eq!(FILL_NEW_GROUPS.load(Relaxed), want);
+            assert_eq!(EraseFillSpec::defaults(&info).create_new_groups, want);
+        }
     }
 
     #[test]

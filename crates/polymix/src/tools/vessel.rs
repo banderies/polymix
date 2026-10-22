@@ -553,6 +553,10 @@ struct FlowOut {
     mesh: Mesh,
     /// Cap groups created for previously open ends (to be named outlet_N).
     new_caps: Vec<i32>,
+    /// Wall groups of the extensions (to be named extension_N).
+    new_walls: Vec<i32>,
+    /// Groups of caps removed and not replaced ("Cap the ends" off): their names go.
+    removed: Vec<i32>,
     msg: String,
 }
 
@@ -661,7 +665,7 @@ impl FlowExtensionTool {
             crate::jobs::Job::spawn("Flow extensions", cx.egui.clone(), move |progress| {
                 let mut m = (*src).clone();
                 let n = ends.len();
-                let mut new_caps = Vec::new();
+                let (mut new_caps, mut new_walls, mut removed) = (Vec::new(), Vec::new(), Vec::new());
                 for (k, e) in ends.iter().enumerate() {
                     if !progress(k as f32 / n as f32) {
                         anyhow::bail!("cancelled");
@@ -695,9 +699,6 @@ impl FlowExtensionTool {
                         ..Default::default()
                     };
                     let r = mm_edit::extrude_boundary_loop(&mut m, &lp, &params)?;
-                    for &t in &r.wall_triangles {
-                        m.set_tri_group(t, 0);
-                    }
                     match (keep_group, r.cap_group) {
                         (Some(g), Some(_)) => {
                             for &t in &r.cap_triangles {
@@ -705,11 +706,22 @@ impl FlowExtensionTool {
                             }
                         }
                         (None, Some(g)) => new_caps.push(g),
-                        _ => {}
+                        (Some(g), None) => removed.push(g),
+                        (None, None) => {}
                     }
+                    // The wall keeps a group of its own (its own patch, apart from the vessel
+                    // wall). Its id was free when built, so it can be the removed cap's.
+                    let mut wall = r.wall_group;
+                    if keep_group == Some(wall) {
+                        wall = m.max_group_id() + 1;
+                        for &t in &r.wall_triangles {
+                            m.set_tri_group(t, wall);
+                        }
+                    }
+                    new_walls.push(wall);
                 }
                 m.bump_shape_version();
-                Ok(FlowOut { source, mesh: m, new_caps, msg: format!("extended {n} end(s)") })
+                Ok(FlowOut { source, mesh: m, new_caps, new_walls, removed, msg: format!("extended {n} end(s)") })
             }),
         ));
     }
@@ -836,8 +848,15 @@ impl Tool for FlowExtensionTool {
         cx.history.push("Flow extensions", cx.scene);
         let Some(o) = cx.scene.get_mut(id) else { return true };
         o.set_mesh(out.mesh);
+        for g in out.removed {
+            o.group_names.remove(&g);
+        }
         for g in out.new_caps {
             let n = next_name(&o.group_names, "outlet");
+            o.group_names.insert(g, n);
+        }
+        for g in out.new_walls {
+            let n = next_name(&o.group_names, "extension");
             o.group_names.insert(g, n);
         }
         *cx.status = format!("Flow extensions: {}", out.msg);
@@ -1502,6 +1521,57 @@ mod tests {
         tool.params.selected = vec![false; 2];
         tool.update(&mut cx);
         assert!(tool.job.is_none() && tool.preview.is_none() && !tool.pending());
+    }
+
+    #[test]
+    fn flow_extension_walls_get_named_groups_of_their_own() {
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let (mut camera, mut status) = (crate::camera::Camera::default(), String::new());
+        // Extend both ends of a capped vessel, capping the extensions (`cap`) or not.
+        let extend = |cap: bool, camera: &mut crate::camera::Camera, status: &mut String| {
+            let (mut scene, mut history) = (vessel_scene(), crate::scene::History::default());
+            let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera, status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+            CapTool::new(&mut cx).act("cap_all", &json!({}), &mut cx).unwrap();
+            let caps = cx.scene.active().unwrap().group_names.clone();
+            let mut tool = FlowExtensionTool::new(&mut cx);
+            assert!(tool.ends.iter().all(|e| matches!(e.kind, EndKind::Cap(_))));
+            tool.params.selected = vec![true; tool.ends.len()];
+            tool.params.cap = cap;
+            tool.start(&mut cx);
+            let t0 = Instant::now();
+            while tool.preview.is_none() && t0.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(5));
+                tool.update(&mut cx);
+            }
+            assert!(tool.accept(&mut cx), "{:?}", tool.error);
+            let o = cx.scene.active().unwrap();
+            (caps, o.group_names.clone(), crate::tools::patches::group_stats(&o.mesh).keys().copied().collect::<Vec<i32>>(), find_vessel_ends(&o.mesh))
+        };
+        let (caps, names, groups, ends) = extend(true, &mut camera, &mut status);
+        assert_eq!(caps.len(), 2);
+        // The vessel wall, two extension walls and the two caps, which keep their groups and names.
+        assert_eq!(groups.len(), 5, "{groups:?}");
+        for (g, n) in &caps {
+            assert_eq!(names.get(g), Some(n));
+        }
+        let walls: Vec<i32> = groups.iter().copied().filter(|g| *g != 0 && !caps.contains_key(g)).collect();
+        let mut wall_names: Vec<&str> = walls.iter().map(|g| names[g].as_str()).collect();
+        wall_names.sort();
+        assert_eq!(wall_names, ["extension_1", "extension_2"]);
+        // Only the caps are taken for ends: the extension walls are tubes, not flat.
+        let mut cap_ends: Vec<i32> = ends.iter().filter_map(|e| if let EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
+        cap_ends.sort();
+        let mut cap_groups: Vec<i32> = caps.keys().copied().collect();
+        cap_groups.sort();
+        assert_eq!(cap_ends, cap_groups);
+        // Not capped: the old caps' names go with their triangles, and no wall takes them over.
+        let (caps, names, groups, _) = extend(false, &mut camera, &mut status);
+        assert!(caps.keys().all(|g| !names.contains_key(g) && !groups.contains(g)), "{names:?} {groups:?}");
+        assert_eq!(groups.len(), 3, "{groups:?}");
+        let mut named: Vec<&str> = names.iter().filter(|(g, _)| **g != 0).map(|(_, n)| n.as_str()).collect();
+        named.sort();
+        assert_eq!(named, ["extension_1", "extension_2"]);
     }
 
     #[test]

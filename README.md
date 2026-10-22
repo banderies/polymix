@@ -174,7 +174,8 @@ cargo run -p polymix --example gen_test_meshes --release -- test_meshes
    `outlet_N`. **Plane Cut** is available for general cuts (drag a line; Shift+click a vessel to
    cut it square; the red half is removed).
 6. **Vessel → Flow extensions**: extrude straight, optionally circular extensions (length in
-   diameters) from the selected ends; caps keep their patch names.
+   diameters) from the selected ends; caps keep their patch names, and each extension's wall
+   becomes a patch of its own (`extension_N`), apart from the vessel wall.
 7. **Edit → Remesh** (`R`) for uniform, well-shaped triangles. **Make Solid** rebuilds a
    guaranteed closed, manifold, non-self-intersecting surface when the input is messy.
 8. **Vessel → Check for CFD**: watertight, manifold, single shell, outward orientation,
