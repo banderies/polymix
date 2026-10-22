@@ -85,71 +85,98 @@ fn tri_color(m: &Mesh, t: u32) -> DVec3 {
 struct ExpandSession {
     object: ObjectId,
     original: TriSelection,
-    /// Per triangle: surface distance (across faces) from the selection border, with
-    /// creases as barriers.
-    dist: Vec<f32>,
+    /// Per triangle: surface distance (across faces) from the selection border, with creases
+    /// as barriers, where the search has reached so far (infinite elsewhere).
+    dist: Vec<f64>,
+    /// The search outward (growing) and inward (shrinking). Each goes only as far as the
+    /// drag has: searching the whole mesh at the press took long enough on big meshes to
+    /// stall the start of the drag.
+    grow: Front,
+    shrink: Front,
     /// World length per screen point at the press position.
     scale: f64,
     mode: ExpandMode,
     crease_cos: Option<f64>,
 }
 
+/// Dijkstra over the face graph on one side of the selection border, continued on demand.
+#[derive(Default)]
+struct Front {
+    heap: std::collections::BinaryHeap<FrontItem>,
+    /// Triangles whose distance is final, nearest first.
+    settled: Vec<(f64, u32)>,
+}
+
+/// A triangle and its tentative distance; the heap pops the nearest first.
+#[derive(PartialEq)]
+struct FrontItem(f64, u32);
+
+impl Eq for FrontItem {}
+
+impl PartialOrd for FrontItem {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for FrontItem {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.0.total_cmp(&self.0)
+    }
+}
+
 impl ExpandSession {
     fn new(mesh: &Mesh, object: ObjectId, original: TriSelection, scale: f64, mode: ExpandMode, crease_cos: Option<f64>) -> Self {
-        use std::collections::BinaryHeap;
-        #[derive(PartialEq)]
-        struct Item(f64, u32);
-        impl Eq for Item {}
-        impl PartialOrd for Item {
-            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-        impl Ord for Item {
-            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-                o.0.total_cmp(&self.0)
-            }
-        }
-        // Dijkstra over the face graph from both sides of the border.
+        // Both searches start at the border: each pair of faces across it, half the distance
+        // between their centres from it.
         let mut dist = vec![f64::INFINITY; mesh.max_tid()];
-        let mut heap = BinaryHeap::new();
+        let (mut grow, mut shrink) = (Front::default(), Front::default());
         for t in original.iter() {
             for n in mesh.tri_neighbors(t) {
                 if n == mm_core::INVALID || original.contains(n) || mm_core::selection::is_crease(mesh, t, n, crease_cos) {
                     continue;
                 }
                 let half = 0.5 * mesh.tri_centroid(t).distance(mesh.tri_centroid(n));
-                for x in [t, n] {
+                for (x, front) in [(t, &mut shrink), (n, &mut grow)] {
                     if half < dist[x as usize] {
                         dist[x as usize] = half;
-                        heap.push(Item(half, x));
+                        front.heap.push(FrontItem(half, x));
                     }
                 }
             }
         }
-        while let Some(Item(d, t)) = heap.pop() {
+        Self { object, original, dist, grow, shrink, scale, mode, crease_cos }
+    }
+
+    /// Triangles on one side of the border (`inside`: within the selection) whose distance
+    /// from it is at most `reach`, nearest first, searching further if needed.
+    fn within(&mut self, mesh: &Mesh, inside: bool, reach: f64) -> impl Iterator<Item = u32> + '_ {
+        let Self { dist, original, crease_cos, grow, shrink, .. } = self;
+        let front = if inside { shrink } else { grow };
+        while front.heap.peek().is_some_and(|i| i.0 <= reach) {
+            let FrontItem(d, t) = front.heap.pop().unwrap();
             if d > dist[t as usize] {
                 continue;
             }
-            let side = original.contains(t);
+            front.settled.push((d, t));
             let c = mesh.tri_centroid(t);
             for n in mesh.tri_neighbors(t) {
                 // Stay on this side of the border; creases are barriers.
-                if n == mm_core::INVALID || original.contains(n) != side || mm_core::selection::is_crease(mesh, t, n, crease_cos) {
+                if n == mm_core::INVALID || original.contains(n) != inside || mm_core::selection::is_crease(mesh, t, n, *crease_cos) {
                     continue;
                 }
                 let nd = d + c.distance(mesh.tri_centroid(n));
                 if nd < dist[n as usize] {
                     dist[n as usize] = nd;
-                    heap.push(Item(nd, n));
+                    front.heap.push(FrontItem(nd, n));
                 }
             }
         }
-        Self { object, original, dist: dist.into_iter().map(|d| d as f32).collect(), scale, mode, crease_cos }
+        front.settled.iter().take_while(move |s| s.0 <= reach).map(|s| s.1)
     }
 
     /// Selection for a signed drag of `d` world units (positive grows).
-    fn apply(&self, mesh: &Mesh, d: f64, out: &mut TriSelection) {
+    fn apply(&mut self, mesh: &Mesh, d: f64, out: &mut TriSelection) {
         *out = self.original.clone();
         if d > 0.0 && self.mode == ExpandMode::VertexColor && mesh.has_vertex_colors() {
             let n = self.original.len().max(1) as f64;
@@ -181,12 +208,12 @@ impl ExpandSession {
             }
             return;
         }
-        let d = d as f32;
-        for t in mesh.triangle_ids() {
-            let within = self.dist[t as usize] <= d.abs();
-            if d > 0.0 && within {
+        if d > 0.0 {
+            for t in self.within(mesh, false, d) {
                 out.insert(t);
-            } else if d < 0.0 && within {
+            }
+        } else if d < 0.0 {
+            for t in self.within(mesh, true, -d) {
                 out.remove(t);
             }
         }
@@ -992,7 +1019,7 @@ impl Tool for SelectTool {
                 self.expand = Some(ExpandSession::new(&mesh, id, o.selection.clone(), scale, self.expand_mode, self.crease_cos()));
             }
             DragPhase::Move | DragPhase::End => {
-                let Some(session) = &self.expand else { return };
+                let Some(session) = &mut self.expand else { return };
                 let Some(o) = cx.scene.get_mut(session.object) else {
                     self.expand = None;
                     return;
@@ -1313,7 +1340,7 @@ mod tests {
             }
         }
         let n0 = sel.len();
-        let session = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::Geodesic, None);
+        let mut session = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::Geodesic, None);
         let mut out = TriSelection::new(&m);
         session.apply(&m, 0.0, &mut out);
         assert_eq!(out.len(), n0);
@@ -1329,6 +1356,85 @@ mod tests {
         assert!(out.iter().all(|t| sel.contains(t)), "shrinking only removes");
     }
 
+    /// Surface distance of every triangle from the selection border, searched over the whole
+    /// mesh at once (what the press used to do).
+    fn full_border_distances(m: &Mesh, sel: &TriSelection, crease_cos: Option<f64>) -> Vec<f64> {
+        let mut dist = vec![f64::INFINITY; m.max_tid()];
+        let mut heap = std::collections::BinaryHeap::new();
+        for t in sel.iter() {
+            for n in m.tri_neighbors(t) {
+                if n == mm_core::INVALID || sel.contains(n) || mm_core::selection::is_crease(m, t, n, crease_cos) {
+                    continue;
+                }
+                let half = 0.5 * m.tri_centroid(t).distance(m.tri_centroid(n));
+                for x in [t, n] {
+                    if half < dist[x as usize] {
+                        dist[x as usize] = half;
+                        heap.push(FrontItem(half, x));
+                    }
+                }
+            }
+        }
+        while let Some(FrontItem(d, t)) = heap.pop() {
+            if d > dist[t as usize] {
+                continue;
+            }
+            for n in m.tri_neighbors(t) {
+                if n == mm_core::INVALID || sel.contains(n) != sel.contains(t) || mm_core::selection::is_crease(m, t, n, crease_cos) {
+                    continue;
+                }
+                let nd = d + m.tri_centroid(t).distance(m.tri_centroid(n));
+                if nd < dist[n as usize] {
+                    dist[n as usize] = nd;
+                    heap.push(FrontItem(nd, n));
+                }
+            }
+        }
+        dist
+    }
+
+    #[test]
+    fn expand_searches_only_as_far_as_the_drag_and_matches_a_full_search() {
+        // A bumpy sphere with a crease limit, so both sides and the barriers are exercised.
+        let mut m = primitives::icosphere(1.0, 4);
+        for v in m.vertex_ids().collect::<Vec<_>>() {
+            let p = m.vertex(v);
+            m.set_vertex(v, p * (1.0 + 0.15 * (5.0 * p.x).sin() * (4.0 * p.y).cos()));
+        }
+        let mut sel = TriSelection::new(&m);
+        for t in m.triangle_ids() {
+            if m.tri_centroid(t).z > 0.3 {
+                sel.insert(t);
+            }
+        }
+        let crease_cos = Some(35f64.to_radians().cos());
+        let full = full_border_distances(&m, &sel, crease_cos);
+        let mut session = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::Geodesic, crease_cos);
+        assert!(session.grow.settled.is_empty() && session.shrink.settled.is_empty(), "the press searches nothing");
+        let mut out = TriSelection::new(&m);
+        session.apply(&m, 0.05, &mut out);
+        let outside = m.triangle_count() - sel.len();
+        assert!(session.grow.settled.len() * 4 < outside && session.shrink.settled.is_empty(), "a short drag searches a little of one side");
+        // Out and back, both ways: always what the full search selects.
+        for d in [0.05, 0.3, 0.1, -0.2, 0.6, -0.05, -0.9, 1.5, 0.0, -3.0, 4.0] {
+            session.apply(&m, d, &mut out);
+            let want: Vec<u32> = m
+                .triangle_ids()
+                .filter(|&t| {
+                    let reached = full[t as usize] <= d.abs();
+                    if d > 0.0 {
+                        sel.contains(t) || reached
+                    } else {
+                        sel.contains(t) && !(d < 0.0 && reached)
+                    }
+                })
+                .collect();
+            let mut got: Vec<u32> = out.iter().collect();
+            got.sort_unstable();
+            assert_eq!(got, want, "drag {d}");
+        }
+    }
+
     #[test]
     fn crease_angle_expand_and_barriers() {
         let m = primitives::cube(2.0, 6);
@@ -1337,14 +1443,14 @@ mod tests {
         sel.insert(top[0]);
         let mut out = TriSelection::new(&m);
         // Crease Angle mode: a short drag (10°) fills the flat top face only…
-        let crease = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::CreaseAngle, None);
+        let mut crease = ExpandSession::new(&m, 0, sel.clone(), 1.0, ExpandMode::CreaseAngle, None);
         crease.apply(&m, 25.0, &mut out);
         assert_eq!(out.len(), top.len());
         // …a long one (100°) crosses the 90° edges.
         crease.apply(&m, 250.0, &mut out);
         assert_eq!(out.len(), m.triangle_count());
         // Geodesic growth with a 30° crease limit stays on the top face however far it grows.
-        let limited = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::Geodesic, Some(30f64.to_radians().cos()));
+        let mut limited = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::Geodesic, Some(30f64.to_radians().cos()));
         limited.apply(&m, 100.0, &mut out);
         assert_eq!(out.len(), top.len());
     }
@@ -1360,7 +1466,7 @@ mod tests {
         let seed = m.triangle_ids().find(|&t| m.tri_centroid(t).x < -3.0).unwrap();
         let mut sel = TriSelection::new(&m);
         sel.insert(seed);
-        let session = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::VertexColor, None);
+        let mut session = ExpandSession::new(&m, 0, sel, 1.0, ExpandMode::VertexColor, None);
         let mut out = TriSelection::new(&m);
         // A small tolerance fills the red half (triangles straddling x = 0 are mixed).
         session.apply(&m, 20.0, &mut out);
