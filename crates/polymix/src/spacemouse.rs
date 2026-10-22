@@ -13,10 +13,22 @@ use std::time::{Duration, Instant};
 
 /// Cap deflection that counts as "full" (SpaceMouse axes report roughly ±350).
 const FULL_SCALE: f32 = 350.0;
+/// Largest deflection used, in full deflections. 3Dconnexion's own sensitivity setting scales
+/// what the driver reports, so a cap near 1 (it was 1.5) would undo its higher settings; this
+/// one only guards against glitches.
+const MAX_DEFLECTION: f32 = 6.0;
 /// Axis values below this are treated as rest.
 const DEAD_ZONE: i16 = 4;
 /// A cap that stopped reporting for this long is treated as released (missed final event).
 const STALE: Duration = Duration::from_millis(400);
+
+/// Rates at full deflection and speed 1: orbit in radians per second (about 143°/s), pan in
+/// viewport heights per second, zoom in e-folds per second (about 7.4× closer per second).
+pub const ORBIT_RATE: f64 = 2.5;
+pub const PAN_RATE: f64 = 1.0;
+pub const ZOOM_RATE: f64 = 2.0;
+/// Range of the orbit, pan and zoom speed sliders.
+pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=10.0;
 
 /// Cap state in the *view* frame: translation (x right, y up, z toward the viewer) and
 /// rotation about those axes, about -1..1 at full deflection.
@@ -36,11 +48,10 @@ impl Motion {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub enabled: bool,
-    /// Overall speed multiplier.
-    pub speed: f32,
+    /// Speed multipliers (within [`SPEED_RANGE`]) for orbiting, panning and zooming.
+    pub orbit_speed: f32,
     pub pan_speed: f32,
     pub zoom_speed: f32,
-    pub rotate_speed: f32,
     /// Invert pan X, pan Y, zoom, tilt, spin, roll.
     pub invert: [bool; 6],
     pub lock_rotation: bool,
@@ -49,40 +60,52 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, speed: 1.0, pan_speed: 1.0, zoom_speed: 1.0, rotate_speed: 1.0, invert: [false; 6], lock_rotation: false, lock_translation: false }
+        Self { enabled: true, orbit_speed: 1.0, pan_speed: 1.0, zoom_speed: 1.0, invert: [false; 6], lock_rotation: false, lock_translation: false }
     }
 }
 
 impl Settings {
     pub const AXIS_NAMES: [&'static str; 6] = ["Pan left/right", "Pan up/down", "Zoom", "Tilt", "Spin", "Roll"];
 
-    /// Compact text form for the preferences store.
+    /// Compact text form for the preferences store: enabled, orbit, pan and zoom speeds,
+    /// inverted axes, locks.
     pub fn to_pref(&self) -> String {
         let inv: String = self.invert.iter().map(|b| if *b { '1' } else { '0' }).collect();
         format!(
-            "{} {} {} {} {} {} {} {}",
-            self.enabled as u8, self.speed, self.pan_speed, self.zoom_speed, self.rotate_speed, inv, self.lock_rotation as u8, self.lock_translation as u8
+            "{} {} {} {} {} {} {}",
+            self.enabled as u8, self.orbit_speed, self.pan_speed, self.zoom_speed, inv, self.lock_rotation as u8, self.lock_translation as u8
         )
     }
 
+    /// Reads [`Self::to_pref`]'s form, and the earlier one with an overall speed in front of
+    /// pan, zoom and rotate speeds (folded into each).
     pub fn from_pref(s: &str) -> Option<Self> {
         let f: Vec<&str> = s.split_whitespace().collect();
-        if f.len() != 8 || f[5].len() != 6 {
+        let num = |i: usize| f[i].parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+        let (orbit, pan, zoom, rest) = match f.len() {
+            7 => (num(1)?, num(2)?, num(3)?, &f[4..]),
+            8 => {
+                let overall = num(1)?;
+                (overall * num(4)?, overall * num(2)?, overall * num(3)?, &f[5..])
+            }
+            _ => return None,
+        };
+        if rest[0].len() != 6 {
             return None;
         }
         let mut invert = [false; 6];
-        for (i, c) in f[5].chars().enumerate() {
+        for (i, c) in rest[0].chars().enumerate() {
             invert[i] = c == '1';
         }
+        let clamp = |v: f32| v.clamp(*SPEED_RANGE.start(), *SPEED_RANGE.end());
         Some(Self {
             enabled: f[0] == "1",
-            speed: f[1].parse().ok()?,
-            pan_speed: f[2].parse().ok()?,
-            zoom_speed: f[3].parse().ok()?,
-            rotate_speed: f[4].parse().ok()?,
+            orbit_speed: clamp(orbit),
+            pan_speed: clamp(pan),
+            zoom_speed: clamp(zoom),
             invert,
-            lock_rotation: f[6] == "1",
-            lock_translation: f[7] == "1",
+            lock_rotation: rest[1] == "1",
+            lock_translation: rest[2] == "1",
         })
     }
 }
@@ -169,7 +192,7 @@ fn on_buttons(buttons: u32) {
 /// (= −device z) negated, about view z (= device y) as is. (Checked on the user's
 /// SpaceMouse, 2026-10-17: the earlier, opposite signs turned the model backwards.)
 pub fn to_view(axis: [i16; 6]) -> Motion {
-    let n = |v: i16| if v.abs() < DEAD_ZONE { 0.0 } else { (v as f32 / FULL_SCALE).clamp(-1.5, 1.5) };
+    let n = |v: i16| if v.abs() < DEAD_ZONE { 0.0 } else { (v as f32 / FULL_SCALE).clamp(-MAX_DEFLECTION, MAX_DEFLECTION) };
     Motion { t: [n(axis[0]), -n(axis[2]), n(axis[1])], r: [n(axis[3]), -n(axis[5]), n(axis[4])] }
 }
 
@@ -244,11 +267,9 @@ pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: 
         return false;
     }
     let sign = |i: usize| if s.invert[i] { -1.0 } else { 1.0 };
-    let k = s.speed as f64 * dt;
     if !s.lock_translation {
-        // Object mode: the model follows the cap. Pan in screen points (one viewport height
-        // per second at full deflection), zoom by e^2 per second.
-        let pan_rate = viewport_h * s.pan_speed as f64 * k;
+        // Object mode: the model follows the cap. Pan in screen points.
+        let pan_rate = viewport_h * PAN_RATE * s.pan_speed as f64 * dt;
         let dx = m.t[0] as f64 * sign(0) * pan_rate;
         let dy = -(m.t[1] as f64) * sign(1) * pan_rate;
         if dx != 0.0 || dy != 0.0 {
@@ -256,12 +277,11 @@ pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: 
         }
         let z = m.t[2] as f64 * sign(2);
         if z != 0.0 {
-            camera.zoom((-2.0 * s.zoom_speed as f64 * k * z).exp());
+            camera.zoom((-ZOOM_RATE * s.zoom_speed as f64 * dt * z).exp());
         }
     }
     if !s.lock_rotation {
-        // About 140°/s at full deflection.
-        let rate = 2.5 * s.rotate_speed as f64 * k;
+        let rate = ORBIT_RATE * s.orbit_speed as f64 * dt;
         camera.rotate_view_about(m.r[0] as f64 * sign(3) * rate, m.r[1] as f64 * sign(4) * rate, m.r[2] as f64 * sign(5) * rate, pivot);
     }
     true
@@ -438,13 +458,60 @@ mod tests {
         assert_eq!(to_view([0, 0, 0, 0, 350, 0]).r, [0.0, 0.0, 1.0]);
         // Dead zone.
         assert!(to_view([2, -3, 1, 0, 3, -2]).is_zero());
+        // The driver's raised sensitivity reports past ±350: kept, up to the glitch guard.
+        assert_eq!(to_view([1050, 0, 0, 0, 0, 0]).t[0], 3.0);
+        assert_eq!(to_view([i16::MAX, 0, 0, 0, 0, 0]).t[0], MAX_DEFLECTION);
     }
 
     #[test]
     fn settings_round_trip() {
-        let s = Settings { enabled: false, speed: 1.5, invert: [true, false, true, false, false, true], lock_rotation: true, ..Default::default() };
+        let s = Settings { enabled: false, orbit_speed: 7.5, pan_speed: 0.25, zoom_speed: 3.0, invert: [true, false, true, false, false, true], lock_rotation: true, ..Default::default() };
         assert_eq!(Settings::from_pref(&s.to_pref()), Some(s));
         assert_eq!(Settings::from_pref("garbage"), None);
+        assert_eq!(Settings::from_pref("1 1 1 1 0000 0 0"), None);
+        // Out of range or not a positive number.
+        assert_eq!(Settings::from_pref("1 50 1 1 000000 0 0").map(|s| s.orbit_speed), Some(10.0));
+        assert_eq!(Settings::from_pref("1 -2 1 1 000000 0 0"), None);
+    }
+
+    #[test]
+    fn earlier_settings_fold_the_overall_speed_in() {
+        // enabled, overall 2, pan 1.5, zoom 0.5, rotate 3, invert, lock rotation, lock pan/zoom
+        let s = Settings::from_pref("1 2 1.5 0.5 3 100001 0 1").unwrap();
+        assert_eq!((s.orbit_speed, s.pan_speed, s.zoom_speed), (6.0, 3.0, 1.0));
+        assert_eq!(s.invert, [true, false, false, false, false, true]);
+        assert!(!s.lock_rotation && s.lock_translation);
+        // The user's saved defaults read back as the defaults.
+        assert_eq!(Settings::from_pref("1 1 1 1 1 000000 0 0"), Some(Settings::default()));
+    }
+
+    #[test]
+    fn each_speed_scales_only_its_own_motion() {
+        let pivot = glam::DVec3::ZERO;
+        let run = |s: &Settings| {
+            let mut c = Camera::default();
+            let (t0, d0, f0) = (c.target, c.distance, c.forward());
+            apply(&mut c, Motion { t: [0.5, 0.0, 0.0], r: [0.0; 3] }, s, 0.01, 800.0, pivot);
+            let pan = c.target.distance(t0);
+            let mut c = Camera::default();
+            apply(&mut c, Motion { t: [0.0, 0.0, 0.5], r: [0.0; 3] }, s, 0.01, 800.0, pivot);
+            let zoom = (d0 / c.distance).ln();
+            let mut c = Camera::default();
+            apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 0.5, 0.0] }, s, 0.01, 800.0, pivot);
+            let orbit = c.forward().angle_between(f0);
+            (orbit, pan, zoom)
+        };
+        let (orbit, pan, zoom) = run(&Settings::default());
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-6 * b.abs().max(1e-12);
+        // Half deflection for 10 ms at speed 1.
+        assert!(close(orbit, ORBIT_RATE * 0.5 * 0.01), "{orbit}");
+        assert!(close(zoom, ZOOM_RATE * 0.5 * 0.01), "{zoom}");
+        let fast_orbit = run(&Settings { orbit_speed: 4.0, ..Default::default() });
+        assert!(close(fast_orbit.0, 4.0 * orbit) && close(fast_orbit.1, pan) && close(fast_orbit.2, zoom), "{fast_orbit:?}");
+        let fast_pan = run(&Settings { pan_speed: 4.0, ..Default::default() });
+        assert!(close(fast_pan.0, orbit) && close(fast_pan.1, 4.0 * pan) && close(fast_pan.2, zoom), "{fast_pan:?}");
+        let fast_zoom = run(&Settings { zoom_speed: 4.0, ..Default::default() });
+        assert!(close(fast_zoom.0, orbit) && close(fast_zoom.1, pan) && close(fast_zoom.2, 4.0 * zoom), "{fast_zoom:?}");
     }
 
     #[test]

@@ -540,6 +540,8 @@ const DEFAULT_CREASE_DEG: f32 = 40.0;
 const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_millis(66);
 /// The object browser's width range (drag its left edge).
 const OBJECTS_WIDTH: (f32, f32) = (170.0, 520.0);
+/// The Preferences window's 3D mouse tab (also `prefs:4` in scripts).
+const PREFS_TAB_3D_MOUSE: usize = 4;
 
 /// Destination of a tool switch.
 #[derive(Clone, Debug)]
@@ -731,10 +733,9 @@ pub struct MeshWorkspace {
     /// Last pointer position seen over the viewport (for releases outside it).
     last_pointer: Option<egui::Pos2>,
     show_help: bool,
-    /// 3D mouse (3Dconnexion) input and its settings window.
+    /// 3D mouse (3Dconnexion) input and its settings (Preferences → 3D mouse).
     space: SpaceMouse,
     space_cfg: spacemouse::Settings,
-    show_space_window: bool,
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
     hotbox: Option<egui::Pos2>,
     show_objects: bool,
@@ -831,7 +832,6 @@ impl MeshWorkspace {
             show_help: false,
             space: SpaceMouse::start(ctx),
             space_cfg: spacemouse::Settings::default(),
-            show_space_window: false,
             hotbox: None,
             show_objects: true,
             objects_folded: false,
@@ -2008,9 +2008,10 @@ impl MeshWorkspace {
                     self.show_prefs = true;
                     self.prefs_tab = 0;
                 }
-                if ui.button("3D mouse…").on_hover_text("3Dconnexion SpaceMouse settings").clicked() {
+                if ui.button("3D mouse…").on_hover_text("3Dconnexion SpaceMouse settings (Preferences → 3D mouse)").clicked() {
                     ui.close();
-                    self.show_space_window = true;
+                    self.show_prefs = true;
+                    self.prefs_tab = PREFS_TAB_3D_MOUSE;
                 }
                 ui.separator();
                 ui.label("Up axis");
@@ -2733,12 +2734,13 @@ impl MeshWorkspace {
         let mut open = true;
         egui::Window::new("Preferences").open(&mut open).resizable(false).collapsible(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for (i, t) in ["General", "View", "File", "Dialogs"].iter().enumerate() {
+                for (i, t) in ["General", "View", "File", "Dialogs", "3D mouse"].iter().enumerate() {
                     ui.selectable_value(&mut self.prefs_tab, i, *t);
                 }
             });
             ui.separator();
             match self.prefs_tab {
+                PREFS_TAB_3D_MOUSE => self.space_settings_ui(ui),
                 0 => {
                     egui::Grid::new("prefs_general").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                         ui.label("Navigation mode");
@@ -3019,66 +3021,73 @@ impl MeshWorkspace {
         }
     }
 
-    fn space_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_space_window;
-        egui::Window::new("3D mouse").open(&mut open).resizable(false).show(ctx, |ui| {
-            match &self.space.status {
-                spacemouse::Status::Ready { device: Some((vendor, product)) } => {
-                    ui.label(format!("Connected · device {vendor:04x}:{product:04x}"));
-                }
-                spacemouse::Status::Ready { device: None } => {
-                    ui.label("3Dconnexion driver ready · no device connected");
-                }
-                spacemouse::Status::DriverMissing => {
-                    ui.label("3Dconnexion driver (3DxWare) not installed.");
-                }
-                spacemouse::Status::Unsupported => {
-                    ui.label("3D mice are not supported on this platform yet.");
-                }
-                spacemouse::Status::Failed(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 90), format!("Could not connect: {e}"));
-                }
+    /// Preferences → 3D mouse: connection, orbit / pan / zoom speeds, locks, inverted axes and
+    /// a live readout of the cap.
+    fn space_settings_ui(&mut self, ui: &mut egui::Ui) {
+        match &self.space.status {
+            spacemouse::Status::Ready { device: Some((vendor, product)) } => {
+                ui.label(format!("Connected · device {vendor:04x}:{product:04x}"));
             }
-            let c = &mut self.space_cfg;
-            ui.checkbox(&mut c.enabled, "Enabled");
-            ui.small("Object mode: move the cap the way you want the model to move.");
-            egui::Grid::new("space_speeds").num_columns(2).show(ui, |ui| {
-                for (label, v) in [("Speed", &mut c.speed), ("Pan", &mut c.pan_speed), ("Zoom", &mut c.zoom_speed), ("Rotate", &mut c.rotate_speed)] {
-                    ui.label(label);
-                    ui.add(egui::Slider::new(v, 0.1..=4.0).logarithmic(true));
-                    ui.end_row();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut c.lock_rotation, "Lock rotation");
-                ui.checkbox(&mut c.lock_translation, "Lock pan/zoom");
-            });
-            ui_util::section(ui, "Invert");
-            ui.horizontal_wrapped(|ui| {
-                for (i, name) in spacemouse::Settings::AXIS_NAMES.iter().enumerate() {
-                    ui.checkbox(&mut c.invert[i], *name);
-                }
-            });
-            ui_util::section(ui, "Live input");
-            let (axis, buttons) = self.space.raw();
-            let m = spacemouse::to_view(axis);
-            egui::Grid::new("space_live").num_columns(2).show(ui, |ui| {
-                for (name, v) in spacemouse::Settings::AXIS_NAMES.iter().zip(m.t.iter().chain(m.r.iter())) {
-                    ui.label(*name);
-                    ui.add(egui::ProgressBar::new((v * 0.5 + 0.5).clamp(0.0, 1.0)).desired_width(160.0).text(format!("{v:+.2}")));
-                    ui.end_row();
-                }
-                ui.label("Buttons");
-                ui.monospace(if buttons == 0 { "–".to_string() } else { (0..32).filter(|b| buttons & (1 << b) != 0).map(|b| b.to_string()).collect::<Vec<_>>().join(" ") });
-                ui.end_row();
-            });
-            ui.small("Buttons: Menu = Hotbox, Fit = focus, Top / Right / Front = views.");
-        });
-        if open {
-            // Keep the live readout moving.
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            spacemouse::Status::Ready { device: None } => {
+                ui.label("3Dconnexion driver ready · no device connected");
+            }
+            spacemouse::Status::DriverMissing => {
+                ui.label("3Dconnexion driver (3DxWare) not installed.");
+            }
+            spacemouse::Status::Unsupported => {
+                ui.label("3D mice are not supported on this platform yet.");
+            }
+            spacemouse::Status::Failed(e) => {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 90), format!("Could not connect: {e}"));
+            }
         }
-        self.show_space_window = open;
+        let c = &mut self.space_cfg;
+        ui.checkbox(&mut c.enabled, "Enabled");
+        ui.small("Object mode: move the cap the way you want the model to move.");
+        ui_util::section(ui, "Speed");
+        // One row: name, multiplier slider, and the rate it gives at full deflection.
+        fn speed_row(ui: &mut egui::Ui, label: &str, hint: &str, v: &mut f32, rate: impl Fn(f64) -> String) {
+            ui.label(label).on_hover_text(hint);
+            ui.add(egui::Slider::new(&mut *v, spacemouse::SPEED_RANGE).logarithmic(true).suffix("×")).on_hover_text(hint);
+            ui.weak(rate(*v as f64)).on_hover_text("At full deflection");
+            ui.end_row();
+        }
+        egui::Grid::new("space_speeds").num_columns(3).show(ui, |ui| {
+            speed_row(ui, "Orbit", "Tilting, spinning and rolling the cap", &mut c.orbit_speed, |v| format!("{:.0}°/s", (spacemouse::ORBIT_RATE * v).to_degrees()));
+            speed_row(ui, "Pan", "Pushing the cap left, right, up or down", &mut c.pan_speed, |v| format!("{:.1} view heights/s", spacemouse::PAN_RATE * v));
+            speed_row(ui, "Zoom", "Pushing the cap in or pulling it out", &mut c.zoom_speed, |v| {
+                format!("halves the distance in {:.2} s", std::f64::consts::LN_2 / (spacemouse::ZOOM_RATE * v))
+            });
+        });
+        if ui.small_button("Reset speeds").clicked() {
+            (c.orbit_speed, c.pan_speed, c.zoom_speed) = (1.0, 1.0, 1.0);
+        }
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut c.lock_rotation, "Lock rotation");
+            ui.checkbox(&mut c.lock_translation, "Lock pan/zoom");
+        });
+        ui_util::section(ui, "Invert");
+        ui.horizontal_wrapped(|ui| {
+            for (i, name) in spacemouse::Settings::AXIS_NAMES.iter().enumerate() {
+                ui.checkbox(&mut c.invert[i], *name);
+            }
+        });
+        ui_util::section(ui, "Live input");
+        let (axis, buttons) = self.space.raw();
+        let m = spacemouse::to_view(axis);
+        egui::Grid::new("space_live").num_columns(2).show(ui, |ui| {
+            for (name, v) in spacemouse::Settings::AXIS_NAMES.iter().zip(m.t.iter().chain(m.r.iter())) {
+                ui.label(*name);
+                ui.add(egui::ProgressBar::new((v * 0.5 + 0.5).clamp(0.0, 1.0)).desired_width(160.0).text(format!("{v:+.2}")));
+                ui.end_row();
+            }
+            ui.label("Buttons");
+            ui.monospace(if buttons == 0 { "–".to_string() } else { (0..32).filter(|b| buttons & (1 << b) != 0).map(|b| b.to_string()).collect::<Vec<_>>().join(" ") });
+            ui.end_row();
+        });
+        ui.small("Buttons: Menu = Hotbox, Fit = focus, Top / Right / Front = views.");
+        // Keep the live readout moving.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
     }
 
     // ------------------------------------------------------------------
@@ -4189,7 +4198,6 @@ impl polymix_workspace::Workspace for MeshWorkspace {
         self.slices.window(&ctx);
         self.finish_import(&ctx);
         self.recovery_window(&ctx);
-        self.space_window(&ctx);
         self.hotbox_ui(&ctx);
         self.run_script(&ctx, vp_prev);
         // An edit made above (a button released) is seen by the next frame's tick, which may
