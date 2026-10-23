@@ -2680,17 +2680,23 @@ fn script_refine_bulge(refine: &mut f64, bulge: &mut f64, key: &str, val: &str) 
 pub(crate) fn run_loft(m: &mut Mesh, a: &[u32], b: &[u32], loft: &LoftUi, edge_length: f64, bulge: f64, group: Option<i32>) -> Result<mm_edit::BridgeResult, mm_edit::EditError> {
     let params = loft.params(edge_length, bulge, group);
     let along_wall = matches!(params.shape, mm_edit::LoftShape::Smooth | mm_edit::LoftShape::Sweep);
-    let guides = if loft.centerline && along_wall { [a, b].map(|l| opening_centerline(m, l)) } else { [None, None] };
+    let capped = crate::centerline::CappedCache::default();
+    let guides = if loft.centerline && along_wall { [a, b].map(|l| opening_centerline(m, &capped, l)) } else { [None, None] };
     mm_edit::loft_guided(m, a, b, &params, [guides[0].as_ref(), guides[1].as_ref()])
 }
 
-/// The centerline of the vessel behind opening `lp`: the first branch of a centerline grown
-/// from the opening (up to the vessel's first fork), as a loft guide.
-fn opening_centerline(m: &Mesh, lp: &[u32]) -> Option<mm_edit::AxisGuide> {
+/// The centerline of the vessel behind opening `lp`: the first branch of the lumen's
+/// centerline traced from the opening (up to the vessel's first fork), as a loft guide. Only
+/// the vessel within twelve opening radii is traced (the loft looks at most ten along it).
+/// The mesh's open ends are capped by `capped`, or a capping kept there is used.
+fn opening_centerline(m: &Mesh, capped: &crate::centerline::CappedCache, lp: &[u32]) -> Option<mm_edit::AxisGuide> {
+    use crate::centerline::{Anchor, LumenEnd, LumenInput, LumenParams};
     let pts: Vec<DVec3> = lp.iter().map(|&v| m.vertex(v)).collect();
     let c = pts.iter().sum::<DVec3>() / pts.len().max(1) as f64;
     let radius = pts.iter().map(|p| p.distance(c)).sum::<f64>() / pts.len().max(1) as f64;
-    let cl = crate::centerline::compute(m, lp, radius, &crate::centerline::CenterlineParams::default());
+    let input = LumenInput { inlet: LumenEnd { at: c, radius, anchor: Anchor::Opening }, outlets: Vec::new(), cap_groups: Vec::new() };
+    let params = LumenParams { within: Some((c, 12.0 * radius)), ..Default::default() };
+    let cl = crate::centerline::compute_lumen(m, capped, &input, &params, None).ok()??.centerline;
     let root = cl.branches.iter().find(|b| b.parent.is_none())?;
     let points: Vec<DVec3> = root.nodes.iter().map(|&k| cl.nodes[k].position).collect();
     let radii: Vec<f64> = root.nodes.iter().map(|&k| cl.nodes[k].radius).collect();
@@ -3376,6 +3382,30 @@ mod tests {
                 d1.dot(d2).clamp(-1.0, 1.0).acos()
             })
             .sum()
+    }
+
+    #[test]
+    fn an_opening_s_centerline_follows_its_vessel_s_axis() {
+        // A tube (radius 2) bent along an arc of radius 20, open at both ends: traced from the
+        // first opening, the loft's guide runs from its centre along the axis, within twelve
+        // radii of it.
+        let (r, bend) = (2.0, 20.0);
+        let axis: Vec<DVec3> = (0..=90).map(|i| {
+            let a = (i as f64).to_radians();
+            DVec3::new(bend * (1.0 - a.cos()), 0.0, bend * a.sin())
+        }).collect();
+        let m = mm_core::primitives::tube_along(&axis, &vec![r; axis.len()], 48);
+        let lp = mm_core::topology::boundary_loops(&m).into_iter().min_by(|a, b| a.centroid(&m).z.total_cmp(&b.centroid(&m).z)).unwrap();
+        let g = opening_centerline(&m, &crate::centerline::CappedCache::default(), &lp.vertices).expect("a guide");
+        let start = lp.centroid(&m);
+        assert!(g.points[0].distance(start) < 1e-9, "starts at {:?}", g.points[0]);
+        for (p, &radius) in g.points.iter().zip(&g.radii) {
+            let off = (DVec3::new(p.x - bend, 0.0, p.z).length() - bend).abs().max(p.y.abs());
+            assert!(off < 0.1 * r, "{off:.3} off the axis at {p:?}");
+            assert!(p.distance(start) + radius <= 12.0 * r + 1e-6, "{p:?} beyond the region");
+            assert!(radius > 0.9 * r && radius < 1.01 * r, "radius {radius}");
+        }
+        assert!(g.points.last().unwrap().distance(start) > 9.0 * r, "the guide stops short: {:?}", g.points.last());
     }
 
     #[test]

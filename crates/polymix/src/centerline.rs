@@ -1,23 +1,18 @@
-//! Vessel centerlines from geodesic level sets.
+//! Vessel centerlines: the tree through the centres of the largest spheres inside the lumen
+//! ([`lumen`], [`compute_lumen`]), a single path between two points of it
+//! ([`inscribed_path`]), and the vessel's mean half-width along a path ([`section_radii`]).
 //!
-//! Geodesic distance from the inlet is computed over the surface (Dijkstra on the edge
-//! graph, multi-source from the inlet boundary/cap). The surface is cut into bands of
-//! equal distance; every connected ring of vertices in a band becomes a centerline node
-//! (area-weighted centroid, mean radius), and nodes of consecutive bands are linked when
-//! their rings touch. On a branching tube this yields a tree whose nodes lie on the
-//! vessel axes; bifurcations appear where one ring splits into several. The tree is split
-//! into branches, short spurs from surface noise are pruned, and branches are smoothed.
-//!
-//! Ring centroids can lie outside the lumen where the vessel is not a simple tube (a
-//! confluence, a fenestration, a tight bend): the Centerline tool uses [`lumen`]'s
-//! centerlines, through the centres of the largest spheres inside the vessel, instead.
+//! (Centerlines were first traced from geodesic level sets: rings of equal distance over the
+//! surface from the inlet, each ring's centroid a node. Where a vessel is not a simple tube,
+//! at a confluence such as the torcula, round a fenestration's bridge or in a tight bend, a
+//! ring wraps more than one channel and its centroid lies in the tissue between them.)
 
 mod lumen;
 
-pub use lumen::{compute_lumen, LumenCenterline, LumenEnd, LumenInput, LumenParams};
+pub use lumen::{compute_lumen, Anchor, LumenCenterline, LumenEnd, LumenInput, LumenParams};
 
 use glam::DVec3;
-use mm_core::{Bvh, Mesh, INVALID};
+use mm_core::{Bvh, Mesh};
 use std::cmp::Ordering;
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
@@ -28,8 +23,6 @@ use std::time::Duration;
 pub struct CenterlineNode {
     pub position: DVec3,
     pub radius: f64,
-    /// Geodesic distance band index (0 at the inlet; 0 throughout a lumen centerline).
-    pub band: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -51,24 +44,9 @@ pub struct Centerline {
     pub nodes: Vec<CenterlineNode>,
     pub edges: Vec<(usize, usize)>,
     pub branches: Vec<Branch>,
-    /// The node (ring) each vertex belongs to, by vertex id (`usize::MAX`: unreached; empty
-    /// for a lumen centerline).
+    /// The node each vertex is wall of, by vertex id (`usize::MAX`: none), once
+    /// [`Centerline::assign_vertices`] has filled it (empty until then).
     pub vertex_node: Vec<usize>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CenterlineParams {
-    /// Band width (geodesic distance between rings). <= 0: automatic (half the inlet radius).
-    pub step: f64,
-    /// Spurs shorter than this multiple of their radius are pruned.
-    pub prune_factor: f64,
-    pub smoothing_iterations: usize,
-}
-
-impl Default for CenterlineParams {
-    fn default() -> Self {
-        Self { step: 0.0, prune_factor: 2.5, smoothing_iterations: 3 }
-    }
 }
 
 #[derive(PartialEq)]
@@ -83,255 +61,6 @@ impl Ord for Item {
     fn cmp(&self, o: &Self) -> Ordering {
         o.0.total_cmp(&self.0).then(o.1.cmp(&self.1))
     }
-}
-
-/// Multi-source Dijkstra distances over mesh edges (indexed by vertex id; infinity if
-/// unreachable).
-pub fn geodesic_distance(mesh: &Mesh, sources: &[u32]) -> Vec<f64> {
-    let mut dist = vec![f64::INFINITY; mesh.max_vid()];
-    let mut heap = BinaryHeap::new();
-    for &s in sources {
-        if mesh.is_vertex(s) {
-            dist[s as usize] = 0.0;
-            heap.push(Item(0.0, s));
-        }
-    }
-    while let Some(Item(d, v)) = heap.pop() {
-        if d > dist[v as usize] {
-            continue;
-        }
-        let p = mesh.vertex(v);
-        for u in mesh.vertex_neighbors(v) {
-            let nd = d + p.distance(mesh.vertex(u));
-            if nd < dist[u as usize] {
-                dist[u as usize] = nd;
-                heap.push(Item(nd, u));
-            }
-        }
-    }
-    dist
-}
-
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        parent[x as usize] = parent[parent[x as usize] as usize];
-        x = parent[x as usize];
-    }
-    x
-}
-
-/// Compute the centerline tree. `sources` are the inlet vertices (e.g. a boundary loop or
-/// the vertices of an inlet cap); `inlet_radius` sets the automatic band width.
-pub fn compute(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &CenterlineParams) -> Centerline {
-    compute_with(mesh, sources, inlet_radius, params, None).expect("only a progress callback stops it")
-}
-
-/// [`compute`], reporting progress (0..1) to `progress` between its steps; `None` once
-/// `progress` returns false (the work then stops there).
-pub fn compute_with(mesh: &Mesh, sources: &[u32], inlet_radius: f64, params: &CenterlineParams, progress: Option<&dyn Fn(f32) -> bool>) -> Option<Centerline> {
-    let going = |x: f32| progress.is_none_or(|p| p(x));
-    let dist = geodesic_distance(mesh, sources);
-    if !going(0.4) {
-        return None;
-    }
-    let step = if params.step > 0.0 { params.step } else { (inlet_radius * 0.5).max(mesh.average_edge_length() * 2.0) };
-    let band = |v: u32| -> usize {
-        let d = dist[v as usize];
-        if d.is_finite() {
-            (d / step) as usize
-        } else {
-            usize::MAX
-        }
-    };
-    // Vertex areas for weighted centroids.
-    let mut area = vec![0.0; mesh.max_vid()];
-    for t in mesh.triangle_ids() {
-        let a = mesh.tri_area(t) / 3.0;
-        for v in mesh.triangle(t) {
-            area[v as usize] += a;
-        }
-    }
-    // Union-find of vertices within the same band.
-    let mut parent: Vec<u32> = (0..mesh.max_vid() as u32).collect();
-    for e in mesh.edge_ids() {
-        let [a, b] = mesh.edge_vertices(e);
-        if band(a) == band(b) && band(a) != usize::MAX {
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
-                parent[ra as usize] = rb;
-            }
-        }
-    }
-    if !going(0.6) {
-        return None;
-    }
-    // Components -> nodes (numbered in the order their first vertex comes up).
-    let mut comp_of_root = vec![u32::MAX; mesh.max_vid()];
-    let mut sums: Vec<(DVec3, f64, usize)> = Vec::new();
-    let mut vcomp = vec![usize::MAX; mesh.max_vid()];
-    for v in mesh.vertex_ids() {
-        if band(v) == usize::MAX {
-            continue;
-        }
-        let r = find(&mut parent, v);
-        if comp_of_root[r as usize] == u32::MAX {
-            comp_of_root[r as usize] = sums.len() as u32;
-            sums.push((DVec3::ZERO, 0.0, band(v)));
-        }
-        let c = comp_of_root[r as usize] as usize;
-        vcomp[v as usize] = c;
-        let w = area[v as usize].max(1e-30);
-        sums[c].0 += mesh.vertex(v) * w;
-        sums[c].1 += w;
-    }
-    let mut nodes: Vec<CenterlineNode> = sums.iter().map(|&(s, w, b)| CenterlineNode { position: s / w, radius: 0.0, band: b }).collect();
-    let mut rsum = vec![(0.0, 0.0); nodes.len()];
-    for v in mesh.vertex_ids() {
-        let c = vcomp[v as usize];
-        if c != usize::MAX {
-            let w = area[v as usize].max(1e-30);
-            rsum[c].0 += mesh.vertex(v).distance(nodes[c].position) * w;
-            rsum[c].1 += w;
-        }
-    }
-    for (n, (s, w)) in nodes.iter_mut().zip(&rsum) {
-        n.radius = if *w > 0.0 { s / w } else { 0.0 };
-    }
-    if !going(0.8) {
-        return None;
-    }
-    // Links between rings of later bands (consecutive ones, or further apart where an edge
-    // is longer than a band on a coarse mesh).
-    let mut edges: Vec<(usize, usize)> = Vec::new();
-    for e in mesh.edge_ids() {
-        let [a, b] = mesh.edge_vertices(e);
-        let (ca, cb) = (vcomp[a as usize], vcomp[b as usize]);
-        if ca == usize::MAX || cb == usize::MAX || ca == cb {
-            continue;
-        }
-        let (lo, hi) = if nodes[ca].band < nodes[cb].band { (ca, cb) } else { (cb, ca) };
-        if nodes[hi].band > nodes[lo].band {
-            edges.push((lo, hi));
-        }
-    }
-    edges.sort_unstable();
-    edges.dedup();
-    if !going(0.9) {
-        return None;
-    }
-    let mut cl = Centerline { nodes, edges, branches: Vec::new(), vertex_node: vcomp };
-    build_branches(&mut cl, params);
-    Some(cl)
-}
-
-fn build_branches(cl: &mut Centerline, params: &CenterlineParams) {
-    let n = cl.nodes.len();
-    if n == 0 {
-        return;
-    }
-    // Directed tree: children are nodes one band further (or further on, where a coarse
-    // mesh skips bands and there is no nearer parent).
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut has_parent = vec![false; n];
-    let mut links = cl.edges.clone();
-    links.sort_by_key(|&(a, b)| (cl.nodes[b].band - cl.nodes[a].band, a, b));
-    for &(a, b) in &links {
-        if !has_parent[b] {
-            children[a].push(b);
-            has_parent[b] = true;
-        }
-    }
-    // Root: band-0 node with the most descendants.
-    let roots: Vec<usize> = match (0..n).filter(|&i| !has_parent[i] && cl.nodes[i].band == 0).collect::<Vec<_>>() {
-        r if !r.is_empty() => r,
-        _ => (0..n).filter(|&i| !has_parent[i]).collect(),
-    };
-    let count = |r: usize, children: &Vec<Vec<usize>>| {
-        let mut stack = vec![r];
-        let mut k = 0;
-        while let Some(x) = stack.pop() {
-            k += 1;
-            stack.extend(children[x].iter().copied());
-        }
-        k
-    };
-    let Some(&root) = roots.iter().max_by_key(|&&r| count(r, &children)) else { return };
-    // Prune short spurs repeatedly.
-    loop {
-        let mut pruned = false;
-        for i in 0..n {
-            if children[i].len() < 2 {
-                continue;
-            }
-            let kids = children[i].clone();
-            for k in kids {
-                // Walk the chain below k until a leaf or a junction.
-                let mut chain = vec![k];
-                let mut cur = k;
-                while children[cur].len() == 1 {
-                    cur = children[cur][0];
-                    chain.push(cur);
-                }
-                if !children[cur].is_empty() {
-                    continue;
-                }
-                let len: f64 = std::iter::once(i).chain(chain.iter().copied()).collect::<Vec<_>>().windows(2).map(|w| cl.nodes[w[0]].position.distance(cl.nodes[w[1]].position)).sum();
-                let r = cl.nodes[i].radius.max(1e-12);
-                if len < params.prune_factor * r {
-                    children[i].retain(|&c| c != k);
-                    pruned = true;
-                }
-            }
-        }
-        if !pruned {
-            break;
-        }
-    }
-    // Branches: chains between root/junctions and junctions/leaves.
-    let mut branches: Vec<Branch> = Vec::new();
-    let mut stack: Vec<(usize, Option<usize>)> = vec![(root, None)];
-    while let Some((start, parent)) = stack.pop() {
-        let mut nodes = vec![start];
-        let mut cur = start;
-        while children[cur].len() == 1 {
-            cur = children[cur][0];
-            nodes.push(cur);
-        }
-        let id = branches.len();
-        branches.push(Branch { nodes, length: 0.0, mean_radius: 0.0, min_radius: 0.0, max_radius: 0.0, parent, joins: None });
-        for &c in &children[cur] {
-            // Child branches start at the junction node so they connect.
-            stack.push((c, Some(id)));
-        }
-        if let Some(p) = parent {
-            let junction = *branches[p].nodes.last().unwrap();
-            branches[id].nodes.insert(0, junction);
-        }
-    }
-    // Smooth node positions along branches (endpoints fixed).
-    for _ in 0..params.smoothing_iterations {
-        let mut newpos: Vec<DVec3> = cl.nodes.iter().map(|n| n.position).collect();
-        for b in &branches {
-            for w in b.nodes.windows(3) {
-                newpos[w[1]] = (cl.nodes[w[0]].position + cl.nodes[w[1]].position * 2.0 + cl.nodes[w[2]].position) / 4.0;
-            }
-        }
-        for (n, p) in cl.nodes.iter_mut().zip(newpos) {
-            n.position = p;
-        }
-    }
-    for b in &mut branches {
-        let pts: Vec<&CenterlineNode> = b.nodes.iter().map(|&i| &cl.nodes[i]).collect();
-        b.length = pts.windows(2).map(|w| w[0].position.distance(w[1].position)).sum();
-        // Radius stats exclude the shared junction node, whose ring spans several branches.
-        let interior: Vec<f64> = pts.iter().skip(if b.parent.is_some() { 1 } else { 0 }).map(|n| n.radius).collect();
-        let rs = if interior.is_empty() { vec![pts[0].radius] } else { interior };
-        b.mean_radius = rs.iter().sum::<f64>() / rs.len() as f64;
-        b.min_radius = rs.iter().copied().fold(f64::INFINITY, f64::min);
-        b.max_radius = rs.iter().copied().fold(0.0, f64::max);
-    }
-    cl.branches = branches;
-    let _ = INVALID;
 }
 
 impl Centerline {
@@ -384,6 +113,50 @@ impl Centerline {
         }
         s
     }
+}
+
+/// The mean distance from each point of `path` (inside the lumen of `mesh`) to the wall
+/// across the cross-section square to the path there, over sixteen rays, as the geodesic
+/// rings' radii measured: a flat vessel's mean half-width rather than its largest sphere's
+/// radius. The open ends are capped by `cache` (or a capping kept there is used); a point
+/// whose rays all leave through a hole keeps its radius from `fallback`. `None` once `going`
+/// returns false.
+pub fn section_radii(mesh: &Mesh, cache: &CappedCache, path: &[DVec3], fallback: &[f64], going: &dyn Fn(f32) -> bool) -> Option<Vec<f64>> {
+    use mm_core::Ray;
+    let capped = cache.get(mesh, going);
+    if !going(0.0) {
+        return None;
+    }
+    let own;
+    let (surface, bvh) = match &capped {
+        Some(c) => (&c.mesh, &c.bvh),
+        None => {
+            own = Bvh::build(mesh);
+            (mesh, &own)
+        }
+    };
+    let n = path.len();
+    Some(
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let t = (path[(i + 1).min(n - 1)] - path[i.saturating_sub(1)]).normalize_or_zero();
+                let u = t.any_orthonormal_vector();
+                let w = t.cross(u);
+                let hits: Vec<f64> = (0..16)
+                    .filter_map(|k| {
+                        let a = std::f64::consts::TAU * k as f64 / 16.0;
+                        bvh.raycast(surface, &Ray::new(path[i], u * a.cos() + w * a.sin())).map(|h| h.t)
+                    })
+                    .collect();
+                if hits.is_empty() || t == DVec3::ZERO {
+                    fallback[i]
+                } else {
+                    hits.iter().sum::<f64>() / hits.len() as f64
+                }
+            })
+            .collect(),
+    )
 }
 
 /// A centerline through the centres of the largest spheres inside the lumen, with their radii.
@@ -514,6 +287,27 @@ impl CappedCache {
         }
         let bvh = Bvh::build(&closed);
         Some(Some(Capped { mesh: closed, bvh }))
+    }
+}
+
+/// A centerline tree of a mesh, kept for the next use through the same shape (one entry, by
+/// the mesh's shape version, which no other shape shares). Clones share the entry.
+#[derive(Clone, Default)]
+pub struct TreeCache(Arc<Mutex<KeptTree>>);
+
+/// A tree and the shape version it was made for.
+type KeptTree = Option<(u64, Arc<Centerline>)>;
+
+impl TreeCache {
+    /// The tree kept for `mesh`'s shape, if any.
+    pub fn get(&self, mesh: &Mesh) -> Option<Arc<Centerline>> {
+        let slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.as_ref().filter(|(v, _)| *v == mesh.shape_version()).map(|(_, t)| t.clone())
+    }
+
+    /// Keep `tree` for `mesh`'s shape (in place of any other).
+    pub fn keep(&self, mesh: &Mesh, tree: Arc<Centerline>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((mesh.shape_version(), tree));
     }
 }
 
@@ -856,22 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn straight_tube_centerline() {
-        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.0, i as f64 * 0.5)).collect();
-        let tube = primitives::tube_along(&path, &vec![1.0; path.len()], 32);
-        let lp = mm_core::topology::boundary_loops(&tube).into_iter().min_by(|a, b| a.centroid(&tube).z.partial_cmp(&b.centroid(&tube).z).unwrap()).unwrap();
-        let cl = compute(&tube, &lp.vertices, 1.0, &CenterlineParams::default());
-        assert_eq!(cl.branches.len(), 1, "{:?}", cl.branches);
-        let b = &cl.branches[0];
-        assert!((b.length - 20.0).abs() < 2.0, "length {}", b.length);
-        assert!((b.mean_radius - 1.0).abs() < 0.1, "radius {}", b.mean_radius);
-        for &i in &b.nodes {
-            let p = cl.nodes[i].position;
-            assert!((p.x * p.x + p.y * p.y).sqrt() < 0.15, "off axis {p:?}");
-        }
-    }
-
-    #[test]
     fn bifurcation_has_three_branches() {
         // Y made of three overlapping tubes, merged into one surface.
         let mut raw = Mesh::new();
@@ -887,7 +665,8 @@ mod tests {
         let plane = mm_core::Plane::from_point_normal(DVec3::new(0.0, 0.0, 1.0), -DVec3::Z);
         mm_edit::plane_cut(&mut solid, plane, &mm_edit::PlaneCutParams { keep: mm_edit::KeepSide::Below, fill: mm_edit::CutFill::None, ..Default::default() }).unwrap();
         let lp = mm_core::topology::boundary_loops(&solid).into_iter().next().unwrap();
-        let cl = compute(&solid, &lp.vertices, 2.0, &CenterlineParams::default());
+        let inlet = LumenEnd { at: lp.centroid(&solid), radius: 2.0, anchor: Anchor::Opening };
+        let cl = compute_lumen(&solid, &CappedCache::default(), &LumenInput { inlet, outlets: Vec::new(), cap_groups: Vec::new() }, &LumenParams::default(), None).unwrap().unwrap().centerline;
         assert_eq!(cl.branches.len(), 3, "branches: {:?}", cl.branches.iter().map(|b| (b.length, b.mean_radius)).collect::<Vec<_>>());
         let mut radii: Vec<f64> = cl.branches.iter().map(|b| b.mean_radius).collect();
         radii.sort_by(|a, b| a.partial_cmp(b).unwrap());

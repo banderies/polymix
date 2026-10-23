@@ -1,9 +1,10 @@
 //! Centerlines through the lumen, and a check that a centerline stays inside it.
 //!
-//! [`super::compute`]'s rings follow the surface, and where a vessel is not a simple tube (a
-//! confluence such as the torcula, a fenestration or septum, a tight bend) a ring's centroid
-//! can lie in the tissue between channels. These centerlines are found from the inside
-//! instead, through the centres of the largest spheres inside the vessel, as VMTK's run:
+//! Rings of equal geodesic distance over the surface follow it, and where a vessel is not a
+//! simple tube (a confluence such as the torcula, a fenestration or septum, a tight bend) a
+//! ring's centroid can lie in the tissue between channels. These centerlines are found from
+//! the inside instead, through the centres of the largest spheres inside the vessel, as
+//! VMTK's run:
 //!
 //! 1. The lumen (the surface with its open ends capped) is voxelized row by row from the
 //!    signed crossings of a ray along each row: a ray grazing the surface crosses it twice in
@@ -51,16 +52,26 @@ const OFFSETS: [[i64; 3]; 26] = {
     o
 };
 
-/// A vessel end, or a point picked on the wall near the inlet.
+/// What a [`LumenEnd`]'s point is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// The centre of an opening (an open end or a flat end cap): the centerline runs to it
+    /// exactly.
+    Opening,
+    /// A point picked on the wall: the centerline starts on the axis inside, near it.
+    Wall,
+    /// A point inside the lumen, such as a cross-section's centre: the centerline starts
+    /// there (at the voxel nearest it), running both ways along the vessel.
+    Inside,
+}
+
+/// A vessel end, or a point near the inlet.
 #[derive(Clone, Copy, Debug)]
 pub struct LumenEnd {
     pub at: DVec3,
     /// The vessel's radius there, mm (sets the grid's resolution and the spacing).
     pub radius: f64,
-    /// `at` is the centre of an opening (an open end or a flat end cap), which the centerline
-    /// runs to exactly; otherwise it is a point on the wall, and the centerline starts on the
-    /// axis inside.
-    pub opening: bool,
+    pub anchor: Anchor,
 }
 
 #[derive(Clone, Debug)]
@@ -85,11 +96,14 @@ pub struct LumenParams {
     /// Also follow blind side branches (vessels without an open end), as when there are no
     /// other ends. Otherwise the tree joins the ends, with loops round fenestrations.
     pub blind_branches: bool,
+    /// Only the lumen within this ball (centre, radius in mm) is followed, as when only the
+    /// vessel near an opening is wanted: its edge counts as the vessel's end.
+    pub within: Option<(DVec3, f64)>,
 }
 
 impl Default for LumenParams {
     fn default() -> Self {
-        Self { spacing: 0.0, prune_factor: 2.5, voxel: 0.0, blind_branches: false }
+        Self { spacing: 0.0, prune_factor: 2.5, voxel: 0.0, blind_branches: false, within: None }
     }
 }
 
@@ -260,17 +274,28 @@ impl Grid {
     }
 }
 
-/// The voxels inside the closed `surface` on a grid of `v` mm voxels, voxel (0, 0, 0)'s corner
-/// at `lo` (outside the surface's bounds).
-fn voxelize(surface: &Mesh, bvh: &Bvh, lo: DVec3, v: f64, dims: [usize; 3], winding: &OnceLock<mm_solid::WindingNumber>, going: &dyn Fn(f32) -> bool) -> Option<Grid> {
+/// The voxels inside the closed `surface` on a grid of `v` mm voxels, `dims` of them, voxel
+/// (0, 0, 0)'s corner at `lo`; rays along the rows start at `x0` (outside the surface), and
+/// only voxels within the ball `within` (centre, radius) are kept.
+fn voxelize(surface: &Mesh, bvh: &Bvh, (lo, v, dims): (DVec3, f64, [usize; 3]), x0: f64, within: Option<(DVec3, f64)>, winding: &OnceLock<mm_solid::WindingNumber>, going: &dyn Fn(f32) -> bool) -> Option<Grid> {
     let [nx, ny, _] = dims;
     let total = ny * dims[2];
-    let x0 = lo.x - v;
     let index = |x: f64| (x - lo.x) / v - 0.5;
     let row = |hits: &mut Vec<mm_core::bvh::RayHit>, r: usize| -> Vec<(u32, u32)> {
             let (j, k) = (r % ny, r / ny);
             // Nudged off the grid, so a ray does not run exactly along an edge.
             let (y, z) = (lo.y + (j as f64 + 0.500_37) * v, lo.z + (k as f64 + 0.500_61) * v);
+            // The row's stretch within the ball.
+            let (xa, xb) = match within {
+                Some((c, r)) => {
+                    let left = r * r - (y - c.y).powi(2) - (z - c.z).powi(2);
+                    if left < 0.0 {
+                        return Vec::new();
+                    }
+                    (c.x - left.sqrt(), c.x + left.sqrt())
+                }
+                None => (f64::NEG_INFINITY, f64::INFINITY),
+            };
             bvh.raycast_all(surface, &Ray::new(DVec3::new(x0, y, z), DVec3::X), hits);
             if hits.is_empty() {
                 return Vec::new();
@@ -300,8 +325,9 @@ fn voxelize(surface: &Mesh, bvh: &Bvh, lo: DVec3, v: f64, dims: [usize; 3], wind
                 a = b;
             }
             let mut spans: Vec<(u32, u32)> = Vec::new();
+            let (ia, ib) = (index(xa), index(xb));
             let mut push = |i0: f64, i1: f64| {
-                let (i0, i1) = (i0.ceil().max(0.0), i1.floor().min(nx as f64 - 1.0));
+                let (i0, i1) = (i0.max(ia).ceil().max(0.0), i1.min(ib).floor().min(nx as f64 - 1.0));
                 if i1 >= i0 {
                     let (i0, i1) = (i0 as u32, i1 as u32);
                     match spans.last_mut() {
@@ -1104,7 +1130,16 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
             (mesh, &fallback)
         }
     };
-    let wall_tris: Vec<u32> = mesh.triangle_ids().filter(|&t| !input.cap_groups.contains(&mesh.tri_group(t))).collect();
+    // The wall near the region followed, if one is given (the nearest wall of a point in it
+    // lies within half its radius further out).
+    let near = |t: u32| {
+        params.within.is_none_or(|(c, r)| {
+            let [a, b, d] = mesh.tri_positions(t);
+            let (lo, hi) = (a.min(b).min(d), a.max(b).max(d));
+            c.clamp(lo, hi).distance(c) <= 1.5 * r
+        })
+    };
+    let wall_tris: Vec<u32> = mesh.triangle_ids().filter(|&t| !input.cap_groups.contains(&mesh.tri_group(t)) && near(t)).collect();
     if wall_tris.is_empty() {
         bail!("the model has no wall besides its end caps");
     }
@@ -1114,17 +1149,24 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
 
     // Voxels: a sixth of the narrowest end's radius, coarser where the lumen would take more
     // than about eight million of them.
-    let bounds = closed.bounds();
-    let size = bounds.max - bounds.min;
+    let model = closed.bounds();
+    let (bmin, bmax) = match params.within {
+        Some((c, r)) => (model.min.max(c - DVec3::splat(r)), model.max.min(c + DVec3::splat(r))),
+        None => (model.min, model.max),
+    };
+    if bmin.cmpgt(bmax).any() {
+        bail!("the region followed lies outside the model");
+    }
+    let size = bmax - bmin;
     let r_ref = std::iter::once(&input.inlet).chain(&input.outlets).map(|e| e.radius).filter(|r| r.is_finite() && *r > 0.0).fold(f64::INFINITY, f64::min);
     let r_ref = if r_ref.is_finite() { r_ref } else { 0.05 * size.min_element() };
     let volume = mm_core::measure::volume(closed).abs().min(size.x * size.y * size.z);
     let mut v = if params.voxel > 0.0 { params.voxel } else { r_ref / 6.0 };
     v = v.max((volume / 8.0e6).cbrt()).max((size.y * size.z / 4.0e6).sqrt()).max(size.max_element() * 1e-4);
-    let lo = bounds.min - DVec3::splat(v);
+    let lo = bmin - DVec3::splat(v);
     let dims = [0, 1, 2].map(|a| ((size[a] + 2.0 * v) / v).ceil() as usize + 1);
     let winding = OnceLock::new();
-    let Some(grid) = voxelize(closed, closed_bvh, lo, v, dims, &winding, &|x| going(0.2 + 0.1 * x)) else { return Ok(None) };
+    let Some(grid) = voxelize(closed, closed_bvh, (lo, v, dims), model.min.x - v, params.within, &winding, &|x| going(0.2 + 0.1 * x)) else { return Ok(None) };
     if grid.len() == 0 {
         bail!("found no inside to the model (is it a closed surface, or one with open vessel ends?)");
     }
@@ -1132,6 +1174,12 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
     let wall: Vec<f64> = (0..n as u32).into_par_iter().map(|a| s.wall(grid.centre(a))).collect();
     at!(0.4);
     let clear: Vec<f64> = (0..n as u32).into_par_iter().map(|a| s.clearance(grid.centre(a), wall[a as usize])).collect();
+    // The paths keep off the edge of a region followed as off the wall, and end short of it
+    // as at a blind end (the points' radii are measured to the wall alone below).
+    let wall: Vec<f64> = match params.within {
+        Some((c, r)) => wall.par_iter().enumerate().map(|(a, &w)| w.min(r - grid.centre(a as u32).distance(c)).max(0.0)).collect(),
+        None => wall,
+    };
     at!(0.45);
     let links = link(&grid, &clear, &s);
     at!(0.5);
@@ -1209,7 +1257,7 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
             tail = nodes.split_off(keep);
         }
         let mut head = Vec::new();
-        if first && !input.inlet.opening {
+        if first && input.inlet.anchor == Anchor::Wall {
             nodes.reverse();
             let keep = trim_tip(&grid, &wall, &nodes);
             head = nodes.split_off(keep);
@@ -1221,8 +1269,8 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
             }
             continue;
         }
-        let start_at = if first && input.inlet.opening { opening_end(&s, grid.centre(nodes[0]), &input.inlet) } else { None };
-        let tip_at = outlet.and_then(|o| opening_end(&s, grid.centre(*nodes.last().unwrap()), &input.outlets[o]));
+        let start_at = if first && input.inlet.anchor == Anchor::Opening { opening_end(&s, grid.centre(nodes[0]), &input.inlet) } else { None };
+        let tip_at = outlet.filter(|&o| input.outlets[o].anchor == Anchor::Opening).and_then(|o| opening_end(&s, grid.centre(*nodes.last().unwrap()), &input.outlets[o]));
         let arc = arcs(&grid, &nodes);
         let offset = parent.map_or(0.0, |(q, k): (usize, usize)| t.paths[q].offset + t.paths[q].arc[k]);
         let path = Path { nodes, head, tail, parent, arc, offset, start_at, tip_at, join: None };
@@ -1356,16 +1404,37 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
         .collect();
     at!(0.97);
 
+    // In a region followed, each chain up to where its spheres leave it (a chain beyond, or
+    // from a chain cut short, is dropped).
+    let mut kept: Vec<Option<usize>> = vec![None; chains.len()];
+    let mut whole = vec![true; chains.len()];
+    let mut refined = refined;
+    if let Some((c, r)) = params.within {
+        for (k, pts) in refined.iter_mut().enumerate() {
+            let inside = pts.iter().take_while(|&&(p, w)| p.distance(c) + w <= r).count();
+            whole[k] = inside == pts.len();
+            pts.truncate(inside);
+        }
+    }
+    let mut order = Vec::new();
+    for k in 0..chains.len() {
+        if refined[k].len() >= 2 && chains[k].parent.is_none_or(|p| kept[p].is_some() && whole[p]) {
+            kept[k] = Some(order.len());
+            order.push(k);
+        }
+    }
+
     let junction = |x: usize| adj[x].len() >= 3;
     let mut cl = Centerline::default();
     let mut node_of: HashMap<usize, usize> = HashMap::new();
-    for (c, pts) in chains.iter().zip(&refined) {
+    for &k in &order {
+        let (c, pts) = (&chains[k], &refined[k]);
         let m = pts.len();
         let mut ids = Vec::with_capacity(m);
         for (i, &(p, w)) in pts.iter().enumerate() {
-            let shared = if i == 0 { Some(c.verts[0]) } else if i + 1 == m { c.verts.last().copied() } else { None };
+            let shared = if i == 0 { Some(c.verts[0]) } else if i + 1 == m && whole[k] { c.verts.last().copied() } else { None };
             let mut add = || {
-                cl.nodes.push(CenterlineNode { position: p, radius: w, band: 0 });
+                cl.nodes.push(CenterlineNode { position: p, radius: w });
                 cl.nodes.len() - 1
             };
             ids.push(match shared {
@@ -1379,7 +1448,7 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
         let length = pts.windows(2).map(|w| w[0].0.distance(w[1].0)).sum();
         // Radii of the junctions' spheres, which span several branches, are left out.
         let from = usize::from(junction(c.verts[0]) && m > 2);
-        let to = m - usize::from(junction(*c.verts.last().unwrap()) && m > 2 + from);
+        let to = m - usize::from(whole[k] && junction(*c.verts.last().unwrap()) && m > 2 + from);
         let rs: Vec<f64> = pts[from..to].iter().map(|p| p.1).collect();
         cl.branches.push(Branch {
             nodes: ids,
@@ -1387,14 +1456,92 @@ pub fn compute_lumen(mesh: &Mesh, cache: &CappedCache, input: &LumenInput, param
             mean_radius: rs.iter().sum::<f64>() / rs.len().max(1) as f64,
             min_radius: rs.iter().copied().fold(f64::INFINITY, f64::min),
             max_radius: rs.iter().copied().fold(0.0, f64::max),
-            parent: c.parent,
-            joins: c.joins,
+            parent: c.parent.and_then(|p| kept[p]),
+            joins: c.joins.filter(|_| whole[k]).and_then(|j| kept[j]),
         });
     }
     let wn = mm_solid::WindingNumber::new(closed);
     let check = check_with(closed, closed_bvh, (s.wall, &s.wall_bvh), &wn, &cl, &ends_at);
     at!(1.0);
     Ok(Some(LumenCenterline { centerline: cl, check, unreached, loops, voxel: v }))
+}
+
+impl Centerline {
+    /// Each vertex of `mesh` with the centerline's node nearest its tube (the spheres of its
+    /// radii swept along it), as VMTK splits a surface into branches: the vessel whose wall
+    /// the vertex is, even at a junction or either side of a septum. Fills `vertex_node`
+    /// (`usize::MAX` for unused ids, or with no centerline).
+    pub fn assign_vertices(&mut self, mesh: &Mesh) {
+        let segs: Vec<(usize, usize)> = self.branches.iter().flat_map(|b| b.nodes.windows(2).map(|w| (w[0], w[1]))).collect();
+        self.vertex_node = vec![usize::MAX; mesh.max_vid()];
+        if segs.is_empty() {
+            return;
+        }
+        let pos = |i: usize| self.nodes[i].position;
+        let rad = |i: usize| self.nodes[i].radius;
+        let r_max = self.nodes.iter().map(|n| n.radius).fold(0.0, f64::max);
+        // Segments by the cells of a grid their boxes meet.
+        let longest = segs.iter().map(|&(a, b)| pos(a).distance(pos(b))).fold(0.0, f64::max);
+        let cell = (2.0 * r_max).max(longest).max(1e-6);
+        let key = |p: DVec3| (p / cell).floor().as_ivec3();
+        let mut grid: HashMap<glam::IVec3, Vec<usize>> = HashMap::new();
+        for (k, &(a, b)) in segs.iter().enumerate() {
+            let (lo, hi) = (key(pos(a).min(pos(b))), key(pos(a).max(pos(b))));
+            for x in lo.x..=hi.x {
+                for y in lo.y..=hi.y {
+                    for z in lo.z..=hi.z {
+                        grid.entry(glam::IVec3::new(x, y, z)).or_default().push(k);
+                    }
+                }
+            }
+        }
+        let tube = |p: DVec3, k: usize| {
+            let (a, b) = segs[k];
+            let ab = pos(b) - pos(a);
+            let t = ((p - pos(a)).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
+            (p.distance(pos(a) + ab * t) - (rad(a) + (rad(b) - rad(a)) * t), if t < 0.5 { a } else { b })
+        };
+        let (lo, hi) = segs.iter().fold((glam::IVec3::MAX, glam::IVec3::MIN), |(l, h), &(a, b)| (l.min(key(pos(a))).min(key(pos(b))), h.max(key(pos(a))).max(key(pos(b)))));
+        let assigned: Vec<(u32, usize)> = mesh
+            .vertex_ids()
+            .collect::<Vec<u32>>()
+            .par_iter()
+            .map(|&v| {
+                let p = mesh.vertex(v);
+                let c = key(p);
+                let mut best = (f64::INFINITY, usize::MAX);
+                // Shells of cells about the vertex's, until no nearer tube can lie further out
+                // (a segment first met in shell n lies at least n - 1 cells away), or every
+                // cell has been seen.
+                for n in 0i32.. {
+                    let (sl, sh) = (c - glam::IVec3::splat(n), c + glam::IVec3::splat(n));
+                    if (best.1 != usize::MAX && (n - 1).max(0) as f64 * cell - r_max > best.0) || (sl.cmplt(lo).all() && sh.cmpgt(hi).all()) {
+                        break;
+                    }
+                    for x in sl.x..=sh.x {
+                        for y in sl.y..=sh.y {
+                            for z in sl.z..=sh.z {
+                                let q = glam::IVec3::new(x, y, z);
+                                if (q - c).abs().max_element() != n {
+                                    continue;
+                                }
+                                for &k in grid.get(&q).map_or(&[][..], |s| &s[..]) {
+                                    let d = tube(p, k);
+                                    if d.0 < best.0 {
+                                        best = d;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                (v, best.1)
+            })
+            .collect();
+        for (v, node) in assigned {
+            self.vertex_node[v as usize] = node;
+        }
+    }
 }
 
 /// Test every point of `cl` and every segment between its neighbouring points against the
@@ -1462,7 +1609,7 @@ mod tests {
 
     /// The planar ends of `mesh` as openings.
     fn openings(mesh: &Mesh) -> Vec<LumenEnd> {
-        crate::tools::vessel::find_vessel_ends(mesh).iter().filter(|e| e.planar).map(|e| LumenEnd { at: e.center, radius: 0.5 * e.diameter, opening: true }).collect()
+        crate::tools::vessel::find_vessel_ends(mesh).iter().filter(|e| e.planar).map(|e| LumenEnd { at: e.center, radius: 0.5 * e.diameter, anchor: Anchor::Opening }).collect()
     }
 
     /// The centerline from the end nearest `inlet` to the others.
@@ -1471,15 +1618,6 @@ mod tests {
         let i = (0..ends.len()).min_by(|&a, &b| ends[a].at.distance(inlet).total_cmp(&ends[b].at.distance(inlet))).expect("an end");
         let inlet = ends.remove(i);
         compute_lumen(mesh, &CappedCache::default(), &LumenInput { inlet, outlets: ends, cap_groups: Vec::new() }, &LumenParams::default(), None).unwrap().unwrap()
-    }
-
-    /// The rings' centerline from the end nearest `inlet`, checked the same way.
-    fn rings_checked(mesh: &Mesh, inlet: DVec3) -> LumenCheck {
-        let lp = mm_core::topology::boundary_loops(mesh).into_iter().min_by(|a, b| a.centroid(mesh).distance(inlet).total_cmp(&b.centroid(mesh).distance(inlet))).unwrap();
-        let r = lp.positions(mesh).iter().map(|p| p.distance(lp.centroid(mesh))).sum::<f64>() / lp.len() as f64;
-        let cl = super::super::compute(mesh, &lp.vertices, r, &Default::default());
-        let ends: Vec<DVec3> = openings(mesh).iter().map(|e| e.at).collect();
-        check(mesh, &CappedCache::default(), &cl, &ends, &|_| true).unwrap()
     }
 
     /// Union of tubes along `paths` (radius `r` each) as one surface, opened square to the
@@ -1540,7 +1678,6 @@ mod tests {
             assert!(!bridge, "a point in the bridge: {p:?}");
         }
         assert_eq!(r.centerline.branches.iter().filter(|b| b.joins.is_some()).count(), 1);
-        println!("rings on the fenestration: {:?}", rings_checked(&m, DVec3::ZERO));
     }
 
     #[test]
@@ -1563,6 +1700,12 @@ mod tests {
         assert!(all_points(&r.centerline).iter().any(|p| p.z > 26.5), "it did not go round");
         let along: f64 = path.windows(2).map(|w| w[0].distance(w[1])).sum();
         assert!((r.centerline.branches[0].length - along).abs() < 0.03 * along, "length {} of {along}", r.centerline.branches[0].length);
+        // Each leg's wall is that leg's, even facing the other across the septum.
+        let mut cl = r.centerline;
+        cl.assign_vertices(&tube);
+        let wrong = tube.vertex_ids().filter(|&v| tube.vertex(v).z < 12.0 && cl.vertex_node[v as usize] != usize::MAX && (cl.nodes[cl.vertex_node[v as usize]].position.x > 0.0) != (tube.vertex(v).x > 0.0)).count();
+        assert_eq!(wrong, 0, "wall given to the other leg");
+        assert!(tube.vertex_ids().all(|v| cl.vertex_node[v as usize] != usize::MAX));
     }
 
     #[test]
@@ -1586,7 +1729,6 @@ mod tests {
         assert!(r.check.passed(), "{:?}", r.check);
         assert!(r.unreached.is_empty());
         assert!(r.centerline.branches.len() >= 4, "{:?}", r.centerline.branches.iter().map(|b| (b.length, b.parent)).collect::<Vec<_>>());
-        println!("rings on the confluence: {:?}", rings_checked(&m, DVec3::X * 28.0));
     }
 
     #[test]
@@ -1617,7 +1759,7 @@ mod tests {
         let right: Vec<DVec3> = (0..=20).map(|i| DVec3::new(i as f64 * 0.6, 0.0, 20.0 + i as f64 * 0.8)).collect();
         let m = vessel(&[(line(DVec3::ZERO, DVec3::Z * 20.0, 20), 2.0), (left, 1.5), (right, 1.5)], &[]);
         assert!(mm_core::topology::boundary_loops(&m).is_empty());
-        let inlet = LumenEnd { at: DVec3::new(2.0, 0.0, 3.0), radius: 2.0, opening: false };
+        let inlet = LumenEnd { at: DVec3::new(2.0, 0.0, 3.0), radius: 2.0, anchor: Anchor::Wall };
         let r = compute_lumen(&m, &CappedCache::default(), &LumenInput { inlet, outlets: Vec::new(), cap_groups: Vec::new() }, &LumenParams::default(), None).unwrap().unwrap();
         assert!(r.check.passed(), "{:?}", r.check);
         let cl = &r.centerline;
@@ -1634,8 +1776,8 @@ mod tests {
         let path: Vec<DVec3> = (0..=20).map(|i| DVec3::new(0.0, 0.0, i as f64)).collect();
         let tube = primitives::tube_along(&path, &vec![1.0; path.len()], 32);
         let mut cl = Centerline::default();
-        for (i, p) in [DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 0.0, 5.0), DVec3::new(3.0, 0.0, 10.0), DVec3::new(0.0, 0.0, 15.0), DVec3::new(0.0, 0.0, 20.0)].into_iter().enumerate() {
-            cl.nodes.push(CenterlineNode { position: p, radius: 1.0, band: i });
+        for p in [DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 0.0, 5.0), DVec3::new(3.0, 0.0, 10.0), DVec3::new(0.0, 0.0, 15.0), DVec3::new(0.0, 0.0, 20.0)] {
+            cl.nodes.push(CenterlineNode { position: p, radius: 1.0 });
         }
         cl.branches.push(Branch { nodes: (0..5).collect(), length: 0.0, mean_radius: 1.0, min_radius: 1.0, max_radius: 1.0, parent: None, joins: None });
         let k = check(&tube, &CappedCache::default(), &cl, &[DVec3::ZERO, DVec3::Z * 20.0], &|_| true).unwrap();
@@ -1645,7 +1787,7 @@ mod tests {
         assert!(!k.passed());
     }
 
-    /// The centerline of a mesh of one's own, against the rings': `POLYMIX_CENTERLINE_MESH` (a
+    /// The centerline of a mesh of one's own: `POLYMIX_CENTERLINE_MESH` (a
     /// mesh file), `POLYMIX_CENTERLINE_INLET` (x,y,z near the inlet end; else the widest end),
     /// `POLYMIX_CENTERLINE_OUT` (a .vtk to save the centerline to), `POLYMIX_CENTERLINE_BLIND`
     /// (set: blind branches too). Run with
@@ -1667,12 +1809,6 @@ mod tests {
         .expect("an end");
         let inlet = ends.remove(i);
         println!("{} triangles; inlet at {:?} (radius {:.2}), {} other ends", mesh.triangle_count(), inlet.at, inlet.radius, ends.len());
-        let t = std::time::Instant::now();
-        let rings = rings_checked(&mesh, inlet.at);
-        println!("rings: {} of {} points outside, {} of {} segments cross the wall ({:.1} s)", rings.outside.len(), rings.points, rings.crossing.len(), rings.segments, t.elapsed().as_secs_f64());
-        for p in rings.outside.iter().take(10) {
-            println!("  outside: {p:.2?}");
-        }
         let t = std::time::Instant::now();
         let params = LumenParams { blind_branches: std::env::var("POLYMIX_CENTERLINE_BLIND").is_ok(), ..Default::default() };
         let r = compute_lumen(&mesh, &CappedCache::default(), &LumenInput { inlet, outlets: ends, cap_groups: Vec::new() }, &params, None).unwrap().unwrap();

@@ -4,12 +4,13 @@
 //! is reshaped around it (see [`mm_edit::stent`]), previewed live, then kept in place or as a
 //! copy.
 //!
-//! The vessel's centerline is traced from the first section (geodesic rings, as the
-//! Centerline tool does) through the second and on past both, and the vertices whose rings lie
-//! on it are the stented vessel's own wall; side branches follow them with distance.
+//! The vessel's centerline is traced through the lumen from the first section (as the
+//! Centerline tool does: through the centres of the largest spheres inside it) through the
+//! second and on past both, and the vertices nearest its tube there are the stented vessel's
+//! own wall; side branches follow them with distance.
 
 use super::*;
-use crate::centerline::{self, Centerline, CenterlineParams};
+use crate::centerline::{self, Anchor, Centerline, LumenEnd, LumenInput, LumenParams};
 use crate::jobs::{Job, ProgressFn};
 use crate::ui_util;
 use mm_edit::EndContinuity;
@@ -138,9 +139,9 @@ pub struct StentTool {
     sized: [bool; 2],
     trace: Option<(u64, Arc<Mesh>, Arc<VesselTrace>)>,
     trace_job: Option<(u64, Job<VesselTrace>)>,
-    /// The vessel capped at its open ends, with its tree, for the traces (built once per shape
-    /// of the mesh rather than for each pair of ends; dropped with the tool).
-    capped: centerline::CappedCache,
+    /// The vessel capped at its open ends (with its tree) and its centerline tree, for the
+    /// traces (built once per shape of the mesh; a copy of the whole mesh while it is kept).
+    cache: TraceCache,
     job: Option<(StentKey, Job<StentOut>)>,
     preview: Option<(StentKey, StentOut)>,
     changed: Option<(StentKey, Instant)>,
@@ -159,7 +160,7 @@ impl StentTool {
             sized: [false; 2],
             trace: None,
             trace_job: None,
-            capped: centerline::CappedCache::default(),
+            cache: TraceCache::default(),
             job: None,
             preview: None,
             changed: None,
@@ -309,8 +310,8 @@ impl StentTool {
             if self.trace_job.as_ref().is_none_or(|(rev, _)| *rev != self.revision) {
                 let sections = [self.sections[0].clone(), self.sections[1].clone()];
                 let mesh = source.clone();
-                let capped = self.capped.clone();
-                self.trace_job = Some((self.revision, Job::spawn("Centerline", cx.egui.clone(), move |progress| trace_vessel_with(&mesh, &sections, &capped, Some(progress)))));
+                let cache = self.cache.clone();
+                self.trace_job = Some((self.revision, Job::spawn("Centerline", cx.egui.clone(), move |progress| trace_vessel_with(&mesh, &sections, &cache, Some(progress)))));
             }
             return;
         }
@@ -353,7 +354,7 @@ impl StentTool {
             _ => {
                 let trace = match &self.trace {
                     Some((rev, m, t)) if *rev == self.revision && Arc::ptr_eq(m, &source) => t.clone(),
-                    _ => Arc::new(trace_vessel_with(&source, &[self.sections[0].clone(), self.sections[1].clone()], &self.capped, None).map_err(|e| format!("{e:#}"))?),
+                    _ => Arc::new(trace_vessel_with(&source, &[self.sections[0].clone(), self.sections[1].clone()], &self.cache, None).map_err(|e| format!("{e:#}"))?),
                 };
                 let (mesh, _, report, _) = Self::build(&source, &trace, [self.sections[0].stent(), self.sections[1].stent()], &key).map_err(|e| format!("{e:#}"))?;
                 (mesh, report)
@@ -381,7 +382,7 @@ impl StentTool {
         self.error = None;
         // The next stent is traced through the result: the capped vessel of the source has
         // done its work (and is a copy of the whole mesh).
-        self.capped = centerline::CappedCache::default();
+        self.cache = TraceCache::default();
         Ok(format!("Stent {label}: narrowest lumen ⌀ {:.2} → {:.2} mm{}", 2.0 * report.narrowest[0], 2.0 * report.narrowest[1], sealed_text(&report)))
     }
 }
@@ -428,45 +429,63 @@ fn sealed_text(r: &mm_edit::StentReport) -> String {
     }
 }
 
-fn point_segment_distance(p: DVec3, a: DVec3, b: DVec3) -> f64 {
-    let ab = b - a;
-    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0);
-    p.distance(a + ab * t)
-}
-
 /// Trace the vessel's centerline from the first section through the second and on past
 /// both (the straightest way at each junction).
 #[cfg_attr(not(test), allow(dead_code))]
 fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTrace> {
-    trace_vessel_with(mesh, sections, &centerline::CappedCache::default(), None)
+    trace_vessel_with(mesh, sections, &TraceCache::default(), None)
 }
 
-/// [`trace_vessel`], with the capped vessel kept in `capped` for the next trace through the
-/// same mesh, and stopping early (with an error) once `progress` says the trace is no longer
+/// The vessel capped at its open ends (with its tree) and its centerline tree, each built once
+/// per shape of the mesh and kept for the next trace through it. Clones share them.
+#[derive(Clone, Default)]
+struct TraceCache {
+    capped: centerline::CappedCache,
+    tree: centerline::TreeCache,
+}
+
+/// [`trace_vessel`], with what is built for the mesh kept in `cache` for the next trace
+/// through it, and stopping early (with an error) once `progress` says the trace is no longer
 /// wanted.
-fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], capped: &centerline::CappedCache, progress: Option<ProgressFn>) -> anyhow::Result<VesselTrace> {
+fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], cache: &TraceCache, progress: Option<ProgressFn>) -> anyhow::Result<VesselTrace> {
     let going = |x: f32| progress.is_none_or(|p| p(x));
     let [a, b] = sections;
-    let h = mesh.average_edge_length();
-    let n = a.normal.normalize_or_zero();
-    let sources: Vec<u32> = (0..mesh.max_vid() as u32)
-        .into_par_iter()
-        .filter(|&v| {
-            if !mesh.is_vertex(v) {
-                return false;
-            }
-            let p = mesh.vertex(v);
-            (p - a.center).dot(n).abs() < h && a.ring.iter().any(|s| point_segment_distance(p, s[0], s[1]) < h)
-        })
-        .collect();
-    if sources.is_empty() {
-        anyhow::bail!("could not find the first end's cross-section on the surface");
-    }
     if !going(0.05) {
         anyhow::bail!("cancelled");
     }
-    let Some(cl) = centerline::compute_with(mesh, &sources, 0.5 * a.diameter, &CenterlineParams::default(), Some(&|x| going(0.05 + 0.35 * x))) else {
-        anyhow::bail!("cancelled");
+    // The lumen's centerline through the vessel tree and the vessel each vertex is wall of:
+    // traced from the widest open end to the others (blind side branches too) once per shape
+    // and kept, or, where a section lies off that tree (or there are no open ends), from the
+    // first section's centre.
+    let ends = crate::tools::vessel::find_vessel_ends(mesh);
+    let mut openings: Vec<LumenEnd> = ends.iter().filter(|e| e.planar).map(|e| LumenEnd { at: e.center, radius: 0.5 * e.diameter, anchor: Anchor::Opening }).collect();
+    let cap_groups: Vec<i32> = ends.iter().filter_map(|e| if let crate::tools::vessel::EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
+    let params = LumenParams { blind_branches: true, ..Default::default() };
+    let trace = |inlet: LumenEnd, outlets: Vec<LumenEnd>| -> anyhow::Result<Arc<Centerline>> {
+        let input = LumenInput { inlet, outlets, cap_groups: cap_groups.clone() };
+        let Some(lumen) = centerline::compute_lumen(mesh, &cache.capped, &input, &params, Some(&|x| going(0.05 + 0.3 * x)))? else {
+            anyhow::bail!("cancelled");
+        };
+        let mut cl = lumen.centerline;
+        cl.assign_vertices(mesh);
+        Ok(Arc::new(cl))
+    };
+    let kept = match cache.tree.get(mesh) {
+        Some(t) => Some(t),
+        None => match (0..openings.len()).max_by(|&i, &j| openings[i].radius.total_cmp(&openings[j].radius)) {
+            Some(widest) => {
+                let inlet = openings.remove(widest);
+                let t = trace(inlet, std::mem::take(&mut openings))?;
+                cache.tree.keep(mesh, t.clone());
+                Some(t)
+            }
+            None => None,
+        },
+    };
+    let on = |t: &Centerline, s: &Section| t.branches.iter().flat_map(|b| &b.nodes).any(|&i| t.nodes[i].position.distance(s.center) < 0.5 * s.diameter);
+    let cl = match kept.filter(|t| on(t, a) && on(t, b)) {
+        Some(t) => t,
+        None => trace(LumenEnd { at: a.center, radius: 0.5 * a.diameter, anchor: Anchor::Inside }, Vec::new())?,
     };
     if !going(0.4) {
         anyhow::bail!("cancelled");
@@ -498,8 +517,15 @@ fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], capped: &centerline::
     let nodes: Vec<usize> = before.iter().rev().chain(&chain).chain(&after).copied().collect();
     let on_path: std::collections::HashSet<usize> = nodes.iter().copied().collect();
     let owner = cl.vertex_node.iter().map(|n| on_path.contains(n)).collect();
-    let mut path = mm_edit::VesselPath { points: nodes.iter().map(|&i| pos(i)).collect(), radii: nodes.iter().map(|&i| cl.nodes[i].radius).collect() };
-    let min_lumen = inscribed_between_with(mesh, &mut path, sections, capped, &|x| going(0.4 + 0.4 * x));
+    // Radii as the stent's bounds on the wall it carries expect: the vessel's mean half-width
+    // (between the sections they become the inscribed spheres' below).
+    let points: Vec<DVec3> = nodes.iter().map(|&i| pos(i)).collect();
+    let inscribed: Vec<f64> = nodes.iter().map(|&i| cl.nodes[i].radius).collect();
+    let Some(radii) = centerline::section_radii(mesh, &cache.capped, &points, &inscribed, &|x| going(0.37 + 0.03 * x)) else {
+        anyhow::bail!("cancelled");
+    };
+    let mut path = mm_edit::VesselPath { points, radii };
+    let min_lumen = inscribed_between_with(mesh, &mut path, sections, &cache.capped, &|x| going(0.4 + 0.4 * x));
     if !going(0.8) {
         anyhow::bail!("cancelled");
     }
@@ -1276,7 +1302,7 @@ mod tests {
         };
         // A trace through the kept capped vessel is the trace capping it afresh, for the
         // ends it was first made for and for others.
-        let capped = centerline::CappedCache::default();
+        let capped = TraceCache::default();
         for ends in [&sections, &moved, &sections] {
             let kept = trace_vessel_with(&m, ends, &capped, None).unwrap();
             assert!(kept.min_lumen.is_some());
@@ -1285,7 +1311,7 @@ mod tests {
         // A trace no longer wanted stops at whichever check it is told to (in the centerline,
         // the capping and the inscribed path), with the capped vessel kept or still to build.
         for kept in [true, false] {
-            let cache = || if kept { capped.clone() } else { centerline::CappedCache::default() };
+            let cache = || if kept { capped.clone() } else { TraceCache::default() };
             let reports = std::cell::Cell::new(0);
             let count = |_: f32| {
                 reports.set(reports.get() + 1);
@@ -1374,30 +1400,24 @@ mod tests {
     }
 
     /// A real mesh (`POLYMIX_STENT_MESH`, local only): stents along the longest branch of its
-    /// centerline, traced from the widest opening. Prints counts and timings only.
+    /// centerline, traced from the widest opening, or between the sections through the wall
+    /// points `POLYMIX_STENT_AT` (`x,y,z;x,y,z`, as printed, to compare traces). Prints
+    /// counts and timings only.
     #[test]
     #[ignore]
     fn stent_on_a_real_mesh() {
         let Some(path) = std::env::var_os("POLYMIX_STENT_MESH") else { return };
         let m = mm_io::read_mesh(std::path::Path::new(&path)).unwrap().mesh;
         let loops = mm_core::topology::boundary_loops(&m);
-        let (sources, r) = match loops.iter().max_by(|a, b| a.perimeter(&m).total_cmp(&b.perimeter(&m))) {
-            Some(inlet) => (inlet.vertices.clone(), inlet.perimeter(&m) / std::f64::consts::TAU),
-            None => {
-                // Closed: from the widest flat cap.
-                let ends = super::super::vessel::find_vessel_ends(&m);
-                let Some(e) = ends.iter().max_by(|a, b| a.diameter.total_cmp(&b.diameter)) else {
-                    eprintln!("{} triangles, closed with no flat caps: skipped", m.triangle_count());
-                    return;
-                };
-                let super::super::vessel::EndKind::Cap(g) = e.kind else { panic!("no cap") };
-                let mut v: Vec<u32> = m.triangle_ids().filter(|&t| m.tri_group(t) == g).flat_map(|t| m.triangle(t)).collect();
-                v.sort_unstable();
-                v.dedup();
-                (v, 0.5 * e.diameter)
-            }
+        // From the widest opening or flat cap to the others.
+        let mut ends: Vec<LumenEnd> = super::super::vessel::find_vessel_ends(&m).iter().filter(|e| e.planar).map(|e| LumenEnd { at: e.center, radius: 0.5 * e.diameter, anchor: Anchor::Opening }).collect();
+        let Some(widest) = (0..ends.len()).max_by(|&a, &b| ends[a].radius.total_cmp(&ends[b].radius)) else {
+            eprintln!("{} triangles, closed with no flat caps: skipped", m.triangle_count());
+            return;
         };
-        let cl = centerline::compute(&m, &sources, r, &CenterlineParams::default());
+        let inlet = ends.remove(widest);
+        let cap_groups: Vec<i32> = super::super::vessel::find_vessel_ends(&m).iter().filter_map(|e| if let super::super::vessel::EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
+        let cl = centerline::compute_lumen(&m, &centerline::CappedCache::default(), &LumenInput { inlet, outlets: ends, cap_groups }, &LumenParams::default(), None).unwrap().unwrap().centerline;
         let branch = cl.branches.iter().max_by(|a, b| a.length.total_cmp(&b.length)).unwrap();
         let all: Vec<u32> = m.triangle_ids().collect();
         eprintln!("input crossings {}", ops::crossings(&m, &all));
@@ -1430,11 +1450,23 @@ mod tests {
                 pairs.push((clean[i].1.clone(), clean[j].1.clone()));
             }
         }
+        // Or the sections through the wall points given (`x,y,z;x,y,z`), to compare traces.
+        if let Ok(at) = std::env::var("POLYMIX_STENT_AT") {
+            let p: Vec<DVec3> = at.split(';').map(|q| {
+                let v: Vec<f64> = q.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                DVec3::new(v[0], v[1], v[2])
+            }).collect();
+            let wall = |q: DVec3| bvh.nearest(&m, q, f64::INFINITY).unwrap().point;
+            pairs = vec![(Section::at(&m, &bvh, wall(p[0])).unwrap(), Section::at(&m, &bvh, wall(p[1])).unwrap())];
+        }
+        // One cache for all the traces, as the tool keeps.
+        let cache = TraceCache::default();
         for (a, b) in pairs {
             let t0 = std::time::Instant::now();
             let sections = [a, b];
-            eprintln!("sections {:.1} mm apart", sections[0].center.distance(sections[1].center));
-            let trace = match trace_vessel(&m, &sections) {
+            let on_wall = |s: &Section| s.ring.first().map_or(s.center, |r| r[0]);
+            eprintln!("sections {:.1} mm apart (POLYMIX_STENT_AT={:.4},{:.4},{:.4};{:.4},{:.4},{:.4})", sections[0].center.distance(sections[1].center), on_wall(&sections[0]).x, on_wall(&sections[0]).y, on_wall(&sections[0]).z, on_wall(&sections[1]).x, on_wall(&sections[1]).y, on_wall(&sections[1]).z);
+            let trace = match trace_vessel_with(&m, &sections, &cache, None) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("trace failed: {e:#}");
@@ -1454,7 +1486,7 @@ mod tests {
                 let key = StentKey { sections: 1, ui };
                 match StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &key) {
                     Ok((out, pl, rep, crossings)) => eprintln!(
-                        "  {label}: {:.0} ms, valid {}, oriented {}, crossings {crossings}, sharpest {:.1}°, narrowest ⌀ {:.2} -> {:.2}, moved {}, overhang {:.1}/{:.1}, outside {}, open ends {} -> {}, sealed {}",
+                        "  {label}: {:.0} ms, valid {}, oriented {}, crossings {crossings}, sharpest {:.1}°, narrowest ⌀ {:.2} -> {:.2}, moved {} (up to {:.3} mm), overhang {:.1}/{:.1}, outside {}, open ends {} -> {}, sealed {}",
                         t0.elapsed().as_secs_f64() * 1e3,
                         out.check_validity().is_ok(),
                         out.is_consistently_oriented(),
@@ -1462,6 +1494,7 @@ mod tests {
                         2.0 * rep.narrowest[0],
                         2.0 * rep.narrowest[1],
                         rep.moved,
+                        rep.max_shift,
                         pl.overhang()[0],
                         pl.overhang()[1],
                         rep.outside,
@@ -1535,12 +1568,10 @@ mod tests {
             .collect();
         let sections = [sections[0].clone(), sections[1].clone()];
         {
-            // The lumen's inscribed-sphere centerline between the ends, on its own.
+            // The lumen's centerline from the first end, on its own.
             let a = &sections[0];
-            let h = m.average_edge_length();
-            let n = a.normal.normalize();
-            let src: Vec<u32> = m.vertex_ids().filter(|&v| (m.vertex(v) - a.center).dot(n).abs() < h && a.ring.iter().any(|sg| point_segment_distance(m.vertex(v), sg[0], sg[1]) < h)).collect();
-            let cl = centerline::compute(&m, &src, 0.5 * a.diameter, &CenterlineParams::default());
+            let input = LumenInput { inlet: LumenEnd { at: a.center, radius: 0.5 * a.diameter, anchor: Anchor::Inside }, outlets: Vec::new(), cap_groups: Vec::new() };
+            let cl = centerline::compute_lumen(&m, &centerline::CappedCache::default(), &input, &LumenParams::default(), None).unwrap().unwrap().centerline;
             let pts: Vec<DVec3> = cl.branches.iter().flat_map(|b| b.nodes.iter().map(|&i| cl.nodes[i].position)).collect();
             let near = |c: DVec3| pts.iter().copied().min_by(|p, q| p.distance(c).total_cmp(&q.distance(c))).unwrap();
             eprintln!("  (traced centerline: {} nodes; nearest to the ends {:.2} / {:.2} mm)", pts.len(), near(sections[0].center).distance(sections[0].center), near(sections[1].center).distance(sections[1].center));

@@ -56,17 +56,24 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
 
 ### The vessel's centerline
 
-- Traced from end 1's cross-section: geodesic distance rings, as in the Centerline tool,
-  through end 2 and on past both ends, taking the straightest way at junctions.
-- Vertices whose ring lies on this path are the stented vessel's own wall. Side branches and
-  anything else joined near it follow with distance along the surface.
-- The path is smoothed over half the vessel's radius. Rings kink by open ends and at
-  junctions.
-- **Through the centres of inscribed spheres between the ends.** Ring centroids can lie
-  millimetres off the lumen's centre, even outside it, through a stenosis that bends or
-  narrows eccentrically. So between the ends the path is the lumen's centerline through the
-  centres of the largest spheres inside it, as VMTK's Voronoi centerlines run
-  (`centerline::inscribed_path`):
+- The lumen's centerline tree, as in the Centerline tool (`centerline::compute_lumen`:
+  through the centres of the largest spheres inside the lumen, every point and segment
+  inside it): from the model's widest open end to the others, blind side branches too,
+  traced once per shape of the mesh and kept for the next pair of ends. Where an end's
+  cross-section lies off that tree (or the model has no open ends), it is traced from end 1's
+  centre instead. The path runs along it from end 1 through end 2 and on past both ends,
+  taking the straightest way at junctions.
+- Each vertex is wall of the vessel whose centerline tube (its spheres swept along it) is
+  nearest, as VMTK splits branches; those of the path are the stented vessel's own wall, even
+  at a junction or either side of a septum. Side branches and anything else joined near it
+  follow with distance along the surface.
+- The path's radii are the vessel's mean half-width across its cross-section (sixteen rays,
+  `centerline::section_radii`), which bound the wall the stent carries; a flat sinus's
+  inscribed sphere is much narrower than its wings. The path is smoothed over half that
+  radius.
+- **Through the centres of inscribed spheres between the ends**, on a finer grid. Between the
+  ends the path is the lumen's centerline through the centres of the largest spheres inside
+  it, as VMTK's Voronoi centerlines run (`centerline::inscribed_path`):
   - The lumen is voxelized in a tube a few radii around the traced path (inside by the parity
     of ray crossings, the mesh's open ends capped), and each voxel gets its distance to the
     wall (an exact distance transform).

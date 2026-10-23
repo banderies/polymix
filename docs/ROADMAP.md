@@ -100,10 +100,12 @@ holes and Thicken (M18), which printed flow models need.
       septum thinner than a voxel still parts its sides), TEASAR to every end, loops closed
       round fenestrations (only round tissue, and channels at least a quarter of the vessel's
       width), blind side branches on request (tube-shaped, leading away from the tree), each
-      point centred in its cross-section by moves that cannot leave the lumen. Every point (winding number) and segment (ray) is then checked
-      against the surface and the result shown in the panel; radii are inscribed-sphere radii.
-      Still on the rings: the stent tool's trace past the stent's ends and the loft's *Follow
-      the vessel centerlines*.
+      point centred in its cross-section by moves that cannot leave the lumen. Every point
+      (winding number) and segment (ray) is then checked against the surface and the result
+      shown in the panel; radii are inscribed-sphere radii. The stent tool traces its vessel on
+      this tree (kept per shape of the mesh; each vertex the wall of the centerline whose tube
+      is nearest), and the loft's *Follow the vessel centerlines* on it within twelve opening
+      radii of each opening. The rings are gone.
 
 ## M6 — Display and shading
 

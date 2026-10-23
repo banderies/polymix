@@ -4,7 +4,7 @@
 //! ParaView or VMTK).
 
 use super::*;
-use crate::centerline::{self, LumenCenterline, LumenEnd, LumenInput, LumenParams};
+use crate::centerline::{self, Anchor, LumenCenterline, LumenEnd, LumenInput, LumenParams};
 use crate::jobs::Job;
 use crate::tools::vessel::{find_vessel_ends, EndKind, VesselEnd};
 use crate::ui_util;
@@ -83,7 +83,7 @@ impl CenterlineTool {
     fn start(&mut self, cx: &mut ToolCx) {
         let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
         let mesh = o.mesh.clone();
-        let opening = |e: &VesselEnd| LumenEnd { at: e.center, radius: 0.5 * e.diameter, opening: true };
+        let opening = |e: &VesselEnd| LumenEnd { at: e.center, radius: 0.5 * e.diameter, anchor: Anchor::Opening };
         // The inlet's end, or a picked point to find the vessel's radius at in the job.
         let inlet: Result<LumenEnd, DVec3> = if let Some(i) = self.inlet {
             Ok(opening(&self.ends[i]))
@@ -114,7 +114,7 @@ impl CenterlineTool {
             let inlet = match inlet {
                 Ok(e) => e,
                 Err(p) => match inlet_near(&mesh, bvh, p) {
-                    Some((_, radius)) => LumenEnd { at: p, radius, opening: false },
+                    Some((_, radius)) => LumenEnd { at: p, radius, anchor: Anchor::Wall },
                     None => return Ok(None),
                 },
             };
