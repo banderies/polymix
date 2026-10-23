@@ -7,6 +7,14 @@
 //! their rings touch. On a branching tube this yields a tree whose nodes lie on the
 //! vessel axes; bifurcations appear where one ring splits into several. The tree is split
 //! into branches, short spurs from surface noise are pruned, and branches are smoothed.
+//!
+//! Ring centroids can lie outside the lumen where the vessel is not a simple tube (a
+//! confluence, a fenestration, a tight bend): the Centerline tool uses [`lumen`]'s
+//! centerlines, through the centres of the largest spheres inside the vessel, instead.
+
+mod lumen;
+
+pub use lumen::{compute_lumen, LumenCenterline, LumenEnd, LumenInput, LumenParams};
 
 use glam::DVec3;
 use mm_core::{Bvh, Mesh, INVALID};
@@ -20,7 +28,7 @@ use std::time::Duration;
 pub struct CenterlineNode {
     pub position: DVec3,
     pub radius: f64,
-    /// Geodesic distance band index (0 at the inlet).
+    /// Geodesic distance band index (0 at the inlet; 0 throughout a lumen centerline).
     pub band: usize,
 }
 
@@ -34,6 +42,8 @@ pub struct Branch {
     pub max_radius: f64,
     /// Index of the parent branch (None for the root).
     pub parent: Option<usize>,
+    /// The branch whose end this one's end meets too: a loop, as around a fenestration.
+    pub joins: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -41,7 +51,8 @@ pub struct Centerline {
     pub nodes: Vec<CenterlineNode>,
     pub edges: Vec<(usize, usize)>,
     pub branches: Vec<Branch>,
-    /// The node (ring) each vertex belongs to, by vertex id (`usize::MAX`: unreached).
+    /// The node (ring) each vertex belongs to, by vertex id (`usize::MAX`: unreached; empty
+    /// for a lumen centerline).
     pub vertex_node: Vec<usize>,
 }
 
@@ -287,7 +298,7 @@ fn build_branches(cl: &mut Centerline, params: &CenterlineParams) {
             nodes.push(cur);
         }
         let id = branches.len();
-        branches.push(Branch { nodes, length: 0.0, mean_radius: 0.0, min_radius: 0.0, max_radius: 0.0, parent });
+        branches.push(Branch { nodes, length: 0.0, mean_radius: 0.0, min_radius: 0.0, max_radius: 0.0, parent, joins: None });
         for &c in &children[cur] {
             // Child branches start at the junction node so they connect.
             stack.push((c, Some(id)));

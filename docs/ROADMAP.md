@@ -92,6 +92,18 @@ holes and Thicken (M18), which printed flow models need.
 - [x] **M5.2 Mesh Query**: per-triangle/vertex info, curvature and normal colour modes.
 - [x] **M5.3 Units/Dimensions from measurements** (set scale from a measured length).
 - [x] **M5.4 Clearance** (minimum distance between objects).
+- [x] **M5.5 Centerline through the lumen**: the Centerline tool's rings (geodesic level sets)
+      put points in the tissue at confluences (the torcula), fenestrations and tight bends.
+      It now follows the centres of the largest spheres inside the lumen
+      (`centerline::compute_lumen`): the capped lumen voxelized by signed ray crossings, each
+      voxel's exact distance to the wall, voxel steps kept only where they stay inside (a
+      septum thinner than a voxel still parts its sides), TEASAR to every end, loops closed
+      round fenestrations (only round tissue, and channels at least a quarter of the vessel's
+      width), blind side branches on request (tube-shaped, leading away from the tree), each
+      point centred in its cross-section by moves that cannot leave the lumen. Every point (winding number) and segment (ray) is then checked
+      against the surface and the result shown in the panel; radii are inscribed-sphere radii.
+      Still on the rings: the stent tool's trace past the stent's ends and the loft's *Follow
+      the vessel centerlines*.
 
 ## M6 — Display and shading
 

@@ -200,8 +200,10 @@ ends kept open with flat rims. The new side comes from a distance field, so it n
 into itself at a bifurcation or a tight bend as moving the surface along its normals would,
 and the result is a closed, manifold wall ready to print.
 
-Analysis extras: **Centerline** (vessel tree, per-branch length and diameters, CSV / VTK export
-for ParaView/VMTK), **Measure** (cross-section equivalent diameter, distances), **Deviation**
+Analysis extras: **Centerline** (vessel tree through the centres of the largest spheres inside
+the lumen, as VMTK's, with loops around fenestrations; every point and segment is checked to lie
+inside the lumen; per-branch length and inscribed diameters, CSV / VTK export for
+ParaView/VMTK), **Measure** (cross-section equivalent diameter, distances), **Deviation**
 (signed distance to a reference with colour map, mean/RMS/95th percentile/Hausdorff — handy for
 reporting how much a cleanup changed the geometry), **Units/Dimensions**.
 

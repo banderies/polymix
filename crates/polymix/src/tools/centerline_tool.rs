@@ -1,8 +1,10 @@
-//! Centerline tool: choose the inlet, compute the vessel centerline tree, inspect branch
-//! lengths and diameters, and export it (CSV / VTK for ParaView or VMTK).
+//! Centerline tool: choose the inlet, compute the vessel centerline tree through the lumen
+//! (the centres of the largest spheres inside it, see [`centerline::compute_lumen`]), check
+//! that it stays inside, inspect branch lengths and diameters, and export it (CSV / VTK for
+//! ParaView or VMTK).
 
 use super::*;
-use crate::centerline::{self, Centerline, CenterlineParams};
+use crate::centerline::{self, LumenCenterline, LumenEnd, LumenInput, LumenParams};
 use crate::jobs::Job;
 use crate::tools::vessel::{find_vessel_ends, EndKind, VesselEnd};
 use crate::ui_util;
@@ -17,8 +19,14 @@ pub struct CenterlineTool {
     inlet_clicked: bool,
     step: f64,
     auto_step: bool,
-    job: Option<Job<Option<Centerline>>>,
-    result: Option<Centerline>,
+    /// Also follow blind side branches (vessels without an open end).
+    blind: bool,
+    job: Option<Job<Option<LumenCenterline>>>,
+    result: Option<LumenCenterline>,
+    /// The ends (indices into `ends`) the computation was asked to reach, in its order.
+    outlet_ends: Vec<usize>,
+    /// The surface with its open ends capped, kept for the next computation through it.
+    capped: centerline::CappedCache,
     hovered_branch: Option<usize>,
     message: Option<String>,
 }
@@ -62,8 +70,11 @@ impl CenterlineTool {
             inlet_clicked: false,
             step: 0.5,
             auto_step: true,
+            blind: false,
             job: None,
             result: None,
+            outlet_ends: Vec::new(),
+            capped: centerline::CappedCache::default(),
             hovered_branch: None,
             message: None,
         }
@@ -72,34 +83,22 @@ impl CenterlineTool {
     fn start(&mut self, cx: &mut ToolCx) {
         let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
         let mesh = o.mesh.clone();
-        // The inlet's vertices and radius, or a picked point to find them from in the job.
-        let inlet: Result<(Vec<u32>, f64), DVec3> = if let Some(i) = self.inlet {
-            let e = &self.ends[i];
-            let verts: Vec<u32> = match e.kind {
-                EndKind::Cap(g) => {
-                    let mut v: Vec<u32> = mesh.triangle_ids().filter(|&t| mesh.tri_group(t) == g).flat_map(|t| mesh.triangle(t)).collect();
-                    v.sort_unstable();
-                    v.dedup();
-                    v
-                }
-                EndKind::Open => mm_core::topology::boundary_loops(&mesh)
-                    .into_iter()
-                    .min_by(|a, b| a.centroid(&mesh).distance(e.center).partial_cmp(&b.centroid(&mesh).distance(e.center)).unwrap())
-                    .map(|l| l.vertices)
-                    .unwrap_or_default(),
-            };
-            Ok((verts, e.diameter * 0.5))
+        let opening = |e: &VesselEnd| LumenEnd { at: e.center, radius: 0.5 * e.diameter, opening: true };
+        // The inlet's end, or a picked point to find the vessel's radius at in the job.
+        let inlet: Result<LumenEnd, DVec3> = if let Some(i) = self.inlet {
+            Ok(opening(&self.ends[i]))
         } else if let Some(p) = self.inlet_point {
             Err(p)
         } else {
             self.message = Some("Pick an inlet first.".into());
             return;
         };
-        if inlet.as_ref().is_ok_and(|(sources, _)| sources.is_empty()) {
-            self.message = Some("Could not find the inlet boundary.".into());
-            return;
-        }
-        let params = CenterlineParams { step: if self.auto_step { 0.0 } else { self.step }, ..Default::default() };
+        // Every other cut end and end cap is reached (not holes in the wall, which are capped).
+        self.outlet_ends = (0..self.ends.len()).filter(|&i| Some(i) != self.inlet && self.ends[i].planar).collect();
+        let outlets: Vec<LumenEnd> = self.outlet_ends.iter().map(|&i| opening(&self.ends[i])).collect();
+        let cap_groups: Vec<i32> = self.ends.iter().filter_map(|e| if let EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
+        let params = LumenParams { spacing: if self.auto_step { 0.0 } else { self.step }, blind_branches: self.blind, ..Default::default() };
+        let capped = self.capped.clone();
         self.message = None;
         // Building the BVH takes about half a second on a large mesh, so that is done in the
         // job, or the scene's is used if it is up to date (the Shift+click that picked the point
@@ -111,15 +110,15 @@ impl CenterlineTool {
         // equally near several triangles around a vertex, so for those the job builds a fresh
         // tree, as before.
         let bvh = if self.inlet_clicked { o.cached_bvh() } else { None };
-        self.job = Some(Job::spawn("Centerline", cx.egui.clone(), move |_| {
-            let (sources, radius) = match inlet {
-                Ok(s) => s,
+        self.job = Some(Job::spawn("Centerline", cx.egui.clone(), move |progress| {
+            let inlet = match inlet {
+                Ok(e) => e,
                 Err(p) => match inlet_near(&mesh, bvh, p) {
-                    Some(s) => s,
+                    Some((_, radius)) => LumenEnd { at: p, radius, opening: false },
                     None => return Ok(None),
                 },
             };
-            Ok(Some(centerline::compute(&mesh, &sources, radius, &params)))
+            centerline::compute_lumen(&mesh, &capped, &LumenInput { inlet, outlets, cap_groups }, &params, Some(progress))
         }));
     }
 
@@ -135,7 +134,7 @@ impl CenterlineTool {
 
     /// Write the centerline as CSV or VTK (by the extension).
     fn save_to(&self, path: &std::path::Path) -> Result<String, String> {
-        let cl = self.result.as_ref().ok_or("compute the centerline first")?;
+        let cl = &self.result.as_ref().ok_or("compute the centerline first")?.centerline;
         let text = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
             Some("csv") => cl.to_csv(),
             Some("vtk") => cl.to_vtk(),
@@ -148,11 +147,11 @@ impl CenterlineTool {
         if let Some(r) = self.job.as_ref().and_then(|j| j.poll()) {
             self.job = None;
             match r {
-                Ok(Some(cl)) => {
-                    *cx.status = format!("Centerline: {} branch(es)", cl.branches.len());
-                    self.result = Some(cl);
+                Ok(Some(r)) => {
+                    *cx.status = format!("Centerline: {} branch(es){}", r.centerline.branches.len(), if r.check.passed() { "" } else { " — NOT inside the lumen everywhere" });
+                    self.result = Some(r);
                 }
-                // No surface near the picked point (an empty mesh): nothing to compute.
+                // No surface near the picked point (an empty mesh), or stopped: nothing to show.
                 Ok(None) => {}
                 Err(e) => self.message = Some(format!("{e:#}")),
             }
@@ -187,6 +186,7 @@ impl Tool for CenterlineTool {
                 ui.add(egui::DragValue::new(&mut self.step).speed(0.01).range(1e-4..=1e4).prefix("step "));
             }
         });
+        ui.checkbox(&mut self.blind, "Blind branches too").on_hover_text("Also follow side branches that end closed (no open end): tube-shaped, at least a fifth as wide as the vessel they leave, and ending at least 2.5 of its radii from the rest of the tree and 2.5 of their own beyond it. Without it the tree joins the vessel's ends, with loops round fenestrations; a model with no other ends always gets them.");
         if ui.add_enabled(self.job.is_none(), egui::Button::new("Compute centerline")).clicked() {
             self.start(cx);
         }
@@ -195,7 +195,8 @@ impl Tool for CenterlineTool {
             polymix_workspace::spinner(ui);
         }
         self.hovered_branch = None;
-        if let Some(cl) = &self.result {
+        if let Some(r) = &self.result {
+            let cl = &r.centerline;
             ui_util::section(ui, "Branches");
             egui::Grid::new("branches").striped(true).num_columns(5).show(ui, |ui| {
                 ui.strong("#");
@@ -206,7 +207,8 @@ impl Tool for CenterlineTool {
                 ui.end_row();
                 for (i, b) in cl.branches.iter().enumerate() {
                     let c = BRANCH_COLORS[i % BRANCH_COLORS.len()];
-                    let r = ui.colored_label(egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8), format!("{}", i + 1));
+                    let label = if b.joins.is_some() { format!("{} ↺", i + 1) } else { format!("{}", i + 1) };
+                    let r = ui.colored_label(egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8), label);
                     let mut hovered = r.hovered();
                     hovered |= ui.label(format!("{:.2}", b.length)).hovered();
                     hovered |= ui.label(format!("{:.2}", 2.0 * b.mean_radius)).hovered();
@@ -218,7 +220,20 @@ impl Tool for CenterlineTool {
                     ui.end_row();
                 }
             });
-            ui.weak("Diameters are 2 × mean ring radius; hover a row to highlight the branch.");
+            ui.weak("Diameters are of the largest sphere inside the vessel at each point (as VMTK's); ↺ closes a loop, as round a fenestration. Hover a row to highlight the branch.");
+            let k = &r.check;
+            if k.passed() {
+                ui.colored_label(egui::Color32::from_rgb(120, 210, 130), format!("✓ Inside the lumen: all {} points and {} segments (nearest the wall {:.2} mm)", k.points, k.segments, k.min_clearance));
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(240, 110, 90), format!("⚠ Not inside the lumen everywhere: {} of {} points outside, {} of {} segments cross the wall (red)", k.outside.len(), k.points, k.crossing.len(), k.segments));
+            }
+            if r.loops > 0 {
+                ui.label(format!("{} loop{} round fenestrations", r.loops, if r.loops == 1 { "" } else { "s" }));
+            }
+            if !r.unreached.is_empty() {
+                let ends: Vec<String> = r.unreached.iter().filter_map(|&o| self.outlet_ends.get(o)).map(|i| (i + 1).to_string()).collect();
+                ui.colored_label(egui::Color32::from_rgb(240, 170, 90), format!("Not connected to the inlet inside the model: end {}", ends.join(", ")));
+            }
             ui.horizontal(|ui| {
                 if ui.button("Export CSV…").clicked() {
                     self.save(true);
@@ -278,7 +293,7 @@ impl Tool for CenterlineTool {
             painter.circle(p, 8.0, ui_util::ACCENT, egui::Stroke::new(1.5, egui::Color32::WHITE));
         }
         // Centerline drawn on top of the surface (it lies inside the vessel).
-        if let Some(cl) = &self.result {
+        if let Some(cl) = self.result.as_ref().map(|r| &r.centerline) {
             for (i, b) in cl.branches.iter().enumerate() {
                 let c = BRANCH_COLORS[i % BRANCH_COLORS.len()];
                 let hot = self.hovered_branch == Some(i);
@@ -287,8 +302,16 @@ impl Tool for CenterlineTool {
                 painter.add(egui::Shape::line(pts, egui::Stroke::new(if hot { 4.0 } else { 2.5 }, col)));
             }
         }
+        // Where the check found it outside the lumen.
+        if let Some(r) = &self.result {
+            for &p in r.check.outside.iter().chain(&r.check.crossing) {
+                if let Some(p) = cx.project(p) {
+                    painter.circle(p, 5.0, egui::Color32::from_rgb(240, 60, 50), egui::Stroke::new(1.0, egui::Color32::WHITE));
+                }
+            }
+        }
         // Branch labels at their midpoints.
-        if let Some(cl) = &self.result {
+        if let Some(cl) = self.result.as_ref().map(|r| &r.centerline) {
             for (i, b) in cl.branches.iter().enumerate() {
                 let mid = cl.nodes[b.nodes[b.nodes.len() / 2]].position;
                 if let Some(p) = cx.project(mid) {
@@ -305,15 +328,15 @@ impl Tool for CenterlineTool {
     }
 
     fn busy(&self) -> Option<(String, f32)> {
-        self.job.as_ref().map(|_| ("Centerline".to_string(), 0.5))
+        self.job.as_ref().map(|j| ("Centerline".to_string(), j.progress()))
     }
 
     fn settings(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"spacing_mm": (!self.auto_step).then_some(self.step)}))
+        Some(serde_json::json!({"spacing_mm": (!self.auto_step).then_some(self.step), "blind_branches": self.blind}))
     }
 
     fn settings_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "object", "properties": {"spacing_mm": {"type": ["number", "null"], "description": "Distance between centerline nodes along the vessel, mm; null for automatic (half the inlet radius)"}}}))
+        Some(serde_json::json!({"type": "object", "properties": {"spacing_mm": {"type": ["number", "null"], "description": "Distance between centerline points along the vessel, mm (bends keep more); null for automatic (a fifth of the inlet radius)"}, "blind_branches": {"type": "boolean", "description": "Also follow side branches that end closed (no open end); otherwise the tree joins the vessel's ends, with loops round fenestrations (a model with no other ends always gets them)"}}}))
     }
 
     fn set_settings(&mut self, changes: &serde_json::Value, _cx: &mut ToolCx) -> Result<(), String> {
@@ -326,6 +349,7 @@ impl Tool for CenterlineTool {
                 self.auto_step = false;
             }
         }
+        self.blind = v["blind_branches"].as_bool().ok_or("blind_branches must be true or false")?;
         Ok(())
     }
 
@@ -341,18 +365,30 @@ impl Tool for CenterlineTool {
                 _ => serde_json::Value::Null,
             },
             "computing": self.job.is_some(),
-            "branches": self.result.as_ref().map(|cl| cl.branches.iter().enumerate().map(|(i, b)| {
+            "check": self.result.as_ref().map(|r| json!({
+                "inside_lumen": r.check.passed(),
+                "points": r.check.points,
+                "points_outside": r.check.outside.len(),
+                "segments": r.check.segments,
+                "segments_crossing_wall": r.check.crossing.len(),
+                "closest_to_wall_mm": round(r.check.min_clearance, 3),
+            })),
+            "loops": self.result.as_ref().map(|r| r.loops),
+            "ends_not_connected": self.result.as_ref().map(|r| r.unreached.iter().filter_map(|&o| self.outlet_ends.get(o)).map(|i| i + 1).collect::<Vec<_>>()),
+            "voxel_mm": self.result.as_ref().map(|r| round(r.voxel, 4)),
+            "branches": self.result.as_ref().map(|r| &r.centerline).map(|cl| cl.branches.iter().enumerate().map(|(i, b)| {
                 // Up to 12 samples along the branch, ends included.
                 let n = b.nodes.len();
                 let samples: Vec<serde_json::Value> = (0..n.min(12)).map(|k| if n <= 12 { k } else { k * (n - 1) / 11 }).map(|k| {
                     let node = &cl.nodes[b.nodes[k]];
-                    json!({"at_mm": vec3(node.position.to_array(), 3), "diameter_mm": round(2.0 * node.radius, 3)})
+                    json!({"at_mm": vec3(node.position.to_array(), 3), "inscribed_diameter_mm": round(2.0 * node.radius, 3)})
                 }).collect();
                 json!({
                     "branch": i + 1,
                     "parent": b.parent.map(|p| p + 1),
+                    "rejoins": b.joins.map(|j| j + 1),
                     "length_mm": round(b.length, 3),
-                    "diameter_mm": {"mean": round(2.0 * b.mean_radius, 3), "min": round(2.0 * b.min_radius, 3), "max": round(2.0 * b.max_radius, 3)},
+                    "inscribed_diameter_mm": {"mean": round(2.0 * b.mean_radius, 3), "min": round(2.0 * b.min_radius, 3), "max": round(2.0 * b.max_radius, 3)},
                     "samples": samples,
                 })
             }).collect::<Vec<_>>()),
@@ -365,7 +401,7 @@ impl Tool for CenterlineTool {
         use serde_json::json;
         vec![
             Action::new("set_inlet", "Choose the inlet: an end by number (from the state's ends), or on a closed model a point near it", json!({"end": arg::integer("End number (from 1)"), "at": arg::point("A point in mm on or near the inlet")})),
-            Action::plain("compute", "Compute the centerline tree from the inlet (in the background)"),
+            Action::plain("compute", "Compute the centerline tree from the inlet through the lumen, and check every point and segment lies inside it (in the background)"),
             Action::new("export", "Save the centerline: CSV (nodes, branches, radii) or VTK (polyline with Radius point data, for ParaView or VMTK), by the extension", json!({"path": arg::text("Absolute path ending in .csv or .vtk"), "overwrite": arg::boolean("Replace an existing file")})).required(&["path"]),
         ]
     }
