@@ -1,14 +1,15 @@
-//! The application shell: the workspace tabs (Volume | Segmentation | Mesh) above
-//! independent workspaces.
+//! The application shell: the workspace tabs (Volume | Segmentation | Mesh | Reverse Engineer)
+//! above independent workspaces.
 //!
 //! The shell owns the window-level things every workspace shares: the tab bar and its
-//! hotkeys (⌘1 / ⌘2 / ⌘3), routing of dropped files and command-line paths, the window title,
+//! hotkeys (⌘1 – ⌘4), routing of dropped files and command-line paths, the window title,
 //! persistence of the chosen tab, and the test-script runner (`POLYMIX_SCRIPT`). Each
 //! workspace is called through its [`Slot`], so a panic inside one stops only that one: its
 //! tab shows a crash card with a Restart button while the others keep working.
 
 use crate::agents::{self, AgentAccess};
 use crate::app::MeshWorkspace;
+use crate::reverse::ReverseWorkspace;
 use mm_volume::model::Catalog;
 use polymix_mcp::{Call, Reply};
 use polymix_segmentation::SegmentationWorkspace;
@@ -39,16 +40,18 @@ pub enum Tab {
     Volume,
     Segmentation,
     Mesh,
+    Reverse,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Volume, Tab::Segmentation, Tab::Mesh];
+    const ALL: [Tab; 4] = [Tab::Volume, Tab::Segmentation, Tab::Mesh, Tab::Reverse];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Volume => "Volume",
             Tab::Segmentation => "Segmentation",
             Tab::Mesh => "Mesh",
+            Tab::Reverse => "Reverse Engineer",
         }
     }
 
@@ -57,6 +60,7 @@ impl Tab {
             Tab::Volume => "volume",
             Tab::Segmentation => "segmentation",
             Tab::Mesh => "mesh",
+            Tab::Reverse => "reverse",
         }
     }
 
@@ -69,6 +73,7 @@ impl Tab {
             Tab::Volume => egui::Key::Num1,
             Tab::Segmentation => egui::Key::Num2,
             Tab::Mesh => egui::Key::Num3,
+            Tab::Reverse => egui::Key::Num4,
         }
     }
 }
@@ -78,6 +83,7 @@ pub struct PolymixApp {
     volume: Slot<VolumeWorkspace>,
     segmentation: Slot<SegmentationWorkspace>,
     mesh: Slot<MeshWorkspace>,
+    reverse: Slot<ReverseWorkspace>,
     /// Paths from the command line, opened on the first frame.
     pending_open: Vec<PathBuf>,
     /// The modifier keys the keyboard holds, and those the 3D mouse's buttons held last frame
@@ -180,6 +186,7 @@ impl PolymixApp {
         let volume = slot("Volume", || VolumeWorkspace::new(ctx, storage));
         let segmentation = slot("Segmentation", || SegmentationWorkspace::new(ctx, storage));
         let mesh = slot("Mesh", || MeshWorkspace::new(ctx, cc.wgpu_render_state.as_ref(), storage));
+        let reverse = slot("Reverse Engineer", || ReverseWorkspace::new(ctx, cc.wgpu_render_state.as_ref(), storage));
         // A recovery prompt (or similar) must be seen: show that workspace first.
         if mesh.live().is_some_and(|w| w.needs_attention()) {
             active = Tab::Mesh;
@@ -190,7 +197,7 @@ impl PolymixApp {
         let mut agents = AgentAccess::new(storage, agents::all_tools());
         agents.start_if_enabled(ctx);
         let ui_access = crate::ui_access::UiAccess::new(ctx);
-        Self { active, volume, segmentation, mesh, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None, overlay_key: None, keyboard_modifiers: egui::Modifiers::NONE, held_modifiers: egui::Modifiers::NONE, keys_down: Vec::new() }
+        Self { active, volume, segmentation, mesh, reverse, pending_open: files, script, frames: 0, crash_next: None, restart_next: None, title: String::new(), agents, ui_access, waits: Vec::new(), shots: Vec::new(), want_frame: None, brought_forward: false, agent_work_until: None, overlay_key: None, keyboard_modifiers: egui::Modifiers::NONE, held_modifiers: egui::Modifiers::NONE, keys_down: Vec::new() }
     }
 
     /// Open paths in the workspaces that take them (meshes and projects → Mesh, images and
@@ -221,6 +228,7 @@ impl PolymixApp {
             Tab::Volume => matches!(self.volume, Slot::Crashed(_)),
             Tab::Segmentation => matches!(self.segmentation, Slot::Crashed(_)),
             Tab::Mesh => matches!(self.mesh, Slot::Crashed(_)),
+            Tab::Reverse => matches!(self.reverse, Slot::Crashed(_)),
         }
     }
 
@@ -283,6 +291,21 @@ impl PolymixApp {
                     }
                 }
             },
+            Tab::Reverse => match &self.reverse {
+                Slot::Live(_) => {
+                    self.reverse.call(|w| {
+                        if crash {
+                            panic!("crash test requested by the script");
+                        }
+                        w.ui(ui, frame)
+                    });
+                }
+                Slot::Crashed(report) => {
+                    if guard::crash_card(ui, report, "Restart opens the Reverse Engineer workspace again with the part as it was last saved.") == CardAction::Restart || restart {
+                        self.reverse = slot("Reverse Engineer", || ReverseWorkspace::new(&ctx, frame.wgpu_render_state(), frame.storage()));
+                    }
+                }
+            },
             Tab::Segmentation => match &self.segmentation {
                 Slot::Live(_) => {
                     self.segmentation.call(|w| {
@@ -306,6 +329,7 @@ impl PolymixApp {
             Tab::Volume => self.volume.live().map(|w| w.title()),
             Tab::Segmentation => self.segmentation.live().map(|w| w.title()),
             Tab::Mesh => self.mesh.live().map(|w| w.title()),
+            Tab::Reverse => self.reverse.live().map(|w| w.title()),
         }
         .unwrap_or_else(|| format!("Polymix — {} (stopped)", self.active.label()));
         if title != self.title {
@@ -363,6 +387,7 @@ impl PolymixApp {
                         Tab::Volume => self.volume.call(|w| w.agent_acting()),
                         Tab::Segmentation => self.segmentation.call(|w| w.agent_acting()),
                         Tab::Mesh => self.mesh.call(|w| w.agent_acting()),
+                        Tab::Reverse => self.reverse.call(|w| w.agent_acting()),
                     };
                     self.ui_access.act(call, ctx);
                 }
@@ -373,13 +398,14 @@ impl PolymixApp {
                     self.active = tab;
                     Reply::Json(json!({"shown": tab.key()}))
                 }
-                None => Reply::Error("workspace must be volume, segmentation or mesh".into()),
+                None => Reply::Error("workspace must be volume, segmentation, mesh or reverse".into()),
             },
             tool => {
                 let (name, r) = match tool.split('_').next().unwrap_or("") {
                     "volume" => ("Volume", self.volume.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
                     "segmentation" => ("Segmentation", self.segmentation.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
                     "mesh" => ("Mesh", self.mesh.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
+                    "reverse" => ("Reverse Engineer", self.reverse.call(|w| agents::workspace_call(w, tool, &call.args, ctx))),
                     _ => ("", Some(AgentReply::error(format!("unknown tool {tool}")))),
                 };
                 match r {
@@ -403,7 +429,7 @@ impl PolymixApp {
             "app": "Polymix",
             "version": env!("CARGO_PKG_VERSION"),
             "workspace_shown": self.active.key(),
-            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh)},
+            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh), "reverse": state(&self.reverse)},
             "window": {"width": r.width().round(), "height": r.height().round(), "pixels_per_point": ctx.pixels_per_point()},
             "identifiers_hidden_in_volume": self.volume.live().is_some_and(|w| w.hides_identifiers()),
         })
@@ -443,7 +469,7 @@ impl PolymixApp {
     }
 
     fn all_idle(&self) -> bool {
-        self.volume.live().is_none_or(|w| w.script_idle()) && self.segmentation.live().is_none_or(|w| w.script_idle()) && self.mesh.live().is_none_or(|w| w.script_idle())
+        self.volume.live().is_none_or(|w| w.script_idle()) && self.segmentation.live().is_none_or(|w| w.script_idle()) && self.mesh.live().is_none_or(|w| w.script_idle()) && self.reverse.live().is_none_or(|w| w.script_idle())
     }
 
     /// Ask for a screenshot of the next frame; the callback hands it to the server to encode.
@@ -511,6 +537,7 @@ impl PolymixApp {
             Tab::Volume => self.volume.live().is_none_or(|w| w.script_idle()),
             Tab::Segmentation => self.segmentation.live().is_none_or(|w| w.script_idle()),
             Tab::Mesh => self.mesh.live().is_none_or(|w| w.script_idle()),
+            Tab::Reverse => self.reverse.live().is_none_or(|w| w.script_idle()),
         }
     }
 
@@ -615,6 +642,7 @@ impl PolymixApp {
                     Tab::Volume => self.volume.call(|w| w.script_push(step.clone())),
                     Tab::Segmentation => self.segmentation.call(|w| w.script_push(step.clone())),
                     Tab::Mesh => self.mesh.call(|w| w.script_push(step.clone())),
+                    Tab::Reverse => self.reverse.call(|w| w.script_push(step.clone())),
                 };
                 if taken.is_none() {
                     log::warn!("script step {step} dropped: the {} workspace is not running", self.active.label());
@@ -686,7 +714,26 @@ impl eframe::App for PolymixApp {
         }
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
         self.segmentation.call(|w| w.tick(ctx, active == Tab::Segmentation));
+        // The Reverse Engineer workspace models over the scan the Mesh workspace holds, moves
+        // its view the way Mesh does (the 3D mouse too), and sends its bodies there as meshes.
+        self.mesh.call(|w| w.set_space_mouse_elsewhere(active == Tab::Reverse));
+        if active == Tab::Reverse {
+            if let Some((scans, flip)) = self.mesh.call(|w| w.scans_for_reverse()) {
+                let nav = self.mesh.call(|w| w.nav_for_reverse());
+                self.reverse.call(|w| w.set_scan(scans, flip, nav));
+            }
+        }
+        if let Some(meshes) = self.reverse.call(|w| w.take_for_mesh()).filter(|m| !m.is_empty()) {
+            self.mesh.call(|w| w.add_from_reverse(meshes));
+            self.active = Tab::Mesh;
+        }
+        // Compare in Deviation: the bodies go to Mesh as its Deviation tool's reference.
+        if let Some((name, mesh)) = self.reverse.call(|w| w.take_compare()).flatten() {
+            self.mesh.call(|w| w.compare_from_reverse(name, mesh));
+            self.active = Tab::Mesh;
+        }
         self.mesh.call(|w| w.tick(ctx, active == Tab::Mesh));
+        self.reverse.call(|w| w.tick(ctx, active == Tab::Reverse));
         self.serve_agents(ctx);
         self.finish_waits(ctx);
         self.ui_access.tick(ctx);
@@ -732,6 +779,7 @@ impl eframe::App for PolymixApp {
         self.volume.call(|w| w.save(storage));
         self.segmentation.call(|w| w.save(storage));
         self.mesh.call(|w| w.save(storage));
+        self.reverse.call(|w| w.save(storage));
     }
 
     fn on_exit(&mut self) {
@@ -739,6 +787,7 @@ impl eframe::App for PolymixApp {
         self.volume.call(|w| w.on_exit());
         self.segmentation.call(|w| w.on_exit());
         self.mesh.call(|w| w.on_exit());
+        self.reverse.call(|w| w.on_exit());
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -755,8 +804,9 @@ impl eframe::App for PolymixApp {
         if !self.keys_down.is_empty() {
             ctx.request_repaint();
         }
-        // Only the Mesh tab acts on button presses: elsewhere they are not kept for later.
-        if self.active != Tab::Mesh {
+        // Only the tabs with a 3D view act on button presses: elsewhere they are not kept for
+        // later.
+        if !matches!(self.active, Tab::Mesh | Tab::Reverse) {
             crate::spacemouse::drop_presses();
         }
         if let Some(script) = &mut self.script {

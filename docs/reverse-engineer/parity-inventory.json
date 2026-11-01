@@ -1,0 +1,4602 @@
+[
+ {
+  "id": "BUILD-01",
+  "package": "BUILD",
+  "area": "Feature model",
+  "capability": "Feature list stored by reference as JSON: ordered features, ids never reused, names from the kind's count, every kind's fields",
+  "sources": "core/features.ts; app/projectSection.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/model.rs",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-02",
+  "package": "BUILD",
+  "area": "Build",
+  "capability": "Features played in order on the CAD kernel; a failed feature is reported by name and the rest still build",
+  "sources": "core/build.ts; core/resolve.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-03",
+  "package": "BUILD",
+  "area": "Body semantics",
+  "capability": "Join merges with every solid it touches (bridging several under the oldest id); cut goes through every solid met and fails when none; New keeps its own body",
+  "sources": "core/build.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (place, settle)",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-04",
+  "package": "BUILD",
+  "area": "Body semantics",
+  "capability": "One body is one solid: pieces a step leaves become bodies of their own; split words say which piece kept the id and where each lies",
+  "sources": "core/build.ts; core/splitWords.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (island_id); crates/mm-reverse/src/build/mod.rs",
+  "missing": "Islands are made; the narration of which piece kept the id / where each lies (splitWords) is not"
+ },
+ {
+  "id": "BUILD-05",
+  "package": "BUILD",
+  "area": "Body semantics",
+  "capability": "Legacy target: a join/cut saved with a named body works on that body alone; null lets it go",
+  "sources": "app/reSchemas.ts (targetIn); core/build.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (place_on_target)",
+  "missing": "Built; no UI to set or clear the target"
+ },
+ {
+  "id": "BUILD-06",
+  "package": "BUILD",
+  "area": "Topology",
+  "capability": "Face/edge fingerprints (kind, centroid/mid, dir, area/length, radius, maker) found again on every rebuild; a lost pick fails its feature by name",
+  "sources": "core/topo.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/topo.rs; crates/mm-reverse/src/build/mod.rs",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-07",
+  "package": "BUILD",
+  "area": "Topology",
+  "capability": "Every face carries the feature that first made it, through each step's kernel history",
+  "sources": "core/kernelOps.ts; core/kernelMath.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (origins_after)",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-08",
+  "package": "BUILD",
+  "area": "Topology",
+  "capability": "Where-queries as picks (box, near, through, kind, between normals, madeBy, length/area/radius/diameter, faces, loop, coaxial, exclude, optional, sharp, sides, nested) stored and re-run at every rebuild",
+  "sources": "core/where.ts; app/reSchemas.ts (whereIn)",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/pick_query.rs",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-09",
+  "package": "BUILD",
+  "area": "Topology",
+  "capability": "Tangent chain of picked edges (a round runs on along tangent edges)",
+  "sources": "core/topo.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/topo.rs (tangent_chain)",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-10",
+  "package": "BUILD",
+  "area": "Topology",
+  "capability": "Seams and same-surface split lines neither drawn nor pickable",
+  "sources": "core/edgeLines.ts; core/topo.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/topo.rs (split_edges); crates/mm-reverse/src/build/mod.rs (body_mesh)",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-11",
+  "package": "BUILD",
+  "area": "Profiles",
+  "capability": "Sketch regions lifted into profiles; picked regions remembered by their pieces and middle and found again after the sketch is edited",
+  "sources": "core/profiles.ts; core/regions.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/regions.rs; crates/mm-reverse/src/build/mod.rs (regions_by_pick)",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-12",
+  "package": "BUILD",
+  "area": "Preview",
+  "capability": "A feature box builds the part as it stood before the feature (picks taken there) and the part with the feature (preview)",
+  "sources": "state/reFeatureSlice.ts; core/build.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (build_before); crates/polymix/src/reverse/mod.rs (request_build)",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-13",
+  "package": "BUILD",
+  "area": "Performance",
+  "capability": "Incremental build: a step's outcome reused when what it read is unchanged; only what a change reaches is rebuilt; rollback bar moved back is a look-up",
+  "sources": "core/build.ts; core/buildReads.ts; core/buildSteps.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Every change rebuilds the whole list (only unchanged meshes are shared)"
+ },
+ {
+  "id": "BUILD-14",
+  "package": "BUILD",
+  "area": "Performance",
+  "capability": "Parallel build: independent body groups built on helper kernels at the same time and taken over",
+  "sources": "core/buildGroups.ts; core/reParallel.ts; core/reHelper.ts; core/buildTransfer.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Single-threaded build per request; rayon is available"
+ },
+ {
+  "id": "BUILD-15",
+  "package": "BUILD",
+  "area": "Performance",
+  "capability": "Latest-wins build queue: changes during a build wait; only the newest is built; overtaken builds/previews left unplayed",
+  "sources": "core/reQueue.ts; core/reClient.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (request_build, poll_build)",
+  "missing": "Stale results are discarded by generation, but each change spawns a new thread and old builds run to completion"
+ },
+ {
+  "id": "BUILD-16",
+  "package": "BUILD",
+  "area": "Robustness",
+  "capability": "Build stop: a build that never finishes is stopped, the kernel restarted and the feature in play suppressed",
+  "sources": "app/reBuildStop.ts; core/reEvents.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "No cancellation of a running build"
+ },
+ {
+  "id": "BUILD-17",
+  "package": "BUILD",
+  "area": "Robustness",
+  "capability": "Boolean volume guard: a join never loses volume, a cut never gains, a combine keeps the volume it should",
+  "sources": "core/booleanGuard.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (cut skips bodies only touched)",
+  "missing": "Only the touch check on cuts; no volume sanity guard on join/combine"
+ },
+ {
+  "id": "BUILD-18",
+  "package": "BUILD",
+  "area": "Robustness",
+  "capability": "Failure diagnosis: why a round, shell, draft or offset was refused (round larger than a face, wall thinner than the shell) and the trapped edges named",
+  "sources": "core/diagnose.ts; core/trapEdges.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Only the kernel's message is shown"
+ },
+ {
+  "id": "BUILD-19",
+  "package": "BUILD",
+  "area": "Robustness",
+  "capability": "Cut-elsewhere warning: a cut extent that also nicks material far from where it was drawn",
+  "sources": "core/cutElsewhere.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "BUILD-20",
+  "package": "BUILD",
+  "area": "Meshing",
+  "capability": "Bodies meshed for display with every face drawn (bare faces re-meshed)",
+  "sources": "core/kernelMesh.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (body_mesh)",
+  "missing": "SolidCraft display mesh; no bare-face check"
+ },
+ {
+  "id": "HIST-01",
+  "package": "HIST",
+  "area": "Rows",
+  "capability": "Feature row: name, kind, status (ok / failed with message / warnings / notes), the bodies it joined or cut",
+  "sources": "ui/ReversePanel.tsx; ui/featureReading.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (feature_list)",
+  "missing": "Error/warnings/touched only in a hover tooltip; no op word or status icons"
+ },
+ {
+  "id": "HIST-02",
+  "package": "HIST",
+  "area": "Rows",
+  "capability": "Row key-number field (10 mm, 360°, R 2 mm, 1.35 mm wall): typed over, the features rebuild without opening the box",
+  "sources": "ui/ReversePanel.tsx; state/reDrafts.ts; ui/ExprInput.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-03",
+  "package": "HIST",
+  "area": "Rows",
+  "capability": "Open a feature's box from its row (double click) — reopened box shows the body before it with picks lit",
+  "sources": "ui/ReversePanel.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (edit_feature)",
+  "missing": "Single click opens it"
+ },
+ {
+  "id": "HIST-04",
+  "package": "HIST",
+  "area": "Rows",
+  "capability": "Delete a row; refused while another feature is made on it",
+  "sources": "ui/FeatureMenu.tsx; app/reFeatureCommands.ts (remove)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs; crates/mm-reverse/src/model.rs (Part::remove)",
+  "missing": "Polymix deletes the feature and every dependent instead of refusing"
+ },
+ {
+  "id": "HIST-05",
+  "package": "HIST",
+  "area": "Rows",
+  "capability": "Sketch row eye; a sketch is hidden once a feature is made from it and drawn while a feature on it is open",
+  "sources": "state/reFeatureHelpers.ts; ui/ReversePanel.tsx",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (toggle_visible)",
+  "missing": "Eye works; auto-hide on use and show-while-open not ported"
+ },
+ {
+  "id": "HIST-06",
+  "package": "HIST",
+  "area": "Suppress",
+  "capability": "Suppress key on every non-sketch row; suppressed rows greyed and struck through, picks and numbers kept",
+  "sources": "ui/FeatureMenu.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (toggle_suppress)",
+  "missing": ""
+ },
+ {
+  "id": "HIST-07",
+  "package": "HIST",
+  "area": "Suppress",
+  "capability": "Row menu (right click): Suppress / Build again",
+  "sources": "ui/FeatureMenu.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-08",
+  "package": "HIST",
+  "area": "Suppress",
+  "capability": "Row menu: Suppress every <kind> (n) / Build every <kind> again, and every round and chamfer at once",
+  "sources": "ui/FeatureMenu.tsx; app/reFeatureCommands.ts (suppress)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-09",
+  "package": "HIST",
+  "area": "Rollback",
+  "capability": "Rollback bar under the list: drag up to set features aside (greyed, not built), To end, undo step, waits while a box is open, saved with the project",
+  "sources": "ui/ReversePanel.tsx; state/reStore.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Part::rolled_to); crates/mm-reverse/src/build/mod.rs (build_upto)",
+  "missing": "Honoured by the build and saved; no bar in the UI"
+ },
+ {
+  "id": "HIST-10",
+  "package": "HIST",
+  "area": "Rollback",
+  "capability": "New features go in at the bar (a fillet before the shell); a feature that lost what it stood on says so",
+  "sources": "state/reStore.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (add_named)",
+  "missing": "No UI insertion point; Part::add appends at the end"
+ },
+ {
+  "id": "HIST-11",
+  "package": "HIST",
+  "area": "Order",
+  "capability": "Reorder features (drag rows / feature.move) keeping ids, names and picks",
+  "sources": "app/reFeatureCommands.ts (move)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (moved_list)",
+  "missing": "List reorder function exists; no UI or command"
+ },
+ {
+  "id": "HIST-12",
+  "package": "HIST",
+  "area": "Order",
+  "capability": "Rename a feature (names unique across sketches and features)",
+  "sources": "app/reSchemas.ts (nameIn); state/reFeatureHelpers.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs",
+  "missing": "Names stored and unique; no rename UI"
+ },
+ {
+  "id": "HIST-13",
+  "package": "HIST",
+  "area": "Undo",
+  "capability": "Undo/redo of the feature list (Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y), each change one step",
+  "sources": "state/reFeatureHelpers.ts; state/reStore.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (checkpoint, undo, redo)",
+  "missing": ""
+ },
+ {
+  "id": "HIST-14",
+  "package": "HIST",
+  "area": "Undo",
+  "capability": "Sketch's own undo/redo while it is open",
+  "sources": "state/reSketchSlice.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (undo, redo)",
+  "missing": ""
+ },
+ {
+  "id": "HIST-15",
+  "package": "HIST",
+  "area": "Confirm",
+  "capability": "Enter or middle click confirms (finish sketch / create feature); Escape backs out one step; Finish on an empty sketch makes nothing",
+  "sources": "app/keyboard.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (confirm, keys)",
+  "missing": ""
+ },
+ {
+  "id": "HIST-16",
+  "package": "HIST",
+  "area": "Confirm",
+  "capability": "Tab walks from one number field to the next in a box",
+  "sources": "ui/ExtrudeEditor.tsx; app/keyboard.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-17",
+  "package": "HIST",
+  "area": "Clear",
+  "capability": "Remove every feature in one undo step, parameters kept",
+  "sources": "app/reFeatureCommands.ts (clear)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (New part)",
+  "missing": "New part resets the whole part, parameters and notes included"
+ },
+ {
+  "id": "HIST-18",
+  "package": "HIST",
+  "area": "Fitted marks",
+  "capability": "Rows mark numbers fitted to the scan this session; Refit fits them again after alignment or an upstream change",
+  "sources": "app/reFitMarks.ts; app/reFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-19",
+  "package": "HIST",
+  "area": "Playback",
+  "capability": "Play in the list heading: bar to the top (scan alone or bare stage), down one feature at a time, each held 0.5–5 s once built, row lit, sketches drawn at their step",
+  "sources": "app/playback.ts; ui/Playback.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-20",
+  "package": "HIST",
+  "area": "Playback",
+  "capability": "Playback caption in the viewport's top left (Step 4 / 6, Extrude 2, Join · 10 mm), switchable",
+  "sources": "ui/Playback.tsx (PlaybackCaption)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-21",
+  "package": "HIST",
+  "area": "Playback",
+  "capability": "Skip sketches: only geometry-changing steps, the caption counting those",
+  "sources": "ui/Playback.tsx; state/rePrefs.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HIST-22",
+  "package": "HIST",
+  "area": "Playback",
+  "capability": "Playback keys: Space hold/resume, arrows step, Escape stops; bar restored; not an undo step; agent commands wait",
+  "sources": "app/keyboard.ts; app/playback.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-01",
+  "package": "PROJ",
+  "area": "Saving",
+  "capability": "Features saved by reference (sketches, picks as fingerprints, planes/axes by the element they name); bodies rebuilt on load",
+  "sources": "app/projectSection.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Part::to_json/from_json); crates/polymix/src/reverse/mod.rs (save/open .rpart)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-02",
+  "package": "PROJ",
+  "area": "Saving",
+  "capability": "One project archive with scan, model and notes (and the other workspaces)",
+  "sources": "app/projectSection.ts; app/notesSection.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs",
+  "missing": "Part saved alone as .rpart; the scan stays in the Mesh workspace"
+ },
+ {
+  "id": "PROJ-03",
+  "package": "PROJ",
+  "area": "Saving",
+  "capability": "Version check: a part from an older or newer model refused with a sentence",
+  "sources": "app/projectSection.ts (validation)",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/model.rs (PART_VERSION)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-04",
+  "package": "PROJ",
+  "area": "Saving",
+  "capability": "Autosave and recovery of the part",
+  "sources": "(session persistence)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (autosave, emergency_save)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-05",
+  "package": "PROJ",
+  "area": "Saving",
+  "capability": "Start over / new project; opening a part is undoable",
+  "sources": "app/projectSection.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (New part, open_part_dialog)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-06",
+  "package": "PROJ",
+  "area": "Blank stage",
+  "capability": "Model with no scan: blank stage sized for a hand-size part; a scan loaded later joins the model",
+  "sources": "README; app/useReverseWorkspace.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (set_scan)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-07",
+  "package": "PROJ",
+  "area": "Export",
+  "capability": "Export body STEP: every visible body as a solid, each a part under its name",
+  "sources": "app/reBodyCommands.ts (step); core/kernel.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (export_step); crates/polymix/src/reverse/mod.rs (export_step_dialog)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-08",
+  "package": "PROJ",
+  "area": "Export",
+  "capability": "STEP part colours from the body's colour",
+  "sources": "core/kernelStep.ts; app/reBodyCommands.ts (step)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "export_step takes names only"
+ },
+ {
+  "id": "PROJ-09",
+  "package": "PROJ",
+  "area": "Export",
+  "capability": "STEP mending: loop orientation for Parasolid readers, round-curve ends a hair off their corner",
+  "sources": "core/kernelStep.ts; core/stepLoops.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs a check of SolidCraft's writer in Onshape/SolidWorks"
+ },
+ {
+  "id": "PROJ-10",
+  "package": "PROJ",
+  "area": "Export",
+  "capability": "Export STL (binary, chord) or 3MF (each body an object), visible solids only",
+  "sources": "app/reBodyCommands.ts (stl)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (send_to_mesh)",
+  "missing": "Bodies go to the Mesh workspace, which exports STL; no direct STL/3MF or chord option"
+ },
+ {
+  "id": "PROJ-11",
+  "package": "PROJ",
+  "area": "Import",
+  "capability": "Import STEP: a body per solid in the file's frame, named after its part (count suffix)",
+  "sources": "core/kernelStep.ts; app/reFeatureCommands.ts (import.step)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/import.rs; crates/polymix/src/reverse/editors/import.rs (stub)",
+  "missing": "Built from Part::step_files; no file dialog/editor"
+ },
+ {
+  "id": "PROJ-12",
+  "package": "PROJ",
+  "area": "Import",
+  "capability": "Import box: file shown as a ghost before Import; row named after the file; Another file… replaces it",
+  "sources": "ui/FeatureEditor.tsx (import-*)",
+  "status": "missing",
+  "polymix_file": "crates/polymix/src/reverse/editors/import.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "PROJ-13",
+  "package": "PROJ",
+  "area": "Import",
+  "capability": "STEP files travel in the project and are read once a session",
+  "sources": "app/projectSection.ts (STEP_MEMBER)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (step_files)",
+  "missing": "Stored in the part JSON; re-read on every build"
+ },
+ {
+  "id": "PROJ-14",
+  "package": "PROJ",
+  "area": "Preferences",
+  "capability": "Preferences remembered: fit options, live map and its range, draw modes, polygon sides, grid snap, relation glyphs, playback hold/caption/skip",
+  "sources": "state/rePrefs.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (save: fit options, deviation range)",
+  "missing": "Only fit options and the deviation range are stored"
+ },
+ {
+  "id": "PLANE-01",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Sketch on a coordinate plane (XY, XZ, YZ) at zero",
+  "sources": "ui/PlaneSelect.tsx; app/reSchemas.ts (worldPlane)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (idle_box, chosen_plane)",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-02",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Sketch on a coordinate plane through the scan's centre",
+  "sources": "ui/PlaneSelect.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (chosen_plane)",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-03",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Sketch on a section (cut through the part), by id or name",
+  "sources": "ui/PlaneSelect.tsx; app/reSchemas.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (PlaneRef::Section); crates/mm-reverse/src/build/mod.rs (resolve_plane_frame)",
+  "missing": "Resolved if present; Polymix has no way to make a section"
+ },
+ {
+  "id": "PLANE-04",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Sketch on a measured plane element",
+  "sources": "ui/PlaneSelect.tsx",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (PlaneRef::Plane)",
+  "missing": "Model/resolve only; no element source"
+ },
+ {
+  "id": "PLANE-05",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Plane through an axis at an angle (radial: half section of a turned part); angle editable later",
+  "sources": "app/reSchemas.ts (radialPlane)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/frame.rs (radial_frame); crates/mm-reverse/src/model.rs (PlaneRef::Radial)",
+  "missing": "No UI"
+ },
+ {
+  "id": "PLANE-06",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Plane fitted through a clicked face of the scan (to sketch on)",
+  "sources": "app/reSchemas.ts; core/snapFace.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (PlaneRef::Fitted)",
+  "missing": "Model only; plane fit staged in ports/fits"
+ },
+ {
+  "id": "PLANE-07",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Sketch on a flat face of a body (Sketch here) that follows the face by fingerprint when an earlier feature moves it",
+  "sources": "ui/ContextChips.tsx; core/build.ts (placeSketch)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/sketch.rs; crates/mm-reverse/src/model.rs (PlaneRef::BodyFace)",
+  "missing": "Build follows the face; no chip/UI to start one"
+ },
+ {
+  "id": "PLANE-08",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Face's outline projected into a sketch on that face (fixed closed profile; project: false leaves it out)",
+  "sources": "core/project.ts; app/reSchemas.ts (sketchIn.project)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-09",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Plane offset under the sketch's name, as a number or an expression the sketch follows",
+  "sources": "ui/SketchEditor.tsx (sketch-offset)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (sketch_box Offset)",
+  "missing": "Number only; expressions wait on PARAM"
+ },
+ {
+  "id": "PLANE-10",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Plane's `up` axis (u = up × normal)",
+  "sources": "app/reSchemas.ts (upIn)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (up_u)",
+  "missing": "No UI"
+ },
+ {
+  "id": "PLANE-11",
+  "package": "PLANE",
+  "area": "Sheet",
+  "capability": "Sheet zero is the part's origin projected; datum dot; coordinate planes' lines across the sheet as dimension targets",
+  "sources": "core/datums.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/datums.rs; crates/polymix/src/reverse/sketcher.rs (paint)",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-12",
+  "package": "PLANE",
+  "area": "Sketch on",
+  "capability": "Hover a Sketch-on entry: that plane drawn on the part with its name",
+  "sources": "ui/PlaneSelect.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-13",
+  "package": "PLANE",
+  "area": "Coordinate planes",
+  "capability": "XY/XZ/YZ planes at the origin drawn faint, listed at the head of the body list with eyes (hidden over a scan); a click offers a sketch",
+  "sources": "viewer/coordinatePlanes.ts; ui/ReversePanel.tsx (plane-row)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-14",
+  "package": "PLANE",
+  "area": "Elements",
+  "capability": "Element source: planes, cylinders, cones, spheres, tori, lines, circles, points fitted on the scan (ScanRuler's 3D Measure)",
+  "sources": "(host src/core/fit); app/reSchemas.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Element, data only)",
+  "missing": "No element creation in Polymix; fits staged in ports/fits"
+ },
+ {
+  "id": "PLANE-15",
+  "package": "PLANE",
+  "area": "Elements",
+  "capability": "Measured elements and sections drawn on the part as datums",
+  "sources": "viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PLANE-16",
+  "package": "PLANE",
+  "area": "Alignment",
+  "capability": "First sketch on a part still in the scanner's frame warns and offers Align part; alignment carries sketches and notes",
+  "sources": "ui/SketchEditor.tsx (sketch-align)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Polymix has no 3-2-1 alignment"
+ },
+ {
+  "id": "SKT-01",
+  "package": "SKT",
+  "area": "Select",
+  "capability": "Select tool: click a piece; Shift/Ctrl adds",
+  "sources": "ui/SketchEditor.tsx; state/reSketchSlice.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (click_select)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-02",
+  "package": "SKT",
+  "area": "Drag",
+  "capability": "Drag an end, a centre or a whole piece; constraints hold; dragged point snaps; an end dropped on another end joins it",
+  "sources": "core/drag.ts; app/reSketchInput.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (select_pointer)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-03",
+  "package": "SKT",
+  "area": "Drag",
+  "capability": "A line dragged by its body moves square to itself; Ctrl moves it freely",
+  "sources": "core/drag.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": "Whole piece follows the cursor in any direction"
+ },
+ {
+  "id": "SKT-04",
+  "package": "SKT",
+  "area": "Drag",
+  "capability": "A fitted piece dragged by hand lets go of its slice points",
+  "sources": "core/drag.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (select_pointer)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-05",
+  "package": "SKT",
+  "area": "Box select",
+  "capability": "Selection box on the sheet: right = window (inside), left = crossing (touching), lit while dragged, Shift/Ctrl adds",
+  "sources": "core/boxSelect.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged: ports/sketchtools box_select.rs"
+ },
+ {
+  "id": "SKT-06",
+  "package": "SKT",
+  "area": "Line",
+  "capability": "Line tool (L) draws a chain; ends on Escape, Enter, a second click on the last end, or landing on another end",
+  "sources": "ui/SketchEditor.tsx; state/reSketchSlice.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (draw_click)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-07",
+  "package": "SKT",
+  "area": "Line",
+  "capability": "Press on the chain's last end and drag: an arc tangent to the piece before it",
+  "sources": "core/draw.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged: ports/sketchtools draw.rs"
+ },
+ {
+  "id": "SKT-08",
+  "package": "SKT",
+  "area": "Line",
+  "capability": "Line within 3° of level/upright made so; inferred relation shown as a chip under the tools, one click takes it off",
+  "sources": "core/sketch.ts; ui/SketchEditor.tsx (sketch-inferred-chip)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs; crates/mm-reverse/src/sketch.rs (axis_relation_of)",
+  "missing": "Inferred; removable from the relation list, no chip row"
+ },
+ {
+  "id": "SKT-09",
+  "package": "SKT",
+  "area": "Rectangle",
+  "capability": "Rectangle: two corners (R)",
+  "sources": "ui/SketchEditor.tsx (DRAW_MODES corners)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "SKT-10",
+  "package": "SKT",
+  "area": "Rectangle",
+  "capability": "Rectangle: centre and a corner (construction diagonals and centre point)",
+  "sources": "ui/SketchEditor.tsx (center)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-11",
+  "package": "SKT",
+  "area": "Rectangle",
+  "capability": "Rectangle: 3-point (one side, then the far side at any angle)",
+  "sources": "ui/SketchEditor.tsx (threePoint)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/sketch.rs (add_turned_rectangle)",
+  "missing": "Model helper only, no tool mode"
+ },
+ {
+  "id": "SKT-12",
+  "package": "SKT",
+  "area": "Circle",
+  "capability": "Circle: centre and rim (C)",
+  "sources": "ui/SketchEditor.tsx (center)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "SKT-13",
+  "package": "SKT",
+  "area": "Circle",
+  "capability": "Circle: 2-point (ends of a diameter)",
+  "sources": "ui/SketchEditor.tsx (twoPoint)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-14",
+  "package": "SKT",
+  "area": "Circle",
+  "capability": "Circle: 3 points on the rim",
+  "sources": "ui/SketchEditor.tsx (threePoint)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-15",
+  "package": "SKT",
+  "area": "Arc",
+  "capability": "Arc: 3-point (start, end, through)",
+  "sources": "ui/SketchEditor.tsx (threePoint)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "SKT-16",
+  "package": "SKT",
+  "area": "Arc",
+  "capability": "Arc: centre, start, end (shorter way round)",
+  "sources": "ui/SketchEditor.tsx (center)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-17",
+  "package": "SKT",
+  "area": "Draw modes",
+  "capability": "Mode picker: rest on a key and its ways open as pictures; the chosen one becomes the key's picture and is remembered",
+  "sources": "ui/SketchEditor.tsx (sketch-draw-modes); state/rePrefs.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-18",
+  "package": "SKT",
+  "area": "Polygon",
+  "capability": "Polygon inscribed: centre and a corner; sides field (3–64); corners on a construction circle; sides Equal; fully defined",
+  "sources": "ui/SketchEditor.tsx; core/loops.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/sketch.rs (add_polygon)",
+  "missing": "Model helper only, no tool"
+ },
+ {
+  "id": "SKT-19",
+  "package": "SKT",
+  "area": "Polygon",
+  "capability": "Polygon circumscribed: centre and middle of a side (sized across flats like a hex nut)",
+  "sources": "ui/SketchEditor.tsx (circumscribed)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/sketch.rs (add_polygon circumscribed)",
+  "missing": "Model helper only, no tool"
+ },
+ {
+  "id": "SKT-20",
+  "package": "SKT",
+  "area": "Spline",
+  "capability": "Spline tool (S): smooth curve through clicked points; end open (re-click/double/Enter/Esc), close on the first point; fit points snap, drag, take relations",
+  "sources": "core/sketchSpline.ts; state/reSketchDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Sketch model has no spline piece; staged ports/spline"
+ },
+ {
+  "id": "SKT-21",
+  "package": "SKT",
+  "area": "Spline",
+  "capability": "Spline held tangent where joined end-to-end to a line, arc or spline",
+  "sources": "core/sketchSpline.ts; core/solver.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/spline spline_solve.rs"
+ },
+ {
+  "id": "SKT-22",
+  "package": "SKT",
+  "area": "Spline",
+  "capability": "Fit spline to slice: slice points along it become soft data",
+  "sources": "ui/SketchEditor.tsx (sketch-spline-fit)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-23",
+  "package": "SKT",
+  "area": "Spline",
+  "capability": "Spline handed to the kernel as one B-spline edge (in the STEP)",
+  "sources": "core/sketchSpline.ts; core/kernel.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-24",
+  "package": "SKT",
+  "area": "Shapes",
+  "capability": "Rounded rectangle (radius; degenerates to slot or circle) with dimensioned rounds",
+  "sources": "app/reSchemas.ts (shapeIn rectangle.radius); app/reSketchInput.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-25",
+  "package": "SKT",
+  "area": "Shapes",
+  "capability": "Slot (two straights, half-rounds tangent and equal) by ends or centre/length/angle",
+  "sources": "app/reSchemas.ts (slot)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-26",
+  "package": "SKT",
+  "area": "Shapes",
+  "capability": "Polyline shape (open or closed)",
+  "sources": "app/reSchemas.ts (polyline)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-27",
+  "package": "SKT",
+  "area": "Shapes",
+  "capability": "Ellipse as one closed spline (points count; deviation from a true ellipse reported)",
+  "sources": "app/reSchemas.ts (ellipse)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-28",
+  "package": "SKT",
+  "area": "Shapes",
+  "capability": "Shapes placed in world coordinates (`world: true`), fixed, construction, centre+size, angle",
+  "sources": "app/reSchemas.ts (shapeCommon)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-29",
+  "package": "SKT",
+  "area": "Snap",
+  "capability": "Every click snaps: to an end (held coincident), a piece (held on), a slice point, the origin, a fitted piece",
+  "sources": "core/snap.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (snap, hold)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-30",
+  "package": "SKT",
+  "area": "Snap",
+  "capability": "Snap markers: cross on an end, diamond on the slice, square on the grid",
+  "sources": "core/snap.ts; app/useSketchSceneSync.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (paint)",
+  "missing": "Generic marker only"
+ },
+ {
+  "id": "SKT-31",
+  "package": "SKT",
+  "area": "Snap",
+  "capability": "Snap to grid (off by default); millimetre grid anchored on the origin, spacing following the zoom",
+  "sources": "core/snap.ts; app/useSketchSceneSync.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "No sheet grid drawn"
+ },
+ {
+  "id": "SKT-32",
+  "package": "SKT",
+  "area": "Snap",
+  "capability": "Ctrl places a point exactly at the cursor",
+  "sources": "core/snap.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (exact)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-33",
+  "package": "SKT",
+  "area": "Hover",
+  "capability": "What a tool would take is lit under the cursor before the click (piece, end, plane line, both lines of a corner)",
+  "sources": "app/useSketchSceneSync.ts; state/reSketchDraft.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (pick_at, hover)",
+  "missing": "Piece/end hover only; no plane-line or corner-pair lighting"
+ },
+ {
+  "id": "SKT-34",
+  "package": "SKT",
+  "area": "Corner tools",
+  "capability": "Sketch Fillet (F): click a corner or two lines; arc with its radius as a dimension; next starts with the last size",
+  "sources": "core/filletCorner.ts; state/reSketchDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fillet fillet_corner.rs"
+ },
+ {
+  "id": "SKT-35",
+  "package": "SKT",
+  "area": "Corner tools",
+  "capability": "Sketch Chamfer: corner or two lines; even or uneven distances as dimensions",
+  "sources": "core/filletCorner.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fillet"
+ },
+ {
+  "id": "SKT-36",
+  "package": "SKT",
+  "area": "Corner tools",
+  "capability": "Sharp corner: remove a fillet arc or chamfer line and carry its sides to the corner",
+  "sources": "core/corners.ts (sharpen)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (sharpen); crates/mm-reverse/src/corners.rs (sharpen_corner)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-37",
+  "package": "SKT",
+  "area": "Corner tools",
+  "capability": "Round a fitted corner where the scan is round (arc tangent to any two pieces; sketch.edit rounds)",
+  "sources": "core/roundCorner.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fillet round_corner.rs"
+ },
+ {
+  "id": "SKT-38",
+  "package": "SKT",
+  "area": "Project",
+  "capability": "Project tool: a body edge or another sketch's piece clicked under the sheet comes in as a fixed magenta piece; straight edges and circles flat or square to the plane; slanted circles refused",
+  "sources": "core/project.ts; app/reSketchInput.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/sketch.rs (Entity.projected flag)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-39",
+  "package": "SKT",
+  "area": "Project",
+  "capability": "Projections follow their source on every build (edge by fingerprint, piece by id) and the sketch is solved again; a lost source is reported on the row",
+  "sources": "core/project.ts; core/build.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-40",
+  "package": "SKT",
+  "area": "Pattern",
+  "capability": "Sketch Pattern: selected pieces in a row, grid or round a centre, copies previewed until applied, their relations copied",
+  "sources": "core/patternCopies.ts; ui/SketchEditor.tsx (sketch-pattern-*)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools pattern_copies.rs"
+ },
+ {
+  "id": "SKT-41",
+  "package": "SKT",
+  "area": "Picture",
+  "capability": "Picture: photo/drawing under the sketch, scaled by two points, moved by a point, levelled by two points, faded, saved with the sketch, removed",
+  "sources": "core/sketchImage.ts; ui/SketchEditor.tsx (sketch-image-*)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (SketchImage)",
+  "missing": "Data only; staged ports/sketchtools sketch_image.rs"
+ },
+ {
+  "id": "SKT-42",
+  "package": "SKT",
+  "area": "Align",
+  "capability": "Align: turn the sheet so the selected line lies along X (frame turns underneath)",
+  "sources": "core/drag.ts; ui/SketchEditor.tsx (sketch-align)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SKT-43",
+  "package": "SKT",
+  "area": "Edit keys",
+  "capability": "Fix (lock) and its removable row; Construction toggle; Delete (Del/Backspace)",
+  "sources": "ui/SketchEditor.tsx (sketch-fix, sketch-construction, sketch-delete)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (toggle_fix, toggle_construction, delete_selection)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-44",
+  "package": "SKT",
+  "area": "Sheet",
+  "capability": "The sheet has no edge: a click beyond the card lands on the plane",
+  "sources": "app/useSketchSceneSync.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (sheet_point)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-45",
+  "package": "SKT",
+  "area": "Status",
+  "capability": "Closed regions filled faintly; status Needs input / Solved with the solver's words in a tooltip; loose pieces counted and coloured",
+  "sources": "ui/SketchEditor.tsx (sketch-status, sketch-loose)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (status, paint)",
+  "missing": "Status and loose colour shown; regions not filled, no loose count"
+ },
+ {
+  "id": "SKT-46",
+  "package": "SKT",
+  "area": "Finish",
+  "capability": "Extrude/Revolve offered as soon as a region closes (finish and open the feature on it)",
+  "sources": "ui/SketchEditor.tsx (sketch-extrude, sketch-revolve)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (sketch_box)",
+  "missing": ""
+ },
+ {
+  "id": "SKT-47",
+  "package": "SKT",
+  "area": "Keys",
+  "capability": "Tool letters D, L, R, C, S, F; Escape backs out one step; Delete removes",
+  "sources": "app/keyboard.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (keys); crates/polymix/src/reverse/sketcher.rs (Tool::key)",
+  "missing": "D, L, R, C (and A) only; S and F wait for their tools"
+ },
+ {
+  "id": "SKT-48",
+  "package": "SKT",
+  "area": "Overlay",
+  "capability": "Finished sketches drawn on the part in their plane; regions as click targets",
+  "sources": "viewer/sketchOverlay.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (paint_overlays)",
+  "missing": ""
+ },
+ {
+  "id": "REL-01",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Coincident",
+  "sources": "core/solver.ts; ui/SketchEditor.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (apply_relation); crates/mm-reverse/src/solver.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-02",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Horizontal",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-03",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Vertical",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-04",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Parallel",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-05",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Perpendicular",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-06",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Tangent (line–arc/circle, arc–arc; spline end tangency)",
+  "sources": "core/solver.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": "No spline tangency (no splines)"
+ },
+ {
+  "id": "REL-07",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Concentric",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-08",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Equal (two lines one length; two round pieces one radius)",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": ""
+ },
+ {
+  "id": "REL-09",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Symmetric: two pieces then the mirror line (construction line or a coordinate plane's line); lines end for end, circles by centres, arcs by both; prompt says which pick is next",
+  "sources": "core/mirrorRelation.ts; state/reSketchDraft.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/solver.rs (Rule::Symmetric)",
+  "missing": "Solver has it; not offered in the UI; staged ports/sketchtools mirror_relation.rs"
+ },
+ {
+  "id": "REL-10",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Point on a line, a round piece, a spline or a coordinate plane's line; bounded (T-junction) option",
+  "sources": "core/solver.ts; app/reSchemas.ts (pointOn)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs ('on piece')",
+  "missing": "Datum-line target and bounded not offered"
+ },
+ {
+  "id": "REL-11",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Collinear: a line along another line or a coordinate plane's line",
+  "sources": "core/solver.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/solver.rs (Rule::Collinear)",
+  "missing": "Not offered in the UI"
+ },
+ {
+  "id": "REL-12",
+  "package": "REL",
+  "area": "Relations",
+  "capability": "Two points level or upright",
+  "sources": "core/solver.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs ('horizontal points')",
+  "missing": "Polymix uses a construction line"
+ },
+ {
+  "id": "REL-13",
+  "package": "REL",
+  "area": "Applying",
+  "capability": "Relation tool armed then the next pieces clicked, or applied to the selection made beforehand",
+  "sources": "ui/SketchEditor.tsx (RELATIONS); state/reSketchDraft.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (sketch_box)",
+  "missing": "Selection-first only"
+ },
+ {
+  "id": "REL-14",
+  "package": "REL",
+  "area": "Glyphs",
+  "capability": "Relation glyphs on the sheet, off until the eye key asks; hovering a glyph lights it and its pieces",
+  "sources": "ui/SketchEditor.tsx (sketch-show-relations); app/useSketchSceneSync.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Relations only listed in the panel"
+ },
+ {
+  "id": "REL-15",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "Dimension tool (D): line length, arc radius, circle diameter, two pieces or ends → distance between parallels, angle, point–line, point–point, centres, to a coordinate plane's line",
+  "sources": "core/draw.ts; state/reSketchDraft.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (dimension_click)",
+  "missing": ""
+ },
+ {
+  "id": "REL-16",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "New dimension's number follows the cursor; click puts it down and opens it for typing; Enter uses the layout; Escape takes it back",
+  "sources": "state/reSketchDraft.ts (dimMade); app/keyboard.ts",
+  "status": "missing",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs",
+  "missing": "Polymix places it and opens the field at once"
+ },
+ {
+  "id": "REL-17",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "While a length/radius/diameter follows the cursor, a click on another piece, end or plane line turns it into a distance or angle",
+  "sources": "state/reSketchDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "REL-18",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "Dimension drawn as a drawing carries it: extension lines, arrows (turned in when short), number in a gap; radius leader; diameter through the centre; angle arc",
+  "sources": "core/dimLayout.ts",
+  "status": "missing",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (paint_dimensions)",
+  "missing": "Number label only; staged ports/sketchtools dim_layout.rs"
+ },
+ {
+  "id": "REL-19",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "Drag the number to where it reads best; it keeps that place against what it measures",
+  "sources": "core/dimLayout.ts; core/sketch.ts (place)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/sketch.rs (DimPlace)",
+  "missing": "Stored, not draggable"
+ },
+ {
+  "id": "REL-20",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "Click a number on the sheet to type; Ø12 over an R or R6 over a Ø turns it over",
+  "sources": "viewer/sketchDimText.ts; ui/SketchEditor.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (dimension_editor); crates/polymix/src/reverse/sketcher.rs (set_dimension)",
+  "missing": ""
+ },
+ {
+  "id": "REL-21",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "Row chip →Ø / →R turns a round dimension over with the size held",
+  "sources": "ui/SketchEditor.tsx (sketch-dimension-row)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "REL-22",
+  "package": "REL",
+  "area": "Dimension",
+  "capability": "Nominal chip beside every measured number (halves under 10 mm, whole above, radii to the half, angles to 5°), one click takes it",
+  "sources": "core/nominal.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (round_value)",
+  "missing": "New dimensions auto-round when within 0.5 %; no chip; staged ports/sketchtools nominal.rs"
+ },
+ {
+  "id": "REL-23",
+  "package": "REL",
+  "area": "Rows",
+  "capability": "Relation and dimension rows in the box, selectable, value editable, removable; inferred rows marked",
+  "sources": "ui/SketchEditor.tsx (sketch-relation-row, sketch-dimension-row)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (sketch_box relations list)",
+  "missing": ""
+ },
+ {
+  "id": "REL-24",
+  "package": "REL",
+  "area": "Solver",
+  "capability": "Every relation and dimension met exactly; unmet reported (not split); redundant relations counted",
+  "sources": "core/solver.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/solver.rs (SolveReport); crates/polymix/src/reverse/view.rs",
+  "missing": "Unmet shown in red; redundant count not displayed"
+ },
+ {
+  "id": "REL-25",
+  "package": "REL",
+  "area": "Solver",
+  "capability": "Hover a dimension or relation row/number lights the pieces it holds",
+  "sources": "app/useSketchSceneSync.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (hover Pick::Constraint)",
+  "missing": "Row hover only"
+ },
+ {
+  "id": "REL-26",
+  "package": "REL",
+  "area": "Parameters",
+  "capability": "A dimension driven by a parameter wears ƒ on the sheet; dimension expressions",
+  "sources": "core/parameters.ts; viewer/sketchDimText.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/sketch.rs (Constraint.expr)",
+  "missing": "Expr stored, never evaluated (PARAM)"
+ },
+ {
+  "id": "FIT-01",
+  "package": "FIT",
+  "area": "Slice",
+  "capability": "The plane's slice through the scan drawn as edge chains on the sheet",
+  "sources": "app/useReverseWorkspace.ts; app/useSketchSceneSync.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/section.rs (section_chains); crates/polymix/src/reverse/sketcher.rs (paint)",
+  "missing": ""
+ },
+ {
+  "id": "FIT-02",
+  "package": "FIT",
+  "area": "Slice",
+  "capability": "Slice under a sketch on a part modelled without a scan (the bodies cut as a scan is)",
+  "sources": "README §2; viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (slice)",
+  "missing": "Slice reads the scan only"
+ },
+ {
+  "id": "FIT-03",
+  "package": "FIT",
+  "area": "Fit all chains",
+  "capability": "Fit all chains: lines and arcs, corners joined, closed slice → closed profile; pieces keep their slice points and the solver holds them",
+  "sources": "core/segment.ts; core/corners.ts; state/reSketchDraft.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/section.rs (fit_all_chains); crates/mm-reverse/src/segment.rs; crates/mm-reverse/src/corners.rs",
+  "missing": ""
+ },
+ {
+  "id": "FIT-04",
+  "package": "FIT",
+  "area": "Fit all chains",
+  "capability": "Robust cut: a bowing wall is one line, a fillet stays, a corner blob is cut out, a small step's riser stays a line",
+  "sources": "core/segment.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/segment.rs",
+  "missing": ""
+ },
+ {
+  "id": "FIT-05",
+  "package": "FIT",
+  "area": "Fit options",
+  "capability": "Detail slider (coarse … fine)",
+  "sources": "ui/FitOptionsModal.tsx (fit-detail); core/fitOptions.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (Fit options…)",
+  "missing": ""
+ },
+ {
+  "id": "FIT-06",
+  "package": "FIT",
+  "area": "Fit options",
+  "capability": "Fit tolerance typed or from the scan's noise",
+  "sources": "ui/FitOptionsModal.tsx (sketch-tolerance)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs",
+  "missing": ""
+ },
+ {
+  "id": "FIT-07",
+  "package": "FIT",
+  "area": "Fit options",
+  "capability": "Join the corners toggle",
+  "sources": "ui/FitOptionsModal.tsx (fit-join)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs",
+  "missing": ""
+ },
+ {
+  "id": "FIT-08",
+  "package": "FIT",
+  "area": "Fit options",
+  "capability": "Align lines to the sheet's axes (within N°, and 45° if asked), merging one wall's pieces; inferred relation one click takes off",
+  "sources": "core/axisAlign.ts; ui/FitOptionsModal.tsx (fit-align*)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools axis_align.rs"
+ },
+ {
+  "id": "FIT-09",
+  "package": "FIT",
+  "area": "Fit options",
+  "capability": "A change refits the chains already fitted as one undo step; options remembered; Reset",
+  "sources": "ui/FitOptionsModal.tsx (fit-options-reset)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (refit); crates/polymix/src/reverse/mod.rs",
+  "missing": "Refit and remembering done; no reset, not one undo step"
+ },
+ {
+  "id": "FIT-10",
+  "package": "FIT",
+  "area": "Corners",
+  "capability": "Infer corners: join ends within 2 mm, tangency where a line runs into a fillet",
+  "sources": "core/corners.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (infer_corners); crates/mm-reverse/src/corners.rs",
+  "missing": ""
+ },
+ {
+  "id": "FIT-11",
+  "package": "FIT",
+  "area": "Corners",
+  "capability": "Close: two lines carried to their intersection, anything else bridged straight",
+  "sources": "core/corners.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/sketcher.rs (close); crates/mm-reverse/src/corners.rs (close_chain)",
+  "missing": ""
+ },
+ {
+  "id": "FIT-12",
+  "package": "FIT",
+  "area": "Chains",
+  "capability": "Close gaps between chain ends before fitting (holes in the scan); open chains report their ends, gap and a closeGaps to try",
+  "sources": "core/chainOutline.ts; app/reSchemas.ts (fit.closeGaps)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools chain_outline.rs"
+ },
+ {
+  "id": "FIT-13",
+  "package": "FIT",
+  "area": "Chains",
+  "capability": "Which chains: all / largest / the one at a point / by index; only within a box (one wall)",
+  "sources": "app/reSchemas.ts (fit.chains, fit.within)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/section.rs (fit_all_chains skip)",
+  "missing": "All (with skips) only"
+ },
+ {
+  "id": "FIT-14",
+  "package": "FIT",
+  "area": "Levels",
+  "capability": "Level: cut the scan this far off the sketch plane and fit that level into the same sketch (stacked parts)",
+  "sources": "ui/SketchEditor.tsx (sketch-level); app/reSchemas.ts (fit.level)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "FIT-15",
+  "package": "FIT",
+  "area": "Levels",
+  "capability": "draftDeg with a level: chains moved out by level·tan(draft) so a tapered extrude lands on the wall",
+  "sources": "core/taper.ts; app/reSchemas.ts (fit.draftDeg)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps taper.rs"
+ },
+ {
+  "id": "FIT-16",
+  "package": "FIT",
+  "area": "Share",
+  "capability": "Share fit: slice points near pieces already drawn/fitted/projected go to them; the rest fitted as open runs landing on them",
+  "sources": "core/shareFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools share_fit.rs"
+ },
+ {
+  "id": "FIT-17",
+  "package": "FIT",
+  "area": "Skins",
+  "capability": "Skin (outer / inner of a thin wall) and facing-direction filters",
+  "sources": "src/core/section/skin.ts; app/reSchemas.ts (skinIn, facingIn)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools section_skin.rs"
+ },
+ {
+  "id": "FIT-18",
+  "package": "FIT",
+  "area": "Modes",
+  "capability": "Arcs mode: a chain as N arcs end to end",
+  "sources": "core/segment.ts (arcs); app/reSchemas.ts (fit.arcs)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/segment.rs (arcs_of_chain)",
+  "missing": "Core only, not reachable"
+ },
+ {
+  "id": "FIT-19",
+  "package": "FIT",
+  "area": "Modes",
+  "capability": "Spline mode: a chain as one spline through N fit points settled onto the slice",
+  "sources": "app/reSchemas.ts (fit.spline)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs SKT spline"
+ },
+ {
+  "id": "FIT-20",
+  "package": "FIT",
+  "area": "Stations",
+  "capability": "Fit like a station sketch: the run cut into the same pieces in the same order (loft stations), drawn pieces copied, relations copied",
+  "sources": "core/stations.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps stations.rs"
+ },
+ {
+  "id": "FIT-21",
+  "package": "FIT",
+  "area": "Candidates",
+  "capability": "Candidates: each piece's residual, uncertainty and nominal; near-relations (level, upright, parallel, square, in line, round angle, equal, concentric, tangent, on datum, mirrored) with off and sigmas",
+  "sources": "core/intent.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools intent.rs"
+ },
+ {
+  "id": "FIT-22",
+  "package": "FIT",
+  "area": "Candidates",
+  "capability": "Accept candidates within N sigmas (kinds, maxMoveMm), reporting conflict / implied / moved",
+  "sources": "core/accept.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "FIT-23",
+  "package": "FIT",
+  "area": "Inset",
+  "capability": "Inset: every closed chain moved inward by a wall (a shell's inner station), kept pieces, refusals by chain",
+  "sources": "app/reSchemas.ts (sketchIn.inset); app/reSketchInput.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (SketchInset)",
+  "missing": "Data only"
+ },
+ {
+  "id": "FIT-24",
+  "package": "FIT",
+  "area": "Teeth",
+  "capability": "A chain of regular teeth (Fresnel rings, rack, knurl) read for its design",
+  "sources": "core/teeth.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/threads teeth.rs"
+ },
+ {
+  "id": "FIT-25",
+  "package": "FIT",
+  "area": "Near miss",
+  "capability": "Pieces nearly coinciding with another sketch's on a parallel plane flagged",
+  "sources": "core/sketchNearMiss.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools sketch_near_miss.rs"
+ },
+ {
+  "id": "FIT-26",
+  "package": "FIT",
+  "area": "Shadow",
+  "capability": "Shadow section's outline (lines, arcs, circles as read) as a sketch's start",
+  "sources": "core/shadowPieces.ts; core/silhouette.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps shadow.rs"
+ },
+ {
+  "id": "EXT-01",
+  "package": "EXT",
+  "area": "Profiles",
+  "capability": "Regions shown on the part as faces, clicked to toggle; one region preselected; an unpicked inner loop is a hole",
+  "sources": "state/reSolidSlice.ts; viewer/sketchOverlay.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs (pick_region); crates/polymix/src/reverse/editors/mod.rs",
+  "missing": ""
+ },
+ {
+  "id": "EXT-02",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "Distance: From and To either side of the plane",
+  "sources": "ui/ExtrudeEditor.tsx; core/buildExtrude.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs; crates/mm-reverse/src/build/extrude.rs",
+  "missing": ""
+ },
+ {
+  "id": "EXT-03",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "Symmetric total",
+  "sources": "ui/ExtrudeEditor.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs; crates/mm-reverse/src/build/extrude.rs",
+  "missing": ""
+ },
+ {
+  "id": "EXT-04",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "Up to a plane (from an offset)",
+  "sources": "ui/ExtrudeEditor.tsx; core/buildExtrude.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/extrude.rs",
+  "missing": "Built for planes parallel to the sketch; no editor; slanted planes refused"
+ },
+ {
+  "id": "EXT-05",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "Between two planes",
+  "sources": "ui/ExtrudeEditor.tsx",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/extrude.rs",
+  "missing": "As above"
+ },
+ {
+  "id": "EXT-06",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "To a face of a body (flat as its plane; curved face as itself; refused where it does not lie under the whole profile)",
+  "sources": "ui/ExtrudeEditor.tsx (extrude-to-face); core/buildExtrude.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/extrude.rs",
+  "missing": "Fails by name"
+ },
+ {
+  "id": "EXT-07",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "To a body's surface (solid skin or sheet), reverse",
+  "sources": "app/reSchemas.ts (toBody); ui/ExtrudeEditor.tsx (extrude-to-body)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "EXT-08",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "To next: until the profile first meets the body it joins or cuts (cut through the first wall); whole profile must land",
+  "sources": "ui/ExtrudeEditor.tsx (extrude-until)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "EXT-09",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "To last / through all (a cut a hair beyond)",
+  "sources": "ui/ExtrudeEditor.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs; crates/mm-reverse/src/build/extrude.rs (ToLast)",
+  "missing": ""
+ },
+ {
+  "id": "EXT-10",
+  "package": "EXT",
+  "area": "Extent",
+  "capability": "To scan: end at the scan face capping the region, offset fitted (near), stored as a distance",
+  "sources": "app/reSchemas.ts (toScan); app/reFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Not in the model"
+ },
+ {
+  "id": "EXT-11",
+  "package": "EXT",
+  "area": "Direction",
+  "capability": "Reverse direction (flip the extrude; next/last look the other way)",
+  "sources": "ui/ExtrudeEditor.tsx (extrude-flip)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs",
+  "missing": ""
+ },
+ {
+  "id": "EXT-12",
+  "package": "EXT",
+  "area": "Taper",
+  "capability": "Taper typed: positive leans out, negative in; outline stays the section at the sketch plane; refused if it closes the profile, saying how far it gets",
+  "sources": "core/taper.ts; core/buildExtrude.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs; crates/mm-reverse/src/build/extrude.rs",
+  "missing": "Only from the sketch plane outward; no closing-distance message"
+ },
+ {
+  "id": "EXT-13",
+  "package": "EXT",
+  "area": "Taper",
+  "capability": "Taper on an extent reaching both ways or ending on a plane/face leans all the way to it",
+  "sources": "core/buildExtrude.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/extrude.rs",
+  "missing": "Refused (taper has to start at the plane)"
+ },
+ {
+  "id": "EXT-14",
+  "package": "EXT",
+  "area": "Direction",
+  "capability": "Oblique direction: along a measured line/axis, a coordinate axis or a typed vector; ends parallel to the sketch; taper about it",
+  "sources": "ui/DirectionField.tsx; core/buildExtrude.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/extrude.rs",
+  "missing": "Refused when slanted"
+ },
+ {
+  "id": "EXT-15",
+  "package": "EXT",
+  "area": "Height",
+  "capability": "With a Distance, a click on the scan/body/corner puts To (in front) or From (behind) at that height; Symmetric reaches it with a half",
+  "sources": "state/reSolidSlice.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/editors/extrude.rs (pick Height)",
+  "missing": "Distance only"
+ },
+ {
+  "id": "EXT-16",
+  "package": "EXT",
+  "area": "Face extrude",
+  "capability": "Extrude a flat face of a body as it stands (outline made a sketch; out adds, in cuts; Cancel takes the sketch back)",
+  "sources": "ui/ExtrudeEditor.tsx (extrude-face-profile); state/reSolidSlice.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/extrude.rs",
+  "missing": "Refused by name"
+ },
+ {
+  "id": "EXT-17",
+  "package": "EXT",
+  "area": "Result",
+  "capability": "Join / Cut / New body (no body chosen)",
+  "sources": "ui/featureFields.tsx; core/build.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/mod.rs (op_line)",
+  "missing": ""
+ },
+ {
+  "id": "EXT-18",
+  "package": "EXT",
+  "area": "Ghost",
+  "capability": "Ghost of the body; a cut's ghost red",
+  "sources": "viewer/reScene.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (BODY_PREVIEW, BODY_CUT)",
+  "missing": ""
+ },
+ {
+  "id": "EXT-19",
+  "package": "EXT",
+  "area": "Grips",
+  "capability": "Arrow on each face to drag the distance, one on the far edge for the taper, ring for a revolve's angle; constant size on screen; a field on the grip takes typing",
+  "sources": "core/preview.ts; state/reGripSlice.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "EXT-20",
+  "package": "EXT",
+  "area": "Grips",
+  "capability": "Ghost follows a dragged grip frame by frame (last ghost stretched; one request out at a time)",
+  "sources": "core/preview.ts; core/reQueue.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "EXT-21",
+  "package": "EXT",
+  "area": "Readouts",
+  "capability": "Box reads the ghost's volume; From/To/Total/Angle offer round-value chips",
+  "sources": "ui/ExtrudeEditor.tsx; core/nominal.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Volume only in the body list"
+ },
+ {
+  "id": "EXT-22",
+  "package": "EXT",
+  "area": "Planes",
+  "capability": "Plane lists show the plane under the cursor on the part",
+  "sources": "ui/PlaneSelect.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "EXT-23",
+  "package": "EXT",
+  "area": "Revolve axis",
+  "capability": "Revolve about a coordinate axis",
+  "sources": "ui/RevolveEditor.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/revolve.rs; crates/mm-reverse/src/build/revolve.rs",
+  "missing": ""
+ },
+ {
+  "id": "EXT-24",
+  "package": "EXT",
+  "area": "Revolve axis",
+  "capability": "Revolve about a line of the sketch (construction line)",
+  "sources": "ui/RevolveEditor.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/revolve.rs",
+  "missing": ""
+ },
+ {
+  "id": "EXT-25",
+  "package": "EXT",
+  "area": "Revolve axis",
+  "capability": "Revolve about a measured element's axis (line, cylinder, cone, circle)",
+  "sources": "ui/RevolveEditor.tsx",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (resolve_axis)",
+  "missing": "Resolved; no element source or list entry"
+ },
+ {
+  "id": "EXT-26",
+  "package": "EXT",
+  "area": "Revolve axis",
+  "capability": "Click the axis line on the part to choose it; hovering the list draws the axis",
+  "sources": "ui/RevolveEditor.tsx; viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "EXT-27",
+  "package": "EXT",
+  "area": "Revolve",
+  "capability": "Angle (≤ 360°) typed or dragged on a ring; presets",
+  "sources": "ui/RevolveEditor.tsx",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/editors/revolve.rs",
+  "missing": "Typed and presets; no ring grip"
+ },
+ {
+  "id": "EXT-28",
+  "package": "EXT",
+  "area": "Coil",
+  "capability": "Coil: pitch, angle past 360° as degrees / turns / height, left-handed, reverse or negative pitch; defaults (1.5× reach, 3 turns); refused when self-touching or touching the axis",
+  "sources": "ui/RevolveEditor.tsx (revolve-coil, revolve-left); core/buildExtrude.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/revolve.rs",
+  "missing": "Refused by name"
+ },
+ {
+  "id": "RND-01",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "Fillet at a constant radius on picked edges",
+  "sources": "ui/FeatureEditor.tsx; core/kernel.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/fillet.rs; crates/mm-reverse/src/build/fillet.rs",
+  "missing": ""
+ },
+ {
+  "id": "RND-02",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "Tangent propagation switch (on), the edges the chain will reach lit lighter as soon as one is picked",
+  "sources": "ui/FeatureEditor.tsx; viewer/bodyPicks.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/editors/fillet.rs (Along tangent edges)",
+  "missing": "Switch only; chain not previewed"
+ },
+ {
+  "id": "RND-03",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "Radius read off the scan across the first edge (section square to the edge, circle tangent to both faces); box says what it found or that there is no round",
+  "sources": "core/filletEstimate.ts; core/curvedEdge.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fillet fillet_estimate.rs, curved_edge.rs"
+ },
+ {
+  "id": "RND-04",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "Variable radius: each edge with Start and End radii, ⇄ swaps them, Start/End labels with radii on the part",
+  "sources": "ui/FeatureEditor.tsx (fillet-varying*); viewer/varyingEnds.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/fillet.rs",
+  "missing": "Refused by name"
+ },
+ {
+  "id": "RND-05",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "Radius \"fit\" (median of the edges read), variable \"fit\" law, reach",
+  "sources": "app/reFit.ts; app/reFilletRead.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fillet fillet_read.rs"
+ },
+ {
+  "id": "RND-06",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "skipFailing: round what the kernel can, the note naming the chains left out",
+  "sources": "app/reSchemas.ts (skipFailing); core/build.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/fillet.rs (what_holds)",
+  "missing": "Built; no UI switch"
+ },
+ {
+  "id": "RND-07",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "A feature of several solids rounded solid by solid (<name> 1..n, all or none)",
+  "sources": "app/reSchemas.ts (solidsAsBody)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "RND-08",
+  "package": "RND",
+  "area": "Fillet",
+  "capability": "Rounds taking the whole face between their edges made a hair under size, the sliver taken off",
+  "sources": "core/kernelRounds.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "RND-09",
+  "package": "RND",
+  "area": "Chamfer",
+  "capability": "Chamfer Equal distance",
+  "sources": "ui/FeatureEditor.tsx (chamfer-mode)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/chamfer.rs; crates/mm-reverse/src/build/chamfer.rs",
+  "missing": ""
+ },
+ {
+  "id": "RND-10",
+  "package": "RND",
+  "area": "Chamfer",
+  "capability": "Chamfer Two distances (first on the reference face)",
+  "sources": "core/chamferSides.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/chamfer.rs",
+  "missing": ""
+ },
+ {
+  "id": "RND-11",
+  "package": "RND",
+  "area": "Chamfer",
+  "capability": "Chamfer Distance and angle",
+  "sources": "core/chamferSides.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/chamfer.rs",
+  "missing": ""
+ },
+ {
+  "id": "RND-12",
+  "package": "RND",
+  "area": "Chamfer",
+  "capability": "Reference face = the face most edges share (a rim's top); Flip takes the other",
+  "sources": "core/chamferSides.ts; ui/FeatureEditor.tsx (chamfer-flip)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/chamfer.rs",
+  "missing": "Reference is the face facing up most; staged ports/fillet chamfer_sides.rs"
+ },
+ {
+  "id": "RND-13",
+  "package": "RND",
+  "area": "Chamfer",
+  "capability": "Chamfer distance \"fit\" from the scan",
+  "sources": "app/reFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "RND-14",
+  "package": "RND",
+  "area": "Shell",
+  "capability": "Shell: faces to take away (none = closed hollow), wall thickness",
+  "sources": "ui/FeatureEditor.tsx (shell-faces)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/shell.rs; crates/mm-reverse/src/build/shell.rs",
+  "missing": ""
+ },
+ {
+  "id": "RND-15",
+  "package": "RND",
+  "area": "Shell",
+  "capability": "Shell wall from the Thickness map's reading (2 mm otherwise); arrow on the opened face to drag it",
+  "sources": "ui/FeatureEditor.tsx (shell-source); core/preview.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "RND-16",
+  "package": "RND",
+  "area": "Shell",
+  "capability": "Shell strategies: kernel thick solid, offset core cut out, core rebuilt with sharp inside corners",
+  "sources": "core/kernelShell.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/shell.rs",
+  "missing": "Kernel shell only"
+ },
+ {
+  "id": "RND-17",
+  "package": "RND",
+  "area": "Delete face",
+  "capability": "Delete face: faces taken off and the faces round them run on over the gap",
+  "sources": "ui/FeatureEditor.tsx (delete-face-faces)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/delete_face.rs; crates/polymix/src/reverse/editors/delete_face.rs (stub)",
+  "missing": "Built; no editor"
+ },
+ {
+  "id": "RND-18",
+  "package": "RND",
+  "area": "Delete face",
+  "capability": "One click takes the whole feature: faces it is split from, faces it closes in (blind hole's floor, boss top); second click lets it go",
+  "sources": "core/faceGroup.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "No `whole` field in the model"
+ },
+ {
+  "id": "RND-19",
+  "package": "RND",
+  "area": "Delete face",
+  "capability": "Tangent faces: the rounds running on from a round (a fillet's whole chain)",
+  "sources": "ui/FeatureEditor.tsx (delete-face-tangent)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "RND-20",
+  "package": "RND",
+  "area": "Preview",
+  "capability": "A feature on a body previews as the body it will leave (solid, with edges)",
+  "sources": "viewer/reScene.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (shown_part)",
+  "missing": ""
+ },
+ {
+  "id": "RND-21",
+  "package": "RND",
+  "area": "Picking",
+  "capability": "Shift+drag window picks edges/faces into an open Fillet, Chamfer, Shell or Draft (window/crossing, hidden edges included)",
+  "sources": "viewer/bodyPicks.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-01",
+  "package": "HOLE",
+  "area": "Hole",
+  "capability": "Hole along a cylinder, circle or line element's axis",
+  "sources": "ui/FeatureEditor.tsx (hole-*); core/resolve.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/hole.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-02",
+  "package": "HOLE",
+  "area": "Hole",
+  "capability": "Hole along a round face of the body (its radius by default)",
+  "sources": "ui/FeatureEditor.tsx",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/hole.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-03",
+  "package": "HOLE",
+  "area": "Hole",
+  "capability": "Hole into a flat face at a point or its centre, square to it (a standoff's top)",
+  "sources": "app/reSchemas.ts (hole.axis point)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-04",
+  "package": "HOLE",
+  "area": "Hole",
+  "capability": "Through everything, or to a depth each way along the axis (into the body alone from a flat face)",
+  "sources": "ui/FeatureEditor.tsx (hole-through)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-05",
+  "package": "HOLE",
+  "area": "Hole",
+  "capability": "Insert list (CNC Kitchen M2–M8, ¼\"-20): hole Ø, 1 mm deeper than the insert, wall to leave shown",
+  "sources": "core/inserts.ts; ui/FeatureEditor.tsx (hole-insert, hole-insert-wall)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/threads inserts.rs"
+ },
+ {
+  "id": "HOLE-06",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Thread on a full round face: bolt on a boss or nut in a bore, told by the face's side",
+  "sources": "core/thread.ts; core/kernelThread.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/thread.rs (stub)",
+  "missing": "Staged ports/threads thread.rs, thread_cut.rs"
+ },
+ {
+  "id": "HOLE-07",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "ISO metric coarse and fine",
+  "sources": "core/thread.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-08",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "UNC and UNF",
+  "sources": "core/thread.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-09",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "3D printing form print45: 45° flanks, flat crest/root p/5, 0.3 p deep, Ø3–Ø64 at the deep pitch or ISO coarse",
+  "sources": "core/thread.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-10",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Size from the clicked face: a boss's major Ø; a bore drawn at a size's Ø that size, otherwise its tap drill",
+  "sources": "core/thread.ts; ui/FeatureEditor.tsx (thread-size)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-11",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Size by designation (M10x1, 1/4-20 UNC, Ø10) or diameter + pitch typed",
+  "sources": "core/thread.ts; ui/FeatureEditor.tsx (thread-designation)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-12",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Right or left hand",
+  "sources": "ui/FeatureEditor.tsx (thread-hand)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-13",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Full length, or a length from a start in from either end (flip)",
+  "sources": "ui/FeatureEditor.tsx (thread-full, thread-flip)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-14",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Offset clearance for printing; refused at √3/8 p (√2/8 for print45)",
+  "sources": "core/thread.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-15",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Face brought to the thread (bore filled/bored to minor, boss built up/turned down to major); box and row say so past the thread depth",
+  "sources": "core/kernelThread.ts; ui/FeatureEditor.tsx (thread-problem)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-16",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Chamfer the free ends (45°, from 0.1 p past the root); refused where it comes out free nowhere",
+  "sources": "ui/FeatureEditor.tsx (thread-chamfer)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-17",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Thread stops at a shoulder or bore floor, runs out past a free end",
+  "sources": "core/kernelThread.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "HOLE-18",
+  "package": "HOLE",
+  "area": "Thread",
+  "capability": "Thread read off the scan along a cylinder element, round face or axis: pitch, minor/major, bore or boss, hand, nearest standard size, feature ready to add",
+  "sources": "core/threadRead.ts; app/reThreadCommand.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/threads thread_read.rs"
+ },
+ {
+  "id": "HOLE-19",
+  "package": "HOLE",
+  "area": "Expressions",
+  "capability": "Hole diameter/depth and thread diameter/pitch/length/start/offset driven by expressions",
+  "sources": "app/reSchemas.ts (exprs)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs PARAM"
+ },
+ {
+  "id": "DRAFT-01",
+  "package": "DRAFT",
+  "area": "Draft",
+  "capability": "Draft: neutral plane by the flat face that stays or a chosen plane; faces to lean; angle (in positive, out negative, under 89°)",
+  "sources": "ui/FeatureEditor.tsx (draft-*); core/kernelFaces.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/draft.rs (stub); crates/polymix/src/reverse/editors/draft.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-02",
+  "package": "DRAFT",
+  "area": "Draft",
+  "capability": "Draft groups: more faces each at its own angle; tangent-joined faces passed over or refused",
+  "sources": "app/reSchemas.ts (draft.groups); ui/FeatureEditor.tsx (draft-groups)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-03",
+  "package": "DRAFT",
+  "area": "Draft",
+  "capability": "Draft angle \"fit\" from the scan (plane fitted inside each face, median; coverage warned under 50 %)",
+  "sources": "app/reFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-04",
+  "package": "DRAFT",
+  "area": "Move face",
+  "capability": "Move face: a flat face along its outward normal (out adds, in cuts), a round face by radius; box reads the new diameter",
+  "sources": "ui/FeatureEditor.tsx (move-face-*); core/kernelFaces.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/move_face.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-05",
+  "package": "DRAFT",
+  "area": "Move face",
+  "capability": "Several faces moved by one distance as a whole (a cylinder's wall and ends)",
+  "sources": "core/kernelFaces.ts (offsetFacesTracked)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-06",
+  "package": "DRAFT",
+  "area": "Move face",
+  "capability": "Distance typed, dragged by its arrow, rounded by its chip",
+  "sources": "core/preview.ts; core/nominal.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-07",
+  "package": "DRAFT",
+  "area": "Snap to scan",
+  "capability": "Snap to scan: pick a body face, click the scan where it should lie; plane fit for a flat face, cylinder for a round; σ, tilt, axis offset reported; > 20° off refused",
+  "sources": "core/snapFace.ts; ui/FeatureEditor.tsx (move-face-snap, move-face-reading)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Fits staged in ports/fits"
+ },
+ {
+  "id": "DRAFT-08",
+  "package": "DRAFT",
+  "area": "Snap to scan",
+  "capability": "While clicking the scan: bodies as tint and edges, the scan solid, a ghost of the face where it will lie",
+  "sources": "viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-09",
+  "package": "DRAFT",
+  "area": "Snap to scan",
+  "capability": "Change what made it instead: extrude cap → From/To; wall → its sketch line; bore/boss → sketch circle radius; revolve section lines; nothing added to the list",
+  "sources": "core/snapEdit.ts; ui/FeatureEditor.tsx (move-face-history)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "snapEdit.ts / snapFace.ts not staged anywhere yet"
+ },
+ {
+  "id": "DRAFT-10",
+  "package": "DRAFT",
+  "area": "Snap to scan",
+  "capability": "Why there is no offer (fillet/mirror face, dimension holds the wall, extrude to a plane, line would overlap another profile)",
+  "sources": "core/snapEdit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-11",
+  "package": "DRAFT",
+  "area": "Move face",
+  "capability": "Move face knows only the face's outline: walls must stand square, rim rounds do not follow — box says so",
+  "sources": "ui/FeatureEditor.tsx (move-face-plan)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-12",
+  "package": "DRAFT",
+  "area": "Snap to scan",
+  "capability": "Draft it as well, by N°: when the scan's face leans past the fit's scatter, a Draft hinged across the face's middle is added after the Move face; one Ctrl+Z",
+  "sources": "ui/FeatureEditor.tsx (move-face-lean)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "DRAFT-13",
+  "package": "DRAFT",
+  "area": "Move face",
+  "capability": "Several picked faces that all trace back are moved in their makers in one edit",
+  "sources": "core/snapEdit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-01",
+  "package": "LOFT",
+  "area": "Loft",
+  "capability": "Loft through two or more sketches' largest regions, ruled or smooth",
+  "sources": "ui/FeatureEditor.tsx (loft-*); core/profiles.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/loft.rs (stub); crates/polymix/src/reverse/editors/loft.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-02",
+  "package": "LOFT",
+  "area": "Loft",
+  "capability": "Stations fitted from the scan on planes like a sketch (sections + fit.like) into “<name> station k”",
+  "sources": "core/stations.ts; app/reSchemas.ts (loft.sections, loft.fit)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps stations.rs"
+ },
+ {
+  "id": "LOFT-03",
+  "package": "LOFT",
+  "area": "Loft",
+  "capability": "Inner loft: every station inset by the wall into “<name> inner k” and lofted as a body of its own",
+  "sources": "app/reSchemas.ts (loft.inner)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-04",
+  "package": "LOFT",
+  "area": "Loft",
+  "capability": "Station offsets and inner wall driven by expressions",
+  "sources": "app/reSchemas.ts (loft.exprs)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-05",
+  "package": "LOFT",
+  "area": "Loft",
+  "capability": "Smooth loft fold detection (skin crossing itself between close sections)",
+  "sources": "core/loftFold.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps loft_fold.rs"
+ },
+ {
+  "id": "LOFT-06",
+  "package": "LOFT",
+  "area": "Sweep",
+  "capability": "Sweep a sketch's largest region along another sketch's chain of lines and arcs, section square to the path (profile within 1° square at the start)",
+  "sources": "ui/SweepFields.tsx; core/profiles.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/sweep.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-07",
+  "package": "LOFT",
+  "area": "Sweep",
+  "capability": "Route: 3D centreline points with a bend radius (and per-bend radii); a bend that does not fit refused with its largest",
+  "sources": "core/sweepRoute.ts; ui/SweepFields.tsx (sweep-route)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps sweep_route.rs"
+ },
+ {
+  "id": "LOFT-08",
+  "package": "LOFT",
+  "area": "Sweep",
+  "capability": "Swap profile and path",
+  "sources": "ui/SweepFields.tsx (sweep-swap)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-09",
+  "package": "LOFT",
+  "area": "Tube",
+  "capability": "Tube trace: a bent tube's centreline read from the scan, stopping at a flange, bellows or junction",
+  "sources": "core/tubeTrace.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps tube_trace.rs"
+ },
+ {
+  "id": "LOFT-10",
+  "package": "LOFT",
+  "area": "Pattern",
+  "capability": "Body pattern circular about an axis: count, angle spanned (360° spreads evenly)",
+  "sources": "ui/FeatureEditor.tsx (pattern-mode); core/patternCopies.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/pattern.rs; crates/polymix/src/reverse/editors/pattern.rs (stub)",
+  "missing": "Built; no editor"
+ },
+ {
+  "id": "LOFT-11",
+  "package": "LOFT",
+  "area": "Pattern",
+  "capability": "Body pattern linear along a direction with a spacing",
+  "sources": "ui/FeatureEditor.tsx",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/pattern.rs",
+  "missing": "Built; no editor"
+ },
+ {
+  "id": "LOFT-12",
+  "package": "LOFT",
+  "area": "Pattern",
+  "capability": "Grid: second direction with count and spacing",
+  "sources": "ui/FeatureEditor.tsx (pattern-axis2-clear)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/pattern.rs",
+  "missing": "Built; no editor"
+ },
+ {
+  "id": "LOFT-13",
+  "package": "LOFT",
+  "area": "Pattern",
+  "capability": "Pattern of a sheet (one window outline patterned into cutters)",
+  "sources": "README §7",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs SURF sheets"
+ },
+ {
+  "id": "LOFT-14",
+  "package": "LOFT",
+  "area": "Pattern",
+  "capability": "Copies apart are bodies of their own; copies' faces keep their makers",
+  "sources": "core/patternCopies.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/pattern.rs",
+  "missing": "Islands made; maker tracking of copies not verified"
+ },
+ {
+  "id": "LOFT-15",
+  "package": "LOFT",
+  "area": "Move body",
+  "capability": "Move body: selected bodies, the one there is, or clicked once open; Shift+drag window; click a picked one to let it go",
+  "sources": "ui/FeatureEditor.tsx (move-body-*); state/reFeatureSlice.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/move_body.rs; crates/polymix/src/reverse/editors/move_body.rs (stub)",
+  "missing": "Built; no editor"
+ },
+ {
+  "id": "LOFT-16",
+  "package": "LOFT",
+  "area": "Move body",
+  "capability": "Gizmo: arrows along X/Y/Z and gimbal rings, constant screen size, field on the grip",
+  "sources": "core/preview.ts; state/reGripSlice.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools body_move.rs"
+ },
+ {
+  "id": "LOFT-17",
+  "package": "LOFT",
+  "area": "Move body",
+  "capability": "Six numbers: Move (mm) and Turn (deg) about X then Y then Z through the stored pivot (middle of the bodies as picked); parameters may drive them",
+  "sources": "core/move.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/move_body.rs; crates/mm-reverse/src/build/mod.rs (move_matrix)",
+  "missing": "Built; no box, no expressions"
+ },
+ {
+  "id": "LOFT-18",
+  "package": "LOFT",
+  "area": "Move body",
+  "capability": "Copy: copies moved as bodies of their own, originals left",
+  "sources": "ui/FeatureEditor.tsx (move-body-copy)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/move_body.rs",
+  "missing": "Built; no UI"
+ },
+ {
+  "id": "LOFT-19",
+  "package": "LOFT",
+  "area": "Move body",
+  "capability": "Ghost rides the gizmo at once (meshes carried, nothing built); live map against where the bodies go",
+  "sources": "state/reFeatureSlice.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LOFT-20",
+  "package": "LOFT",
+  "area": "Move body",
+  "capability": "A moved body's faces keep their makers (later picks still find them)",
+  "sources": "core/move.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/build/move_body.rs",
+  "missing": ""
+ },
+ {
+  "id": "BOOL-01",
+  "package": "BOOL",
+  "area": "Mirror",
+  "capability": "Mirror about a plane: coordinate (with offset), section, measured plane, radial",
+  "sources": "ui/FeatureEditor.tsx (mirror-*)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/editors/mirror.rs; crates/mm-reverse/src/build/mirror.rs",
+  "missing": "Editor offers coordinate planes and the face only"
+ },
+ {
+  "id": "BOOL-02",
+  "package": "BOOL",
+  "area": "Mirror",
+  "capability": "Mirror about a flat face of the body",
+  "sources": "ui/ContextChips.tsx (mirror)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/mirror.rs; crates/mm-reverse/src/build/mirror.rs",
+  "missing": ""
+ },
+ {
+  "id": "BOOL-03",
+  "package": "BOOL",
+  "area": "Mirror",
+  "capability": "Join with the original (default) or a body of its own",
+  "sources": "ui/FeatureEditor.tsx (mirror-join)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/mirror.rs",
+  "missing": ""
+ },
+ {
+  "id": "BOOL-04",
+  "package": "BOOL",
+  "area": "Mirror",
+  "capability": "A new Mirror opens on the scan's symmetry plane (measured, or mirror registration of the principal planes accepted ≤ 0.1 mm RMS over half the samples; σ and counts; refused by name)",
+  "sources": "core/symmetryPlane.ts; ui/FeatureEditor.tsx (mirror-symmetry*)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools symmetry_plane.rs"
+ },
+ {
+  "id": "BOOL-05",
+  "package": "BOOL",
+  "area": "Mirror",
+  "capability": "Keep the found symmetry plane as a plane element",
+  "sources": "ui/FeatureEditor.tsx (mirror-symmetry-keep)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs PLANE element source"
+ },
+ {
+  "id": "BOOL-06",
+  "package": "BOOL",
+  "area": "Combine",
+  "capability": "Combine two bodies: join, cut, intersect",
+  "sources": "ui/FeatureEditor.tsx (boolean-op)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/boolean.rs; crates/mm-reverse/src/build/boolean.rs",
+  "missing": ""
+ },
+ {
+  "id": "BOOL-07",
+  "package": "BOOL",
+  "area": "Combine",
+  "capability": "Keep the tool body beside the result",
+  "sources": "ui/FeatureEditor.tsx (boolean-keep)",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/editors/boolean.rs",
+  "missing": ""
+ },
+ {
+  "id": "BOOL-08",
+  "package": "BOOL",
+  "area": "Combine",
+  "capability": "A tool feature left in pieces goes in with all of them (a plug patterned into copies cuts every window); two profiles extruded together combined either way round",
+  "sources": "core/build.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/boolean.rs",
+  "missing": "One tool body only"
+ },
+ {
+  "id": "BOOL-09",
+  "package": "BOOL",
+  "area": "Combine",
+  "capability": "Sheet as the body: intersect keeps it inside a solid tool, cut outside, join sews two sheets edge to edge",
+  "sources": "ui/FeatureEditor.tsx (boolean-sheet)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs SURF"
+ },
+ {
+  "id": "BOOL-10",
+  "package": "BOOL",
+  "area": "Cut by plane",
+  "capability": "Cut a body by a plane and keep one side (flip); plane offset by expression",
+  "sources": "ui/FeatureEditor.tsx (cut-plane-flip)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/cut_plane.rs; crates/polymix/src/reverse/editors/cut_plane.rs (stub)",
+  "missing": "Built; no editor"
+ },
+ {
+  "id": "BOOL-11",
+  "package": "BOOL",
+  "area": "Offset body",
+  "capability": "Offset body: grow or shrink all round by a distance (convex edges rounded); kept as a body of its own (default) or replacing it",
+  "sources": "ui/FeatureEditor.tsx (offset-body-keep)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/offset_body.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "BOOL-12",
+  "package": "BOOL",
+  "area": "Offset body",
+  "capability": "Keep-out workflow: offset body + Combine Cut (tool kept) → a pocket with clearance",
+  "sources": "README §7",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-01",
+  "package": "SURF",
+  "area": "Sheet",
+  "capability": "Sheet: a sketch's pieces (an open chain will do) extruded as a surface body (from/to), marked surface, never exported alone",
+  "sources": "ui/FeatureEditor.tsx (sheet-sketch)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/sheet.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "SURF-02",
+  "package": "SURF",
+  "area": "Sheet",
+  "capability": "Surface bodies: never joined or cut; marked surface in the body list; live map against them",
+  "sources": "core/build.ts; ui/BodyList.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-03",
+  "package": "SURF",
+  "area": "Split",
+  "capability": "Split by sheets/bodies keeping the fragments on the scan (sampled by area, tolerance, overlap share)",
+  "sources": "ui/FeatureEditor.tsx (split-*)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/split.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "SURF-04",
+  "package": "SURF",
+  "area": "Split",
+  "capability": "Split keep largest / smallest (volume, a sheet's area)",
+  "sources": "ui/FeatureEditor.tsx (split-keep)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-05",
+  "package": "SURF",
+  "area": "Split",
+  "capability": "Split keep between: the wall between two fitted skins; refused where they meet",
+  "sources": "app/reSchemas.ts (split.keep between)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-06",
+  "package": "SURF",
+  "area": "Split",
+  "capability": "Split within: freeform surfaces trimmed to their region's outline + margin; surfaces carried on to the body's sides; offScan reported",
+  "sources": "core/surfaceRegion.ts; app/reSchemas.ts (split.within)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/surface surface_region.rs"
+ },
+ {
+  "id": "SURF-07",
+  "package": "SURF",
+  "area": "Split",
+  "capability": "A sheet as the split body: trimmed, the pieces kept sewn into one sheet",
+  "sources": "app/reSchemas.ts (split)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-08",
+  "package": "SURF",
+  "area": "Thicken",
+  "capability": "Thicken a sheet or fitted surface: thickness, side in/out/both, New/Join/Cut, target; both refused for a multi-patch sheet",
+  "sources": "ui/FeatureEditor.tsx (thicken-*); core/kernelThicken.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/thicken.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "SURF-09",
+  "package": "SURF",
+  "area": "Thicken",
+  "capability": "Why a sheet does not thicken (a face bending tighter than the thickness), the wall reached along its edge",
+  "sources": "core/diagnoseThicken.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-10",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Region flood from a clicked scan face over edges turning less than the angle (1°); Ctrl-click takes a flood away",
+  "sources": "ui/FeatureEditor.tsx (surface-region); app/reSurfaceRegion.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/surface.rs (stub)",
+  "missing": "Staged ports/fits region_grow.rs"
+ },
+ {
+  "id": "SURF-11",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Region marked with the tools (brush, window, lasso), or by box / normal / exclude boxes / limit",
+  "sources": "ui/FeatureEditor.tsx (surface-paint); app/reSurfaceRegion.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-12",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Freeform fit: degree-3 B-spline, control net from extent and noise or typed 3–20, Expand by 35 %, Smoothness 0.01, robust (strays named), height direction",
+  "sources": "core/surfaceFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/surface surface_fit.rs"
+ },
+ {
+  "id": "SURF-13",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Fit report: σ, worst point, net used, past-region standoff; live map against the surface",
+  "sources": "core/surfaceFit.ts; core/surfaceRegion.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-14",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Shape: Plane or Cylinder instead of freeform, grown by Expand by",
+  "sources": "ui/FeatureEditor.tsx (surface-shape)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-15",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Auto Constrain: within 0.5° parallel/square to XY/YZ/ZX, measured or earlier-fitted references refitted held; within 1 mm put on it; says what held and σ before/after",
+  "sources": "core/autoConstrain.ts; ui/featureFields.tsx (surface-held)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sketchtools auto_constrain.rs"
+ },
+ {
+  "id": "SURF-16",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Hold to: force a relation however far off, or Nothing (the free fit)",
+  "sources": "ui/FeatureEditor.tsx (surface-constrain)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-17",
+  "package": "SURF",
+  "area": "Fit surface",
+  "capability": "Region box driven by expressions, the points read again when a parameter moves it",
+  "sources": "app/reSchemas.ts (surface.exprs)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/model.rs (RegionBox, RegionStale)",
+  "missing": ""
+ },
+ {
+  "id": "SURF-18",
+  "package": "SURF",
+  "area": "Trim",
+  "capability": "Trim: surfaces, sheets, solid bodies and measured planes/cylinders/cones/spheres/tori; a box round the scan cut by all; faces lying on the scan kept (Tolerance from 3× median σ, Overlap)",
+  "sources": "ui/FeatureEditor.tsx (trim-*)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/trim.rs (stub)",
+  "missing": ""
+ },
+ {
+  "id": "SURF-19",
+  "package": "SURF",
+  "area": "Trim",
+  "capability": "Closed → solid (faces named by their surfaces, filletable, exportable); open → surface body, counts, open edges drawn red",
+  "sources": "core/build.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-20",
+  "package": "SURF",
+  "area": "Trim",
+  "capability": "Planes and cylinders cut as the whole plane/cylinder, not the patch drawn",
+  "sources": "core/build.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "SURF-21",
+  "package": "SURF",
+  "area": "Extract",
+  "capability": "Extract a measured plane (slab of a thickness), cylinder, cone, sphere at its extents; new/join/cut; element put out of view",
+  "sources": "ui/FeatureEditor.tsx (extract-element); core/primitives.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/extract.rs; crates/mm-reverse/src/build/mod.rs (primitive_of)",
+  "missing": "Built; no editor; no element source"
+ },
+ {
+  "id": "SURF-22",
+  "package": "SURF",
+  "area": "Extract",
+  "capability": "Torus element extracted as a ring body; torus in the trim's set",
+  "sources": "core/primitives.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (primitive_of)",
+  "missing": "Ring built; trim missing"
+ },
+ {
+  "id": "SURF-23",
+  "package": "SURF",
+  "area": "Extract",
+  "capability": "Extract a shadow section: its outline stood up through the part's thickness, following the shadow",
+  "sources": "core/primitives.ts; core/shadowPieces.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/extract.rs",
+  "missing": "Refused by name; staged ports/sweeps shadow"
+ },
+ {
+  "id": "NET-01",
+  "package": "NET",
+  "area": "Placing",
+  "capability": "Click a patch's corners on the scan; its sides follow the scan between them; shaded as it grows",
+  "sources": "state/reNetworkDraft.ts; viewer/networkLayer.ts",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/network.rs (stub); crates/polymix/src/reverse/editors/network.rs (stub)",
+  "missing": "Staged ports/network"
+ },
+ {
+  "id": "NET-02",
+  "package": "NET",
+  "area": "Placing",
+  "capability": "Close with a click on the first corner, Enter, double click or middle click; fitted at once",
+  "sources": "state/reNetworkDraft.ts; app/keyboard.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-03",
+  "package": "NET",
+  "area": "Placing",
+  "capability": "Backspace takes the last corner back; Esc lets the patch go; Enter with two corners makes a line",
+  "sources": "state/reNetworkDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-04",
+  "package": "NET",
+  "area": "Placing",
+  "capability": "A corner on a corner, an edge (split there) or a point of an edge joins the neighbours (one shared edge)",
+  "sources": "state/reNetworkDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-05",
+  "package": "NET",
+  "area": "Placing",
+  "capability": "Drag an outer edge across the scan to make the next patch (corners landing on corners near)",
+  "sources": "state/reNetworkDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-06",
+  "package": "NET",
+  "area": "Editing",
+  "capability": "Corners and points dragged along the scan; a shared edge bent by dragging (point inserted); Shift-click puts a point in",
+  "sources": "state/reNetworkDraft.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-07",
+  "package": "NET",
+  "area": "Editing",
+  "capability": "Click picks a patch (its strips' spans in the box); Delete patch removes it and its unshared edges",
+  "sources": "ui/NetworkEditor.tsx (network-delete-patch)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-08",
+  "package": "NET",
+  "area": "Editing",
+  "capability": "Delete a point, corner or edge under the cursor; C makes an edge a crease (dashed)",
+  "sources": "app/useNetworkLayer.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-09",
+  "package": "NET",
+  "area": "Editing",
+  "capability": "Wheel over an edge sets its strip's span count",
+  "sources": "app/useNetworkLayer.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-10",
+  "package": "NET",
+  "area": "Editing",
+  "capability": "Three-, five- and six-sided patches split from a draggable centre into four-sided ones",
+  "sources": "core/networkSplit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/network network_split.rs"
+ },
+ {
+  "id": "NET-11",
+  "package": "NET",
+  "area": "Editing",
+  "capability": "Network editor's own Undo/Redo",
+  "sources": "ui/NetworkEditor.tsx (network-undo, network-redo)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-12",
+  "package": "NET",
+  "area": "Display",
+  "capability": "Scan coloured by curvature while the box is open",
+  "sources": "app/useNetworkLayer.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs VIEW curvature"
+ },
+ {
+  "id": "NET-13",
+  "package": "NET",
+  "area": "Bodies",
+  "capability": "A body's edge as a boundary: Contact, or Tangent to one of its faces",
+  "sources": "ui/NetworkEditor.tsx (network-bodies)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-14",
+  "package": "NET",
+  "area": "Creases",
+  "capability": "Suggest creases: sharp edges and folds (not rounds) dashed violet; click one or Accept all",
+  "sources": "core/networkCreases.ts; ui/NetworkEditor.tsx (network-suggest*)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/network network_creases.rs"
+ },
+ {
+  "id": "NET-15",
+  "package": "NET",
+  "area": "Fill",
+  "capability": "Fill: click a patch; Ctrl-click empties; click inside a region closed another way; Fill all; refusals drawn where (not closed, 2 or 7 sides, crossing, scan rim)",
+  "sources": "core/networkCells.ts; ui/NetworkEditor.tsx (network-fill-all, network-refused)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/network network_cells.rs"
+ },
+ {
+  "id": "NET-16",
+  "package": "NET",
+  "area": "Fit",
+  "capability": "Joint fit: shared curve poles exact, tangency pole by pole, T-junctions by weight; corners of 3/5/6 near tangent with angle reported",
+  "sources": "core/networkFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/network network_fit.rs"
+ },
+ {
+  "id": "NET-17",
+  "package": "NET",
+  "area": "Fit",
+  "capability": "Auto spans (4, up to 20 where a patch misses by > Tolerance 0.01 beyond noise); Smoothness 0.001; Leave out stray points",
+  "sources": "core/networkFit.ts; ui/NetworkEditor.tsx (network-robust)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-18",
+  "package": "NET",
+  "area": "Readout",
+  "capability": "Status line (patches, unfilled regions, worst tangent angle, worst gap, worst corner) and a row per patch (σ, worst, net)",
+  "sources": "ui/NetworkEditor.tsx (network-status, network-patches)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-19",
+  "package": "NET",
+  "area": "Body",
+  "capability": "Result: a sheet (surface) or a solid where it closes; exported as a skin; thickened by Thicken",
+  "sources": "core/networkBody.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/network network_body.rs"
+ },
+ {
+  "id": "NET-20",
+  "package": "NET",
+  "area": "Performance",
+  "capability": "Preview without kernel faces; traces and maps kept between edits (fit on screen in ~0.25 s)",
+  "sources": "core/network.ts; app/useNetworkLayer.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NET-21",
+  "package": "NET",
+  "area": "Live map",
+  "capability": "Live map against the patches",
+  "sources": "core/liveMap.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-01",
+  "package": "PARAM",
+  "area": "Expressions",
+  "capability": "Arithmetic in every number field: + − × ÷ ^, parentheses, sin cos tan asin acos atan atan2 sqrt abs min max floor ceil round pow, pi, e; degrees",
+  "sources": "core/expression.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/expressions expression.rs"
+ },
+ {
+  "id": "PARAM-02",
+  "package": "PARAM",
+  "area": "Expressions",
+  "capability": "Units on numbers (in, cm, deg, rad); a bare number read in the field's unit",
+  "sources": "core/expression.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-03",
+  "package": "PARAM",
+  "area": "Expressions",
+  "capability": "What was typed stays in the field; the value it comes to is written where the unit was",
+  "sources": "ui/ExprInput.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-04",
+  "package": "PARAM",
+  "area": "Parameters",
+  "capability": "Parameters section: named length / angle / integer / number, each an expression that may read the others",
+  "sources": "ui/ParameterList.tsx; core/parameters.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Parameter)",
+  "missing": "Data only; no UI, no evaluator"
+ },
+ {
+  "id": "PARAM-05",
+  "package": "PARAM",
+  "area": "Parameters",
+  "capability": "Any field takes a parameter by name; a change rebuilds every number that reads it (sketches re-solved, profiles kept)",
+  "sources": "core/parameters.ts; state/reFeatureHelpers.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/expressions parameters.rs, param_slots.rs"
+ },
+ {
+  "id": "PARAM-06",
+  "package": "PARAM",
+  "area": "Parameters",
+  "capability": "Kinds kept apart (length + angle refused, area refused, integer must be whole); error under the field, old number kept",
+  "sources": "core/expression.ts; ui/ParameterList.tsx (parameter-error)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-07",
+  "package": "PARAM",
+  "area": "Parameters",
+  "capability": "A plain number typed (or a grip dragged) over a parameter-driven field lets the parameter go",
+  "sources": "core/parameters.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-08",
+  "package": "PARAM",
+  "area": "Parameters",
+  "capability": "Rename a parameter renames it in every expression",
+  "sources": "core/parameters.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-09",
+  "package": "PARAM",
+  "area": "Parameters",
+  "capability": "Remove refused while something reads it; the row names the readers",
+  "sources": "core/parameters.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PARAM-10",
+  "package": "PARAM",
+  "area": "Saving",
+  "capability": "Parameters saved with the project, expressions beside the numbers they last came to",
+  "sources": "app/projectSection.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Part.parameters, exprs maps)",
+  "missing": "Saved; numbers never refreshed from expressions"
+ },
+ {
+  "id": "PARAM-11",
+  "package": "PARAM",
+  "area": "Slots",
+  "capability": "Feature expression slots per kind (extent.from/to/total, draftDeg, angleDeg, pitch, turns, height, thickness, radius, distance, distance2, count, step, translate.x…, plane.offset, sections.k.offset, region.box…)",
+  "sources": "app/reSchemas.ts (exprsIn); core/parameters.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Exprs on every kind)",
+  "missing": "Stored, not evaluated"
+ },
+ {
+  "id": "PARAM-12",
+  "package": "PARAM",
+  "area": "Units",
+  "capability": "Display units (inch-aware length fields)",
+  "sources": "ui/reLength.ts; src/core/units.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/expressions display_units.rs, length_fields.rs"
+ },
+ {
+  "id": "LIST-01",
+  "package": "LIST",
+  "area": "Rows",
+  "capability": "Body rows: eye, name, faces/triangles count",
+  "sources": "ui/BodyList.tsx (body-row)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (body_list)",
+  "missing": "Eye, name, volume; no face/triangle counts"
+ },
+ {
+  "id": "LIST-02",
+  "package": "LIST",
+  "area": "Rows",
+  "capability": "Name a body by double click (its STEP part name); cleared → Solid n",
+  "sources": "ui/BodyList.tsx (body-name-input)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (BodyStyle); crates/mm-reverse/src/build/mod.rs (name_bodies)",
+  "missing": "Names applied; no UI"
+ },
+ {
+  "id": "LIST-03",
+  "package": "LIST",
+  "area": "Rows",
+  "capability": "Colour a body from swatches its dot opens; Auto restores the maker's colour",
+  "sources": "ui/BodyList.tsx (body-color, body-swatch*)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (BodyStyle.color)",
+  "missing": "Data only; bodies drawn one colour"
+ },
+ {
+  "id": "LIST-04",
+  "package": "LIST",
+  "area": "Hover",
+  "capability": "Pointer on a row lights the body in blue over everything; cursor on a body lights its row",
+  "sources": "ui/BodyList.tsx; viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-05",
+  "package": "LIST",
+  "area": "Visibility",
+  "capability": "Hide / Hide others / Show all (row menu and chips)",
+  "sources": "ui/BodyList.tsx (body-menu); ui/ContextChips.tsx",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (hidden_bodies)",
+  "missing": "Per-body eye only"
+ },
+ {
+  "id": "LIST-06",
+  "package": "LIST",
+  "area": "Components",
+  "capability": "Components: Component key makes one; drag bodies/components in, drop on the strip to take out; nesting",
+  "sources": "core/bodyFolders.ts; ui/BodyList.tsx (body-folder*, body-drop-top)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (BodyFolder)",
+  "missing": "Data only"
+ },
+ {
+  "id": "LIST-07",
+  "package": "LIST",
+  "area": "Components",
+  "capability": "Component eye shows/hides all it holds; fold; double-click rename; Remove component; New component inside; Move to …",
+  "sources": "ui/BodyList.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-08",
+  "package": "LIST",
+  "area": "Components",
+  "capability": "Components saved with the project and undone like features",
+  "sources": "app/projectSection.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Part.body_folders)",
+  "missing": "Saved; nothing edits them"
+ },
+ {
+  "id": "LIST-09",
+  "package": "LIST",
+  "area": "Selection",
+  "capability": "Rows picked as in a file browser (click, Ctrl+click, Shift+click range), lit in the viewport, dragged together; Move / Component / Hide others keys; Escape clears",
+  "sources": "ui/BodyList.tsx (body-selection-*)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-10",
+  "package": "LIST",
+  "area": "Selection",
+  "capability": "While a Move is open a row click puts the body in or takes it out",
+  "sources": "ui/BodyList.tsx (body-list-move-hint)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-11",
+  "package": "LIST",
+  "area": "Readouts",
+  "capability": "Pick readouts: a face's area and normal (round: radius, axis), an edge's length and ends (round: radius, centre), a corner's coordinates",
+  "sources": "core/selectionInfo.ts; ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-12",
+  "package": "LIST",
+  "area": "Measure",
+  "capability": "Two picks: corner–corner distance with ΔX ΔY ΔZ, corner to edge/axis/face, parallel faces/edges, angle between, two holes' axes; more picks: lengths and areas summed",
+  "sources": "core/selectionInfo.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-13",
+  "package": "LIST",
+  "area": "Clearance",
+  "capability": "Clearance between two bodies: closest gap, or the volume they share",
+  "sources": "ui/ContextChips.tsx (Clearance); app/reBodyCommands.ts (clearance)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-14",
+  "package": "LIST",
+  "area": "Overlaps",
+  "capability": "Bodies running into each other show the shared volume hatched red (through see-through bodies and on the section cut); Overlaps switch, kept in the project",
+  "sources": "core/overlapMesh.ts; viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "LIST-15",
+  "package": "LIST",
+  "area": "Components",
+  "capability": "Picks on several parts offer Make component; the chip line heads with the body and its component path",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-01",
+  "package": "PICK",
+  "area": "Picking",
+  "capability": "With no box open a click on a body takes a face, an edge or a corner",
+  "sources": "viewer/bodyPicks.ts; viewer/reScene.ts (bodyItemAt)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (pointer_input)",
+  "missing": "Idle click only picks sketch regions; face/edge picks exist inside boxes; no corners"
+ },
+ {
+  "id": "PICK-02",
+  "package": "PICK",
+  "area": "Picking",
+  "capability": "Ctrl+click adds a pick",
+  "sources": "viewer/bodyPicks.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-03",
+  "package": "PICK",
+  "area": "Picking",
+  "capability": "Shift+drag selection window (right: inside, solid; left: touching, dashed; hidden edges included) into the selection",
+  "sources": "viewer/bodyPicks.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-04",
+  "package": "PICK",
+  "area": "Picking",
+  "capability": "Hover lights the face/edge a click would take; bodies not in play dimmed while a box is open",
+  "sources": "viewer/bodyPicks.ts; viewer/reScene.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (hover_edge, hover_face)",
+  "missing": "No dimming"
+ },
+ {
+  "id": "PICK-05",
+  "package": "PICK",
+  "area": "Picking",
+  "capability": "Picks through the scan's veil (a face seen through it is picked)",
+  "sources": "viewer/bodyPicks.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (pick_hit)",
+  "missing": "Not verified against see-through scan"
+ },
+ {
+  "id": "PICK-06",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Sketch region: Extrude, Revolve",
+  "sources": "ui/ContextChips.tsx (sketchRegion)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (pointer_input)",
+  "missing": "A click opens Extrude directly; no chips"
+ },
+ {
+  "id": "PICK-07",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Element with an axis or sketch line: Revolve about this",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-08",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Cylinder/circle element: Hole; element with a volume: Extract as body; plane element or section: Sketch",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs PLANE elements"
+ },
+ {
+  "id": "PICK-09",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Coordinate plane: Sketch, Hide",
+  "sources": "ui/ContextChips.tsx (hide-plane)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-10",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Body face: Edit <the feature that made it>",
+  "sources": "ui/ContextChips.tsx (edit)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-11",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Flat face: Extrude (the face), Sketch here",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-12",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Face: Move face, Snap to scan (not on a fillet's part turn)",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-13",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Face: Shell, Delete face",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-14",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Round face: Hole, Thread (no Thread on a partial round)",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-15",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Flat face: Mirror (about it), Draft (as the neutral plane)",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-16",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Face, edge or selection: Move body",
+  "sources": "ui/ContextChips.tsx (moveChip)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-17",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Edge(s) of one body: Fillet, Chamfer",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-18",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Several faces: Move faces, Shell, Delete faces",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-19",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Picks on two bodies: Clearance, Move bodies",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-20",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Body line: name and component path, Hide, Hide others / Show all, Component",
+  "sources": "ui/ContextChips.tsx (chip-hide-others)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "PICK-21",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Selection: Note (one note on all picks)",
+  "sources": "ui/ContextChips.tsx (Note)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs NOTE"
+ },
+ {
+  "id": "PICK-22",
+  "package": "PICK",
+  "area": "Chips",
+  "capability": "Escape or the next click puts the chips away",
+  "sources": "ui/ContextChips.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-01",
+  "package": "VIEW",
+  "area": "Keys",
+  "capability": "Scan key: put the scan away",
+  "sources": "app/useReversePlugin.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (view_box Scan)",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-02",
+  "package": "VIEW",
+  "area": "Keys",
+  "capability": "Bodies key: put the bodies away with the map left on the scan",
+  "sources": "app/useReversePlugin.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (view_box Bodies)",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-03",
+  "package": "VIEW",
+  "area": "Keys",
+  "capability": "Elements key: put the measured elements and sections away",
+  "sources": "app/useReversePlugin.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs PLANE elements"
+ },
+ {
+  "id": "VIEW-04",
+  "package": "VIEW",
+  "area": "Menus",
+  "capability": "Scan Transparent/solid; the scan a see-through veil once there is a body",
+  "sources": "app/useReversePlugin.tsx",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (See-through)",
+  "missing": "Manual checkbox; no automatic veil"
+ },
+ {
+  "id": "VIEW-05",
+  "package": "VIEW",
+  "area": "Menus",
+  "capability": "Bodies Transparent/solid (both solid shows where each stands proud)",
+  "sources": "app/useReversePlugin.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Bodies only go see-through with Deviation on"
+ },
+ {
+  "id": "VIEW-06",
+  "package": "VIEW",
+  "area": "Bodies",
+  "capability": "Bodies solid with thin dark edges that stay behind what hides them",
+  "sources": "viewer/reScene.ts; core/edgeLines.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (render)",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-07",
+  "package": "VIEW",
+  "area": "Bodies",
+  "capability": "Silhouettes of round faces from the view direction (a boss's sides, a ball's rim)",
+  "sources": "core/silhouette.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/sweeps silhouette.rs"
+ },
+ {
+  "id": "VIEW-08",
+  "package": "VIEW",
+  "area": "Menus",
+  "capability": "Tangent edges: Drawn / Dimmed / Off (off ones not pickable)",
+  "sources": "app/useReversePlugin.tsx (TANGENT_EDGE_CHOICES)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-09",
+  "package": "VIEW",
+  "area": "Menus",
+  "capability": "Curvature map (mean curvature, scale as the radius 9 in 10 stay under, dark caps); one map at a time with Deviation",
+  "sources": "app/useReversePlugin.tsx (curvatureSwitch)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fits mesh_graph curvature.rs"
+ },
+ {
+  "id": "VIEW-10",
+  "package": "VIEW",
+  "area": "Keys",
+  "capability": "Deviation key against the committed bodies",
+  "sources": "app/useReversePlugin.tsx",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (view_box Deviation)",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-11",
+  "package": "VIEW",
+  "area": "Legend",
+  "capability": "Legend beside the viewport reads the ramp; click either end figure to retype the range",
+  "sources": "app/useReversePlugin.tsx (MapLegend)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (legend); crates/polymix/src/reverse/mod.rs (range)",
+  "missing": "Range set in the panel, not on the legend"
+ },
+ {
+  "id": "VIEW-12",
+  "package": "VIEW",
+  "area": "Sketch view",
+  "capability": "No part / Section / Full part under a sketch",
+  "sources": "app/useReversePlugin.tsx (SKETCH_PART_VIEWS)",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (cut_away)",
+  "missing": "Always cut; Scan/Bodies/Slice checkboxes instead"
+ },
+ {
+  "id": "VIEW-13",
+  "package": "VIEW",
+  "area": "Sketch view",
+  "capability": "Part cut open at the sketch plane with a solid slate cap; bodies closed where cut, each in its own cut colour",
+  "sources": "viewer/reScene.ts; viewer/sketchPalette.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (globals.cut_plane)",
+  "missing": "Clip only, no caps"
+ },
+ {
+  "id": "VIEW-14",
+  "package": "VIEW",
+  "area": "Sketch view",
+  "capability": "Camera swings to face the sketch plane and back when it is put away; the part follows the sheet's pan and zoom",
+  "sources": "app/useSketchSceneSync.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/view.rs (face_plane, restore_after_sketch)",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-15",
+  "package": "VIEW",
+  "area": "Section view",
+  "capability": "Section view honoured by the reverse scene: part cut at the section's planes, solid bodies capped in cut colours",
+  "sources": "viewer/reScene.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Polymix has no section view in this workspace"
+ },
+ {
+  "id": "VIEW-16",
+  "package": "VIEW",
+  "area": "Section view",
+  "capability": "Section render layer: bodies cut by a section's plane as outlines and sketches with piece ids (section.render pictures)",
+  "sources": "app/reSectionLayer.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "VIEW-17",
+  "package": "VIEW",
+  "area": "Stage",
+  "capability": "Stage follows the bodies as they grow; fit view",
+  "sources": "app/useReverseWorkspace.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (want_fit_bodies); crates/polymix/src/reverse/view.rs (fit_view)",
+  "missing": ""
+ },
+ {
+  "id": "CMP-01",
+  "package": "CMP",
+  "area": "Live map",
+  "capability": "Live map while a ghost is up: scan near it green/red/blue at ± range (0.1 mm, remembered), darker caps, > 10 ranges left as is; switch in the box",
+  "sources": "core/liveMap.ts; app/useReversePlugin.tsx",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/compare.rs; crates/polymix/src/reverse/mod.rs (update_deviation)",
+  "missing": "Ramp, caps, 10-range reach and remembered range are there; the map reads all bodies (preview included) only when the View box turns Deviation on — no switch in the feature box, not on by default while a ghost is up"
+ },
+ {
+  "id": "CMP-02",
+  "package": "CMP",
+  "area": "Live map",
+  "capability": "Count of scan points near the ghost/bodies within the range",
+  "sources": "core/liveMap.ts",
+  "status": "done",
+  "polymix_file": "crates/polymix/src/reverse/mod.rs (view_box)",
+  "missing": ""
+ },
+ {
+  "id": "CMP-03",
+  "package": "CMP",
+  "area": "Deep inside",
+  "capability": "Scan lying deeper inside the bodies than the reach painted violet and counted (a pocket the bodies lack)",
+  "sources": "core/liveMap.ts",
+  "status": "done",
+  "polymix_file": "crates/mm-reverse/src/compare.rs (deep); crates/polymix/src/reverse/mod.rs",
+  "missing": ""
+ },
+ {
+  "id": "CMP-04",
+  "package": "CMP",
+  "area": "Deviation",
+  "capability": "Compare in Deviation: bodies (0.01 mm chord) as the Deviation workspace's reference, measured at once, no best fit; scale, histogram, pins, report",
+  "sources": "core/compare.ts; app/reBodyCommands.ts (compare_in_deviation)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Polymix has no Deviation workspace; Send to Mesh is the nearest"
+ },
+ {
+  "id": "CMP-05",
+  "package": "CMP",
+  "area": "Volume",
+  "capability": "Volume error of the bodies against the scan as solids",
+  "sources": "app/reVolumeCompare.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "CMP-06",
+  "package": "CMP",
+  "area": "Compare",
+  "capability": "Comparison told by where: patches over tolerance on one face each, worst spots with face and feature, far inside/outside, by feature",
+  "sources": "core/compareDetail.ts; app/reBodyCommands.ts (compare)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/compare.rs",
+  "missing": "Map only"
+ },
+ {
+  "id": "CMP-07",
+  "package": "CMP",
+  "area": "Compare",
+  "capability": "One feature compared against the scan (the faces it made)",
+  "sources": "app/reCompareFeature.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "CMP-08",
+  "package": "CMP",
+  "area": "Check",
+  "capability": "Body check: valid, closed, solids, volume/area, tiny/narrow/untessellated faces, free/non-manifold edges, shells and voids",
+  "sources": "app/reBodyCommands.ts (check); core/kernelEdges.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "CMP-09",
+  "package": "CMP",
+  "area": "Audit",
+  "capability": "Topology audit: kinks, steps between two heights, faces nearly parallel/on an axis, short edges — traced to the sketch piece with a repair",
+  "sources": "core/audit.ts; core/stepsBetween.ts; core/stepWords.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-01",
+  "package": "NOTE",
+  "area": "Pinning",
+  "capability": "Note key, then a click on a face/edge/corner or the scan pins a note; a box by the pin takes the sentence (Enter / middle click keeps, Escape leaves)",
+  "sources": "app/useNotePins.ts; state/noteStore.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-02",
+  "package": "NOTE",
+  "area": "Pinning",
+  "capability": "One note on a selection of faces, edges or corners",
+  "sources": "ui/ContextChips.tsx (Note)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-03",
+  "package": "NOTE",
+  "area": "Pins",
+  "capability": "Numbered pins: dot and amber badge with text label, constant pixel size, faint facing away, drawn into the canvas for pictures",
+  "sources": "viewer/notePins.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-04",
+  "package": "NOTE",
+  "area": "List",
+  "capability": "Notes list: rows, open, done, delete, Delete all (numbers carry on)",
+  "sources": "ui/NoteList.tsx",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-05",
+  "package": "NOTE",
+  "area": "Targets",
+  "capability": "A note keeps its pin, normal and targets by fingerprint; found again on the bodies (first body, then others, joins); gone reported; nearest body face",
+  "sources": "core/notes.ts; app/reNoteCommands.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Note, NoteTarget)",
+  "missing": "Data only"
+ },
+ {
+  "id": "NOTE-06",
+  "package": "NOTE",
+  "area": "Agent",
+  "capability": "Agent questions: blue pin, “The agent asks”, an answer field written into reply",
+  "sources": "ui/NoteList.tsx (note-card-question, note-card-reply)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-07",
+  "package": "NOTE",
+  "area": "Agent",
+  "capability": "Agent resolves a note with a line shown under it; pin goes grey",
+  "sources": "app/reNoteCommands.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-08",
+  "package": "NOTE",
+  "area": "Persistence",
+  "capability": "Notes belong to the scan by file name, set aside for another scan, follow alignment, saved under reverseNotes; a project brings its own",
+  "sources": "app/notesSection.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/model.rs (Part.notes)",
+  "missing": "Saved with the part; no per-scan keying"
+ },
+ {
+  "id": "NOTE-09",
+  "package": "NOTE",
+  "area": "Visibility",
+  "capability": "Notes only while the agent link is on; pins in every workspace with the 3D view, clicks only here",
+  "sources": "app/useNotePins.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-10",
+  "package": "NOTE",
+  "area": "Review",
+  "capability": "Design-loop review: volume error and scan comparison at T merged into places ranked by wrong material, with the plan's verdict and next place",
+  "sources": "app/reReview.ts; core/reviewPlaces.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-11",
+  "package": "NOTE",
+  "area": "Review",
+  "capability": "Review pins in the viewport for its picture",
+  "sources": "viewer/reviewPins.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "NOTE-12",
+  "package": "NOTE",
+  "area": "Plan",
+  "capability": "The plan: archetype, region inventory (function, route, place), ticks/skips, replaced removals, plan gate on commands",
+  "sources": "app/rePlan.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-01",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.parameter.list / add / set / rename / remove",
+  "sources": "app/reParameterCommands.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Needs PARAM"
+ },
+ {
+  "id": "AGENT-02",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.list (rows, status, key value, rollback bar; one feature or detail full with regions)",
+  "sources": "app/reFeatureCommands.ts (list); app/reReadout.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-03",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.add (single or features[], after, through the panel's box path; picks by index/fingerprint/where)",
+  "sources": "app/reFeatureCommands.ts (add); app/reFeatureInput.ts; app/reSketchInput.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Model JSON matches ScanRuler's shape, which helps"
+ },
+ {
+  "id": "AGENT-04",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.schema (per-kind schema with $defs/refs and worked examples)",
+  "sources": "app/reFeatureCommands.ts (schema); app/reSchemas.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-05",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.update (set fields, exprs, visible, suppressed; edits below the bar)",
+  "sources": "app/reFeatureCommands.ts (update)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-06",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.refit (numbers made with \"fit\" fitted again)",
+  "sources": "app/reFeatureCommands.ts (refit); app/reFit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-07",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.remove",
+  "sources": "app/reFeatureCommands.ts (remove)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-08",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.move",
+  "sources": "app/reFeatureCommands.ts (move)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/model.rs (moved_list)",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-09",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.suppress (by kind or name)",
+  "sources": "app/reFeatureCommands.ts (suppress)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-10",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.clear",
+  "sources": "app/reFeatureCommands.ts (clear)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-11",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.feature.rollback",
+  "sources": "app/reFeatureCommands.ts (rollback)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-12",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.sketch.edit (add pieces/shapes/relations/patterns/fit/project/rounds; remove by id; moved report)",
+  "sources": "app/reFeatureCommands.ts (edit); app/reSketchInput.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-13",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.sketch.candidates",
+  "sources": "app/reSectionCommands.ts (candidates); core/intent.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged intent.rs"
+ },
+ {
+  "id": "AGENT-14",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.build (kernel up, every feature's result, where a failure was)",
+  "sources": "app/reFeatureCommands.ts (build)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-15",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.build.stop",
+  "sources": "app/reBuildStop.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-16",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.describe (faces/edges with fingerprints, index, kind, size, side; where; before)",
+  "sources": "app/reBodyCommands.ts (describe); core/where.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/topo.rs; crates/mm-reverse/src/pick_query.rs",
+  "missing": "Core present; no command"
+ },
+ {
+  "id": "AGENT-17",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.set (name, colour, visible)",
+  "sources": "app/reBodyCommands.ts (set)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-18",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.clearance",
+  "sources": "app/reBodyCommands.ts (clearance)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-19",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.compare (score, patches, far, by face/feature; within; feature)",
+  "sources": "app/reBodyCommands.ts (compare); core/compareDetail.ts",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/compare.rs",
+  "missing": "Map only; no command"
+ },
+ {
+  "id": "AGENT-20",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.compare_in_deviation",
+  "sources": "app/reBodyCommands.ts (compare_in_deviation)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-21",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.volume_compare",
+  "sources": "app/reVolumeCompare.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-22",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.review",
+  "sources": "app/reReview.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-23",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.check (with audit)",
+  "sources": "app/reBodyCommands.ts (check); core/audit.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-24",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.fillet_read",
+  "sources": "app/reFilletRead.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged ports/fillet fillet_read.rs"
+ },
+ {
+  "id": "AGENT-25",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.body.fillet_try (sizes tried on the body before the feature)",
+  "sources": "app/reFilletTry.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-26",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.export.step (bytes and name)",
+  "sources": "app/reBodyCommands.ts (step)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (export_step)",
+  "missing": "Core present; no command"
+ },
+ {
+  "id": "AGENT-27",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.export.stl (binary STL to a chord, or 3MF)",
+  "sources": "app/reBodyCommands.ts (stl)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-28",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.import.step",
+  "sources": "app/reFeatureCommands.ts (import.step)",
+  "status": "missing",
+  "polymix_file": "crates/mm-reverse/src/build/import.rs",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-29",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.plane.describe (origin, normal, u, v in numbers and words; a point converted)",
+  "sources": "app/reSectionCommands.ts (describe)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/build/mod.rs (describe_plane_ref); crates/mm-reverse/src/frame.rs",
+  "missing": "Words and frames present; no command"
+ },
+ {
+  "id": "AGENT-30",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.section.fit (chains as lines/arcs with residual, uncertainty, nominal and candidates; chain filters)",
+  "sources": "app/reSectionCommands.ts (fit)",
+  "status": "partial",
+  "polymix_file": "crates/mm-reverse/src/section.rs; crates/mm-reverse/src/segment.rs",
+  "missing": "Fit core present; no evidence, no command"
+ },
+ {
+  "id": "AGENT-31",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.section.stack (several offsets, trends: tilt, draft, taper, round radius)",
+  "sources": "app/reSectionCommands.ts (stack)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-32",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.section.outline (one chain as a polyline shape)",
+  "sources": "app/reSectionCommands.ts (outline); core/chainOutline.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged chain_outline.rs"
+ },
+ {
+  "id": "AGENT-33",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.scan.tube_trace",
+  "sources": "app/reSectionCommands.ts (tube_trace); core/tubeTrace.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged tube_trace.rs"
+ },
+ {
+  "id": "AGENT-34",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.thread.read",
+  "sources": "app/reThreadCommand.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": "Staged thread_read.rs"
+ },
+ {
+  "id": "AGENT-35",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.note.list / add / resolve",
+  "sources": "app/reNoteCommands.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-36",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.network.create / edit / read",
+  "sources": "app/reNetworkCommands.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-37",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.network.suggest_creases",
+  "sources": "app/reNetworkCommands.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-38",
+  "package": "AGENT",
+  "area": "Commands",
+  "capability": "reverse.plan.set / update / tick / replace",
+  "sources": "app/rePlan.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-39",
+  "package": "AGENT",
+  "area": "Readout",
+  "capability": "session.state carries the workspace: kernel, build, parameters with values, features with status, bodies with boxes, notes waiting",
+  "sources": "app/reReadout.ts",
+  "status": "partial",
+  "polymix_file": "crates/polymix/src/shell.rs (agent_status)",
+  "missing": "Only running/busy per workspace"
+ },
+ {
+  "id": "AGENT-40",
+  "package": "AGENT",
+  "area": "Guards",
+  "capability": "Commands refused while a box holds work or the kernel builds; each command one named undo step (Agent: add thread); boxes it opened shut; build awaited",
+  "sources": "app/reCommandCore.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-41",
+  "package": "AGENT",
+  "area": "Answers",
+  "capability": "Answers at detail none/brief/full: the feature row, a sketch's regions by a point, bodies made/changed/removed, open ends of an unclosed sketch",
+  "sources": "app/reCommandAnswers.ts",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-42",
+  "package": "AGENT",
+  "area": "Headless",
+  "capability": "Commands that run headless (no UI) for scripted clients",
+  "sources": "app/reCommands.ts (HEADLESS)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-43",
+  "package": "AGENT",
+  "area": "Pictures",
+  "capability": "view.render / view.set take scan and bodies in show while the workspace is on screen",
+  "sources": "app/useReversePlugin.tsx (registerViewToggles)",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ },
+ {
+  "id": "AGENT-44",
+  "package": "AGENT",
+  "area": "Guides",
+  "capability": "Modelling guidance for agents: scan-to-cad guide, model reference, the cad-stl-reverse-engineering skill",
+  "sources": "guides/*.md; guides/guides.ts; skills/cad-stl-reverse-engineering",
+  "status": "missing",
+  "polymix_file": "",
+  "missing": ""
+ }
+]

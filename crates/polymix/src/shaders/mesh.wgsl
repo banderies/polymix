@@ -243,6 +243,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
         col = col + vec3<f32>(inside);
     }
 
+    // Cut away (the Reverse Engineer workspace's sketch view): what lies in front of the sketch
+    // plane is not drawn, so the part is seen cut open where the sketch lies.
+    if ((object.flags.w & 64u) != 0u && dot(globals.cut_plane.xyz, globals.cut_plane.xyz) > 0.0 && dot(globals.cut_plane.xyz, in.world) - globals.cut_plane.w > 0.0) {
+        discard;
+    }
     // Cut preview: the half that will be discarded is tinted red (as in Meshmixer).
     if ((object.flags.w & 2u) != 0u && dot(globals.cut_plane.xyz, globals.cut_plane.xyz) > 0.0) {
         let side = dot(globals.cut_plane.xyz, in.world) - globals.cut_plane.w;
@@ -334,6 +339,11 @@ fn fs_lean(in: LeanOut, @builtin(front_facing) front_facing: bool) -> @location(
         col = col + vec3<f32>(inside);
     }
 
+    // Cut away (the Reverse Engineer workspace's sketch view): what lies in front of the sketch
+    // plane is not drawn, so the part is seen cut open where the sketch lies.
+    if ((object.flags.w & 64u) != 0u && dot(globals.cut_plane.xyz, globals.cut_plane.xyz) > 0.0 && dot(globals.cut_plane.xyz, in.world) - globals.cut_plane.w > 0.0) {
+        discard;
+    }
     if ((object.flags.w & 2u) != 0u && dot(globals.cut_plane.xyz, globals.cut_plane.xyz) > 0.0) {
         let side = dot(globals.cut_plane.xyz, in.world) - globals.cut_plane.w;
         var inside_region = true;

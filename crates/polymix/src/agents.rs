@@ -26,7 +26,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Masks patients' identifiers in text (see `VolumeWorkspace::agent_mask`).
 pub type Mask = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-const INSTRUCTIONS: &str = "Polymix is a desktop app for medical images and meshes: the Volume workspace finds and previews images (DICOM, NIfTI, …), Segmentation segments one in three planes, and Mesh edits surface meshes (vessel cleanup for CFD). The tools work on the session the user has open, in front of them. Start with app_status; app_screenshot shows the window as the user sees it, app_ui lists the widgets of the shown panels. Tools that change things work only if the user allowed changes (Agents window); each change is an undo step labelled \"Agent: …\" and shows the workspace it changes. Typed tools first: each workspace's state tool (mesh_scene / mesh_tool_state, volume_catalog, segmentation_state) reports everything it holds and shows, and mesh_tool run, volume_do and segmentation_do list and run every action with typed arguments; app_ui_action only for what they lack. Work that takes time (tools computing, files loading, clicks) finishes after the call returns: call app_wait, then read the result. Lengths are in millimetres. Patient identifiers are masked and dates cut to the year: do not try to recover them.";
+const INSTRUCTIONS: &str = "Polymix is a desktop app for medical images and meshes: the Volume workspace finds and previews images (DICOM, NIfTI, …), Segmentation segments one in three planes, Mesh edits surface meshes (vessel cleanup for CFD), and Reverse Engineer turns a scan into solid STEP bodies (sketch on a section through the scan, Fit all chains, extrude or revolve; it has no typed tools yet: work its panel with app_ui and app_ui_action). The tools work on the session the user has open, in front of them. Start with app_status; app_screenshot shows the window as the user sees it, app_ui lists the widgets of the shown panels. Tools that change things work only if the user allowed changes (Agents window); each change is an undo step labelled \"Agent: …\" and shows the workspace it changes. Typed tools first: each workspace's state tool (mesh_scene / mesh_tool_state, volume_catalog, segmentation_state) reports everything it holds and shows, and mesh_tool run, volume_do and segmentation_do list and run every action with typed arguments; app_ui_action only for what they lack. Work that takes time (tools computing, files loading, clicks) finishes after the call returns: call app_wait, then read the result. Lengths are in millimetres. Patient identifiers are masked and dates cut to the year: do not try to recover them.";
 
 /// Every tool agents get: the shell's and each workspace's (listed even for a workspace that
 /// failed to start).
@@ -35,6 +35,7 @@ pub fn all_tools() -> Vec<AgentTool> {
     all.extend(workspace_tools::<polymix_volume::VolumeWorkspace>("volume"));
     all.extend(workspace_tools::<polymix_segmentation::SegmentationWorkspace>("segmentation"));
     all.extend(workspace_tools::<crate::app::MeshWorkspace>("mesh"));
+    all.extend(workspace_tools::<crate::reverse::ReverseWorkspace>("reverse"));
     all
 }
 
@@ -93,8 +94,8 @@ pub fn shell_tools() -> Vec<AgentTool> {
         .kind(ToolKind::Destructive),
         AgentTool::new(
             "app_show",
-            "Show a workspace tab (volume, segmentation or mesh). Tools that change a workspace show it themselves.",
-            json!({"workspace": {"type": "string", "enum": ["volume", "segmentation", "mesh"]}}),
+            "Show a workspace tab (volume, segmentation, mesh or reverse — Reverse Engineer). Tools that change a workspace show it themselves.",
+            json!({"workspace": {"type": "string", "enum": ["volume", "segmentation", "mesh", "reverse"]}}),
         )
         .required(&["workspace"])
         .kind(ToolKind::Change),

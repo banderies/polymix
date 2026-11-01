@@ -558,9 +558,66 @@ enum SwitchTo {
     ClearSelect,
 }
 
+/// What is in view for the 3D mouse to turn about: `None` while the meshes are all in view (their
+/// centre of mass then). Zoomed in: of the vertices seen within a circle in the middle of
+/// the view, half the field of view across, the one nearest the camera, so a near part a
+/// little off the middle wins over what lies far behind the middle; with none in the
+/// circle, the vertex seen nearest the middle.
+pub(crate) fn centre_in_view(camera: &crate::camera::Camera, vp: Viewport, bounds: &mm_core::Aabb, meshes: &[&Mesh]) -> Option<DVec3> {
+    use rayon::prelude::*;
+    let aspect = vp.aspect();
+    let b = *bounds;
+    if b.is_empty() {
+        return None;
+    }
+    let corner = |k: usize| DVec3::new([b.min.x, b.max.x][k & 1], [b.min.y, b.max.y][(k >> 1) & 1], [b.min.z, b.max.z][k >> 2]);
+    let shown = |p: DVec3| camera.project(p, aspect).is_some_and(|n| n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z));
+    if (0..8).all(|k| shown(corner(k))) {
+        return None;
+    }
+    // Screen offsets from the middle of the view, in points.
+    let (w, h) = (vp.rect.width().max(1.0) as f64, vp.rect.height().max(1.0) as f64);
+    let (eye, fwd, right, up) = (camera.eye(), camera.forward(), camera.right(), camera.up());
+    let (ortho, per_point) = (camera.orthographic, camera.pixel_size_at_target(h));
+    let focal = h / 2.0 / (camera.fov_y / 2.0).tan();
+    let radius = CENTRE_CIRCLE * 0.5 * w.min(h);
+    // Per vertex: (distance from the eye, in the circle) and (squared offset, in view);
+    // the smallest of each over every vertex.
+    type Best = (Option<(f64, DVec3)>, Option<(f64, DVec3)>);
+    let least = |a: Option<(f64, DVec3)>, b: Option<(f64, DVec3)>| match (a, b) {
+        (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
+        (x, y) => x.or(y),
+    };
+    let mut best: Best = (None, None);
+    for m in meshes {
+        let found: Best = m
+            .positions()
+            .par_iter()
+            .enumerate()
+            .filter(|(i, _)| m.is_vertex(*i as u32))
+            .map(|(_, &p)| {
+                let v = p - eye;
+                let z = v.dot(fwd);
+                if z <= 1e-9 && !ortho {
+                    return (None, None);
+                }
+                let scale = if ortho { 1.0 / per_point } else { focal / z };
+                let (sx, sy) = (v.dot(right) * scale, v.dot(up) * scale);
+                if sx.abs() > w / 2.0 || sy.abs() > h / 2.0 {
+                    return (None, None);
+                }
+                let off = sx * sx + sy * sy;
+                ((off <= radius * radius).then(|| (v.length(), p)), Some((off, p)))
+            })
+            .reduce(|| (None, None), |a, b| (least(a.0, b.0), least(a.1, b.1)));
+        best = (least(best.0, found.0), least(best.1, found.1));
+    }
+    best.0.or(best.1).map(|(_, p)| p)
+}
+
 /// The 3D mouse's centre of rotation at `at`: a small translucent green ball, `a` its opacity
 /// (0..1, fading out after a move).
-fn paint_centre_marker(painter: &egui::Painter, at: egui::Pos2, a: f32) {
+pub(crate) fn paint_centre_marker(painter: &egui::Painter, at: egui::Pos2, a: f32) {
     let green = |alpha: f32| Color32::from_rgba_unmultiplied(80, 210, 110, (alpha * a * 255.0) as u8);
     painter.circle_filled(at, 4.5, green(0.32));
     painter.circle_stroke(at, 4.5, egui::Stroke::new(1.0, green(0.7)));
@@ -772,6 +829,9 @@ pub struct MeshWorkspace {
     library_failed: Option<u64>,
     /// Tool switch waiting for the current tool to finish computing (then it is accepted).
     pending_switch: Option<SwitchTo>,
+    /// The bodies Reverse Engineer sent to compare against: the reference the Deviation tool
+    /// takes once it is open.
+    reverse_reference: Option<ObjectId>,
     status: String,
     import_job: Option<Job<ImportResult>>,
     pending_import: Option<PendingImport>,
@@ -817,6 +877,8 @@ pub struct MeshWorkspace {
     space_capture: bool,
     /// The last 3D mouse button pressed, for the settings.
     space_last_button: Option<u32>,
+    /// Another workspace's view takes the 3D mouse (see `set_space_mouse_elsewhere`).
+    space_elsewhere: bool,
     /// The button whose key the settings wait for (the next key typed).
     space_key_capture: Option<u32>,
     /// The brush size every brush tool shares (see [`tools::BrushSize`]), kept with the
@@ -898,6 +960,7 @@ impl MeshWorkspace {
             library_changes: crate::parts::library_changes(),
             library_failed: None,
             pending_switch: None,
+            reverse_reference: None,
             status: "Welcome to Polymix. Import a mesh to begin (Ctrl/Cmd+O, or drag a file onto the window).".into(),
             script_prompts: false,
             pending_import: None,
@@ -925,6 +988,7 @@ impl MeshWorkspace {
             space_buttons: spacemouse::default_buttons(),
             space_capture: false,
             space_last_button: None,
+            space_elsewhere: false,
             space_key_capture: None,
             brush: tools::BrushSize::default(),
             space_centre: None,
@@ -1282,6 +1346,78 @@ impl MeshWorkspace {
     /// Meshes sent to the Segmentation workspace (Send to Segmentation), taken by the shell.
     pub fn take_for_segmentation(&mut self) -> Vec<(String, Mesh)> {
         std::mem::take(&mut self.to_segmentation)
+    }
+
+    /// The scan the Reverse Engineer workspace models over: every object as it stands in the
+    /// scene, and whether the scene's axes are the files' with Z and Y swapped (Z up in the
+    /// file, Y up here).
+    pub fn scans_for_reverse(&self) -> (Vec<crate::reverse::ScanObject>, bool) {
+        let objects = self.scene.objects.iter().map(|o| crate::reverse::ScanObject { id: o.id, name: o.name.clone(), mesh: o.mesh.clone(), visible: o.visible, color: o.color }).collect();
+        (objects, self.prefs.flip_zy)
+    }
+
+    /// How this workspace's 3D view is moved, so the Reverse Engineer view moves the same way.
+    pub fn nav_for_reverse(&self) -> crate::reverse::NavSettings {
+        crate::reverse::NavSettings {
+            bindings: self.view.nav_mode.bindings(self.view.nav_custom),
+            zoom_speed: self.view.zoom_speed,
+            zoom_to_cursor: self.view.zoom_to_cursor,
+            background: self.view.background,
+            space: self.space_cfg.clone(),
+            space_buttons: self.space_buttons.clone(),
+        }
+    }
+
+    /// The 3D mouse moves another workspace's view (Reverse Engineer is shown): its button
+    /// presses are left for that workspace rather than drained here.
+    pub fn set_space_mouse_elsewhere(&mut self, elsewhere: bool) {
+        self.space_elsewhere = elsewhere;
+    }
+
+    /// Bodies modelled in the Reverse Engineer workspace, as meshes in scene coordinates: new
+    /// objects, in one undo step.
+    pub fn add_from_reverse(&mut self, meshes: Vec<(String, Mesh)>) {
+        if meshes.is_empty() {
+            return;
+        }
+        self.history.push("Bodies from Reverse Engineer", &self.scene);
+        let n = meshes.len();
+        for (name, m) in meshes {
+            self.scene.add(name, m);
+        }
+        self.status = format!("Added {n} bod{} from Reverse Engineer", if n == 1 { "y" } else { "ies" });
+    }
+
+    // ---- VIEWCMP ----
+
+    /// Compare in Deviation from Reverse Engineer: the bodies, meshed in scene coordinates, come
+    /// in as the reference; the scan (the active object, or the first other one) is measured
+    /// against them by the Deviation tool, in its own frame — no best fit.
+    pub fn compare_from_reverse(&mut self, name: String, mesh: Mesh) {
+        self.history.push("Bodies from Reverse Engineer", &self.scene);
+        let scan = self.scene.active.or_else(|| self.scene.objects.iter().find(|o| o.visible).map(|o| o.id));
+        let id = self.scene.add(name, mesh);
+        self.scene.active = scan.filter(|s| *s != id).or_else(|| self.scene.objects.iter().find(|o| o.id != id).map(|o| o.id));
+        self.reverse_reference = Some(id);
+        self.pending_switch = Some(SwitchTo::Tool("deviation".into()));
+        self.status = "The scan measured against the bodies from Reverse engineer, in the scan’s own frame — no best fit was run.".into();
+    }
+
+    /// The reference from Reverse Engineer handed to the Deviation tool once it is open.
+    fn apply_reverse_reference(&mut self, ctx: &egui::Context, vp: Viewport) {
+        let Some(reference) = self.reverse_reference else { return };
+        if self.pending_switch.is_some() {
+            return;
+        }
+        self.reverse_reference = None;
+        if let Some(mut t) = self.tools.pop() {
+            if t.name() == "Deviation" {
+                if let Err(e) = t.set_settings(&serde_json::json!({"reference": reference}), &mut self.tool_cx(ctx, vp)) {
+                    self.status = format!("The bodies could not be opened as the reference part: {e}");
+                }
+            }
+            self.tools.push(t);
+        }
     }
 
     /// Add meshes made in another workspace (Segmentation's Make mesh), in file coordinates
@@ -3137,62 +3273,10 @@ impl MeshWorkspace {
         in_view.or_else(|| self.center_of_mass()).unwrap_or(self.camera.target)
     }
 
-    /// What is in view to turn about: `None` while the visible objects are all in view (their
-    /// centre of mass then). Zoomed in: of the vertices seen within a circle in the middle of
-    /// the view, half the field of view across, the one nearest the camera, so a near part a
-    /// little off the middle wins over what lies far behind the middle; with none in the
-    /// circle, the vertex seen nearest the middle.
+    /// What is in view to turn about (see [`centre_in_view`]), over the visible objects.
     fn centre_in_view(&mut self, vp: Viewport) -> Option<DVec3> {
-        use rayon::prelude::*;
-        let aspect = vp.aspect();
-        let b = self.scene.bounds();
-        if b.is_empty() {
-            return None;
-        }
-        let corner = |k: usize| DVec3::new([b.min.x, b.max.x][k & 1], [b.min.y, b.max.y][(k >> 1) & 1], [b.min.z, b.max.z][k >> 2]);
-        let shown = |p: DVec3| self.camera.project(p, aspect).is_some_and(|n| n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && (0.0..=1.0).contains(&n.z));
-        if (0..8).all(|k| shown(corner(k))) {
-            return None;
-        }
-        // Screen offsets from the middle of the view, in points.
-        let (w, h) = (vp.rect.width().max(1.0) as f64, vp.rect.height().max(1.0) as f64);
-        let (eye, fwd, right, up) = (self.camera.eye(), self.camera.forward(), self.camera.right(), self.camera.up());
-        let (ortho, per_point) = (self.camera.orthographic, self.camera.pixel_size_at_target(h));
-        let focal = h / 2.0 / (self.camera.fov_y / 2.0).tan();
-        let radius = CENTRE_CIRCLE * 0.5 * w.min(h);
-        // Per vertex: (distance from the eye, in the circle) and (squared offset, in view);
-        // the smallest of each over every vertex.
-        type Best = (Option<(f64, DVec3)>, Option<(f64, DVec3)>);
-        let least = |a: Option<(f64, DVec3)>, b: Option<(f64, DVec3)>| match (a, b) {
-            (Some(x), Some(y)) => Some(if y.0 < x.0 { y } else { x }),
-            (x, y) => x.or(y),
-        };
-        let mut best: Best = (None, None);
-        for o in self.scene.objects.iter().filter(|o| o.visible && !o.reference) {
-            let m = &o.mesh;
-            let found: Best = m
-                .positions()
-                .par_iter()
-                .enumerate()
-                .filter(|(i, _)| m.is_vertex(*i as u32))
-                .map(|(_, &p)| {
-                    let v = p - eye;
-                    let z = v.dot(fwd);
-                    if z <= 1e-9 && !ortho {
-                        return (None, None);
-                    }
-                    let scale = if ortho { 1.0 / per_point } else { focal / z };
-                    let (sx, sy) = (v.dot(right) * scale, v.dot(up) * scale);
-                    if sx.abs() > w / 2.0 || sy.abs() > h / 2.0 {
-                        return (None, None);
-                    }
-                    let off = sx * sx + sy * sy;
-                    ((off <= radius * radius).then(|| (v.length(), p)), Some((off, p)))
-                })
-                .reduce(|| (None, None), |a, b| (least(a.0, b.0), least(a.1, b.1)));
-            best = (least(best.0, found.0), least(best.1, found.1));
-        }
-        best.0.or(best.1).map(|(_, p)| p)
+        let meshes: Vec<&Mesh> = self.scene.objects.iter().filter(|o| o.visible && !o.reference).map(|o| &*o.mesh).collect();
+        centre_in_view(&self.camera, vp, &self.scene.bounds(), &meshes)
     }
 
     /// Every brush tool open takes the one brush size: none keeps a size of its own.
@@ -3828,6 +3912,7 @@ impl MeshWorkspace {
                     _ => 0,
                 },
                 xray: self.view.xray,
+                cut_away: false,
                 material: crate::materials::MATERIALS[o.material.min(crate::materials::MATERIALS.len() - 1)],
             };
             if let Some((pid, pm)) = preview {
@@ -4237,9 +4322,9 @@ impl polymix_workspace::Workspace for MeshWorkspace {
                 ctx.request_repaint();
             }
         }
-        if !active {
+        if !active && !self.space_elsewhere {
             // 3D-mouse buttons meant for the Mesh view must not pile up while another
-            // workspace is shown.
+            // workspace is shown (one with a 3D view of its own takes them itself).
             let _ = self.space.poll();
         }
     }
@@ -4395,6 +4480,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
                 ctx.request_repaint();
             }
         }
+        self.apply_reverse_reference(&ctx, vp_prev);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, vp_prev));
         egui::Panel::bottom("status").show(ui, |ui| {

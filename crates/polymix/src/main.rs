@@ -16,6 +16,7 @@ mod parts;
 mod project;
 mod recent_log;
 mod renderer;
+mod reverse;
 mod scene;
 mod shell;
 mod spacemouse;

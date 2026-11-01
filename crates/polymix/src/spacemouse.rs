@@ -519,6 +519,18 @@ impl SpaceMouse {
     }
 }
 
+/// The current motion and the buttons pressed since the last call, for a view other than the
+/// one that holds the device's registration (the driver reports to the process, and its
+/// reports are shared).
+pub fn poll_shared() -> (Motion, Vec<u32>) {
+    let Ok(mut s) = shared().lock() else { return (Motion::default(), Vec::new()) };
+    let fresh = s.last_axis.is_some_and(|t| t.elapsed() < STALE);
+    if !fresh {
+        s.axis = [0; 6];
+    }
+    (to_view(s.axis), std::mem::take(&mut s.pressed))
+}
+
 /// Move the camera for `dt` seconds of cap deflection, turning about `pivot`. Returns true if
 /// anything moved.
 pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: f64, pivot: glam::DVec3) -> bool {

@@ -35,12 +35,14 @@ xattr -dr com.apple.quarantine /Applications/Polymix.app
 
 ## Workspaces
 
-Polymix has three workspaces, shown as tabs at the top of the window (⌘1 / ⌘2 / ⌘3):
+Polymix has four workspaces, shown as tabs at the top of the window (⌘1 – ⌘4):
 
 - **Volume**: find, organise and preview medical images (DICOM, NIfTI, NRRD, …) in a folder.
 - **Segmentation**: segment the image selected in Volume, in three planes and in 3D, with
   3D Slicer's Segment Editor tools; segments go to Mesh as surfaces.
 - **Mesh**: the mesh editor described below.
+- **Reverse Engineer**: turn the scan Mesh holds back into solid, parametric bodies and a
+  STEP file (below).
 
 **Volume** (*Add folder…*): Polymix looks through the folder and everything under it,
 recognising files by their contents rather than their names (DICOM files often have none), and
@@ -110,6 +112,43 @@ over them. In the Segmentation tab a **double-click** makes a view fill the view
 another brings the four views back (**Fit** resets zoom and pan, **Auto** the window); in the
 Volume tab's thumbnail a double-click resets. In the 3D view, left drag rotates (left + right
 drag sets the window there too).
+
+**Reverse Engineer** models over the scan the Mesh workspace holds (every object in it, in
+the files' own axes, Z up), the way a reverse-engineering tool builds a prismatic part:
+sketch the profile on a section through the scan, close it, extrude or revolve it, and check
+it against the scan. It is a Rust port of the Reverse engineer workspace of
+[ScanRuler](https://github.com/CNCKitchen/scanruler) by CNC Kitchen, with its solids built on
+the [SolidCraft](https://github.com/tangency-labs/solidcraft) kernel.
+
+- **Sketch on** a coordinate plane (through the origin or the scan's centre, with an offset):
+  the view turns to face it, the part is cut open there, and the slice it cuts through the
+  scan is drawn on the sheet. **Fit all chains** cuts every chain into lines and arcs and
+  joins their corners (a tangency where a line runs into a round), so a closed slice comes out
+  a closed profile in one click; each piece keeps its slice points and the solver holds it to
+  them while every relation and dimension is met exactly. *Fit options* set the detail
+  (coarse to fine) and the tolerance (read off the scan's noise by default); **Infer
+  corners** and **Close** join or bridge what is left open; **Sharp corner** takes a fillet
+  out.
+- Draw what the scan did not give with **Line** (L, a chain; within 3° of level or upright
+  it is made so), **Rectangle** (R), **Circle** (C), **Arc** (A, three points); every click
+  snaps to an end, a piece, a point of the slice or the origin (⌘ places it exactly).
+  **Dimension** (D) a piece for its length or radius (a full circle its Ø), or two pieces or
+  ends for the distance or angle between; type `R6` or `Ø12` to turn a round one over.
+  Relations (horizontal, vertical, parallel, perpendicular, tangent, equal, concentric,
+  coincident, point on) go on the selection; **Select** drags ends and pieces with the
+  relations holding.
+- **Extrude** (a distance either side, symmetric or through all, with a taper; a click on the
+  scan puts its end at that height) and **Revolve** a sketch's regions — click regions to pick
+  them, an inner loop left unpicked becomes a hole — to join, cut, intersect or make a new
+  body; then **Fillet**, **Chamfer** (click edges), **Shell**, **Mirror** and **Combine**.
+  Every feature stays editable in the feature list (suppress, delete, undo / redo); a feature
+  that fails says why and the rest still build.
+- **Deviation** colours the scan by its distance from the bodies (green on them, red outside,
+  blue inside, at ± the range) and marks in violet the scan lying deep inside a body — a pocket
+  or a hole the bodies lack.
+- **Export STEP…** writes the bodies (AP242) for CAD; **Send to Mesh** adds them to the Mesh
+  workspace as meshes. The part is kept between sessions, and *Save part…* / *Open part…*
+  store it as a `.rpart` file.
 
 Each workspace is independent: if one runs into an internal error it stops on its own (its
 tab shows what happened, with a Restart button and a log in the data folder) and the
@@ -252,14 +291,29 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 | `mm-repair` | Hole filling (minimal/flat/smooth, Liepa), Laplacian/Taubin smoothing, thin-plate fairing, Inspector auto-repair |
 | `mm-edit` | Plane cut (incl. local vessel cuts), caps, flow extensions, extrude, offset, bridge, mirror, transforms |
 | `mm-solid` | Fast winding numbers, sparse narrow-band SDF, manifold surface extraction (Make Solid), offsets, SDF booleans |
+| `mm-reverse` | Reverse engineering (a port of ScanRuler's core): sections through a mesh, slice chains cut into lines and arcs, the constrained sketch and its least-squares solver, corners, regions, the feature model and its build on the SolidCraft kernel, deviation, STEP export |
 | `polymix` | The application (egui + wgpu), centerline extraction, CFD tools |
 
-Polymix's algorithms are independent implementations of published methods (references in the source).
+Polymix's algorithms are independent implementations of published methods (references in the
+source), except `mm-reverse` and the Reverse Engineer workspace, which are ported from
+ScanRuler (see License).
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT),
-at your option.
+Copyright (C) 2026 Barrett Anderies.
+
+Polymix is free software under the [GNU Affero General Public License v3.0 only](LICENSE)
+(`AGPL-3.0-only`). You may use, modify and redistribute it; if you distribute it, or offer a
+modified version to users over a network, you must make the complete corresponding source of
+your version available under the same license. Releases up to and including 0.2.0 were
+published under MIT OR Apache-2.0 and remain available under those terms.
+
+The Reverse Engineer workspace (`crates/mm-reverse`, `crates/polymix/src/reverse`) is a Rust port of the Reverse
+engineer workspace and the scan-fitting code of [ScanRuler](https://github.com/CNCKitchen/scanruler)
+by CNC Kitchen (Stefan Hermann), which is licensed AGPL-3.0-only; the port keeps that license.
+ScanRuler and CNC Kitchen are trademarks of their owner and are not licensed here; Polymix is
+not affiliated with or endorsed by CNC Kitchen. Its solid modelling runs on the
+[SolidCraft](https://github.com/tangency-labs/solidcraft) crates (MIT OR Apache-2.0).
 
 Polymix is not affiliated with or endorsed by Autodesk. Meshmixer is a trademark of
 Autodesk, Inc.

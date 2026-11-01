@@ -9,6 +9,8 @@ APP=dist/Polymix.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "${CARGO_TARGET_DIR:-target}/dist/polymix" "$APP/Contents/MacOS/polymix"
+# The licence (AGPL-3.0-only) and the third-party notices travel with the app.
+cp LICENSE THIRD-PARTY-NOTICES.md "$APP/Contents/Resources/"
 # App icon from assets/icon_1024.png (regenerate with: cargo run -p polymix --example gen_icon -- assets/icon_1024.png)
 if [ -f assets/icon_1024.png ] && command -v iconutil >/dev/null; then
   ICONSET=$(mktemp -d)/Polymix.iconset

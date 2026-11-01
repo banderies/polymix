@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/mm-core", "crates/mm-edit", "crates/mm-image", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-segment", "crates/mm-solid", "crates/mm-volume", "crates/polymix", "crates/polymix-imaging", "crates/polymix-mcp", "crates/polymix-segmentation", "crates/polymix-volume", "crates/polymix-workspace"]
+members = ["crates/mm-core", "crates/mm-edit", "crates/mm-image", "crates/mm-io", "crates/mm-remesh", "crates/mm-repair", "crates/mm-reverse", "crates/mm-segment", "crates/mm-solid", "crates/mm-volume", "crates/polymix", "crates/polymix-imaging", "crates/polymix-mcp", "crates/polymix-segmentation", "crates/polymix-volume", "crates/polymix-workspace"]
 
 [workspace.package]
 edition = "2021"
 version = "0.2.0"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 glam = { version = "0.34", features = ["bytemuck"] }
@@ -16,6 +16,20 @@ thiserror = "2"
 egui = "0.37"
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "persistence", "system_fonts"] }
 log = "0.4"
+
+# The Reverse Engineer workspace's CAD kernel: SolidCraft (MIT OR Apache-2.0), pinned to a public
+# revision. Its kernel builds on truck with fixes SolidCraft vendors, so the same patches apply here
+# ([patch] is only read from the root workspace).
+solidcraft-geom = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+solidcraft-kernel = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+solidcraft-sketch = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+
+[patch.crates-io]
+truck-geometry = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+truck-shapeops = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+truck-stepio = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+truck-meshalgo = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
+matext4cgmath = { git = "https://github.com/tangency-labs/solidcraft", rev = "e4a67d1e30d0e99e849c6397109770f37d476422" }
 
 [profile.dev]
 opt-level = 1

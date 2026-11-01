@@ -17,6 +17,7 @@ mm-repair = { path = "../mm-repair" }
 mm-edit = { path = "../mm-edit" }
 mm-solid = { path = "../mm-solid" }
 mm-segment = { path = "../mm-segment" }
+mm-reverse = { path = "../mm-reverse" }
 glam.workspace = true
 rayon.workspace = true
 anyhow.workspace = true

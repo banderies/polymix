@@ -56,6 +56,7 @@ struct ObjectUniform {
 const MOVED: u32 = 8;
 const MIRRORED: u32 = 16;
 const NO_SELECTION: u32 = 32;
+const CUT_AWAY: u32 = 64;
 
 const IDENTITY: [[f32; 4]; 4] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
 const IDENTITY3: [[f32; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
@@ -273,6 +274,9 @@ pub struct ObjectStyle {
     pub texture_mode: u8,
     /// See-through, the parts seen edge-on most opaque (X-ray).
     pub xray: bool,
+    /// Not drawn on the positive side of the frame's cut plane (the Reverse Engineer
+    /// workspace's part cut open at its sketch plane).
+    pub cut_away: bool,
     pub material: crate::materials::Material,
 }
 
@@ -965,7 +969,7 @@ impl SceneRenderer {
                     None if show_colors => 4,
                     None => 0,
                 },
-                style.dim as u32 | ((style.cut_tint as u32) << 1) | ((style.xray as u32) << 2),
+                style.dim as u32 | ((style.cut_tint as u32) << 1) | ((style.xray as u32) << 2) | if style.cut_away { CUT_AWAY } else { 0 },
             ],
             material: style.material.uniform().0,
             material2: style.material.uniform().1,
@@ -1009,7 +1013,7 @@ impl SceneRenderer {
                 style.wireframe as u32,
                 style.flat as u32,
                 mode,
-                style.dim as u32 | ((style.cut_tint as u32) << 1) | ((style.xray as u32) << 2) | MOVED | NO_SELECTION | if mirrored { MIRRORED } else { 0 },
+                style.dim as u32 | ((style.cut_tint as u32) << 1) | ((style.xray as u32) << 2) | if style.cut_away { CUT_AWAY } else { 0 } | MOVED | NO_SELECTION | if mirrored { MIRRORED } else { 0 },
             ],
             material: style.material.uniform().0,
             material2: style.material.uniform().1,
@@ -1511,6 +1515,7 @@ mod tests {
             uv_checker: false,
             texture_mode: 0,
             xray: false,
+            cut_away: false,
             material: crate::materials::MATERIALS[0],
         }
     }
