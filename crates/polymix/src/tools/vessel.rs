@@ -22,8 +22,7 @@ pub enum EndKind {
 pub struct VesselEnd {
     pub kind: EndKind,
     pub center: DVec3,
-    /// Outward normal.
-    #[allow(dead_code)]
+    /// Outward normal of the end's plane (away from the vessel behind it).
     pub normal: DVec3,
     pub diameter: f64,
     /// Open loops only: whether the loop is nearly planar (a cut end rather than a wall hole).
@@ -52,9 +51,18 @@ pub fn find_vessel_ends(mesh: &Mesh) -> Vec<VesselEnd> {
         let pts = l.positions(mesh);
         let c = l.centroid(mesh);
         let (mut n, area) = polygon_normal_area(&pts);
-        // Loop edges follow their triangles, so the Newell normal points into the surface
-        // side; orient it away from the mesh instead.
-        if (c - mesh_c).dot(n) < 0.0 {
+        // Away from the vessel: the triangles along the loop lie on its side. Where they do
+        // not tell (a hole in a flat sheet), away from the middle of the mesh.
+        let (mut side, mut scale) = (0.0, 0.0);
+        for &v in &l.vertices {
+            for t in mesh.vertex_triangles(v) {
+                let d = mesh.tri_centroid(t) - c;
+                side += d.dot(n);
+                scale += d.length();
+            }
+        }
+        let behind = if side.abs() > 0.05 * scale { side } else { -(c - mesh_c).dot(n) };
+        if behind > 0.0 {
             n = -n;
         }
         let diameter = 2.0 * (area / std::f64::consts::PI).sqrt();
@@ -539,13 +547,98 @@ impl Tool for TrimTool {
 // Flow extensions
 // ---------------------------------------------------------------------------
 
+/// Which way the extensions run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heading {
+    /// Square to the end: the normal of its cut (or cap).
+    CutNormal,
+    /// On along the vessel: a line fitted to its centerline just inside the end.
+    Centerline,
+}
+
 #[derive(Clone, PartialEq)]
 struct FlowParams {
     diameters: f64,
     absolute: Option<f64>,
     circular: bool,
     cap: bool,
+    heading: Heading,
+    /// The stretch of centerline the heading is fitted to, in diameters of the end
+    /// ([`Heading::Centerline`]).
+    fit: f64,
     selected: Vec<bool>,
+    /// Ends aimed by hand (their arrows dragged), by end: the unit direction, in place of the
+    /// heading.
+    aims: Vec<Option<DVec3>>,
+}
+
+/// Longest stretch of centerline a heading is fitted to, in diameters of the end (the
+/// vessel is traced within [`TRACE_REACH`] radii of it).
+const MAX_FIT: f64 = 5.0;
+/// How far from an end its vessel is traced, in radii of the end.
+const TRACE_REACH: f64 = 12.0;
+/// Shortest stretch of centerline a heading is fitted to, in diameters of the end: where the
+/// vessel forks sooner, the centerline there runs from the opening's centre to the fork's,
+/// which says little about the vessel's own course.
+const MIN_FIT: f64 = 0.5;
+/// The vessel behind an end is followed while its radius stays under this multiple of the
+/// end's: wider, its centerline has entered a bigger vessel (a short branch off a trunk,
+/// whose fork the trace of a region only a few trunk radii across can miss) or a sac.
+const WIDEN: f64 = 1.5;
+/// Extensions further than this off their cut's normal (degrees) are pointed out.
+const OBLIQUE: f64 = 45.0;
+/// Furthest an end can be aimed by hand off its cut's normal, degrees: beyond, the opening
+/// seen along the extension is a sliver.
+const MAX_AIM: f64 = 75.0;
+/// Length of an end's arrow, in diameters of the end (its tip is the handle).
+const ARROW: f64 = 1.5;
+/// How near the pointer must be to an arrow's tip to take it, points.
+const GRAB: f32 = 10.0;
+
+/// `dir` (a unit vector) turned toward `normal` (unit) until it is at most `max_deg` off it.
+fn within_cone(dir: DVec3, normal: DVec3, max_deg: f64) -> DVec3 {
+    let max = max_deg.to_radians();
+    if dir.dot(normal).clamp(-1.0, 1.0).acos() <= max {
+        return dir;
+    }
+    // Along the great circle from the normal through `dir` (any way, if `dir` is opposite).
+    let side = (dir - normal * dir.dot(normal)).try_normalize().unwrap_or_else(|| normal.any_orthonormal_vector());
+    (normal * max.cos() + side * max.sin()).normalize()
+}
+
+/// Where the ray `ray` meets the sphere about `centre` of radius `r` nearest `near` (a point
+/// on it), or, where the ray passes it by, the sphere's point nearest the ray: an arrow's tip
+/// dragged round its end.
+fn on_sphere(ray: &mm_core::Ray, centre: DVec3, r: f64, near: DVec3) -> Option<DVec3> {
+    let oc = ray.origin - centre;
+    let b = oc.dot(ray.dir);
+    let disc = b * b - (oc.length_squared() - r * r);
+    let p = if disc >= 0.0 {
+        let s = disc.sqrt();
+        let (a, c) = (ray.origin + ray.dir * (-b - s), ray.origin + ray.dir * (-b + s));
+        if a.distance(near) <= c.distance(near) { a } else { c }
+    } else {
+        let closest = ray.origin + ray.dir * (-b);
+        centre + (closest - centre).try_normalize()? * r
+    };
+    p.is_finite().then_some(p)
+}
+
+/// Which way one extension ran, and why.
+#[derive(Clone, Debug)]
+struct EndHeading {
+    /// Index of the end.
+    end: usize,
+    /// Unit direction (out of the vessel).
+    dir: DVec3,
+    /// Angle to the cut's normal, degrees.
+    off_normal: f64,
+    /// Length of centerline fitted, mm (none when square to the cut).
+    fitted: Option<f64>,
+    /// Why the heading is not what was asked, or a caution about it.
+    note: Option<String>,
+    /// Aimed by hand.
+    aimed: bool,
 }
 
 struct FlowOut {
@@ -557,7 +650,106 @@ struct FlowOut {
     new_walls: Vec<i32>,
     /// Groups of caps removed and not replaced ("Cap the ends" off): their names go.
     removed: Vec<i32>,
+    /// Which way each extension ran, in the order of the ends.
+    heads: Vec<EndHeading>,
     msg: String,
+}
+
+/// The centerline of the vessel behind each end, by end: its points and radii from the
+/// opening into the vessel, up to its first fork or [`TRACE_REACH`] radii in, traced once
+/// (the object does not change while the tool is open) and shared with the builds. `Err`
+/// where it could not be traced.
+type Traces = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, Result<std::sync::Arc<Vec<(DVec3, f64)>>, String>>>>;
+
+/// The centerline through the lumen behind end `i` of `ends` (see [`Traces`]), as the loft
+/// traces an opening's, with the mesh's open ends capped by `capped` (or a capping kept there
+/// used); `Ok(None)` once `going` returns false.
+fn trace_behind(mesh: &Mesh, capped: &crate::centerline::CappedCache, ends: &[VesselEnd], i: usize, going: &dyn Fn(f32) -> bool) -> anyhow::Result<Option<Vec<(DVec3, f64)>>> {
+    use crate::centerline::{Anchor, LumenEnd, LumenInput, LumenParams};
+    let end = &ends[i];
+    let radius = 0.5 * end.diameter;
+    // Flat caps are not vessel wall: radii are measured to the wall.
+    let cap_groups: Vec<i32> = ends.iter().filter_map(|e| if let EndKind::Cap(g) = e.kind { Some(g) } else { None }).collect();
+    let input = LumenInput { inlet: LumenEnd { at: end.center, radius, anchor: Anchor::Opening }, outlets: Vec::new(), cap_groups };
+    let params = LumenParams { within: Some((end.center, TRACE_REACH * radius)), ..Default::default() };
+    let Some(lumen) = crate::centerline::compute_lumen(mesh, capped, &input, &params, Some(going))? else { return Ok(None) };
+    let cl = lumen.centerline;
+    let root = cl.branches.iter().find(|b| b.parent.is_none()).ok_or_else(|| anyhow::anyhow!("found no vessel behind the end"))?;
+    let points: Vec<(DVec3, f64)> = root.nodes.iter().map(|&k| (cl.nodes[k].position, cl.nodes[k].radius)).collect();
+    if points.len() < 2 {
+        anyhow::bail!("the vessel behind the end is too short to follow");
+    }
+    Ok(Some(points))
+}
+
+/// End `e`'s heading from its centerline `points` (see [`Traces`]) fitted over `fit` of its
+/// diameters: the direction out of the vessel, the stretch fitted (from the end in) and its
+/// length; or why there is none (then the extension is square to the cut).
+fn centerline_heading(points: &[(DVec3, f64)], e: &VesselEnd, fit: f64) -> Result<(DVec3, Vec<DVec3>, f64), String> {
+    let widest = WIDEN * 0.5 * e.diameter;
+    let own = points.iter().skip(1).position(|p| p.1 > widest).map_or(points.len(), |k| k + 1);
+    let own: Vec<DVec3> = points[..own].iter().map(|p| p.0).collect();
+    let length: f64 = own.windows(2).map(|w| w[0].distance(w[1])).sum();
+    if length < MIN_FIT.min(fit) * e.diameter {
+        return Err(format!("the vessel forks or widens {length:.1} mm in, too soon to follow"));
+    }
+    let (dir, stretch) = fit_heading(&own, fit * e.diameter).ok_or("its centerline has no length")?;
+    let length = stretch.windows(2).map(|w| w[0].distance(w[1])).sum();
+    Ok((dir, stretch, length))
+}
+
+/// The line through the first `reach` mm of `points` (a centerline from an end into its
+/// vessel): its unit direction out of the vessel (toward the end), and the stretch fitted,
+/// from the end in. The stretch is shorter where the centerline is (it stops at the vessel's
+/// first fork). `None` for a centerline with no length.
+fn fit_heading(points: &[DVec3], reach: f64) -> Option<(DVec3, Vec<DVec3>)> {
+    if reach.is_nan() || reach <= 0.0 {
+        return None;
+    }
+    // The stretch, cut off at `reach`.
+    let mut stretch = vec![*points.first()?];
+    let mut s = 0.0;
+    for w in points.windows(2) {
+        let step = w[0].distance(w[1]);
+        if s + step >= reach {
+            if step > 0.0 {
+                stretch.push(w[0].lerp(w[1], (reach - s) / step));
+            }
+            s = reach;
+            break;
+        }
+        s += step;
+        stretch.push(w[1]);
+    }
+    if !s.is_finite() || s <= 0.0 || stretch.len() < 2 {
+        return None;
+    }
+    // Least squares for x(t) = X + t D with t the distance along the stretch, sampled
+    // evenly (a bend's extra points would weigh it otherwise).
+    const SAMPLES: usize = 33;
+    let mut samples = Vec::with_capacity(SAMPLES);
+    let (mut seg, mut walked) = (0, 0.0);
+    for i in 0..SAMPLES {
+        let t = s * i as f64 / (SAMPLES - 1) as f64;
+        while seg + 2 < stretch.len() && walked + stretch[seg].distance(stretch[seg + 1]) < t {
+            walked += stretch[seg].distance(stretch[seg + 1]);
+            seg += 1;
+        }
+        let len = stretch[seg].distance(stretch[seg + 1]);
+        let f = if len > 0.0 { ((t - walked) / len).clamp(0.0, 1.0) } else { 0.0 };
+        samples.push((t, stretch[seg].lerp(stretch[seg + 1], f)));
+    }
+    let n = samples.len() as f64;
+    let tm = samples.iter().map(|x| x.0).sum::<f64>() / n;
+    let xm = samples.iter().map(|x| x.1).sum::<DVec3>() / n;
+    let (mut num, mut den) = (DVec3::ZERO, 0.0);
+    for &(t, x) in &samples {
+        num += (x - xm) * (t - tm);
+        den += (t - tm) * (t - tm);
+    }
+    // D runs into the vessel; the extension runs the other way.
+    let dir = -(num / den).normalize_or_zero();
+    (den > 0.0 && dir != DVec3::ZERO && dir.is_finite()).then_some((dir, stretch))
 }
 
 /// Extrude straight extensions from vessel ends (open loops or flat caps).
@@ -572,6 +764,15 @@ pub struct FlowExtensionTool {
     failed: Option<FlowParams>,
     /// Settings changed in the panel, waiting to settle before they are built, and since when.
     changed: Option<(FlowParams, std::time::Instant)>,
+    /// The vessel's centerline behind each end, as the builds trace them.
+    traces: Traces,
+    /// The object capped, for the traces (built by the first, kept for the rest).
+    capped: crate::centerline::CappedCache,
+    /// The end whose arrow's tip the button went down on, where, and whether it has moved
+    /// since (only then is the end aimed).
+    drag: Option<(usize, egui::Pos2, bool)>,
+    /// The end whose arrow's tip is under the pointer.
+    hover: Option<usize>,
 }
 
 impl FlowExtensionTool {
@@ -582,13 +783,64 @@ impl FlowExtensionTool {
         Self {
             object,
             ends,
-            params: FlowParams { diameters: 5.0, absolute: None, circular: true, cap: true, selected: vec![false; n] },
+            params: FlowParams { diameters: 5.0, absolute: None, circular: true, cap: true, heading: Heading::CutNormal, fit: 2.0, selected: vec![false; n], aims: vec![None; n] },
             job: None,
             preview: None,
             error: None,
             failed: None,
             changed: None,
+            traces: Default::default(),
+            capped: Default::default(),
+            drag: None,
+            hover: None,
         }
+    }
+
+    /// Which way end `i`'s extension runs with the current settings: its aim, or else its
+    /// heading.
+    fn direction(&self, i: usize) -> DVec3 {
+        self.params.aims[i].unwrap_or_else(|| self.heading_of(i))
+    }
+
+    /// Which way end `i`'s extension runs unless aimed by hand: along its centerline once
+    /// traced (with [`Heading::Centerline`]), else square to its cut.
+    fn heading_of(&self, i: usize) -> DVec3 {
+        match self.params.heading {
+            Heading::Centerline => self.fitted(i).map_or(self.ends[i].normal, |(d, _)| d),
+            Heading::CutNormal => self.ends[i].normal,
+        }
+    }
+
+    /// The tip of end `i`'s arrow.
+    fn tip(&self, i: usize) -> DVec3 {
+        self.ends[i].center + self.direction(i) * ARROW * self.ends[i].diameter
+    }
+
+    /// The chosen end whose arrow's tip is nearest `pos`, within [`GRAB`] points.
+    fn tip_under(&self, cx: &ToolCx, pos: egui::Pos2) -> Option<usize> {
+        (0..self.ends.len())
+            .filter(|&i| self.params.selected[i])
+            .filter_map(|i| cx.project(self.tip(i)).map(|p| (i, p.distance(pos))))
+            .filter(|&(_, d)| d < GRAB)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+    }
+
+    /// Aim end `i` along `dir` (turned back to within [`MAX_AIM`] of its cut's normal, which
+    /// is returned with the angle to it), or let it run its heading again (`None`).
+    fn aim(&mut self, i: usize, dir: Option<DVec3>) -> Option<(DVec3, f64)> {
+        let n = self.ends[i].normal;
+        let aim = dir.and_then(|d| d.try_normalize()).map(|d| within_cone(d, n, MAX_AIM));
+        self.params.aims[i] = aim;
+        aim.map(|d| (d, d.dot(n).clamp(-1.0, 1.0).acos().to_degrees()))
+    }
+    /// The heading fitted to end `i`'s centerline with the current settings, and the stretch
+    /// fitted, if that end has been traced.
+    fn fitted(&self, i: usize) -> Option<(DVec3, Vec<DVec3>)> {
+        let traces = self.traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let points = traces.get(&i)?.as_ref().ok()?.clone();
+        drop(traces);
+        centerline_heading(&points, &self.ends[i], self.params.fit).ok().map(|(dir, stretch, _)| (dir, stretch))
     }
 
     /// Whether the current settings have a preview, a build under way or an error.
@@ -629,6 +881,11 @@ impl FlowExtensionTool {
             self.changed = None;
             return;
         }
+        if self.drag.is_some_and(|d| d.2) {
+            // An arrow held: built once let go (and settled), not whenever it pauses.
+            self.changed = Some((self.params.clone(), now));
+            return;
+        }
         match &self.changed {
             Some((p, since)) if *p == self.params && now.saturating_duration_since(*since) >= SETTLE => self.start(cx),
             Some((p, since)) if *p == self.params => cx.egui.request_repaint_after(SETTLE - now.saturating_duration_since(*since)),
@@ -644,7 +901,8 @@ impl FlowExtensionTool {
         let Some(o) = self.object.and_then(|id| cx.scene.get(id)) else { return };
         let src = o.mesh.clone();
         let source = src.clone();
-        let ends: Vec<VesselEnd> = self.ends.iter().zip(&self.params.selected).filter(|(_, s)| **s).map(|(e, _)| e.clone()).collect();
+        let ends: Vec<(usize, VesselEnd)> = self.ends.iter().cloned().enumerate().filter(|(i, _)| self.params.selected[*i]).collect();
+        let (all_ends, traces, capped) = (self.ends.clone(), self.traces.clone(), self.capped.clone());
         if ends.is_empty() {
             self.preview = None;
             // A build for ends no longer chosen would only keep the tool busy.
@@ -665,9 +923,62 @@ impl FlowExtensionTool {
             crate::jobs::Job::spawn("Flow extensions", cx.egui.clone(), move |progress| {
                 let mut m = (*src).clone();
                 let n = ends.len();
-                let (mut new_caps, mut new_walls, mut removed) = (Vec::new(), Vec::new(), Vec::new());
-                for (k, e) in ends.iter().enumerate() {
-                    if !progress(k as f32 / n as f32) {
+                let (mut new_caps, mut new_walls, mut removed, mut heads) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                // Each end's heading first, from the object as it was (tracing a vessel
+                // takes most of the time: each end is traced once, then kept).
+                let along = p2.heading == Heading::Centerline;
+                let mut dirs: Vec<Option<DVec3>> = vec![None; n];
+                for (k, (i, e)) in ends.iter().enumerate() {
+                    let at = |x: f32| progress(if along { 0.8 * (k as f32 + x) / n as f32 } else { 0.0 });
+                    if !at(0.0) {
+                        anyhow::bail!("cancelled");
+                    }
+                    let square = e.normal.normalize_or_zero();
+                    let mut head = EndHeading { end: *i, dir: square, off_normal: 0.0, fitted: None, note: None, aimed: false };
+                    if let Some(aim) = p2.aims[*i] {
+                        head.dir = aim;
+                        head.aimed = true;
+                        head.off_normal = aim.dot(square).clamp(-1.0, 1.0).acos().to_degrees();
+                        if head.off_normal > OBLIQUE {
+                            head.note = Some("aimed far off the cut's normal: the extension is narrower than the opening".into());
+                        }
+                        dirs[k] = Some(aim);
+                    } else if along {
+                        let kept = traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).cloned();
+                        let trace = match kept {
+                            Some(t) => t,
+                            None => {
+                                let t = match trace_behind(&src, &capped, &all_ends, *i, &at) {
+                                    Ok(Some(points)) => Ok(std::sync::Arc::new(points)),
+                                    Ok(None) => anyhow::bail!("cancelled"),
+                                    Err(err) => Err(format!("{err:#}")),
+                                };
+                                traces.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(*i, t.clone());
+                                t
+                            }
+                        };
+                        match trace.map_err(|err| format!("no centerline ({err})")).and_then(|points| centerline_heading(&points, e, p2.fit)) {
+                            Ok((dir, _, fitted)) => {
+                                head.off_normal = dir.dot(square).abs().clamp(0.0, 1.0).acos().to_degrees();
+                                head.dir = dir;
+                                head.fitted = Some(fitted);
+                                let mut notes = Vec::new();
+                                if fitted < 0.98 * p2.fit * e.diameter {
+                                    notes.push(format!("fitted to the {fitted:.1} mm of centerline before the vessel forks or widens"));
+                                }
+                                if head.off_normal > OBLIQUE {
+                                    notes.push("far off the cut's normal: check that the centerline follows this vessel".to_string());
+                                }
+                                head.note = (!notes.is_empty()).then(|| notes.join("; "));
+                                dirs[k] = Some(dir);
+                            }
+                            Err(why) => head.note = Some(format!("{why}: square to the cut instead")),
+                        }
+                    }
+                    heads.push(head);
+                }
+                for (k, (_, e)) in ends.iter().enumerate() {
+                    if !progress(if along { 0.8 + 0.2 * k as f32 / n as f32 } else { k as f32 / n as f32 }) {
                         anyhow::bail!("cancelled");
                     }
                     let keep_group = match e.kind {
@@ -693,12 +1004,17 @@ impl FlowExtensionTool {
                             Some(a) => mm_edit::ExtensionLength::Absolute(a),
                             None => mm_edit::ExtensionLength::Diameters(p2.diameters),
                         },
+                        direction: dirs[k],
                         segments,
                         make_circular: p2.circular,
                         cap: p2.cap,
                         ..Default::default()
                     };
-                    let r = mm_edit::extrude_boundary_loop(&mut m, &lp, &params)?;
+                    let r = mm_edit::extrude_boundary_loop(&mut m, &lp, &params).map_err(|err| anyhow::anyhow!("end {}: {err}", ends[k].0 + 1))?;
+                    if dirs[k].is_none() {
+                        // Square to the cut: the side the extrusion took (the loop's own).
+                        heads[k].dir = r.direction;
+                    }
                     match (keep_group, r.cap_group) {
                         (Some(g), Some(_)) => {
                             for &t in &r.cap_triangles {
@@ -721,7 +1037,7 @@ impl FlowExtensionTool {
                     new_walls.push(wall);
                 }
                 m.bump_shape_version();
-                Ok(FlowOut { source, mesh: m, new_caps, new_walls, removed, msg: format!("extended {n} end(s)") })
+                Ok(FlowOut { source, mesh: m, new_caps, new_walls, removed, heads, msg: format!("extended {n} end(s)") })
             }),
         ));
     }
@@ -775,6 +1091,35 @@ impl Tool for FlowExtensionTool {
         }
         ui.checkbox(&mut self.params.circular, "Blend to circular cross-section");
         ui.checkbox(&mut self.params.cap, "Cap the ends");
+        ui_util::section(ui, "Direction");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.params.heading, Heading::CutNormal, "Cut normal").on_hover_text("Square to each end: along the normal of its cut or cap");
+            ui.selectable_value(&mut self.params.heading, Heading::Centerline, "Centerline")
+                .on_hover_text("On along the vessel: a line fitted to its centerline just inside each end, so an end cut at a slant still runs straight on");
+        });
+        if self.params.heading == Heading::Centerline {
+            ui.add(egui::Slider::new(&mut self.params.fit, 0.5..=MAX_FIT).text("× diameter fitted"))
+                .on_hover_text("How much of the vessel the direction follows: a short stretch is the vessel's heading at the end, a long one its overall course (up to where it forks)");
+        }
+        ui.small("Drag the tip of an end's arrow to aim it by hand; double-click the tip to let it go.");
+        let aimed: Vec<usize> = (0..self.ends.len()).filter(|&i| self.params.selected[i] && self.params.aims[i].is_some()).collect();
+        for &i in &aimed {
+            let off = self.params.aims[i].map_or(0.0, |d| d.dot(self.ends[i].normal).clamp(-1.0, 1.0).acos().to_degrees());
+            ui.horizontal(|ui| {
+                let text = format!("End {}: aimed by hand, {off:.0}° off the cut normal", i + 1);
+                if off > OBLIQUE {
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 70), text).on_hover_text("The extension is narrower than the opening, seen along it");
+                } else {
+                    ui.label(text);
+                }
+                if ui.small_button("Reset").on_hover_text("Run this end's heading again").clicked() {
+                    self.aim(i, None);
+                }
+            });
+        }
+        if aimed.len() > 1 && ui.small_button("Reset all").clicked() {
+            self.params.aims.iter_mut().for_each(|a| *a = None);
+        }
         if self.params != before {
             // Built once the settings settle (see `update`).
             self.changed = Some((self.params.clone(), std::time::Instant::now()));
@@ -789,6 +1134,21 @@ impl Tool for FlowExtensionTool {
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(240, 110, 90), e);
         }
+        if let Some((_, out)) = self.preview.as_ref().filter(|(p, _)| *p == self.params && p.heading == Heading::Centerline) {
+            for h in out.heads.iter().filter(|h| !h.aimed) {
+                let angle = h.fitted.map(|_| format!("{:.0}° off the cut normal", h.off_normal));
+                match (angle, &h.note) {
+                    (Some(a), None) => {
+                        ui.weak(format!("End {}: {a}", h.end + 1));
+                    }
+                    (a, Some(note)) => {
+                        let text = a.map_or(format!("End {}: {note}", h.end + 1), |a| format!("End {}: {a}; {note}", h.end + 1));
+                        ui.colored_label(egui::Color32::from_rgb(230, 170, 70), text);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
         let ready = self.preview.as_ref().map(|(p, _)| *p == self.params).unwrap_or(false);
         let (accept, cancel) = ui_util::accept_cancel(ui, ready);
         if accept && self.accept(cx) {
@@ -801,17 +1161,66 @@ impl Tool for FlowExtensionTool {
     }
 
     fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
-        if !input.clicked {
-            return;
-        }
         let Some(pos) = input.pos else { return };
-        if let Some(i) = end_under_cursor(cx, &self.ends, pos) {
-            self.params.selected[i] = !self.params.selected[i];
-            self.start(cx);
+        if self.drag.is_none() {
+            self.hover = self.tip_under(cx, pos);
+        }
+        if input.pressed {
+            self.drag = self.tip_under(cx, pos).map(|i| (i, pos, false));
+        }
+        if input.down {
+            if let Some((i, from, moved)) = self.drag {
+                // A click on the tip leaves the end as it was: it is aimed once the pointer moves.
+                if moved || from.distance(pos) > 3.0 {
+                    self.drag = Some((i, from, true));
+                    let e = &self.ends[i];
+                    if let Some(p) = on_sphere(&cx.ray_at(pos), e.center, ARROW * e.diameter, self.tip(i)) {
+                        self.aim(i, Some(p - e.center));
+                    }
+                }
+            }
+        }
+        if input.released {
+            let held = self.drag.take().map(|d| d.0);
+            if input.double_clicked {
+                if let Some(i) = held.or_else(|| self.tip_under(cx, pos)) {
+                    self.aim(i, None);
+                }
+            } else if input.clicked && held.is_none() {
+                // (A click on an arrow's tip is not one on the marker under it.)
+                if let Some(i) = end_under_cursor(cx, &self.ends, pos) {
+                    self.params.selected[i] = !self.params.selected[i];
+                    self.start(cx);
+                }
+            }
         }
     }
 
     fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
+        // Each chosen end's arrow, its tip a handle to aim it by; along a centerline, the
+        // stretch its heading is fitted to too (drawn on top: they lie inside the vessel).
+        for i in (0..self.ends.len()).filter(|&i| self.params.selected[i]) {
+            let e = &self.ends[i];
+            if self.params.heading == Heading::Centerline {
+                if let Some((_, stretch)) = self.fitted(i) {
+                    let pts: Vec<egui::Pos2> = stretch.iter().filter_map(|&p| cx.project(p)).collect();
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 60))));
+                }
+            }
+            let Some(a) = cx.project(e.center) else { continue };
+            let aimed = self.params.aims[i].is_some();
+            if aimed {
+                // Where it would run unaimed, for reference.
+                if let Some(b) = cx.project(e.center + self.heading_of(i) * ARROW * e.diameter) {
+                    painter.line_segment([a, b], egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110)));
+                }
+            }
+            let Some(b) = cx.project(self.tip(i)) else { continue };
+            let hot = self.drag.map(|d| d.0) == Some(i) || (self.drag.is_none() && self.hover == Some(i));
+            let colour = if aimed { ui_util::ACCENT } else { egui::Color32::WHITE };
+            painter.arrow(a, b - a, egui::Stroke::new(if hot { 3.0 } else { 2.0 }, colour));
+            painter.circle(b, if hot { 7.0 } else { 5.0 }, colour, egui::Stroke::new(1.5, egui::Color32::from_gray(30)));
+        }
         if self.preview.is_none() || self.job.is_some() || self.changed.is_some() {
             draw_end_markers(painter, cx, &self.ends, &self.params.selected);
         }
@@ -874,7 +1283,11 @@ impl Tool for FlowExtensionTool {
 
     fn settings(&self) -> Option<Value> {
         let p = &self.params;
-        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap}))
+        let direction = match p.heading {
+            Heading::CutNormal => "cut_normal",
+            Heading::Centerline => "centerline",
+        };
+        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap, "direction": direction, "fit_diameters": p.fit}))
     }
 
     fn settings_schema(&self) -> Option<Value> {
@@ -883,6 +1296,8 @@ impl Tool for FlowExtensionTool {
             "length_mm": {"type": ["number", "null"], "description": "Extension length in mm for every end (0.1..200); null to use length_in_diameters"},
             "circular": {"type": "boolean", "description": "Blend each extension to a circular cross-section"},
             "cap": {"type": "boolean", "description": "Cap the extensions' ends"},
+            "direction": {"type": "string", "enum": ["cut_normal", "centerline"], "description": "Which way the extensions run: square to each end's cut, or on along the vessel (a line fitted to its centerline just inside the end)"},
+            "fit_diameters": {"type": "number", "description": "With direction centerline: the stretch of centerline inside each end the direction is fitted to, in diameters of the end (0.5..5; shorter where the vessel forks sooner)"},
         }}))
     }
 
@@ -897,29 +1312,51 @@ impl Tool for FlowExtensionTool {
         };
         p.circular = v["circular"].as_bool().ok_or("circular must be true or false")?;
         p.cap = v["cap"].as_bool().ok_or("cap must be true or false")?;
+        p.heading = match v["direction"].as_str() {
+            Some("cut_normal") => Heading::CutNormal,
+            Some("centerline") => Heading::Centerline,
+            _ => return Err("direction must be \"cut_normal\" or \"centerline\"".into()),
+        };
+        p.fit = v["fit_diameters"].as_f64().ok_or("fit_diameters must be a number")?.clamp(0.5, MAX_FIT);
         self.start(cx);
         Ok(())
     }
 
     fn state(&self, _scene: &Scene) -> Value {
         let current = self.preview.as_ref().filter(|(p, _)| *p == self.params);
+        let heads: Option<Vec<Value>> = current.map(|(_, out)| {
+            out.heads
+                .iter()
+                .map(|h| json!({"end": h.end + 1, "direction": vec3(h.dir.to_array(), 4), "off_cut_normal_deg": round(h.off_normal, 1), "aimed_by_hand": h.aimed, "centerline_fitted_mm": h.fitted.map(|x| round(x, 2)), "note": h.note}))
+                .collect()
+        });
         json!({
             "object": self.object,
             "ends": ends_state(&self.ends, |i| self.params.selected[i]),
             "computing": self.job.is_some(),
             "preview": current.map(|(_, out)| out.msg.clone()),
+            "directions": heads,
+            "aims": (0..self.ends.len()).filter_map(|i| self.params.aims[i].map(|d| json!({"end": i + 1, "direction": vec3(d.to_array(), 4), "off_cut_normal_deg": round(d.dot(self.ends[i].normal).clamp(-1.0, 1.0).acos().to_degrees(), 1), "picked": self.params.selected[i]}))).collect::<Vec<_>>(),
             "error": self.error,
             "next": if !self.params.selected.contains(&true) { "select the ends to extend" } else if current.is_some() { "accept (mesh_tool accept) to keep the extensions" } else { "wait for the preview (app_wait)" },
         })
     }
 
     fn actions(&self) -> Vec<Action> {
-        vec![Action::new(
-            "select",
-            "Choose the ends to extend (numbers from the state's ends, as the markers show): replaces the choice unless `add`",
-            json!({"ends": ends_arg("End numbers (from 1)"), "add": arg::boolean("Add to the ends already chosen")}),
-        )
-        .required(&["ends"])]
+        vec![
+            Action::new(
+                "select",
+                "Choose the ends to extend (numbers from the state's ends, as the markers show): replaces the choice unless `add`",
+                json!({"ends": ends_arg("End numbers (from 1)"), "add": arg::boolean("Add to the ends already chosen")}),
+            )
+            .required(&["ends"]),
+            Action::new(
+                "aim",
+                "Aim one end's extension by hand, as dragging its arrow does (within 75° of its outward cut normal, the state's ends' `outward`), or without `direction` let it run its heading again",
+                json!({"end": arg::integer("End number (from 1)"), "direction": arg::point("Direction out of the vessel (any length); leave out to undo the aim")}),
+            )
+            .required(&["end"]),
+        ]
     }
 
     fn act(&mut self, action: &str, args: &Value, cx: &mut ToolCx) -> Result<String, String> {
@@ -935,6 +1372,25 @@ impl Tool for FlowExtensionTool {
                 self.start(cx);
                 let n = self.params.selected.iter().filter(|s| **s).count();
                 Ok(format!("{n} end(s) chosen; previewing"))
+            }
+            "aim" => {
+                let a = Args(args);
+                let k = a.usize("end")?;
+                if k == 0 || k > self.ends.len() {
+                    return Err(format!("{k} is not an end number (1 to {})", self.ends.len()));
+                }
+                let dir = match a.opt_point("direction") {
+                    Some(d) => Some(DVec3::from_array(d).try_normalize().ok_or("direction cannot be zero")?),
+                    None => None,
+                };
+                let aimed = self.aim(k - 1, dir);
+                self.start(cx);
+                let picked = if self.params.selected[k - 1] { "" } else { " (it is not chosen: select it to extend it)" };
+                Ok(match (dir, aimed) {
+                    (Some(d), Some((got, off))) if got.dot(d) < 1.0 - 1e-9 => format!("End {k} aimed {off:.1}° off its cut normal, as near the direction asked as it can be{picked}"),
+                    (_, Some((_, off))) => format!("End {k} aimed {off:.1}° off its cut normal{picked}"),
+                    _ => format!("End {k} runs its heading again{picked}"),
+                })
             }
             _ => Err(format!("Flow extensions has no action {action}")),
         }
@@ -1572,6 +2028,228 @@ mod tests {
         let mut named: Vec<&str> = names.iter().filter(|(g, _)| **g != 0).map(|(_, n)| n.as_str()).collect();
         named.sort();
         assert_eq!(named, ["extension_1", "extension_2"]);
+    }
+
+    #[test]
+    fn heading_is_the_line_through_the_stretch_asked_for() {
+        // From an end at the origin into a vessel along -z, bending toward +x 6 mm in.
+        let mut pts: Vec<DVec3> = (0..=12).map(|i| DVec3::new(0.0, 0.0, -0.5 * i as f64)).collect();
+        pts.extend((1..=12).map(|i| DVec3::new(0.5 * i as f64, 0.0, -6.0)));
+        let (dir, stretch) = fit_heading(&pts, 4.0).unwrap();
+        assert!(dir.dot(DVec3::Z) > 1.0 - 1e-12, "{dir}");
+        let len: f64 = stretch.windows(2).map(|w| w[0].distance(w[1])).sum();
+        assert!((len - 4.0).abs() < 1e-12 && stretch[0] == DVec3::ZERO && (stretch.last().unwrap().z + 4.0).abs() < 1e-12);
+        // Past the bend the line leans toward where the vessel goes (outward: away from it).
+        let (dir, _) = fit_heading(&pts, 10.0).unwrap();
+        assert!(dir.z > 0.5 && dir.x < -0.1, "{dir}");
+        // Longer than the centerline: all of it.
+        let (_, stretch) = fit_heading(&pts, 100.0).unwrap();
+        assert_eq!(stretch.len(), pts.len());
+        assert!(fit_heading(&pts, 0.0).is_none() && fit_heading(&pts[..1], 1.0).is_none());
+    }
+
+    #[test]
+    fn heading_follows_the_vessel_only_until_it_widens() {
+        // An end of diameter 2 on a branch running in along -z for 1.5 mm, then into a trunk
+        // (radius 3) along +x: only the branch counts, however much is asked for.
+        let e = VesselEnd { kind: EndKind::Open, center: DVec3::ZERO, normal: DVec3::Z, diameter: 2.0, planar: true };
+        let mut pts: Vec<(DVec3, f64)> = (0..=6).map(|i| (DVec3::new(0.0, 0.0, -0.25 * i as f64), 1.0 + 0.05 * i as f64)).collect();
+        pts.extend((1..=20).map(|i| (DVec3::new(0.5 * i as f64, 0.0, -1.5 - 0.1 * i as f64), 3.0)));
+        let (dir, _, length) = centerline_heading(&pts, &e, 3.0).unwrap();
+        assert!(dir.dot(DVec3::Z) > 1.0 - 1e-12 && (length - 1.5).abs() < 1e-12, "{dir} {length}");
+        // Narrower ends, the same: the vessel widens too soon (under half a diameter in) for
+        // a heading, and the extension stays square to the cut.
+        let narrow = VesselEnd { diameter: 1.0, ..e };
+        assert!(centerline_heading(&pts, &narrow, 3.0).unwrap_err().contains("too soon"));
+    }
+
+    #[test]
+    fn flow_extensions_run_on_along_the_vessel_from_a_slanted_cut() {
+        // A straight vessel along z, radius 1, its top end cut 25° off square.
+        let slant = 25f64.to_radians();
+        let mut scene = Scene::default();
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.0, 0.5 * i as f64)).collect();
+        let mut m = primitives::tube_along(&path, &[1.0; 41], 48);
+        let plane = mm_core::Plane::from_point_normal(DVec3::new(0.0, 0.0, 15.0), DVec3::new(slant.sin(), 0.0, slant.cos()));
+        mm_edit::plane_cut(&mut m, plane, &mm_edit::PlaneCutParams { keep: mm_edit::KeepSide::Below, fill: mm_edit::CutFill::None, ..Default::default() }).unwrap();
+        scene.add("vessel", m);
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        let top = tool.ends.iter().position(|e| e.center.z > 10.0).expect("the slanted end");
+        let extend = |tool: &mut FlowExtensionTool, cx: &mut ToolCx, heading: &str| {
+            tool.set_settings(&json!({"direction": heading, "fit_diameters": 2.0, "length_in_diameters": 4.0}), cx).unwrap();
+            tool.act("select", &json!({"ends": [top + 1]}), cx).unwrap();
+            let t0 = Instant::now();
+            while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && tool.error.is_none() && t0.elapsed() < Duration::from_secs(60) {
+                std::thread::sleep(Duration::from_millis(5));
+                tool.update(cx);
+            }
+            let (_, out) = tool.preview.as_ref().unwrap_or_else(|| panic!("{:?}", tool.error));
+            // The centre of the extension's far end.
+            let far: Vec<DVec3> = out.mesh.vertex_ids().map(|v| out.mesh.vertex(v)).filter(|p| p.z > 18.0).collect();
+            let tip = far.iter().copied().sum::<DVec3>() / far.len().max(1) as f64;
+            (out.heads.clone(), tip)
+        };
+        // Square to the cut: 25° off the vessel, the far end well off its axis.
+        let (heads, tip) = extend(&mut tool, &mut cx, "cut_normal");
+        assert_eq!(heads.len(), 1);
+        assert!((heads[0].dir.angle_between(DVec3::Z).to_degrees() - 25.0).abs() < 1.0, "{:?}", heads[0]);
+        assert!(tip.x > 2.0, "{tip}");
+        // Along the centerline: on along the vessel, 25° off the cut's normal, its far end on
+        // the vessel's axis.
+        let (heads, tip) = extend(&mut tool, &mut cx, "centerline");
+        let h = &heads[0];
+        assert!(h.dir.angle_between(DVec3::Z).to_degrees() < 2.0, "{h:?}");
+        assert!((h.off_normal - 25.0).abs() < 2.0 && h.note.is_none(), "{h:?}");
+        assert!((h.fitted.unwrap() - 2.0 * tool.ends[top].diameter).abs() < 1e-6, "{h:?}");
+        assert!(tip.truncate().length() < 0.15, "{tip}");
+        // Painted from the trace kept for the end, which the next build uses.
+        assert!(tool.fitted(top).is_some() && tool.traces.lock().unwrap().len() == 1);
+        let state = tool.state(cx.scene);
+        assert_eq!(state["directions"][0]["end"], json!(top + 1));
+    }
+
+    #[test]
+    fn arrow_tips_turn_on_their_sphere_and_stay_in_the_cone() {
+        let n = DVec3::Z;
+        // Turned back to 75° in its own plane; within it, as it is; straight back, still 75°.
+        let c = within_cone(DVec3::new(1.0, 0.0, 0.1).normalize(), n, 75.0);
+        assert!((c.angle_between(n).to_degrees() - 75.0).abs() < 1e-9 && c.y.abs() < 1e-12 && c.x > 0.0, "{c}");
+        let d = DVec3::new(0.0, 0.5, 1.0).normalize();
+        assert_eq!(within_cone(d, n, 75.0), d);
+        assert!((within_cone(-n, n, 75.0).angle_between(n).to_degrees() - 75.0).abs() < 1e-9);
+        // A ray through the sphere: the crossing nearer the tip as it was.
+        let ray = mm_core::Ray { origin: DVec3::new(0.5, -10.0, 0.0), dir: DVec3::Y };
+        let front = on_sphere(&ray, DVec3::ZERO, 1.0, -DVec3::Y).unwrap();
+        assert!((front.length() - 1.0).abs() < 1e-12 && front.y < 0.0 && (front.x - 0.5).abs() < 1e-12, "{front}");
+        assert!(on_sphere(&ray, DVec3::ZERO, 1.0, DVec3::Y).unwrap().y > 0.0);
+        // One passing it by: the rim nearest the ray.
+        let ray = mm_core::Ray { origin: DVec3::new(3.0, -10.0, 0.0), dir: DVec3::Y };
+        assert!(on_sphere(&ray, DVec3::ZERO, 1.0, DVec3::Y).unwrap().distance(DVec3::X) < 1e-12);
+    }
+
+    #[test]
+    fn vessel_ends_face_out_of_the_vessel_even_curled_back() {
+        // A hook: along +x, round a bend and back along -x for 2 mm. Its tip faces -x, though
+        // it lies on the +x side of the middle of the mesh.
+        let mut path: Vec<DVec3> = (0..=20).map(|i| DVec3::new(0.5 * i as f64, 0.0, 0.0)).collect();
+        path.extend((1..=16).map(|k| {
+            let a = std::f64::consts::PI * k as f64 / 16.0;
+            DVec3::new(10.0 + 2.0 * a.sin(), 2.0 - 2.0 * a.cos(), 0.0)
+        }));
+        path.extend((1..=4).map(|i| DVec3::new(10.0 - 0.5 * i as f64, 4.0, 0.0)));
+        let m = primitives::tube_along(&path, &vec![0.6; path.len()], 24);
+        let ends = find_vessel_ends(&m);
+        assert_eq!(ends.len(), 2);
+        let start = ends.iter().find(|e| e.center.x < 1.0).unwrap();
+        let tip = ends.iter().find(|e| e.center.y > 3.0).unwrap();
+        assert!(start.normal.dot(-DVec3::X) > 0.99, "{:?}", start.normal);
+        assert!(tip.normal.dot(-DVec3::X) > 0.99, "{:?}", tip.normal);
+        assert!((tip.center - m.bounds().center()).x > 1.0);
+    }
+
+    #[test]
+    fn dragging_an_arrow_aims_its_end() {
+        let mut scene = Scene::default();
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.0, 0.5 * i as f64)).collect();
+        scene.add("vessel", primitives::tube_along(&path, &[1.0; 41], 32));
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        // From the side.
+        cx.camera.look_along(DVec3::X);
+        let b = cx.scene.bounds();
+        cx.camera.fit(&b, vp.aspect());
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        let top = tool.ends.iter().position(|e| e.center.z > 10.0).unwrap();
+        assert!(tool.ends[top].normal.dot(DVec3::Z) > 0.999);
+        tool.act("select", &json!({"ends": [top + 1]}), &mut cx).unwrap();
+        let settle = |tool: &mut FlowExtensionTool, cx: &mut ToolCx| {
+            let t0 = Instant::now();
+            while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && tool.error.is_none() && t0.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(5));
+                tool.update(cx);
+            }
+            assert!(tool.preview.is_some(), "{:?}", tool.error);
+        };
+        settle(&mut tool, &mut cx);
+        let at = |p: egui::Pos2| PointerInput { pos: Some(p), ..Default::default() };
+        let tip = cx.project(tool.tip(top)).unwrap();
+        // A click on the tip: the end neither aimed nor let go (its marker is not clicked).
+        tool.pointer(&PointerInput { pressed: true, down: true, ..at(tip) }, &mut cx);
+        tool.pointer(&PointerInput { released: true, clicked: true, ..at(tip) }, &mut cx);
+        assert!(tool.params.aims[top].is_none() && tool.params.selected[top]);
+        // Dragged across the arrow on screen: aimed that way, and not built until let go.
+        let along = (tip - cx.project(tool.ends[top].center).unwrap()).normalized();
+        let across = egui::vec2(-along.y, along.x);
+        // (Within the sphere's outline on screen, where the tip can follow the pointer.)
+        let to = tip + across * 40.0;
+        tool.pointer(&PointerInput { pressed: true, down: true, ..at(tip) }, &mut cx);
+        for k in 1..=8 {
+            tool.pointer(&PointerInput { down: true, ..at(tip + across * (5.0 * k as f32)) }, &mut cx);
+            tool.update_at(Instant::now() + SETTLE * 4, &mut cx);
+            assert!(tool.job.is_none(), "frame {k}");
+        }
+        let aim = tool.params.aims[top].expect("aimed");
+        // (Screen y runs down.)
+        let side = (cx.camera.right() * across.x as f64 - cx.camera.up() * across.y as f64).normalize();
+        assert!(aim.dot(side) > 0.2 && aim.dot(DVec3::Z) > 0.5, "{aim}");
+        // The tip followed the pointer.
+        assert!(cx.project(tool.tip(top)).unwrap().distance(to) < 1.0);
+        tool.pointer(&PointerInput { released: true, ..at(to) }, &mut cx);
+        settle(&mut tool, &mut cx);
+        let (_, out) = tool.preview.as_ref().unwrap();
+        let h = &out.heads[0];
+        assert!(h.aimed && h.dir == aim && (h.off_normal - aim.angle_between(DVec3::Z).to_degrees()).abs() < 1e-6, "{h:?}");
+        // The extension leans that way.
+        let far: Vec<DVec3> = out.mesh.vertex_ids().map(|v| out.mesh.vertex(v)).filter(|p| p.z > 22.0).collect();
+        assert!(!far.is_empty() && (far.iter().copied().sum::<DVec3>() / far.len() as f64).dot(side) > 1.0);
+        // A double-click on the tip lets it go.
+        let tip = cx.project(tool.tip(top)).unwrap();
+        tool.pointer(&PointerInput { pressed: true, down: true, ..at(tip) }, &mut cx);
+        tool.pointer(&PointerInput { released: true, clicked: true, double_clicked: true, ..at(tip) }, &mut cx);
+        assert!(tool.params.aims[top].is_none() && tool.params.selected[top]);
+        // Agents aim as the arrow does: no further than 75° off the cut's normal.
+        let reply = tool.act("aim", &json!({"end": top + 1, "direction": [1.0, 0.0, 0.05]}), &mut cx).unwrap();
+        assert!(reply.contains("75.0°") && reply.contains("as near"), "{reply}");
+        assert_eq!(tool.state(cx.scene)["aims"][0]["off_cut_normal_deg"], json!(75.0));
+        tool.act("aim", &json!({"end": top + 1}), &mut cx).unwrap();
+        assert!(tool.params.aims[top].is_none());
+        assert!(tool.act("aim", &json!({"end": 9, "direction": [0, 0, 1]}), &mut cx).is_err());
+    }
+
+    /// A real mesh (`POLYMIX_FLOW_MESH`, local only): every flat end extended along its
+    /// centerline (`POLYMIX_FLOW_FIT` diameters, default 2). Prints each end's direction, its
+    /// angle to the cut's normal and the build's time.
+    #[test]
+    #[ignore]
+    fn flow_extensions_along_the_centerline_on_a_real_mesh() {
+        let Some(path) = std::env::var_os("POLYMIX_FLOW_MESH") else { return };
+        let fit: f64 = std::env::var("POLYMIX_FLOW_FIT").ok().and_then(|x| x.parse().ok()).unwrap_or(2.0);
+        let mut scene = Scene::default();
+        scene.add("vessel", mm_io::read_mesh(std::path::Path::new(&path)).unwrap().mesh);
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        let flat: Vec<usize> = (0..tool.ends.len()).filter(|&i| tool.ends[i].planar).map(|i| i + 1).collect();
+        eprintln!("{} triangles, {} ends, {} flat", cx.scene.active().unwrap().mesh.triangle_count(), tool.ends.len(), flat.len());
+        tool.set_settings(&json!({"direction": "centerline", "fit_diameters": fit}), &mut cx).unwrap();
+        let t0 = Instant::now();
+        tool.act("select", &json!({"ends": flat}), &mut cx).unwrap();
+        while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && tool.error.is_none() && t0.elapsed() < Duration::from_secs(600) {
+            std::thread::sleep(Duration::from_millis(5));
+            tool.update(&mut cx);
+        }
+        eprintln!("built in {:.2?}; {:?}", t0.elapsed(), tool.error);
+        for h in tool.preview.iter().flat_map(|(_, out)| &out.heads) {
+            eprintln!("end {}: ⌀ {:.2}, {:.1}° off the cut normal, fitted {:?} mm, dir {:.3}; {}", h.end + 1, tool.ends[h.end].diameter, h.off_normal, h.fitted.map(|x| (x * 100.0).round() / 100.0), h.dir, h.note.as_deref().unwrap_or(""));
+        }
     }
 
     #[test]
