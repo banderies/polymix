@@ -279,7 +279,7 @@ pub fn loft_guided(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &Lof
     if smooth && params.fair > 0.0 {
         fair_tube(mesh, &rows, params);
     }
-    let band = if params.blend > 0.0 { blend_join(mesh, &result.triangles, [&p, &q], params.blend, &|_| false) } else { Vec::new() };
+    let band = if params.blend > 0.0 { blend_join(mesh, &result.triangles, [&p, &q], [params.blend; 2], &|_| false) } else { Vec::new() };
     if params.remesh {
         remesh_join(mesh, &mut result, band, h);
     }
@@ -287,18 +287,18 @@ pub fn loft_guided(mesh: &mut Mesh, loop_a: &[u32], loop_b: &[u32], params: &Lof
 }
 
 /// Smooth the join between a new tube (`tube`) and the vessels at its `openings`: the tube
-/// and a band of each vessel behind its opening, `blend` diameters wide, get Taubin λ|μ
+/// and a band of each vessel behind its opening, `blend` diameters wide (per opening), get Taubin λ|μ
 /// steps (which smooth without shrinking) at full strength on the tube and its seams, fading
 /// to nothing across the band (smootherstep of the distance along the surface). Other open
 /// edges, and vertices at points `fixed` holds, stay where they are. Returns the vessels'
 /// triangles in the bands.
-pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: f64, fixed: &dyn Fn(DVec3) -> bool) -> Vec<u32> {
+pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], blend: [f64; 2], fixed: &dyn Fn(DVec3) -> bool) -> Vec<u32> {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap, HashSet};
     let tube_verts: HashSet<u32> = tube.iter().flat_map(|&t| mesh.triangle(t)).collect();
     let on_openings: HashSet<u32> = openings.iter().flat_map(|c| c.iter().copied()).collect();
     let mut weight: HashMap<u32, f64> = tube_verts.iter().map(|&v| (v, 1.0)).collect();
-    for c in openings {
+    for (c, blend) in openings.into_iter().zip(blend) {
         let pts = positions(mesh, c);
         let c0 = mean(&pts);
         let width = blend * 2.0 * pts.iter().map(|p| p.distance(c0)).sum::<f64>() / pts.len() as f64;
@@ -344,7 +344,7 @@ pub(crate) fn blend_join(mesh: &mut Mesh, tube: &[u32], openings: [&[u32]; 2], b
         .filter(|&(v, w)| w > 0.0 && !mesh.is_boundary_vertex(v) && !fixed(mesh.vertex(v)))
         .map(|(v, w)| (v, w, mesh.vertex_neighbors(v).collect()))
         .collect();
-    let iterations = (10.0 + 30.0 * blend).round() as usize;
+    let iterations = (10.0 + 30.0 * blend[0].max(blend[1])).round() as usize;
     for _ in 0..iterations {
         for step in [0.5, -0.53] {
             let moved: Vec<DVec3> = movable

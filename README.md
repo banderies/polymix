@@ -193,7 +193,7 @@ Treatment variants: **Vessel → Virtual stent** places a stent between two clic
 cross-sections (or two *Measure → Vessel diameter* rings) and reshapes the vessel around it:
 diameter and length (centred on the two ends along the stent's own axis), *Straightness*
 (follow the centerline ↔ the smoothest G0 / G1 / G2 path between the ends), *Stiffness* (how
-far narrower wall opens to the stent; wider wall is left alone), *End blend*, and *Covered*
+far narrower wall opens to the stent; wider wall is left alone), *End blend* (for each end), and *Covered*
 (the lumen becomes the stent's tube: dilated stretches narrowed, side branches sealed off).
 Previewed live; kept in place or as a copy. Details and limits:
 [docs/virtual_stenting.md](docs/virtual_stenting.md).

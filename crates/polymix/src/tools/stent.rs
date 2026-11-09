@@ -6,8 +6,9 @@
 //!
 //! The vessel's centerline is traced through the lumen from the first section (as the
 //! Centerline tool does: through the centres of the largest spheres inside it) through the
-//! second and on past both, and the vertices nearest its tube there are the stented vessel's
-//! own wall; side branches follow them with distance.
+//! second and on past both (the way that runs on furthest at each junction, or one clicked
+//! where two or more could be the vessel), and the vertices nearest its tube there are the
+//! stented vessel's own wall; side branches follow them with distance.
 
 use super::*;
 use crate::centerline::{self, Anchor, Centerline, LumenEnd, LumenInput, LumenParams};
@@ -63,9 +64,10 @@ struct StentUi {
     /// stent: 100 makes a perfect tube of the stent's diameter, 0 leaves the vessel as it is.
     /// A bare stent never pulls wider wall in; a covered one narrows it to the stent.
     stiffness: f64,
-    /// How far past each end the wall eases back to its own shape and course, mm (0..40).
-    /// Nothing beyond it changes; a straightened stent may need a longer one.
-    end_blend: f64,
+    /// How far past each end the wall eases back to its own shape and course, mm (0..40):
+    /// [past end 1, past end 2]. Nothing beyond it changes; a straightened stent may need a
+    /// longer one.
+    end_blend: [f64; 2],
     /// Stent graft: the lumen along it becomes the stent's tube (wider wall narrowed, side
     /// branches opening along it sealed off and removed).
     covered: bool,
@@ -75,7 +77,7 @@ struct StentUi {
 
 impl Default for StentUi {
     fn default() -> Self {
-        Self { diameter: 8.0, length: 40.0, straightness: 50.0, continuity: EndContinuity::G1, stiffness: 100.0, end_blend: 2.0, covered: false, remesh: true }
+        Self { diameter: 8.0, length: 40.0, straightness: 50.0, continuity: EndContinuity::G1, stiffness: 100.0, end_blend: [2.0; 2], covered: false, remesh: true }
     }
 }
 
@@ -108,6 +110,47 @@ struct VesselTrace {
     /// The minimal lumen diameter between the sections: the largest sphere inside the lumen
     /// at its narrowest (where the inscribed-sphere centerline was found).
     min_lumen: Option<f64>,
+    /// Junctions past the ends where the vessel could run on more than one way.
+    forks: Vec<Fork>,
+}
+
+/// A junction past an end where more than one way on runs far enough to be the vessel (two of
+/// that end's diameters or more). The trace follows the longest unless another was picked.
+#[derive(Clone, Debug)]
+struct Fork {
+    /// Past which end: 0 or 1.
+    end: usize,
+    /// The junction.
+    at: DVec3,
+    /// How far past the end it lies, along the centerline.
+    past: f64,
+    ways: Vec<Way>,
+}
+
+/// One way on from a [`Fork`].
+#[derive(Clone, Debug)]
+struct Way {
+    /// From the junction along the way's longest course, as far as it is drawn.
+    points: Vec<DVec3>,
+    /// How far it runs on from the junction (to its farthest point, along the centerline).
+    length: f64,
+    /// The trace follows it.
+    followed: bool,
+}
+
+impl Way {
+    /// Distance from `p` to the drawn way.
+    fn distance(&self, p: DVec3) -> f64 {
+        let to_segment = |a: DVec3, b: DVec3| {
+            let ab = b - a;
+            p.distance(a + ab * ((p - a).dot(ab) / ab.length_squared().max(1e-300)).clamp(0.0, 1.0))
+        };
+        match self.points.len() {
+            0 => f64::INFINITY,
+            1 => p.distance(self.points[0]),
+            _ => self.points.windows(2).map(|w| to_segment(w[0], w[1])).fold(f64::INFINITY, f64::min),
+        }
+    }
 }
 
 /// What a preview was made from: the sections (by revision) and the settings.
@@ -126,6 +169,10 @@ struct StentOut {
 }
 
 const SETTLE: Duration = Duration::from_millis(150);
+
+/// The way followed at a fork past an end, and the others there.
+const FOLLOWED: egui::Color32 = egui::Color32::from_rgb(120, 255, 170);
+const OTHER_WAY: egui::Color32 = egui::Color32::from_rgb(90, 170, 255);
 
 pub struct StentTool {
     object: Option<ObjectId>,
@@ -147,6 +194,10 @@ pub struct StentTool {
     changed: Option<(StentKey, Instant)>,
     error: Option<(StentKey, String)>,
     pressed: Option<egui::Pos2>,
+    /// Points on ways picked at forks past the ends (cleared with the ends).
+    via: Vec<DVec3>,
+    /// Where the pointer is over the view.
+    hover: Option<egui::Pos2>,
 }
 
 impl StentTool {
@@ -166,6 +217,8 @@ impl StentTool {
             changed: None,
             error: None,
             pressed: None,
+            via: Vec::new(),
+            hover: None,
         }
     }
 
@@ -179,6 +232,9 @@ impl StentTool {
     }
 
     fn sections_changed(&mut self) {
+        if self.sections.is_empty() {
+            self.via.clear();
+        }
         self.revision += 1;
         self.trace = None;
         if let Some((_, j)) = self.trace_job.take() {
@@ -311,7 +367,8 @@ impl StentTool {
                 let sections = [self.sections[0].clone(), self.sections[1].clone()];
                 let mesh = source.clone();
                 let cache = self.cache.clone();
-                self.trace_job = Some((self.revision, Job::spawn("Centerline", cx.egui.clone(), move |progress| trace_vessel_with(&mesh, &sections, &cache, Some(progress)))));
+                let via = self.via.clone();
+                self.trace_job = Some((self.revision, Job::spawn("Centerline", cx.egui.clone(), move |progress| trace_vessel_with(&mesh, &sections, &via, &cache, Some(progress)))));
             }
             return;
         }
@@ -342,6 +399,66 @@ impl StentTool {
         ));
     }
 
+    /// The current trace (for these sections and this shape of the mesh).
+    fn current_trace(&self) -> Option<&VesselTrace> {
+        self.trace.as_ref().filter(|t| t.0 == self.revision).map(|t| &*t.2)
+    }
+
+    /// Whether the way taken at `fork` changes the result with the settings as they are: the
+    /// fork lies within the reach of the stent past its end and that end's blend (with
+    /// margin), where the vessel's course is used. Beyond it nothing moves.
+    fn matters(&self, fork: &Fork, span: f64) -> bool {
+        let overhang = (0.5 * (self.ui.length - span)).max(0.0);
+        let size = self.sections.get(fork.end).map_or(0.0, |s| s.diameter);
+        fork.past <= 1.25 * (self.ui.end_blend[fork.end] + overhang) + size
+    }
+
+    /// The forks drawn for picking: those that matter.
+    fn shown_forks(&self) -> Vec<Fork> {
+        self.current_trace().map_or_else(Vec::new, |t| t.forks.iter().filter(|f| self.matters(f, t.span)).cloned().collect())
+    }
+
+    /// The way not followed whose drawing passes within a few points of `pos` on screen.
+    fn way_at(&self, pos: egui::Pos2, cx: &ToolCx) -> Option<(Fork, usize)> {
+        let mut best: Option<(Fork, usize, f32)> = None;
+        for f in self.shown_forks() {
+            for (i, w) in f.ways.iter().enumerate().filter(|(_, w)| !w.followed) {
+                let pts: Vec<egui::Pos2> = w.points.iter().filter_map(|&p| cx.project(p)).collect();
+                let d = pts.windows(2).map(|s| segment_distance(pos, s[0], s[1])).fold(f32::INFINITY, f32::min);
+                if d < 8.0 && best.as_ref().is_none_or(|b| d < b.2) {
+                    best = Some((f.clone(), i, d));
+                }
+            }
+        }
+        best.map(|(f, i, _)| (f, i))
+    }
+
+    /// Follow way `i` of `fork` from now on (and no longer another way there), and retrace.
+    fn follow(&mut self, fork: &Fork, i: usize) {
+        let tol = 0.25 * self.sections.get(fork.end).map_or(1.0, |s| s.diameter);
+        self.via.retain(|&v| fork.ways.iter().all(|w| w.distance(v) >= tol));
+        let w = &fork.ways[i];
+        // A point well along the way, clear of the junction where the ways run together.
+        self.via.push(w.points[(2 * w.points.len() / 3).min(w.points.len() - 1)]);
+        self.sections_changed();
+    }
+
+    /// Follow the way at any fork whose drawing passes nearest `p`. Returns the status.
+    fn follow_nearest(&mut self, p: DVec3) -> Result<String, String> {
+        let t = self.current_trace().ok_or("no traced centerline yet: set both ends and wait for the trace")?;
+        let (fork, i, _) = t
+            .forks
+            .iter()
+            .flat_map(|f| f.ways.iter().enumerate().map(move |(i, w)| (f, i, w.distance(p))))
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .ok_or("there is no fork past the ends: the vessel runs on one way only")?;
+        let (fork, msg) = (fork.clone(), format!("Following the way that runs on {:.1} mm past end {}", fork.ways[i].length, fork.end + 1));
+        if !fork.ways[i].followed {
+            self.follow(&fork, i);
+        }
+        Ok(msg)
+    }
+
     /// Keep the reshaped vessel (the preview if it is up to date, else built now), in the
     /// object or as a copy. Returns the status.
     fn apply(&mut self, cx: &mut ToolCx) -> Result<String, String> {
@@ -354,7 +471,7 @@ impl StentTool {
             _ => {
                 let trace = match &self.trace {
                     Some((rev, m, t)) if *rev == self.revision && Arc::ptr_eq(m, &source) => t.clone(),
-                    _ => Arc::new(trace_vessel_with(&source, &[self.sections[0].clone(), self.sections[1].clone()], &self.cache, None).map_err(|e| format!("{e:#}"))?),
+                    _ => Arc::new(trace_vessel_with(&source, &[self.sections[0].clone(), self.sections[1].clone()], &self.via, &self.cache, None).map_err(|e| format!("{e:#}"))?),
                 };
                 let (mesh, _, report, _) = Self::build(&source, &trace, [self.sections[0].stent(), self.sections[1].stent()], &key).map_err(|e| format!("{e:#}"))?;
                 (mesh, report)
@@ -392,7 +509,7 @@ fn warnings(out: &StentOut) -> Vec<String> {
     let pl = &out.placement;
     let mut w = Vec::new();
     if let Some(e) = (0..2).filter(|&e| pl.return_bend[e] > 0.7).max_by(|&a, &b| pl.return_bend[a].total_cmp(&pl.return_bend[b])) {
-        w.push(format!("Past end {} the vessel has to bend back sharply onto its course within the end blend, so its wall may crease: lengthen the end blend or lower the straightness.", e + 1));
+        w.push(format!("Past end {} the vessel has to bend back sharply onto its course within the end blend, so its wall may crease: lengthen that end's blend or lower the straightness.", e + 1));
     }
     let moved = out.report.moved_openings.saturating_sub(out.report.sealed_openings);
     if moved > 0 {
@@ -416,6 +533,13 @@ fn warnings(out: &StentOut) -> Vec<String> {
     w
 }
 
+/// Distance on screen from `p` to the segment `a`–`b`.
+fn segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-12)).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
 fn trim(x: f64) -> String {
     let s = format!("{x:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -433,7 +557,7 @@ fn sealed_text(r: &mm_edit::StentReport) -> String {
 /// both (the straightest way at each junction).
 #[cfg_attr(not(test), allow(dead_code))]
 fn trace_vessel(mesh: &Mesh, sections: &[Section; 2]) -> anyhow::Result<VesselTrace> {
-    trace_vessel_with(mesh, sections, &TraceCache::default(), None)
+    trace_vessel_with(mesh, sections, &[], &TraceCache::default(), None)
 }
 
 /// The vessel capped at its open ends (with its tree) and its centerline tree, each built once
@@ -444,10 +568,11 @@ struct TraceCache {
     tree: centerline::TreeCache,
 }
 
-/// [`trace_vessel`], with what is built for the mesh kept in `cache` for the next trace
-/// through it, and stopping early (with an error) once `progress` says the trace is no longer
-/// wanted.
-fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], cache: &TraceCache, progress: Option<ProgressFn>) -> anyhow::Result<VesselTrace> {
+/// [`trace_vessel`] following the ways on past the ends that the points `via` lie on (picked
+/// at a [`Fork`]; elsewhere the longest), with what is built for the mesh kept in `cache` for
+/// the next trace through it, and stopping early (with an error) once `progress` says the
+/// trace is no longer wanted.
+fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], via: &[DVec3], cache: &TraceCache, progress: Option<ProgressFn>) -> anyhow::Result<VesselTrace> {
     let going = |x: f32| progress.is_none_or(|p| p(x));
     let [a, b] = sections;
     if !going(0.05) {
@@ -512,8 +637,13 @@ fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], cache: &TraceCache, p
     let pos = |i: usize| cl.nodes[i].position;
     let length = |c: &[usize]| c.windows(2).map(|w| pos(w[0]).distance(pos(w[1]))).sum::<f64>();
     let reach = (3.0 * length(&chain)).max(20.0 * a.diameter.max(b.diameter));
-    let before = walk_on(&cl, &adjacent, chain[0], chain[1], reach);
-    let after = walk_on(&cl, &adjacent, chain[chain.len() - 1], chain[chain.len() - 2], reach);
+    // On past each end the way that runs on furthest (the vessel, not a short side branch near
+    // the end), or the one picked; never back along the stretch or the other end's way.
+    let mut blocked: std::collections::HashSet<usize> = chain.iter().copied().collect();
+    let (before, forks_a) = walk_on(&cl, &adjacent, chain[0], chain[1], reach, &blocked, via, a.diameter);
+    blocked.extend(before.iter().copied());
+    let (after, forks_b) = walk_on(&cl, &adjacent, chain[chain.len() - 1], chain[chain.len() - 2], reach, &blocked, via, b.diameter);
+    let forks: Vec<Fork> = forks_a.into_iter().map(|f| Fork { end: 0, ..f }).chain(forks_b.into_iter().map(|f| Fork { end: 1, ..f })).collect();
     let nodes: Vec<usize> = before.iter().rev().chain(&chain).chain(&after).copied().collect();
     let on_path: std::collections::HashSet<usize> = nodes.iter().copied().collect();
     let owner = cl.vertex_node.iter().map(|n| on_path.contains(n)).collect();
@@ -534,7 +664,7 @@ fn trace_vessel_with(mesh: &Mesh, sections: &[Section; 2], cache: &TraceCache, p
     }
     let ends = [a, b].map(|s| crossing(&path.points, s.center, s.normal).filter(|c| c.distance(s.center) < 0.5 * s.diameter).unwrap_or(s.center));
     let span = path.span(ends.map(|center| mm_edit::StentSection { center, normal: DVec3::Z })).unwrap_or(0.0);
-    Ok(VesselTrace { path, ends, owner, span, min_lumen })
+    Ok(VesselTrace { path, ends, owner, span, min_lumen, forks })
 }
 
 /// Where `path` crosses the plane through `c` square to `n`, nearest `c`.
@@ -805,24 +935,130 @@ fn chain_between(cl: &Centerline, adjacent: &[Vec<usize>], from: usize, to: usiz
     Some(out)
 }
 
-/// Nodes on past `end` away from `back`, taking the straightest way at junctions, for about
-/// `reach`.
-fn walk_on(cl: &Centerline, adjacent: &[Vec<usize>], end: usize, back: usize, reach: f64) -> Vec<usize> {
+/// Nodes on past `end` away from `back` (never through `blocked`), for about `reach`. At
+/// each junction it takes the way that runs on furthest, counting all of it, not only what
+/// the stent reaches: the vessel goes on where a short side branch or a sprout into a corner
+/// near the end soon stops. A way that a point of `via` lies on (as drawn at a [`Fork`]) is
+/// taken instead. Round a loop (a fenestration, both sides joining again) it takes the
+/// straighter side.
+///
+/// Also returns the junctions where two or more ways run on for twice `size` (the end's
+/// diameter) or more, so either could be the vessel ([`Fork`], its `end` still to be set).
+#[allow(clippy::too_many_arguments)]
+fn walk_on(cl: &Centerline, adjacent: &[Vec<usize>], end: usize, back: usize, reach: f64, blocked: &std::collections::HashSet<usize>, via: &[DVec3], size: f64) -> (Vec<usize>, Vec<Fork>) {
     let pos = |i: usize| cl.nodes[i].position;
+    let long = 2.0 * size;
+    // Ways are drawn for three diameters (10 mm at least), and a picked point lies on one
+    // within a quarter diameter.
+    let shown = (3.0 * size).max(10.0);
+    let tol = 0.25 * size;
     let (mut prev, mut cur, mut len) = (back, end, 0.0);
-    let mut seen: std::collections::HashSet<usize> = [back, end].into_iter().collect();
+    let mut seen = blocked.clone();
+    seen.extend([back, end]);
     let mut out = Vec::new();
+    let mut forks = Vec::new();
     while len < reach {
         let dir = (pos(cur) - pos(prev)).normalize_or_zero();
-        let Some(next) = adjacent[cur].iter().copied().filter(|n| !seen.contains(n)).max_by(|&x, &y| (pos(x) - pos(cur)).normalize_or_zero().dot(dir).total_cmp(&(pos(y) - pos(cur)).normalize_or_zero().dot(dir))) else {
-            break;
+        let straight = |n: usize| (pos(n) - pos(cur)).normalize_or_zero().dot(dir);
+        let open: Vec<usize> = adjacent[cur].iter().copied().filter(|n| !seen.contains(n)).collect();
+        let next = match open.len() {
+            0 => break,
+            1 => open[0],
+            _ => {
+                let ways = ways_on(cl, adjacent, cur, &open, &seen);
+                let drawn: Vec<Way> = ways
+                    .iter()
+                    .map(|w| {
+                        let mut points = vec![pos(w.course[0])];
+                        let mut d = 0.0;
+                        for c in w.course.windows(2) {
+                            if d >= shown {
+                                break;
+                            }
+                            d += pos(c[0]).distance(pos(c[1]));
+                            points.push(pos(c[1]));
+                        }
+                        Way { points, length: w.length, followed: false }
+                    })
+                    .collect();
+                let picked = via.iter().find_map(|&v| (0..drawn.len()).map(|g| (g, drawn[g].distance(v))).filter(|x| x.1 < tol).min_by(|x, y| x.1.total_cmp(&y.1)).map(|x| x.0));
+                let g = picked.unwrap_or_else(|| (0..ways.len()).max_by(|&x, &y| ways[x].length.total_cmp(&ways[y].length)).unwrap());
+                // The ways long enough to be the vessel, and the one followed (a short one picked).
+                let long_ways: Vec<usize> = (0..ways.len()).filter(|&x| ways[x].length >= long || x == g).collect();
+                if long_ways.len() >= 2 {
+                    let ways = long_ways.iter().map(|&x| Way { followed: x == g, ..drawn[x].clone() }).collect();
+                    forks.push(Fork { end: 0, at: pos(cur), past: len, ways });
+                }
+                ways[g].starts.iter().copied().max_by(|&x, &y| straight(x).total_cmp(&straight(y))).unwrap()
+            }
         };
         len += pos(cur).distance(pos(next));
         seen.insert(next);
         out.push(next);
         (prev, cur) = (cur, next);
     }
-    out
+    (out, forks)
+}
+
+/// One way on from a junction: the neighbours it leaves by (more than one where they join
+/// again further on, round a fenestration), how far it runs on (to its farthest node, along
+/// the centerline), and the course there from the junction.
+struct WayOn {
+    starts: Vec<usize>,
+    length: f64,
+    course: Vec<usize>,
+}
+
+/// The ways on from `cur` through the neighbours `open`, never through `cur` or `blocked`.
+fn ways_on(cl: &Centerline, adjacent: &[Vec<usize>], cur: usize, open: &[usize], blocked: &std::collections::HashSet<usize>) -> Vec<WayOn> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let pos = |i: usize| cl.nodes[i].position;
+    let n = cl.nodes.len();
+    let mut group = vec![usize::MAX; n];
+    let mut ways: Vec<WayOn> = Vec::new();
+    for &s in open {
+        if group[s] != usize::MAX {
+            ways[group[s]].starts.push(s);
+            continue;
+        }
+        let g = ways.len();
+        // Shortest distances along the centerline from `cur` through `s`.
+        let mut dist = vec![f64::INFINITY; n];
+        let mut from = vec![usize::MAX; n];
+        dist[s] = pos(cur).distance(pos(s));
+        from[s] = cur;
+        let mut heap = BinaryHeap::from([Reverse((dist[s].to_bits(), s))]);
+        let mut far = s;
+        while let Some(Reverse((bits, u))) = heap.pop() {
+            let d = f64::from_bits(bits);
+            if d > dist[u] {
+                continue;
+            }
+            group[u] = g;
+            if d > dist[far] {
+                far = u;
+            }
+            for &v in &adjacent[u] {
+                if v == cur || blocked.contains(&v) {
+                    continue;
+                }
+                let nd = d + pos(u).distance(pos(v));
+                if nd < dist[v] {
+                    dist[v] = nd;
+                    from[v] = u;
+                    heap.push(Reverse((nd.to_bits(), v)));
+                }
+            }
+        }
+        let mut course = vec![far];
+        while *course.last().unwrap() != cur {
+            course.push(from[*course.last().unwrap()]);
+        }
+        course.reverse();
+        ways.push(WayOn { starts: vec![s], length: dist[far], course });
+    }
+    ways
 }
 
 impl Tool for StentTool {
@@ -832,8 +1068,9 @@ impl Tool for StentTool {
 
     fn script(&mut self, cmd: &str, cx: &mut ToolCx) {
         // `end:x,y,z` (the nearest wall point), `clear`, `apply`, and the settings:
-        // `diameter`, `length`, `straightness` / `stiffness` (%), `ends:g0|g1|g2`, `blend`,
-        // `covered:on|off`, `remesh:on|off`, `inplace:on|off`.
+        // `diameter`, `length`, `straightness` / `stiffness` (%), `ends:g0|g1|g2`, `blend` (both
+        // ends) / `blend1` / `blend2`, `covered:on|off`, `remesh:on|off`, `inplace:on|off`, and
+        // `way:x,y,z` (follow the way on at a fork nearest the point).
         let (key, val) = cmd.split_once(':').unwrap_or((cmd, ""));
         let num = val.parse::<f64>().ok();
         let on = val != "off" && val != "0";
@@ -870,7 +1107,17 @@ impl Tool for StentTool {
             }
             "straightness" => self.ui.straightness = num.unwrap_or(self.ui.straightness).clamp(0.0, 100.0),
             "stiffness" => self.ui.stiffness = num.unwrap_or(self.ui.stiffness).clamp(0.0, 100.0),
-            "blend" => self.ui.end_blend = num.unwrap_or(self.ui.end_blend).clamp(0.0, 40.0),
+            "blend" => self.ui.end_blend = self.ui.end_blend.map(|b| num.unwrap_or(b).clamp(0.0, 40.0)),
+            "blend1" => self.ui.end_blend[0] = num.unwrap_or(self.ui.end_blend[0]).clamp(0.0, 40.0),
+            "blend2" => self.ui.end_blend[1] = num.unwrap_or(self.ui.end_blend[1]).clamp(0.0, 40.0),
+            "way" => {
+                let v: Vec<f64> = val.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let &[x, y, z] = &v[..] {
+                    if let Err(e) = self.follow_nearest(DVec3::new(x, y, z)) {
+                        *cx.status = e;
+                    }
+                }
+            }
             "ends" => {
                 self.ui.continuity = match val {
                     "g0" => EndContinuity::G0,
@@ -937,7 +1184,7 @@ impl Tool for StentTool {
         // Typed sizes stop following the ends, as in the panel.
         self.sized[0] |= changes.get("diameter").is_some();
         self.sized[1] |= changes.get("length").is_some();
-        self.ui = StentUi { diameter: ui.diameter.clamp(0.5, 60.0), length: ui.length.clamp(1.0, 400.0), straightness: ui.straightness.clamp(0.0, 100.0), stiffness: ui.stiffness.clamp(0.0, 100.0), end_blend: ui.end_blend.clamp(0.0, 40.0), ..ui };
+        self.ui = StentUi { diameter: ui.diameter.clamp(0.5, 60.0), length: ui.length.clamp(1.0, 400.0), straightness: ui.straightness.clamp(0.0, 100.0), stiffness: ui.stiffness.clamp(0.0, 100.0), end_blend: ui.end_blend.map(|b| b.clamp(0.0, 40.0)), ..ui };
         self.update(cx);
         Ok(())
     }
@@ -963,6 +1210,17 @@ impl Tool for StentTool {
             "centerline_between_ends_mm": self.trace.as_ref().filter(|t| t.0 == self.revision).map(|t| round(t.2.span, 2)),
             "minimal_lumen_mm": self.trace.as_ref().filter(|t| t.0 == self.revision).and_then(|t| t.2.min_lumen).map(|d| round(d, 2)),
             "sizes_follow_the_ends": {"diameter": !self.sized[0], "length": !self.sized[1]},
+            "forks": self.current_trace().map(|t| t.forks.iter().map(|f| json!({
+                "past_end": f.end + 1,
+                "junction_mm": vec3(f.at.to_array(), 3),
+                "distance_past_end_mm": round(f.past, 2),
+                "matters_with_these_settings": self.matters(f, t.span),
+                "ways": f.ways.iter().map(|w| json!({
+                    "runs_on_mm": round(w.length, 1),
+                    "followed": w.followed,
+                    "point_on_it_mm": vec3(w.points[(2 * w.points.len() / 3).min(w.points.len() - 1)].to_array(), 3),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>()),
             "computing": self.trace_job.as_ref().map(|_| "tracing the centerline").or(self.job.as_ref().map(|_| "previewing")),
             "preview": current.map(|out| {
                 let pl = &out.placement;
@@ -989,6 +1247,12 @@ impl Tool for StentTool {
                 serde_json::json!({"at": arg::point("A point in mm on or near the vessel wall"), "end": arg::integer("1 or 2: which end to set")}),
             )
             .required(&["at"]),
+            Action::new(
+                "follow_way",
+                "At a fork past an end (see `forks` in the state), follow the way on nearest `at` instead of the longest (as clicking a drawn way does); the centerline is traced again",
+                serde_json::json!({"at": arg::point("A point in mm on or near the way, e.g. its point_on_it_mm")}),
+            )
+            .required(&["at"]),
             Action::plain("clear", "Remove both ends"),
             Action::plain("apply", "Keep the reshaped vessel (the preview, or built now) in the object or as a copy (see in_place); the ends are cleared for the next stent"),
         ]
@@ -1011,6 +1275,11 @@ impl Tool for StentTool {
                 self.update(cx);
                 let s = &self.sections[i];
                 Ok(format!("End {} at [{:.2}, {:.2}, {:.2}], ⌀ {:.2} mm", i + 1, s.center.x, s.center.y, s.center.z, s.diameter))
+            }
+            "follow_way" => {
+                let msg = self.follow_nearest(DVec3::from_array(a.point("at")?))?;
+                self.update(cx);
+                Ok(msg)
             }
             "clear" => {
                 self.sections.clear();
@@ -1048,6 +1317,11 @@ impl Tool for StentTool {
                 ui.label(format!("Minimal lumen ⌀ {d:.2} mm")).on_hover_text("The largest sphere that fits inside the lumen at its narrowest, between the ends");
             }
         }
+        let forks = self.shown_forks();
+        if !forks.is_empty() {
+            let ends: Vec<String> = [0, 1].into_iter().filter(|&e| forks.iter().any(|f| f.end == e)).map(|e| (e + 1).to_string()).collect();
+            ui.colored_label(FOLLOWED, format!("Past end {} the vessel could run on more than one way: the trace follows the longest (green). Click a blue one to follow it instead.", ends.join(" and ")));
+        }
         ui.separator();
         egui::Grid::new("stent_size").num_columns(2).show(ui, |ui| {
             ui.label("Diameter");
@@ -1071,8 +1345,10 @@ impl Tool for StentTool {
         });
         ui.add(egui::Slider::new(&mut self.ui.stiffness, 0.0..=100.0).suffix("%").text("Stiffness"))
             .on_hover_text("Radial force: along the stent, each way across, the lumen lies this share of the way from the vessel's own wall to the stent's radius (2 mm vessel, 6 mm stent, 50 % → 4 mm), so the vessel's shape eases into the round stent. 100 % makes a perfect tube of the stent's diameter; 0 % leaves the vessel as it is. A bare stent never pulls wider wall in; a covered one narrows it to the stent");
-        ui.add(egui::Slider::new(&mut self.ui.end_blend, 0.0..=40.0).suffix(" mm").text("End blend"))
-            .on_hover_text("How far past each end of the stent the wall eases back to its own shape and course. Nothing beyond it changes; a straightened stent may need a longer one");
+        for (e, blend) in self.ui.end_blend.iter_mut().enumerate() {
+            ui.add(egui::Slider::new(blend, 0.0..=40.0).suffix(" mm").text(format!("End blend, end {}", e + 1)))
+                .on_hover_text(format!("How far past the stent's end by end {} the wall eases back to its own shape and course. Nothing beyond it changes; a straightened stent may need a longer one", e + 1));
+        }
         ui.checkbox(&mut self.ui.covered, "Covered (stent graft)")
             .on_hover_text("The lumen along the stent becomes the stent's tube: wider wall (an aneurysm, a dilated stretch) is narrowed to the stent's diameter, and side branches opening along it are sealed off and removed");
         ui.checkbox(&mut self.ui.remesh, "Remesh the reshaped wall").on_hover_text("Even triangles over the reshaped region (recommended for CFD)");
@@ -1120,6 +1396,7 @@ impl Tool for StentTool {
     }
 
     fn pointer(&mut self, input: &PointerInput, cx: &mut ToolCx) {
+        self.hover = input.pos;
         let Some(pos) = input.pos else { return };
         if input.pressed {
             self.pressed = Some(pos);
@@ -1129,6 +1406,11 @@ impl Tool for StentTool {
         }
         let Some(p0) = self.pressed.take() else { return };
         if p0.distance(pos) > 5.0 {
+            return;
+        }
+        // A click on a way drawn at a fork follows it; elsewhere it sets an end.
+        if let Some((fork, i)) = self.way_at(pos, cx) {
+            self.follow(&fork, i);
             return;
         }
         if let Some((id, hit)) = cx.pick(pos, self.object.filter(|_| !self.sections.is_empty())) {
@@ -1168,6 +1450,25 @@ impl Tool for StentTool {
     }
 
     fn paint(&mut self, painter: &egui::Painter, cx: &mut ToolCx) {
+        // The ways on at forks past the ends, on top of the surface (they run inside the
+        // vessel): the one followed green, the others blue (white under the pointer).
+        let hot = self.hover.and_then(|p| self.way_at(p, cx));
+        for f in self.shown_forks() {
+            for (i, w) in f.ways.iter().enumerate() {
+                let pts: Vec<egui::Pos2> = w.points.iter().filter_map(|&p| cx.project(p)).collect();
+                let lit = hot.as_ref().is_some_and(|(h, j)| *j == i && h.at == f.at && h.end == f.end);
+                let (width, colour) = if w.followed { (3.0, FOLLOWED) } else if lit { (4.0, egui::Color32::WHITE) } else { (2.5, OTHER_WAY) };
+                if let Some(&last) = pts.last() {
+                    if lit {
+                        painter.text(last + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("follow this way ({:.0} mm on)", w.length), egui::FontId::proportional(13.0), egui::Color32::WHITE);
+                    }
+                }
+                painter.add(egui::Shape::line(pts, egui::Stroke::new(width, colour)));
+            }
+            if let Some(p) = cx.project(f.at) {
+                painter.circle(p, 4.0, FOLLOWED, egui::Stroke::new(1.0, egui::Color32::WHITE));
+            }
+        }
         for (i, s) in self.sections.iter().enumerate() {
             if let Some(p) = cx.project(s.center) {
                 painter.text(p, egui::Align2::LEFT_BOTTOM, format!("{} ⌀ {:.2}", i + 1, s.diameter), egui::FontId::proportional(14.0), egui::Color32::from_rgb(120, 255, 170));
@@ -1256,8 +1557,8 @@ mod tests {
         // blend: a longer one for a smooth wall.
         for (ui, label) in [
             (StentUi { length: 30.0, ..Default::default() }, "bare, half straight"),
-            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, end_blend: 8.0, ..Default::default() }, "bare, straight"),
-            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, covered: true, stiffness: 50.0, end_blend: 16.0, ..Default::default() }, "covered, straight"),
+            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, end_blend: [8.0; 2], ..Default::default() }, "bare, straight"),
+            (StentUi { length: 30.0, straightness: 100.0, continuity: EndContinuity::G0, covered: true, stiffness: 50.0, end_blend: [16.0; 2], ..Default::default() }, "covered, straight"),
         ] {
             let key = StentKey { sections: 1, ui };
             let (out, pl, rep, crossings) = StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &key).unwrap();
@@ -1280,7 +1581,77 @@ mod tests {
         let (mesh, placement, report, crossings) = StentTool::build(&m, &trace, [sections[0].stent(), sections[1].stent()], &StentKey { sections: 1, ui }).unwrap();
         assert_eq!(changed_past_the_end_blend(&m, &mesh, &placement).0, 0);
         let out = StentOut { source: Arc::new(m.clone()), mesh, placement, report, crossings };
-        assert!(warnings(&out).iter().any(|w| w.contains("lengthen the end blend")), "{:?}", warnings(&out));
+        assert!(warnings(&out).iter().any(|w| w.contains("lengthen that end's blend")), "{:?}", warnings(&out));
+    }
+
+    /// A centerline of polylines (each a list of points), joined where they share a point.
+    fn graph(lines: &[Vec<DVec3>]) -> (Centerline, Vec<Vec<usize>>) {
+        let mut cl = Centerline::default();
+        let mut adjacent: Vec<Vec<usize>> = Vec::new();
+        let id = |cl: &mut Centerline, adjacent: &mut Vec<Vec<usize>>, p: DVec3| match cl.nodes.iter().position(|n| n.position.distance(p) < 1e-9) {
+            Some(i) => i,
+            None => {
+                cl.nodes.push(centerline::CenterlineNode { position: p, radius: 1.0 });
+                adjacent.push(Vec::new());
+                cl.nodes.len() - 1
+            }
+        };
+        for line in lines {
+            let ids: Vec<usize> = line.iter().map(|&p| id(&mut cl, &mut adjacent, p)).collect();
+            for w in ids.windows(2) {
+                adjacent[w[0]].push(w[1]);
+                adjacent[w[1]].push(w[0]);
+            }
+        }
+        (cl, adjacent)
+    }
+
+    #[test]
+    fn the_walk_past_an_end_follows_the_longest_way_unless_another_is_picked() {
+        let x = |a: f64, b: f64| (0..=((b - a) as usize)).map(|i| DVec3::new(a + i as f64, 0.0, 0.0)).collect::<Vec<_>>();
+        // The vessel runs along x from 0, the stent's end at 10. At 12 a short sprout carries
+        // on straight (6 mm) while the vessel bends off along y for 60 mm; at 30 along it a
+        // side branch of 25 mm leaves square.
+        let trunk: Vec<DVec3> = x(0.0, 12.0);
+        let sprout: Vec<DVec3> = x(12.0, 18.0);
+        let vessel: Vec<DVec3> = (0..=60).map(|i| DVec3::new(12.0, i as f64, 0.0)).collect();
+        let side: Vec<DVec3> = (0..=25).map(|i| DVec3::new(12.0 - i as f64, 30.0, 0.0)).collect();
+        let (cl, adjacent) = graph(&[trunk, sprout, vessel, side]);
+        let node = |p: DVec3| cl.nodes.iter().position(|n| n.position.distance(p) < 1e-9).unwrap();
+        let (end, back) = (node(DVec3::new(10.0, 0.0, 0.0)), node(DVec3::new(9.0, 0.0, 0.0)));
+        let blocked: std::collections::HashSet<usize> = (0..=10).map(|i| node(DVec3::new(i as f64, 0.0, 0.0))).collect();
+        let last = |nodes: &[usize]| cl.nodes[*nodes.last().unwrap()].position;
+        // The longest way: up the vessel to its end, past the sprout and the side branch. With
+        // a 4 mm end, only the side branch (25 mm) is long enough to be the vessel too.
+        let (nodes, forks) = walk_on(&cl, &adjacent, end, back, 200.0, &blocked, &[], 4.0);
+        assert!(last(&nodes).distance(DVec3::new(12.0, 60.0, 0.0)) < 1e-9, "{:?}", last(&nodes));
+        assert_eq!(forks.len(), 1, "{forks:?}");
+        let f = &forks[0];
+        assert!(f.at.distance(DVec3::new(12.0, 30.0, 0.0)) < 1e-9 && (f.past - 32.0).abs() < 1e-9, "{f:?}");
+        assert_eq!(f.ways.len(), 2);
+        let followed = f.ways.iter().find(|w| w.followed).unwrap();
+        assert!((followed.length - 30.0).abs() < 1e-9, "{followed:?}");
+        // Picking the side branch (a point on it as drawn) follows it instead, and the fork
+        // still offers the vessel.
+        let other = f.ways.iter().find(|w| !w.followed).unwrap();
+        let via = other.points[2 * other.points.len() / 3];
+        let (nodes, forks) = walk_on(&cl, &adjacent, end, back, 200.0, &blocked, &[via], 4.0);
+        assert!(last(&nodes).distance(DVec3::new(-13.0, 30.0, 0.0)) < 1e-9, "{:?}", last(&nodes));
+        assert!(forks.len() == 1 && forks[0].ways.iter().any(|w| w.followed && (w.length - 25.0).abs() < 1e-9));
+        // Picking the short sprout: followed, and drawn as a fork with the vessel.
+        let (nodes, forks) = walk_on(&cl, &adjacent, end, back, 200.0, &blocked, &[DVec3::new(16.0, 0.0, 0.0)], 4.0);
+        assert!(last(&nodes).distance(DVec3::new(18.0, 0.0, 0.0)) < 1e-9, "{:?}", last(&nodes));
+        assert!(forks.len() == 1 && forks[0].ways.len() == 2 && forks[0].ways.iter().any(|w| w.followed && (w.length - 6.0).abs() < 1e-9), "{forks:?}");
+        // Round a loop (a fenestration: the vessel splits and joins again) the straighter side.
+        let left: Vec<DVec3> = [DVec3::new(10.0, 0.0, 0.0), DVec3::new(12.0, 3.0, 0.0), DVec3::new(16.0, 3.0, 0.0), DVec3::new(18.0, 0.0, 0.0)].to_vec();
+        let right: Vec<DVec3> = x(10.0, 18.0);
+        let (cl, adjacent) = graph(&[x(0.0, 10.0), left, right, x(18.0, 50.0)]);
+        let node = |p: DVec3| cl.nodes.iter().position(|n| n.position.distance(p) < 1e-9).unwrap();
+        let blocked: std::collections::HashSet<usize> = (0..=10).map(|i| node(DVec3::new(i as f64, 0.0, 0.0))).collect();
+        let (nodes, forks) = walk_on(&cl, &adjacent, node(DVec3::new(10.0, 0.0, 0.0)), node(DVec3::new(9.0, 0.0, 0.0)), 200.0, &blocked, &[], 4.0);
+        assert!(forks.is_empty(), "{forks:?}");
+        assert!(cl.nodes[nodes[0]].position.distance(DVec3::new(11.0, 0.0, 0.0)) < 1e-9);
+        assert!(cl.nodes[*nodes.last().unwrap()].position.distance(DVec3::new(50.0, 0.0, 0.0)) < 1e-9);
     }
 
     #[test]
@@ -1304,7 +1675,7 @@ mod tests {
         // ends it was first made for and for others.
         let capped = TraceCache::default();
         for ends in [&sections, &moved, &sections] {
-            let kept = trace_vessel_with(&m, ends, &capped, None).unwrap();
+            let kept = trace_vessel_with(&m, ends, &[], &capped, None).unwrap();
             assert!(kept.min_lumen.is_some());
             assert!(same(&kept, &trace_vessel(&m, ends).unwrap()));
         }
@@ -1317,7 +1688,7 @@ mod tests {
                 reports.set(reports.get() + 1);
                 true
             };
-            trace_vessel_with(&m, &sections, &cache(), Some(&count)).unwrap();
+            trace_vessel_with(&m, &sections, &[], &cache(), Some(&count)).unwrap();
             let total = reports.get();
             assert!(total >= if kept { 8 } else { 10 }, "{total} reports");
             for after in 0..total {
@@ -1326,7 +1697,7 @@ mod tests {
                     calls.set(calls.get() + 1);
                     calls.get() <= after
                 };
-                let r = trace_vessel_with(&m, &sections, &cache(), Some(&stop));
+                let r = trace_vessel_with(&m, &sections, &[], &cache(), Some(&stop));
                 assert!(r.is_err_and(|e| e.to_string() == "cancelled"), "kept {kept}: stopped after {after} of {total} reports");
                 // (Asked at most once more on the way out of the inscribed path.)
                 assert!(calls.get() <= after + 2);
@@ -1371,7 +1742,7 @@ mod tests {
         let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
         let mut t = StentTool::new(&mut cx);
         let names: Vec<&str> = t.actions().iter().map(|a| a.name).collect();
-        assert_eq!(names, ["set_end", "clear", "apply"]);
+        assert_eq!(names, ["set_end", "follow_way", "clear", "apply"]);
         assert_eq!(t.state(cx.scene)["next"], "set_end (or click the wall) at both ends of the stretch to treat");
         let wall = |s: f64| (centre(s) + DVec3::Z * 4.5).to_array();
         let (a0, b0) = (15.0 + 25.0 * 30f64.to_radians(), 15.0 + 25.0 * 90f64.to_radians());
@@ -1466,7 +1837,7 @@ mod tests {
             let sections = [a, b];
             let on_wall = |s: &Section| s.ring.first().map_or(s.center, |r| r[0]);
             eprintln!("sections {:.1} mm apart (POLYMIX_STENT_AT={:.4},{:.4},{:.4};{:.4},{:.4},{:.4})", sections[0].center.distance(sections[1].center), on_wall(&sections[0]).x, on_wall(&sections[0]).y, on_wall(&sections[0]).z, on_wall(&sections[1]).x, on_wall(&sections[1]).y, on_wall(&sections[1]).z);
-            let trace = match trace_vessel_with(&m, &sections, &cache, None) {
+            let trace = match trace_vessel_with(&m, &sections, &[], &cache, None) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("trace failed: {e:#}");
@@ -1862,7 +2233,7 @@ mod tests {
         let sections = [sec(&parts[0]), sec(&parts[1])];
         let s = &parts[2];
         let continuity = match s[3] as i32 { 0 => EndContinuity::G0, 2 => EndContinuity::G2, _ => EndContinuity::G1 };
-        let ui = StentUi { diameter: s[0], length: s[1], straightness: s[2], continuity, stiffness: s[4], end_blend: s[5], remesh: s.get(6).is_none_or(|&x| x != 0.0), covered: s.get(7).is_some_and(|&x| x != 0.0) };
+        let ui = StentUi { diameter: s[0], length: s[1], straightness: s[2], continuity, stiffness: s[4], end_blend: [s[5]; 2], remesh: s.get(6).is_none_or(|&x| x != 0.0), covered: s.get(7).is_some_and(|&x| x != 0.0) };
         let t0 = Instant::now();
         let trace = trace_vessel(&m, &sections).unwrap();
         eprintln!("traced in {:.1} s: span {:.1} mm, {} path points, {} owner vertices", t0.elapsed().as_secs_f64(), trace.span, trace.path.points.len(), trace.owner.iter().filter(|&&o| o).count());
@@ -1892,8 +2263,8 @@ mod tests {
         let at = |x: f64| pl.vessel[pl.s.partition_point(|&s| s < x).min(pl.s.len() - 1)];
         let (sa, sb) = (along(at(0.0)).1, along(at(ui.length)).1);
         let (s0, s1) = (sa.min(sb), sa.max(sb));
-        let eb = ui.end_blend;
-        let past = |s: f64| (s0 - eb - s).max(s - s1 - eb);
+        let eb = if sa <= sb { ui.end_blend } else { [ui.end_blend[1], ui.end_blend[0]] };
+        let past = |s: f64| (s0 - eb[0] - s).max(s - s1 - eb[1]);
         let past_of = |p: DVec3| past(along(p).1);
         let (changed, past) = changed_past_the_end_blend(&m, &out, &pl);
         eprintln!("past the end blend: {past} vertices, {changed} changed");

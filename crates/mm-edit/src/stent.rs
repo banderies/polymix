@@ -89,8 +89,9 @@ pub struct StentParams {
     pub continuity: EndContinuity,
     /// Radial force in 0..1: how far narrower wall is opened towards the stent's diameter.
     pub stiffness: f64,
-    /// Distance past each end over which the wall eases back to its own shape.
-    pub end_blend: f64,
+    /// Distance past each end over which the wall eases back to its own shape: past the
+    /// stent's start (by the first section) and past its end (by the second).
+    pub end_blend: [f64; 2],
     /// A covered stent (stent graft): the lumen along it becomes the stent's tube.
     pub covered: bool,
     /// Remesh the reshaped region to even triangles.
@@ -107,7 +108,7 @@ impl Default for StentParams {
             straightness: 0.5,
             continuity: EndContinuity::G1,
             stiffness: 1.0,
-            end_blend: 2.0,
+            end_blend: [2.0; 2],
             covered: false,
             remesh: true,
             edge_length: None,
@@ -118,8 +119,8 @@ impl Default for StentParams {
 fn check(params: &StentParams) -> EditResult<()> {
     let unit = |x: f64| (0.0..=1.0).contains(&x);
     let positive = |x: f64| x.is_finite() && x > 0.0;
-    if !positive(params.diameter) || !positive(params.length) || !unit(params.straightness) || !unit(params.stiffness) || !(params.end_blend >= 0.0 && params.end_blend.is_finite()) || params.edge_length.is_some_and(|h| !positive(h)) {
-        return Err(EditError::InvalidParameter("the stent needs a positive diameter and length, straightness and stiffness in 0..1 and an end blend of 0 or more".into()));
+    if !positive(params.diameter) || !positive(params.length) || !unit(params.straightness) || !unit(params.stiffness) || !params.end_blend.iter().all(|&b| b >= 0.0 && b.is_finite()) || params.edge_length.is_some_and(|h| !positive(h)) {
+        return Err(EditError::InvalidParameter("the stent needs a positive diameter and length, straightness and stiffness in 0..1 and end blends of 0 or more".into()));
     }
     Ok(())
 }
@@ -493,8 +494,8 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
     let span_len: f64 = span.windows(2).map(|x| x[0].0.distance(x[1].0)).sum();
     // Past each end the vessel is back on its own course by the end of the end blend: nothing
     // beyond it moves. (A few samples at least, where there is no end blend.)
-    let ret = params.end_blend.max(2.0 * ds);
-    let past = 1.25 * ((0.5 * (length - span_len)).max(0.0) + ret) + 4.0 * ds;
+    let ret = params.end_blend.map(|b| b.max(2.0 * ds));
+    let past = 1.25 * ((0.5 * (length - span_len)).max(0.0) + ret[0].max(ret[1])) + 4.0 * ds;
     let m = (past / ds).ceil() as usize;
     let ext_a = continue_path(a.center, -dirs[0], bends[0], 2.0 * r, ds, m);
     let ext_b = continue_path(b.center, dirs[1], bends[1], 2.0 * r, ds, m);
@@ -540,8 +541,8 @@ pub fn place_stent(path: &VesselPath, sections: [StentSection; 2], params: &Sten
     };
     let returns: Vec<(Curve, f64, f64)> = (0..2)
         .map(|e| {
-            let (path, sharp) = return_path(e, ret);
-            (path, ret, sharp)
+            let (path, sharp) = return_path(e, ret[e]);
+            (path, ret[e], sharp)
         })
         .collect();
     let beyond = |e: usize, u: f64| {
@@ -644,9 +645,9 @@ pub(crate) fn relax(mesh: &Mesh, moves: &mut [(u32, DVec3)]) {
     }
 }
 
-/// Past the end blend (`end_blend`) at either end, by the vessel's slice nearest `p` (as the
-/// carry decides what it moves). Nothing there changes.
-fn past_end(pl: &StentPlacement, end_blend: f64, p: DVec3) -> bool {
+/// Past the end blend (`end_blend`, per end) at either end, by the vessel's slice nearest `p`
+/// (as the carry decides what it moves). Nothing there changes.
+fn past_end(pl: &StentPlacement, end_blend: [f64; 2], p: DVec3) -> bool {
     let k = pl.vessel.len();
     let mut best = (f64::INFINITY, 0.0);
     for i in 0..k - 1 {
@@ -659,7 +660,7 @@ fn past_end(pl: &StentPlacement, end_blend: f64, p: DVec3) -> bool {
     }
     let i = (best.1.floor() as usize).min(k - 2);
     let s = pl.s[i] + (pl.s[i + 1] - pl.s[i]) * (best.1 - i as f64);
-    best.1 <= 0.0 || best.1 >= (k - 1) as f64 || s < -end_blend || s > pl.length + end_blend
+    best.1 <= 0.0 || best.1 >= (k - 1) as f64 || s < -end_blend[0] || s > pl.length + end_blend[1]
 }
 
 /// The sharpest a stent bends: its radius times its axis' curvature (a bend radius of the
@@ -1034,7 +1035,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, p:
     // The tube eases into the wall over the end blend and ends there: nothing beyond changes.
     let blend = params.end_blend;
     let k = pl.s.len();
-    let (lo, hi) = (pl.s.partition_point(|&x| x < -blend), pl.s.partition_point(|&x| x <= length + blend).min(k));
+    let (lo, hi) = (pl.s.partition_point(|&x| x < -blend[0]), pl.s.partition_point(|&x| x <= length + blend[1]).min(k));
     if hi < lo + 3 {
         return Ok(None);
     }
@@ -1141,7 +1142,7 @@ fn open_with_tube(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, p:
         // The ring's shape along the stent, easing past each end to a round ring just inside
         // the nearest wall.
         let inside = ring.native().min(r) - margin;
-        let w = if x < 0.0 { 1.0 - smoother(-x / blend) } else if x > length { 1.0 - smoother((x - length) / blend) } else { 1.0 };
+        let w = if x < 0.0 { 1.0 - smoother(-x / blend[0]) } else if x > length { 1.0 - smoother((x - length) / blend[1]) } else { 1.0 };
         // In each direction: where the ring opens the wall by more than the margin, the ring;
         // elsewhere just inside the wall, so the two surfaces never run along one another (a
         // union cannot join them) and nothing changes there.
@@ -1341,7 +1342,7 @@ fn reshape(mesh: &mut Mesh, pl: &StentPlacement, params: &StentParams, owner: Op
     let (tp, tc) = (tangents(&pl.axis), tangents(&pl.vessel));
     let beyond = |s: f64| (-s).max(s - length).max(0.0);
     let fade = |x: f64, w: f64| if w <= 0.0 { if x > 0.0 { 0.0 } else { 1.0 } } else { 1.0 - smoother(x / w) };
-    let radial: Vec<f64> = pl.s.iter().map(|&s| fade(beyond(s), params.end_blend)).collect();
+    let radial: Vec<f64> = pl.s.iter().map(|&s| fade(beyond(s), params.end_blend[usize::from(s > 0.0)])).collect();
     let first = pl.s.partition_point(|&s| s < 0.0).min(k - 1);
     let last = pl.s.partition_point(|&s| s <= length).saturating_sub(1).max(first);
 
@@ -1687,7 +1688,7 @@ fn runs_into_wall(m: &Mesh, tris: &[u32]) -> bool {
 /// its place, shaped as `rings` gives (see [`stent_rings`]), easing into each cut over a short
 /// flare. Also returns each cut's width over the stent's ([`StentReport::landing`]). Returns the tube's triangles with the bands blended into
 /// it, the number of open ends removed and the number of triangles removed.
-fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, end_blend: f64, rings: &Profile) -> EditResult<(Vec<u32>, usize, usize, [f64; 2])> {
+fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, end_blend: [f64; 2], rings: &Profile) -> EditResult<(Vec<u32>, usize, usize, [f64; 2])> {
     let (r, l) = (pl.radius, pl.length);
     let around = ((TAU * r / h).round() as usize).clamp(12, 4000);
     let rows = ((l / h).round() as usize).max(3);
@@ -1820,12 +1821,12 @@ fn cover(mesh: &mut Mesh, pl: &StentPlacement, h: f64, end_blend: f64, rings: &P
     tris.extend(end);
     let tube = commit(mesh, tris, new_vertices, group)?;
     // The vessel behind each cut is smoothed over a quarter of its diameter, no further than
-    // the end blend.
+    // that end's blend.
     let across = |lp: &[u32]| {
         let c = lp.iter().map(|&v| mesh.vertex(v)).sum::<DVec3>() / lp.len().max(1) as f64;
         2.0 * lp.iter().map(|&v| mesh.vertex(v).distance(c)).sum::<f64>() / lp.len().max(1) as f64
     };
-    let band = (end_blend / across(&p).max(across(&q)).max(1e-9)).min(0.25);
+    let band = [(0, &p), (1, &q)].map(|(e, lp)| (end_blend[e] / across(lp).max(1e-9)).min(0.25));
     let mut out = blend_join(mesh, &tube.triangles, [&p, &q], band, &|x| past_end(pl, end_blend, x));
     out.extend(tube.triangles);
     Ok((out, sealed, removed, wide))

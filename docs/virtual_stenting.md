@@ -15,6 +15,13 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   nearer end; **Clear** starts over.
   - From **Measure**: make two *Vessel diameter* measurements, then press *Place stent
     between the last two*.
+- **Which way on.** Past each end the trace follows the vessel the way that runs on
+  furthest, so a short side branch or sprout near an end is not mistaken for it. Where two or
+  more ways past an end each run on for at least twice that end's diameter, close enough to
+  the end to change the result (within the stent's overhang and that end's blend, plus a
+  diameter), they are drawn over the model: the way followed in green, the others in blue.
+  Click a blue one to follow it instead; the centerline is traced again. **Clear** forgets
+  the picks.
 - **Stent.**
   - **Diameter**: the nominal, fully expanded diameter.
   - **Length**: measured along the stent's own axis.
@@ -31,7 +38,7 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   | Straightness | 0 %: the stent follows the vessel's centerline. 100 %: it takes the smoothest path between the two ends (where a free stent held at both would settle). In between, a blend. Where the stent grips the wall, the vessel moves with it. |
   | Smoothest path G0 / G1 / G2 | How that path meets the ends. **G0**: a straight line between their centres. **G1**: leaves each end square to its cross-section. **G2**: also continues the vessel's bend there. |
   | Stiffness | Radial force. Along the stent, in each direction across it, the lumen lies this share of the way from the vessel's own wall to the stent's radius: a 2 mm vessel, a 6 mm stent and 50 % give 4 mm. So the vessel's shape eases into the round stent: 100 %, a perfect tube of the stent's diameter; 0 %, the vessel as it is. Wall wider than the stent is never pulled in (unless covered). |
-  | End blend | How far past each end of the stent the wall eases back to its own shape and course (0–40 mm). **Nothing beyond it changes.** A stent straightened across a bend needs one long enough for the vessel to turn back onto its course (the tool warns when it is too short). |
+  | End blend (end 1, end 2) | How far past each end of the stent the wall eases back to its own shape and course (0–40 mm), set for each end on its own. **Nothing beyond it changes.** A stent straightened across a bend needs one long enough for the vessel to turn back onto its course (the tool warns when it is too short). |
   | Covered (stent graft) | The lumen along the stent becomes the stent's tube; see below. |
   | Remesh the reshaped wall | Even triangles where the wall was stretched or squeezed (recommended for CFD). |
   | Edit in place | Reshape the object itself. Otherwise the result is a new object named after the stent, and the original is hidden. |
@@ -48,7 +55,7 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
 - **Warnings:**
   - the stent's axis leaves the vessel;
   - the reshaped wall runs into itself (new crossings only);
-  - the vessel must bend back sharply within the end blend past an end (lengthen the end
+  - the vessel must bend back sharply within the end blend past an end (lengthen that end's
     blend or lower the straightness);
   - the reshaping moves an open end (inlet or outlet) of the mesh.
 
@@ -61,8 +68,12 @@ The geometry is in `mm_edit::stent` ([`place_stent`], [`apply_stent`]); the tool
   inside it): from the model's widest open end to the others, blind side branches too,
   traced once per shape of the mesh and kept for the next pair of ends. Where an end's
   cross-section lies off that tree (or the model has no open ends), it is traced from end 1's
-  centre instead. The path runs along it from end 1 through end 2 and on past both ends,
-  taking the straightest way at junctions.
+  centre instead. The path runs along it from end 1 through end 2 and on past both ends.
+  At each junction past an end it takes the way that runs on furthest (all of it, not only
+  what the stent reaches; the shortest distance along the tree to the way's farthest point),
+  or the way picked there (a point on it, kept with the ends). Round a loop, where both sides
+  join again (a fenestration), it takes the straighter side. Junctions where two or more ways
+  run on for twice the end's diameter or more are offered for picking.
 - Each vertex is wall of the vessel whose centerline tube (its spheres swept along it) is
   nearest, as VMTK splits branches; those of the path are the stented vessel's own wall, even
   at a junction or either side of a septum. Side branches and anything else joined near it

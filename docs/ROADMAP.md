@@ -308,14 +308,16 @@ reshapes the vessel around it ([virtual_stenting.md](virtual_stenting.md)). Firs
 venous sinus stenosis with bare self-expanding stents.
 
 - [x] **M16.1 Placement**: ends clicked as cross-sections (or Measure's last two vessel
-      diameters); the vessel's centerline traced from end 1 through end 2 and on past both;
+      diameters); the vessel's centerline traced from end 1 through end 2 and on past both
+      (the longest way on at each junction, or one clicked where two or more could be the
+      vessel);
       the stent centred on the ends along its own axis. *Straightness* blends the centerline
       with the smoothest path between the ends (G0 line, G1 / G2 Hermite spline of least
       length × ∫κ²).
 - [x] **M16.2 Bare stent**: gripped slices carried onto the stent's axis (none where the stent
       floats in a wider lumen), the vessel returning past each end along a least-bending path
-      within *End blend*; wall inside the stent pushed out by *Stiffness*, faded over *End
-      blend*; side branches follow with distance; stretched wall remeshed. Nothing past the
+      within *End blend* (set per end); wall inside the stent pushed out by *Stiffness*, faded
+      over *End blend*; side branches follow with distance; stretched wall remeshed. Nothing past the
       end blend changes, and only the stretch's own wall is carried (not wall passing near
       it).
 - [x] **M16.3 Covered stent**: the stretch cut out and replaced by the stent's tube (wider wall

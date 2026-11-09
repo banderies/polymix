@@ -392,12 +392,12 @@ fn unchanged(before: &Mesh, after: &Mesh, v: u32) -> bool {
 #[test]
 fn nothing_changes_past_the_end_blend() {
     // A stent straightened across a bend, opening the vessel and remeshed: past each end the
-    // vessel is back on its course by the end of the end blend, and nothing beyond it moves
+    // vessel is back on its course by the end of that end's blend, and nothing beyond it moves
     // or is rebuilt.
     let (m0, path) = vessel(arc, |_| 1.5, 40.0, 24);
     let sections = sections_at(&path, 14.0, 26.0);
-    for (w, continuity) in [(1.0, EndContinuity::G0), (0.5, EndContinuity::G1)] {
-        let params = StentParams { straightness: w, continuity, end_blend: 3.0, remesh: true, ..bare(3.4, 16.0) };
+    for (w, continuity, end_blend) in [(1.0, EndContinuity::G0, [3.0; 2]), (0.5, EndContinuity::G1, [3.0; 2]), (1.0, EndContinuity::G0, [1.5, 6.0])] {
+        let params = StentParams { straightness: w, continuity, end_blend, remesh: true, ..bare(3.4, 16.0) };
         let pl = place_stent(&path, sections, &params).unwrap();
         let mut m = m0.clone();
         apply_stent(&mut m, &pl, &params, None).unwrap();
@@ -405,13 +405,19 @@ fn nothing_changes_past_the_end_blend() {
         assert_eq!(crossings(&m), 0);
         let along = |p: DVec3| ARC * p.y.atan2(p.x);
         let (a, b) = (along(pl.point(0.0)), along(pl.point(pl.length)));
-        let beyond: Vec<u32> = m0.vertex_ids().filter(|&v| (along(m0.vertex(v)) - 0.5 * (a + b)).abs() > 0.5 * (b - a) + params.end_blend + 0.5).collect();
+        let beyond: Vec<u32> = m0.vertex_ids().filter(|&v| along(m0.vertex(v)) < a - end_blend[0] - 0.5 || along(m0.vertex(v)) > b + end_blend[1] + 0.5).collect();
         assert!(beyond.len() > 1000);
         let changed = beyond.iter().filter(|&&v| !unchanged(&m0, &m, v)).count();
-        assert_eq!(changed, 0, "straightness {w}: {changed} of {} vertices past the end blend changed", beyond.len());
+        assert_eq!(changed, 0, "straightness {w}, end blend {end_blend:?}: {changed} of {} vertices past the end blend changed", beyond.len());
         // While the stretch itself was straightened and opened.
         let mid = m0.vertex_ids().filter(|&v| (along(m0.vertex(v)) - 0.5 * (a + b)).abs() < 1.0).map(|v| m.vertex(v).distance(m0.vertex(v))).fold(0.0, f64::max);
         assert!(mid > 0.15, "straightness {w}: the middle moved {mid:.3}");
+        // A longer blend at one end reaches further there: wall past the shorter blend's
+        // reach, within the longer one's, moved.
+        if end_blend[1] > end_blend[0] + 2.0 {
+            let eased = m0.vertex_ids().filter(|&v| (b + end_blend[0] + 1.0..b + end_blend[1] - 1.0).contains(&along(m0.vertex(v)))).filter(|&v| m.is_vertex(v) && m.vertex(v).distance(m0.vertex(v)) > 1e-3).count();
+            assert!(eased > 0, "end blend {end_blend:?}: nothing moved within the longer end blend");
+        }
     }
 }
 
@@ -435,7 +441,7 @@ fn wall_passing_near_the_stent_is_not_carried() {
     let (m0, path) = vessel(axis, |_| 1.2, 80.0 + turn, 24);
     let sections = sections_at(&path, 12.0, 28.0);
     let owner = vec![true; m0.max_vid()];
-    let params = StentParams { straightness: 1.0, continuity: EndContinuity::G0, end_blend: 3.0, remesh: true, ..bare(3.0, 16.0) };
+    let params = StentParams { straightness: 1.0, continuity: EndContinuity::G0, end_blend: [3.0; 2], remesh: true, ..bare(3.0, 16.0) };
     let pl = place_stent(&path, sections, &params).unwrap();
     let mut m = m0.clone();
     let rep = apply_stent(&mut m, &pl, &params, Some(&owner)).unwrap();
