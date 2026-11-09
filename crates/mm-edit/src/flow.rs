@@ -1,5 +1,6 @@
 //! Flow extensions: extrude a (cut) boundary loop straight out of the mesh, optionally
-//! morphing the cross-section into a circle of equal area, and cap the end. This is the
+//! morphing the cross-section into a circle (of equal area, or of a diameter given, as for a
+//! hose to fit), and cap the end. This is the
 //! usual CFD pre-processing step that gives inlets/outlets a straight, developed section.
 
 use crate::cap::cap_oriented_loops;
@@ -32,8 +33,12 @@ pub struct FlowExtensionParams {
     pub segments: usize,
     /// Blend the cross-section into a circle of the same area along the extension.
     pub make_circular: bool,
-    /// Fraction of the length over which the circular blend happens (0..=1, default 0.5);
-    /// the rest of the extension is a straight circular cylinder.
+    /// Diameter of the circle the cross-section blends into, in mesh units, in place of the
+    /// circle of equal area: the extension tapers from the loop to it (whatever
+    /// `make_circular` says). `None` = the loop's equivalent diameter.
+    pub diameter: Option<f64>,
+    /// Fraction of the length over which the circular blend (or taper) happens (0..=1,
+    /// default 0.5); the rest of the extension is a straight circular cylinder.
     pub transition: f64,
     /// Close the end with a planar cap.
     pub cap: bool,
@@ -48,6 +53,7 @@ impl Default for FlowExtensionParams {
             direction: None,
             segments: 0,
             make_circular: false,
+            diameter: None,
             transition: 0.5,
             cap: false,
             cap_remesh: true,
@@ -130,6 +136,12 @@ pub fn extrude_boundary_loop(
     if !(length.is_finite() && length > 0.0) {
         return Err(EditError::InvalidParameter("extension length must be positive".into()));
     }
+    let radius = match params.diameter {
+        None => (area / PI).sqrt(),
+        Some(d) if d.is_finite() && d > 0.0 => 0.5 * d,
+        Some(_) => return Err(EditError::InvalidParameter("extension diameter must be positive".into())),
+    };
+    let circular = params.make_circular || params.diameter.is_some();
     let mut arc = vec![0.0; n + 1];
     for j in 0..n {
         arc[j + 1] = arc[j] + pts[j].distance(pts[(j + 1) % n]);
@@ -138,10 +150,9 @@ pub fn extrude_boundary_loop(
     let mean_edge = perimeter / n as f64;
     let segs = if params.segments == 0 { ((length / mean_edge).round() as usize).clamp(1, 10_000) } else { params.segments };
 
-    // Circle of equal area, parametrised by arc length (keeps the ordering monotonic) and
-    // rotated to best match the loop's own angles.
+    // The circle (of equal area unless a diameter is given), parametrised by arc length
+    // (keeps the ordering monotonic) and rotated to best match the loop's own angles.
     let sigma = if a2 >= 0.0 { 1.0 } else { -1.0 };
-    let radius = (area / PI).sqrt();
     let (mut sx, mut sy) = (0.0, 0.0);
     for j in 0..n {
         let rel = p2[j] - c2;
@@ -180,7 +191,7 @@ pub fn extrude_boundary_loop(
     let mut prev = lp.clone();
     for k in 1..=segs {
         let t = k as f64 / segs as f64;
-        let b = if params.make_circular { smoothstep(t / transition) } else { 0.0 };
+        let b = if circular { smoothstep(t / transition) } else { 0.0 };
         let ring: Vec<u32> = (0..n)
             .map(|j| {
                 let p = c + dir * (length * t + offset[j] * (1.0 - t)) + inplane[j] * (1.0 - b) + circle[j] * b;

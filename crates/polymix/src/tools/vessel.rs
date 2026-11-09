@@ -570,6 +570,34 @@ struct FlowParams {
     /// Ends aimed by hand (their arrows dragged), by end: the unit direction, in place of the
     /// heading.
     aims: Vec<Option<DVec3>>,
+    /// Each extension the diameter and length of its end's `sizes` (a hose to fit), tapering
+    /// to it from the opening, rather than sized from the cut.
+    by_hand: bool,
+    /// By end: its extension's size by hand.
+    sizes: Vec<EndSize>,
+    /// Sized by hand: how much of each extension tapers from its opening to its diameter, mm
+    /// (all of a shorter one); the rest is straight.
+    taper: f64,
+}
+
+/// An extension's size set by hand, mm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EndSize {
+    diameter: f64,
+    /// The taper included.
+    length: f64,
+}
+
+/// What an extension's diameter, length and taper can be set to by hand, mm.
+const SIZE_RANGE: std::ops::RangeInclusive<f64> = 0.1..=200.0;
+/// A taper steeper than this off the extension's axis (degrees) is pointed out.
+const STEEP: f64 = 45.0;
+/// Fewest rings a taper is built with (where the extension's length allows).
+const TAPER_RINGS: f64 = 8.0;
+
+/// `x` to the nearest `step`.
+fn to_step(x: f64, step: f64) -> f64 {
+    (x / step).round() * step
 }
 
 /// Longest stretch of centerline a heading is fitted to, in diameters of the end (the
@@ -587,6 +615,15 @@ const MIN_FIT: f64 = 0.5;
 const WIDEN: f64 = 1.5;
 /// Extensions further than this off their cut's normal (degrees) are pointed out.
 const OBLIQUE: f64 = 45.0;
+
+/// What comes of an extension [`OBLIQUE`]ly off its cut's normal, sized by hand or not.
+fn oblique_why(by_hand: bool) -> &'static str {
+    if by_hand {
+        "seen along the extension the opening is a sliver, so the taper from it is steep"
+    } else {
+        "the extension is narrower than the opening"
+    }
+}
 /// Furthest an end can be aimed by hand off its cut's normal, degrees: beyond, the opening
 /// seen along the extension is a sliver.
 const MAX_AIM: f64 = 75.0;
@@ -773,6 +810,11 @@ pub struct FlowExtensionTool {
     drag: Option<(usize, egui::Pos2, bool)>,
     /// The end whose arrow's tip is under the pointer.
     hover: Option<usize>,
+    /// The panel's row of sizes for every chosen end at once.
+    all: EndSize,
+    /// Whether the sizes by hand have been started from the sizes from the cut (the first time
+    /// they are asked for, so that switching over changes nothing until a size is).
+    seeded: bool,
 }
 
 impl FlowExtensionTool {
@@ -780,10 +822,22 @@ impl FlowExtensionTool {
         let object = cx.scene.active;
         let ends = cx.scene.active().map(|o| find_vessel_ends(&o.mesh)).unwrap_or_default();
         let n = ends.len();
-        Self {
+        let mut tool = Self {
             object,
             ends,
-            params: FlowParams { diameters: 5.0, absolute: None, circular: true, cap: true, heading: Heading::CutNormal, fit: 2.0, selected: vec![false; n], aims: vec![None; n] },
+            params: FlowParams {
+                diameters: 5.0,
+                absolute: None,
+                circular: true,
+                cap: true,
+                heading: Heading::CutNormal,
+                fit: 2.0,
+                selected: vec![false; n],
+                aims: vec![None; n],
+                by_hand: false,
+                sizes: Vec::new(),
+                taper: 5.0,
+            },
             job: None,
             preview: None,
             error: None,
@@ -793,6 +847,105 @@ impl FlowExtensionTool {
             capped: Default::default(),
             drag: None,
             hover: None,
+            all: EndSize { diameter: 5.0, length: 20.0 },
+            seeded: false,
+        };
+        // A size for every end; started again from the cut when first asked for (the length
+        // may have been set meanwhile).
+        tool.seed_sizes();
+        tool.seeded = false;
+        tool
+    }
+
+    /// Start the sizes by hand from the sizes from the cut: each end's diameter, its length as
+    /// set, and a taper of the widest end's diameter.
+    fn seed_sizes(&mut self) {
+        let p = &mut self.params;
+        p.sizes = self.ends.iter().map(|e| EndSize { diameter: to_step(e.diameter, 0.01).max(0.1), length: to_step(p.absolute.unwrap_or(p.diameters * e.diameter), 0.1).max(0.1) }).collect();
+        let widest = self.ends.iter().map(|e| e.diameter).fold(0.0, f64::max);
+        p.taper = if widest > 0.0 { to_step(widest, 0.5).clamp(0.5, *SIZE_RANGE.end()) } else { 5.0 };
+        let first = p.selected.iter().position(|&s| s).unwrap_or(0);
+        self.all = p.sizes.get(first).copied().unwrap_or(self.all);
+        self.seeded = true;
+    }
+
+    /// Size the extensions by hand (`true`), started from the sizes from the cut the first
+    /// time, or from the cut.
+    fn set_by_hand(&mut self, on: bool) {
+        if on && !self.seeded {
+            self.seed_sizes();
+        }
+        self.params.by_hand = on;
+    }
+
+    /// The taper of end `i`'s extension sized by hand: its length (no longer than the
+    /// extension), and its angle off the extension's axis from the cut's diameter, degrees.
+    fn taper_of(&self, i: usize) -> (f64, f64) {
+        let s = self.params.sizes[i];
+        let length = self.params.taper.min(s.length);
+        (length, (0.5 * (s.diameter - self.ends[i].diameter).abs()).atan2(length).to_degrees())
+    }
+
+    /// Sized by hand: what to point out about the chosen ends' tapers, by end.
+    fn size_notes(&self) -> Vec<(usize, String)> {
+        if !self.params.by_hand {
+            return Vec::new();
+        }
+        (0..self.ends.len())
+            .filter(|&i| self.params.selected[i])
+            .filter_map(|i| {
+                let (length, angle) = self.taper_of(i);
+                let mut notes = Vec::new();
+                if length < self.params.taper {
+                    notes.push("shorter than the taper, so it tapers all its length".to_string());
+                }
+                if angle > STEEP {
+                    notes.push(format!("tapers steeply ({angle:.0}° off its axis): a longer taper is gentler"));
+                }
+                (!notes.is_empty()).then(|| (i, notes.join("; ")))
+            })
+            .collect()
+    }
+
+    /// The panel's sizes by hand: a diameter and length for each chosen end (and a row
+    /// setting them all), and the taper.
+    fn sizes_ui(&mut self, ui: &mut egui::Ui) {
+        let chosen: Vec<usize> = (0..self.ends.len()).filter(|&i| self.params.selected[i]).collect();
+        fn drag(v: &mut f64, speed: f64) -> egui::DragValue<'_> {
+            egui::DragValue::new(v).speed(speed).range(SIZE_RANGE).min_decimals(2).max_decimals(3)
+        }
+        if chosen.is_empty() {
+            ui.weak("Choose ends to size their extensions.");
+        } else {
+            egui::Grid::new("flow_extension_sizes").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                ui.label("");
+                ui.label("⌀ mm");
+                ui.label("length mm");
+                ui.end_row();
+                if chosen.len() > 1 {
+                    ui.label("All").on_hover_text("Set every chosen end at once");
+                    if ui.add(drag(&mut self.all.diameter, 0.05)).changed() {
+                        chosen.iter().for_each(|&i| self.params.sizes[i].diameter = self.all.diameter);
+                    }
+                    if ui.add(drag(&mut self.all.length, 0.1)).changed() {
+                        chosen.iter().for_each(|&i| self.params.sizes[i].length = self.all.length);
+                    }
+                    ui.end_row();
+                }
+                for &i in &chosen {
+                    ui.label(format!("End {}", i + 1)).on_hover_text(format!("Its cut is ⌀ {:.2} mm", self.ends[i].diameter));
+                    ui.add(drag(&mut self.params.sizes[i].diameter, 0.05));
+                    ui.add(drag(&mut self.params.sizes[i].length, 0.1));
+                    ui.end_row();
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.add(drag(&mut self.params.taper, 0.1).suffix(" mm"));
+            ui.label("taper").on_hover_text("How much of each extension tapers from its opening to its diameter; the rest is a straight cylinder of that diameter");
+        });
+        for (i, note) in self.size_notes() {
+            ui.colored_label(egui::Color32::from_rgb(230, 170, 70), format!("End {}: {note}", i + 1));
         }
     }
 
@@ -940,7 +1093,7 @@ impl FlowExtensionTool {
                         head.aimed = true;
                         head.off_normal = aim.dot(square).clamp(-1.0, 1.0).acos().to_degrees();
                         if head.off_normal > OBLIQUE {
-                            head.note = Some("aimed far off the cut's normal: the extension is narrower than the opening".into());
+                            head.note = Some(format!("aimed far off the cut's normal: {}", oblique_why(p2.by_hand)));
                         }
                         dirs[k] = Some(aim);
                     } else if along {
@@ -977,7 +1130,7 @@ impl FlowExtensionTool {
                     }
                     heads.push(head);
                 }
-                for (k, (_, e)) in ends.iter().enumerate() {
+                for (k, (i, e)) in ends.iter().enumerate() {
                     if !progress(if along { 0.8 + 0.2 * k as f32 / n as f32 } else { k as f32 / n as f32 }) {
                         anyhow::bail!("cancelled");
                     }
@@ -992,24 +1145,32 @@ impl FlowExtensionTool {
                     let lp = nearest_loop(&m, e.center).ok_or_else(|| anyhow::anyhow!("end {} has no open boundary", k + 1))?;
                     let edge = {
                         let mut s = 0.0;
-                        for i in 0..lp.len() {
-                            s += m.vertex(lp[i]).distance(m.vertex(lp[(i + 1) % lp.len()]));
+                        for j in 0..lp.len() {
+                            s += m.vertex(lp[j]).distance(m.vertex(lp[(j + 1) % lp.len()]));
                         }
                         s / lp.len() as f64
                     };
-                    let length = p2.absolute.unwrap_or(p2.diameters * e.diameter);
-                    let segments = ((length / (2.0 * edge)).ceil() as usize).clamp(2, 150);
-                    let params = mm_edit::FlowExtensionParams {
-                        length: match p2.absolute {
+                    let mut params = mm_edit::FlowExtensionParams { direction: dirs[k], make_circular: p2.circular, cap: p2.cap, ..Default::default() };
+                    let length = if p2.by_hand {
+                        // Tapered from the opening to the diameter, then straight.
+                        let s = p2.sizes[*i];
+                        params.length = mm_edit::ExtensionLength::Absolute(s.length);
+                        params.diameter = Some(s.diameter);
+                        params.transition = (p2.taper / s.length).min(1.0);
+                        s.length
+                    } else {
+                        params.length = match p2.absolute {
                             Some(a) => mm_edit::ExtensionLength::Absolute(a),
                             None => mm_edit::ExtensionLength::Diameters(p2.diameters),
-                        },
-                        direction: dirs[k],
-                        segments,
-                        make_circular: p2.circular,
-                        cap: p2.cap,
-                        ..Default::default()
+                        };
+                        p2.absolute.unwrap_or(p2.diameters * e.diameter)
                     };
+                    let mut segments = ((length / (2.0 * edge)).ceil() as usize).clamp(2, 150);
+                    if p2.by_hand {
+                        // Rings enough for the taper's curve, short as it may be.
+                        segments = segments.max((TAPER_RINGS / params.transition).ceil() as usize).min(150);
+                    }
+                    params.segments = segments;
                     let r = mm_edit::extrude_boundary_loop(&mut m, &lp, &params).map_err(|err| anyhow::anyhow!("end {}: {err}", ends[k].0 + 1))?;
                     if dirs[k].is_none() {
                         // Square to the cut: the side the extrusion took (the loop's own).
@@ -1076,20 +1237,32 @@ impl Tool for FlowExtensionTool {
             }
         });
         ui_util::section(ui, "Extension");
-        let mut abs = self.params.absolute.is_some();
+        let mut by_hand = self.params.by_hand;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut abs, false, "Diameters");
-            ui.selectable_value(&mut abs, true, "Absolute");
+            ui.selectable_value(&mut by_hand, false, "From the cut").on_hover_text("Each extension as wide as its cut, as long as set below");
+            ui.selectable_value(&mut by_hand, true, "Set by hand").on_hover_text("Each extension a diameter and length of your own, in mm (a hose to fit), tapering to it from the opening");
         });
-        if abs {
-            let mut a = self.params.absolute.unwrap_or(10.0);
-            ui.add(egui::Slider::new(&mut a, 0.1..=200.0).logarithmic(true).text("length"));
-            self.params.absolute = Some(a);
-        } else {
-            self.params.absolute = None;
-            ui.add(egui::Slider::new(&mut self.params.diameters, 0.5..=20.0).text("× diameter"));
+        if by_hand != self.params.by_hand {
+            self.set_by_hand(by_hand);
         }
-        ui.checkbox(&mut self.params.circular, "Blend to circular cross-section");
+        if self.params.by_hand {
+            self.sizes_ui(ui);
+        } else {
+            let mut abs = self.params.absolute.is_some();
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut abs, false, "Diameters");
+                ui.selectable_value(&mut abs, true, "Absolute");
+            });
+            if abs {
+                let mut a = self.params.absolute.unwrap_or(10.0);
+                ui.add(egui::Slider::new(&mut a, 0.1..=200.0).logarithmic(true).text("length"));
+                self.params.absolute = Some(a);
+            } else {
+                self.params.absolute = None;
+                ui.add(egui::Slider::new(&mut self.params.diameters, 0.5..=20.0).text("× diameter"));
+            }
+            ui.checkbox(&mut self.params.circular, "Blend to circular cross-section");
+        }
         ui.checkbox(&mut self.params.cap, "Cap the ends");
         ui_util::section(ui, "Direction");
         ui.horizontal(|ui| {
@@ -1108,7 +1281,8 @@ impl Tool for FlowExtensionTool {
             ui.horizontal(|ui| {
                 let text = format!("End {}: aimed by hand, {off:.0}° off the cut normal", i + 1);
                 if off > OBLIQUE {
-                    ui.colored_label(egui::Color32::from_rgb(230, 170, 70), text).on_hover_text("The extension is narrower than the opening, seen along it");
+                    let why = oblique_why(self.params.by_hand);
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 70), text).on_hover_text(format!("{}{}", why[..1].to_uppercase(), &why[1..]));
                 } else {
                     ui.label(text);
                 }
@@ -1287,14 +1461,16 @@ impl Tool for FlowExtensionTool {
             Heading::CutNormal => "cut_normal",
             Heading::Centerline => "centerline",
         };
-        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap, "direction": direction, "fit_diameters": p.fit}))
+        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap, "direction": direction, "fit_diameters": p.fit, "sized_by_hand": p.by_hand, "taper_mm": p.taper}))
     }
 
     fn settings_schema(&self) -> Option<Value> {
         Some(json!({"type": "object", "properties": {
-            "length_in_diameters": {"type": "number", "description": "Extension length as a multiple of each end's diameter (0.5..20), used unless length_mm is set"},
-            "length_mm": {"type": ["number", "null"], "description": "Extension length in mm for every end (0.1..200); null to use length_in_diameters"},
-            "circular": {"type": "boolean", "description": "Blend each extension to a circular cross-section"},
+            "length_in_diameters": {"type": "number", "description": "Extension length as a multiple of each end's diameter (0.5..20), used unless length_mm is set (not sized by hand)"},
+            "length_mm": {"type": ["number", "null"], "description": "Extension length in mm for every end (0.1..200); null to use length_in_diameters (not sized by hand)"},
+            "circular": {"type": "boolean", "description": "Blend each extension to a circular cross-section (not sized by hand: those always end circular)"},
+            "sized_by_hand": {"type": "boolean", "description": "Each extension a diameter and length of its own in mm (the action `size`; e.g. a hose to fit), tapering to that diameter from the opening, instead of as wide as its cut. Started from the cut's diameters and the length set, the first time"},
+            "taper_mm": {"type": "number", "description": "Sized by hand: how much of each extension tapers from its opening to its diameter, mm (0.1..200; all of a shorter one); the rest is a straight cylinder"},
             "cap": {"type": "boolean", "description": "Cap the extensions' ends"},
             "direction": {"type": "string", "enum": ["cut_normal", "centerline"], "description": "Which way the extensions run: square to each end's cut, or on along the vessel (a line fitted to its centerline just inside the end)"},
             "fit_diameters": {"type": "number", "description": "With direction centerline: the stretch of centerline inside each end the direction is fitted to, in diameters of the end (0.5..5; shorter where the vessel forks sooner)"},
@@ -1318,6 +1494,14 @@ impl Tool for FlowExtensionTool {
             _ => return Err("direction must be \"cut_normal\" or \"centerline\"".into()),
         };
         p.fit = v["fit_diameters"].as_f64().ok_or("fit_diameters must be a number")?.clamp(0.5, MAX_FIT);
+        p.taper = v["taper_mm"].as_f64().ok_or("taper_mm must be a number")?.clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
+        let by_hand = v["sized_by_hand"].as_bool().ok_or("sized_by_hand must be true or false")?;
+        let taper = p.taper;
+        self.set_by_hand(by_hand);
+        if changes.get("taper_mm").is_some() {
+            // (Not the seeded one.)
+            self.params.taper = taper;
+        }
         self.start(cx);
         Ok(())
     }
@@ -1336,6 +1520,12 @@ impl Tool for FlowExtensionTool {
             "computing": self.job.is_some(),
             "preview": current.map(|(_, out)| out.msg.clone()),
             "directions": heads,
+            "sized_by_hand": self.params.by_hand,
+            "sizes": self.params.by_hand.then(|| (0..self.ends.len()).filter(|&i| self.params.selected[i]).map(|i| {
+                let (s, (taper, angle)) = (self.params.sizes[i], self.taper_of(i));
+                json!({"end": i + 1, "diameter_mm": round(s.diameter, 3), "length_mm": round(s.length, 3), "taper_mm": round(taper, 3), "taper_off_axis_deg": round(angle, 1), "cut_diameter_mm": round(self.ends[i].diameter, 3)})
+            }).collect::<Vec<_>>()),
+            "size_notes": self.size_notes().into_iter().map(|(i, note)| json!({"end": i + 1, "note": note})).collect::<Vec<_>>(),
             "aims": (0..self.ends.len()).filter_map(|i| self.params.aims[i].map(|d| json!({"end": i + 1, "direction": vec3(d.to_array(), 4), "off_cut_normal_deg": round(d.dot(self.ends[i].normal).clamp(-1.0, 1.0).acos().to_degrees(), 1), "picked": self.params.selected[i]}))).collect::<Vec<_>>(),
             "error": self.error,
             "next": if !self.params.selected.contains(&true) { "select the ends to extend" } else if current.is_some() { "accept (mesh_tool accept) to keep the extensions" } else { "wait for the preview (app_wait)" },
@@ -1356,6 +1546,12 @@ impl Tool for FlowExtensionTool {
                 json!({"end": arg::integer("End number (from 1)"), "direction": arg::point("Direction out of the vessel (any length); leave out to undo the aim")}),
             )
             .required(&["end"]),
+            Action::new(
+                "size",
+                "Size ends' extensions by hand (e.g. a hose to fit): a diameter and/or length in mm for each end listed, tapering from its opening over taper_mm. Turns sized_by_hand on",
+                json!({"ends": ends_arg("End numbers (from 1)"), "diameter_mm": arg::number("Diameter of their extensions, mm (0.1..200)"), "length_mm": arg::number("Length of their extensions, the taper included, mm (0.1..200)")}),
+            )
+            .required(&["ends"]),
         ]
     }
 
@@ -1391,6 +1587,42 @@ impl Tool for FlowExtensionTool {
                     (_, Some((_, off))) => format!("End {k} aimed {off:.1}° off its cut normal{picked}"),
                     _ => format!("End {k} runs its heading again{picked}"),
                 })
+            }
+            "size" => {
+                let a = Args(args);
+                let picked = end_numbers(args, self.ends.len())?;
+                let value = |k: &str| -> Result<Option<f64>, String> {
+                    if !a.has(k) {
+                        return Ok(None);
+                    }
+                    match a.opt_f64(k) {
+                        Some(x) if x.is_finite() && x > 0.0 => Ok(Some(x.clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end()))),
+                        _ => Err(format!("`{k}` must be a positive number of mm")),
+                    }
+                };
+                let (diameter, length) = (value("diameter_mm")?, value("length_mm")?);
+                if diameter.is_none() && length.is_none() {
+                    return Err("give diameter_mm, length_mm or both".into());
+                }
+                let was = self.params.by_hand;
+                self.set_by_hand(true);
+                for &i in &picked {
+                    let s = &mut self.params.sizes[i];
+                    s.diameter = diameter.unwrap_or(s.diameter);
+                    s.length = length.unwrap_or(s.length);
+                }
+                self.start(cx);
+                let list = |v: &[usize]| v.iter().map(|i| (i + 1).to_string()).collect::<Vec<_>>().join(", ");
+                let sized = picked.iter().map(|&i| format!("end {}: ⌀ {:.3} mm, {:.3} mm long", i + 1, self.params.sizes[i].diameter, self.params.sizes[i].length)).collect::<Vec<_>>().join("; ");
+                let unpicked: Vec<usize> = picked.iter().copied().filter(|&i| !self.params.selected[i]).collect();
+                let mut reply = format!("Sized {sized}");
+                if !was {
+                    reply += " (sized by hand now: the other ends from their cuts' diameters)";
+                }
+                if !unpicked.is_empty() {
+                    reply += &format!("; end(s) {} not chosen: select them to extend them", list(&unpicked));
+                }
+                Ok(reply)
             }
             _ => Err(format!("Flow extensions has no action {action}")),
         }
@@ -2220,6 +2452,85 @@ mod tests {
         tool.act("aim", &json!({"end": top + 1}), &mut cx).unwrap();
         assert!(tool.params.aims[top].is_none());
         assert!(tool.act("aim", &json!({"end": 9, "direction": [0, 0, 1]}), &mut cx).is_err());
+    }
+
+    #[test]
+    fn flow_extensions_sized_by_hand_fit_their_hoses() {
+        // A straight vessel along z, radius 1: the top end out to a 6.35 mm hose, 15 mm long
+        // with a 4 mm taper; the bottom down to a 1.5 mm one, 8 mm long.
+        let mut scene = Scene::default();
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.0, 0.5 * i as f64)).collect();
+        scene.add("vessel", primitives::tube_along(&path, &[1.0; 41], 32));
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        let top = tool.ends.iter().position(|e| e.center.z > 10.0).unwrap();
+        let bottom = 1 - top;
+        let settle = |tool: &mut FlowExtensionTool, cx: &mut ToolCx| {
+            let t0 = Instant::now();
+            while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && tool.error.is_none() && t0.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(5));
+                tool.update(cx);
+            }
+            assert!(tool.preview.is_some(), "{:?}", tool.error);
+        };
+        // Switched over, nothing changes until a size does: each end as wide as its cut, as
+        // long as the length set.
+        tool.set_settings(&json!({"length_mm": 12.0}), &mut cx).unwrap();
+        tool.set_settings(&json!({"sized_by_hand": true}), &mut cx).unwrap();
+        let d = tool.ends[top].diameter;
+        assert_eq!(tool.params.sizes[top], EndSize { diameter: to_step(d, 0.01), length: 12.0 });
+        assert!((tool.params.taper - to_step(d, 0.5)).abs() < 1e-12);
+        tool.act("select", &json!({"ends": [1, 2]}), &mut cx).unwrap();
+        tool.set_settings(&json!({"taper_mm": 4.0}), &mut cx).unwrap();
+        let reply = tool.act("size", &json!({"ends": [top + 1], "diameter_mm": 6.35, "length_mm": 15.0}), &mut cx).unwrap();
+        assert!(reply.contains("⌀ 6.350 mm, 15.000 mm long"), "{reply}");
+        tool.act("size", &json!({"ends": [bottom + 1], "diameter_mm": 1.5, "length_mm": 8.0}), &mut cx).unwrap();
+        assert!(tool.act("size", &json!({"ends": [1]}), &mut cx).is_err());
+        assert!(tool.act("size", &json!({"ends": [1], "diameter_mm": -2.0}), &mut cx).is_err());
+        settle(&mut tool, &mut cx);
+        let (_, out) = tool.preview.as_ref().unwrap();
+        let m = &out.mesh;
+        let (z0, z1) = (tool.ends[bottom].center.z, tool.ends[top].center.z);
+        // Each extension's far end where its length puts it, and from the end of the taper on
+        // a cylinder of its diameter.
+        let zs: Vec<f64> = m.vertex_ids().map(|v| m.vertex(v).z).collect();
+        let (lo, hi) = zs.iter().fold((f64::MAX, f64::MIN), |(a, b), &z| (a.min(z), b.max(z)));
+        assert!((hi - (z1 + 15.0)).abs() < 1e-9 && (lo - (z0 - 8.0)).abs() < 1e-9, "{lo} {hi}");
+        let radial = |lo: f64, hi: f64| -> Vec<f64> { m.vertex_ids().map(|v| m.vertex(v)).filter(|p| p.z > lo && p.z < hi).map(|p| p.truncate().length()).collect() };
+        let wide = radial(z1 + 4.0 + 1e-6, z1 + 15.0 - 1e-6);
+        let narrow = radial(z0 - 8.0 + 1e-6, z0 - 4.0 - 1e-6);
+        assert!(!wide.is_empty() && wide.iter().all(|r| (r - 3.175).abs() < 1e-9), "{wide:?}");
+        assert!(!narrow.is_empty() && narrow.iter().all(|r| (r - 0.75).abs() < 1e-9), "{narrow:?}");
+        // The taper, in between: no wider than the hose, and a valid mesh throughout.
+        assert!(radial(z1, z1 + 4.0).iter().all(|&r| r < 3.175 + 1e-9));
+        m.check_validity().unwrap();
+        assert!(m.is_closed(), "the capped extensions close the vessel");
+        // Agents read the sizes back; a short taper of a big step is pointed out.
+        let state = tool.state(cx.scene);
+        assert_eq!(state["sizes"].as_array().unwrap().len(), 2);
+        let s = state["sizes"].as_array().unwrap().iter().find(|s| s["end"] == json!(top + 1)).unwrap();
+        assert_eq!((s["diameter_mm"].as_f64(), s["length_mm"].as_f64(), s["taper_mm"].as_f64()), (Some(6.35), Some(15.0), Some(4.0)));
+        assert!(state["size_notes"].as_array().unwrap().is_empty());
+        tool.set_settings(&json!({"taper_mm": 1.0}), &mut cx).unwrap();
+        let notes = tool.size_notes();
+        assert!(notes.len() == 1 && notes[0].0 == top && notes[0].1.contains("steeply"), "{notes:?}");
+        tool.set_settings(&json!({"taper_mm": 10.0}), &mut cx).unwrap();
+        assert!(tool.size_notes().iter().any(|(i, n)| *i == bottom && n.contains("all its length")));
+        // From the cut again: the sizes are kept for later, and not reseeded.
+        tool.set_settings(&json!({"sized_by_hand": false}), &mut cx).unwrap();
+        tool.set_settings(&json!({"sized_by_hand": true}), &mut cx).unwrap();
+        assert_eq!(tool.params.sizes[top].diameter, 6.35);
+        assert_eq!(tool.params.taper, 10.0);
+        // The panel draws the sizes (a row for all, one per end) and leaves them be.
+        let before = tool.params.clone();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| assert!(matches!(tool.panel(ui, &mut cx), ToolOutcome::Continue)));
+        }
+        assert!(tool.params.by_hand && tool.params.sizes == before.sizes && tool.params.taper == before.taper);
     }
 
     /// A real mesh (`POLYMIX_FLOW_MESH`, local only): every flat end extended along its

@@ -119,3 +119,52 @@ fn flow_extension_custom_direction_and_errors() {
     let bad = extrude_boundary_loop(&mut m, &[0, 1, 2], &FlowExtensionParams::default());
     assert!(bad.is_err());
 }
+
+#[test]
+fn flow_extension_tapers_to_a_diameter_given() {
+    // A tube of radius 0.5 (an ellipse, to see the blend too), out to a hose 1.6 across and
+    // down to one 0.6 across: tapered over the first quarter, then a straight cylinder.
+    for (xscale, d) in [(1.0, 1.6), (1.3, 0.6)] {
+        let (mut m, lp) = cut_tube(40, xscale);
+        let r = extrude_boundary_loop(
+            &mut m,
+            &lp,
+            &FlowExtensionParams {
+                length: ExtensionLength::Absolute(4.0),
+                diameter: Some(d),
+                transition: 0.25,
+                segments: 16,
+                cap: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_valid(&m);
+        assert!(r.capped && (r.length - 4.0).abs() < 1e-12);
+        let radial = |v: u32| {
+            let p = m.vertex(v);
+            DVec3::new(p.x, p.y, 0.0).length()
+        };
+        // Every ring from the end of the taper on is the circle asked for.
+        for (k, ring) in r.rings.iter().enumerate() {
+            if k + 1 >= 4 {
+                assert!(ring.iter().all(|&v| (radial(v) - 0.5 * d).abs() < 1e-9), "ring {k}");
+            }
+        }
+        // The taper widens (or narrows) steadily: each ring's mean radius moves toward it.
+        let mean = |ring: &[u32]| ring.iter().map(|&v| radial(v)).sum::<f64>() / ring.len() as f64;
+        let mut prev = mean(&lp);
+        for ring in &r.rings[..4] {
+            let now = mean(ring);
+            assert!((now - prev) * (0.5 * d - prev) >= -1e-12, "{prev} -> {now}");
+            prev = now;
+        }
+        for &t in &r.wall_triangles {
+            assert!(m.tri_area(t) > 1e-6);
+        }
+    }
+    // A diameter must be positive.
+    let (mut m, lp) = cut_tube(24, 1.0);
+    let bad = FlowExtensionParams { diameter: Some(0.0), ..Default::default() };
+    assert!(extrude_boundary_loop(&mut m, &lp, &bad).is_err());
+}

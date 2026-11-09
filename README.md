@@ -174,7 +174,9 @@ cargo run -p polymix --example gen_test_meshes --release -- test_meshes
    `outlet_N`. **Plane Cut** is available for general cuts (drag a line; Shift+click a vessel to
    cut it square; the red half is removed).
 6. **Vessel → Flow extensions**: extrude straight, optionally circular extensions (length in
-   diameters) from the selected ends, either square to each cut or on along the vessel (a line
+   diameters or mm) from the selected ends, or size each by hand (*Set by hand*: a diameter and
+   length in mm per end, e.g. to fit a hose, tapering to it from the opening over a set
+   length, then straight), either square to each cut or on along the vessel (a line
    fitted to its centerline over the last few diameters inside the end, so a slanted cut still
    runs straight on), and any end aimed by hand by dragging the tip of its arrow; caps keep
    their patch names, and each extension's wall becomes a patch of its own (`extension_N`),
