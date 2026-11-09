@@ -261,6 +261,13 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 
 Polymix's algorithms are independent implementations of published methods (references in the source).
 
+## Funding
+
+Polymix was developed with support from the National Institute of Biomedical Imaging and
+Bioengineering (NIBIB) of the National Institutes of Health under Award Number T32EB001631.
+The content is solely the responsibility of the authors and does not necessarily represent
+the official views of the National Institutes of Health.
+
 ## License
 
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT),
