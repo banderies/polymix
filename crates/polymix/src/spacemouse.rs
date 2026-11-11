@@ -29,6 +29,9 @@ pub const PAN_RATE: f64 = 1.0;
 pub const ZOOM_RATE: f64 = 2.0;
 /// Range of the orbit, pan and zoom speed sliders.
 pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=10.0;
+/// Range of the up-close speed (see [`Settings::near_speed`]): 1 leaves the speeds alone.
+pub const NEAR_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.05..=1.0;
+const DEFAULT_NEAR_SPEED: f32 = 0.3;
 
 /// Cap state in the *view* frame: translation (x right, y up, z toward the viewer) and
 /// rotation about those axes, about -1..1 at full deflection.
@@ -52,6 +55,11 @@ pub struct Settings {
     pub orbit_speed: f32,
     pub pan_speed: f32,
     pub zoom_speed: f32,
+    /// How much pan and zoom slow down as the view closes in on the centre of rotation (within
+    /// [`NEAR_SPEED_RANGE`]): the share of their speed on screen left at a tenth of the
+    /// distance that shows all the objects, that share again at a hundredth (see
+    /// [`near_factor`]).
+    pub near_speed: f32,
     /// Invert pan X, pan Y, zoom, tilt, spin, roll.
     pub invert: [bool; 6],
     pub lock_rotation: bool,
@@ -88,7 +96,7 @@ impl Centre {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, orbit_speed: 1.0, pan_speed: 1.0, zoom_speed: 1.0, invert: [false; 6], lock_rotation: false, lock_translation: false, centre: Centre::View, show_centre: true }
+        Self { enabled: true, orbit_speed: 1.0, pan_speed: 1.0, zoom_speed: 1.0, near_speed: DEFAULT_NEAR_SPEED, invert: [false; 6], lock_rotation: false, lock_translation: false, centre: Centre::View, show_centre: true }
     }
 }
 
@@ -96,11 +104,11 @@ impl Settings {
     pub const AXIS_NAMES: [&'static str; 6] = ["Pan left/right", "Pan up/down", "Zoom", "Tilt", "Spin", "Roll"];
 
     /// Compact text form for the preferences store: enabled, orbit, pan and zoom speeds,
-    /// inverted axes, locks, centre of rotation and whether it is shown.
+    /// inverted axes, locks, centre of rotation, whether it is shown, and the up-close speed.
     pub fn to_pref(&self) -> String {
         let inv: String = self.invert.iter().map(|b| if *b { '1' } else { '0' }).collect();
         format!(
-            "{} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {}",
             self.enabled as u8,
             self.orbit_speed,
             self.pan_speed,
@@ -109,23 +117,26 @@ impl Settings {
             self.lock_rotation as u8,
             self.lock_translation as u8,
             self.centre.key(),
-            self.show_centre as u8
+            self.show_centre as u8,
+            self.near_speed
         )
     }
 
-    /// Reads [`Self::to_pref`]'s form, the one before it without the centre of rotation
-    /// (taken as the default's), and the first one, with an overall speed in front of pan,
-    /// zoom and rotate speeds (folded into each).
+    /// Reads [`Self::to_pref`]'s form; the one before it without the up-close speed, and the
+    /// one before that without the centre of rotation either (taken as the defaults'); and
+    /// the first one, with an overall speed in front of pan, zoom and rotate speeds (folded
+    /// into each).
     pub fn from_pref(s: &str) -> Option<Self> {
         let f: Vec<&str> = s.split_whitespace().collect();
         let num = |i: usize| f[i].parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
         let defaults = Self::default();
-        let (orbit, pan, zoom, rest, centre, show_centre) = match f.len() {
-            9 => (num(1)?, num(2)?, num(3)?, &f[4..7], Centre::from_key(f[7])?, f[8] == "1"),
-            7 => (num(1)?, num(2)?, num(3)?, &f[4..], defaults.centre, defaults.show_centre),
+        let (orbit, pan, zoom, rest, centre, show_centre, near) = match f.len() {
+            10 => (num(1)?, num(2)?, num(3)?, &f[4..7], Centre::from_key(f[7])?, f[8] == "1", num(9)?),
+            9 => (num(1)?, num(2)?, num(3)?, &f[4..7], Centre::from_key(f[7])?, f[8] == "1", defaults.near_speed),
+            7 => (num(1)?, num(2)?, num(3)?, &f[4..], defaults.centre, defaults.show_centre, defaults.near_speed),
             8 => {
                 let overall = num(1)?;
-                (overall * num(4)?, overall * num(2)?, overall * num(3)?, &f[5..], defaults.centre, defaults.show_centre)
+                (overall * num(4)?, overall * num(2)?, overall * num(3)?, &f[5..], defaults.centre, defaults.show_centre, defaults.near_speed)
             }
             _ => return None,
         };
@@ -142,6 +153,7 @@ impl Settings {
             orbit_speed: clamp(orbit),
             pan_speed: clamp(pan),
             zoom_speed: clamp(zoom),
+            near_speed: near.clamp(*NEAR_SPEED_RANGE.start(), *NEAR_SPEED_RANGE.end()),
             invert,
             lock_rotation: rest[1] == "1",
             lock_translation: rest[2] == "1",
@@ -519,16 +531,35 @@ impl SpaceMouse {
     }
 }
 
-/// Move the camera for `dt` seconds of cap deflection, turning about `pivot`. Returns true if
-/// anything moved.
-pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: f64, pivot: glam::DVec3) -> bool {
+/// How much pan and zoom slow down `reach` from the centre of rotation, when the distance
+/// that shows all the objects is `full_view` (`None`: nothing to measure against, no slowing):
+/// to `near_speed` at a tenth of `full_view`, to its square at a hundredth (a power of the
+/// distance); not at all from `full_view` out.
+pub fn near_factor(reach: f64, full_view: Option<f64>, near_speed: f32) -> f64 {
+    let Some(full) = full_view.filter(|d| *d > 0.0 && d.is_finite()) else { return 1.0 };
+    let power = -(near_speed.clamp(*NEAR_SPEED_RANGE.start(), *NEAR_SPEED_RANGE.end()) as f64).log10();
+    (reach.max(0.0) / full).min(1.0).powf(power)
+}
+
+/// Move the camera for `dt` seconds of cap deflection, turning about `pivot`; `full_view` is
+/// the distance that shows all the objects (for [`near_factor`]). Returns true if anything
+/// moved.
+pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: f64, pivot: glam::DVec3, full_view: Option<f64>) -> bool {
     if m.is_zero() {
         return false;
     }
     let sign = |i: usize| if s.invert[i] { -1.0 } else { 1.0 };
     if !s.lock_translation {
+        // Pan and zoom are measured at the centre of rotation, not at wherever the view's
+        // target has drifted to: the target goes to its distance along the line of sight (the
+        // view does not change), so a pan moves what is there by the same share of the view,
+        // and a zoom closes in on it by the same share of the way, at every distance, never
+        // past it. Up close they slow down further (`near_speed`). An orthographic view's
+        // distance is its scale, measured as it is.
+        camera.retarget_at(camera.eye().distance(pivot));
+        let near = near_factor(camera.distance, full_view, s.near_speed);
         // Object mode: the model follows the cap. Pan in screen points.
-        let pan_rate = viewport_h * PAN_RATE * s.pan_speed as f64 * dt;
+        let pan_rate = viewport_h * PAN_RATE * s.pan_speed as f64 * near * dt;
         let dx = m.t[0] as f64 * sign(0) * pan_rate;
         let dy = -(m.t[1] as f64) * sign(1) * pan_rate;
         if dx != 0.0 || dy != 0.0 {
@@ -536,7 +567,7 @@ pub fn apply(camera: &mut Camera, m: Motion, s: &Settings, dt: f64, viewport_h: 
         }
         let z = m.t[2] as f64 * sign(2);
         if z != 0.0 {
-            camera.zoom((-ZOOM_RATE * s.zoom_speed as f64 * dt * z).exp());
+            camera.zoom((-ZOOM_RATE * s.zoom_speed as f64 * near * dt * z).exp());
         }
     }
     if !s.lock_rotation {
@@ -724,11 +755,15 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let s = Settings { enabled: false, orbit_speed: 7.5, pan_speed: 0.25, zoom_speed: 3.0, invert: [true, false, true, false, false, true], lock_rotation: true, centre: Centre::Object, show_centre: false, ..Default::default() };
+        let s = Settings { enabled: false, orbit_speed: 7.5, pan_speed: 0.25, zoom_speed: 3.0, near_speed: 0.5, invert: [true, false, true, false, false, true], lock_rotation: true, centre: Centre::Object, show_centre: false, ..Default::default() };
         assert_eq!(Settings::from_pref(&s.to_pref()), Some(s));
         // Saved before the centre of rotation was a setting: the default's.
         let before = Settings::from_pref("0 7.5 0.25 3 101001 1 0").unwrap();
         assert_eq!((before.orbit_speed, before.centre, before.show_centre), (7.5, Centre::View, true));
+        // Saved before the up-close speed was a setting: the default's.
+        let before = Settings::from_pref("1 2 1 1 000000 0 0 object 0").unwrap();
+        assert_eq!((before.orbit_speed, before.centre, before.near_speed), (2.0, Centre::Object, DEFAULT_NEAR_SPEED));
+        assert_eq!(Settings::from_pref("1 1 1 1 000000 0 0 view 1 0.001").map(|s| s.near_speed), Some(0.05), "kept in range");
         assert_eq!(Settings::from_pref("1 1 1 1 000000 0 0 sideways 1"), None);
         assert_eq!(Settings::from_pref("garbage"), None);
         assert_eq!(Settings::from_pref("1 1 1 1 0000 0 0"), None);
@@ -853,13 +888,13 @@ mod tests {
         let run = |s: &Settings| {
             let mut c = Camera::default();
             let (t0, d0, f0) = (c.target, c.distance, c.forward());
-            apply(&mut c, Motion { t: [0.5, 0.0, 0.0], r: [0.0; 3] }, s, 0.01, 800.0, pivot);
+            apply(&mut c, Motion { t: [0.5, 0.0, 0.0], r: [0.0; 3] }, s, 0.01, 800.0, pivot, None);
             let pan = c.target.distance(t0);
             let mut c = Camera::default();
-            apply(&mut c, Motion { t: [0.0, 0.0, 0.5], r: [0.0; 3] }, s, 0.01, 800.0, pivot);
+            apply(&mut c, Motion { t: [0.0, 0.0, 0.5], r: [0.0; 3] }, s, 0.01, 800.0, pivot, None);
             let zoom = (d0 / c.distance).ln();
             let mut c = Camera::default();
-            apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 0.5, 0.0] }, s, 0.01, 800.0, pivot);
+            apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 0.5, 0.0] }, s, 0.01, 800.0, pivot, None);
             let orbit = c.forward().angle_between(f0);
             (orbit, pan, zoom)
         };
@@ -877,21 +912,80 @@ mod tests {
     }
 
     #[test]
+    fn pan_and_zoom_are_measured_at_the_centre_of_rotation_and_slow_up_close() {
+        use glam::DVec3;
+        // Looking down −z from the origin at a wall 1 ahead, the view's target drifted 100 off.
+        let start = || {
+            let mut c = Camera::default();
+            c.look_along(-DVec3::Z);
+            (c.target, c.distance, c.scene_radius) = (DVec3::new(0.0, 0.0, -100.0), 100.0, 100.0);
+            c
+        };
+        let wall = DVec3::new(0.0, 0.0, -1.0);
+        let off = Settings { near_speed: 1.0, ..Default::default() };
+        let pan = Motion { t: [1.0, 0.0, 0.0], r: [0.0; 3] };
+        // How far a pan moves the wall on screen, in view heights (NDC spans 2).
+        let moved = |s: &Settings, full_view: Option<f64>| {
+            let mut c = start();
+            let eye = c.eye();
+            apply(&mut c, pan, s, 0.01, 800.0, wall, full_view);
+            assert!(c.eye().distance(eye) < 0.1, "measured at the wall, not 100 off");
+            (c.project(wall, 1.0).unwrap().x / 2.0).abs()
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-3 * b.abs();
+        // Not slowed: one view height a second at full deflection, at the wall.
+        let plain = moved(&off, Some(10.0));
+        assert!(close(plain, PAN_RATE * 0.01), "{plain}");
+        // Slowed to the up-close speed at a tenth of the distance that shows everything…
+        let s = Settings { near_speed: 0.3, ..Default::default() };
+        assert!(close(moved(&s, Some(10.0)), 0.3 * plain));
+        // …to its square at a hundredth, and not at all from there out or with nothing shown.
+        assert!(close(moved(&s, Some(100.0)), 0.09 * plain));
+        assert!(close(moved(&s, Some(0.5)), plain) && close(moved(&s, None), plain));
+        // Zooming in closes in on the wall by the same share of the way, never past it.
+        let mut c = start();
+        let push = Motion { t: [0.0, 0.0, 1.0], r: [0.0; 3] };
+        apply(&mut c, push, &off, 0.01, 800.0, wall, Some(10.0));
+        assert!(close(c.eye().distance(wall), (-ZOOM_RATE * 0.01).exp()), "{}", c.eye().distance(wall));
+        for _ in 0..1000 {
+            apply(&mut c, push, &s, 0.05, 800.0, wall, Some(10.0));
+        }
+        assert!(c.eye().z > wall.z && c.eye().distance(wall) < 0.5, "{}", c.eye());
+        // The view does not jump when the target is moved to the wall.
+        let mut c = start();
+        let points = [DVec3::new(0.3, -0.2, -1.0), DVec3::new(-4.0, 2.0, -30.0), DVec3::new(10.0, 5.0, -200.0)];
+        let on_screen = |c: &Camera| points.map(|p| c.project(p, 1.0).unwrap().truncate());
+        let before = on_screen(&c);
+        apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 1e-12, 0.0] }, &s, 0.01, 800.0, wall, Some(10.0));
+        assert!(on_screen(&c).iter().zip(before).all(|(a, b)| a.distance(b) < 1e-9) && close(c.distance, 1.0));
+    }
+
+    #[test]
+    fn near_factor_follows_the_up_close_speed() {
+        assert_eq!(near_factor(5.0, Some(10.0), 1.0), 1.0, "100 %: the same speed at every distance");
+        assert!((near_factor(1.0, Some(10.0), 0.3) - 0.3).abs() < 1e-6);
+        assert!((near_factor(0.1, Some(10.0), 0.3) - 0.09).abs() < 1e-6);
+        assert_eq!(near_factor(20.0, Some(10.0), 0.3), 1.0, "never faster far out");
+        assert_eq!(near_factor(1.0, Some(0.0), 0.3), 1.0);
+        assert_eq!(near_factor(1.0, None, 0.3), 1.0);
+    }
+
+    #[test]
     fn motion_moves_the_camera() {
         let mut c = Camera::default();
         let s = Settings::default();
         let t0 = c.target;
-        assert!(apply(&mut c, Motion { t: [1.0, 0.0, 0.0], r: [0.0; 3] }, &s, 0.1, 800.0, glam::DVec3::ZERO));
+        assert!(apply(&mut c, Motion { t: [1.0, 0.0, 0.0], r: [0.0; 3] }, &s, 0.1, 800.0, glam::DVec3::ZERO, None));
         assert!(c.target.distance(t0) > 0.0);
         let d0 = c.distance;
-        apply(&mut c, Motion { t: [0.0, 0.0, 1.0], r: [0.0; 3] }, &s, 0.1, 800.0, glam::DVec3::ZERO);
+        apply(&mut c, Motion { t: [0.0, 0.0, 1.0], r: [0.0; 3] }, &s, 0.1, 800.0, glam::DVec3::ZERO, None);
         assert!(c.distance < d0, "pulling the cap toward you zooms in");
         let f0 = c.forward();
-        apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 1.0, 0.0] }, &s, 0.1, 800.0, glam::DVec3::ZERO);
+        apply(&mut c, Motion { t: [0.0; 3], r: [0.0, 1.0, 0.0] }, &s, 0.1, 800.0, glam::DVec3::ZERO, None);
         assert!(c.forward().dot(f0) < 0.9999);
         let locked = Settings { lock_rotation: true, lock_translation: true, ..Default::default() };
         let before = (c.target, c.distance, c.forward());
-        apply(&mut c, Motion { t: [1.0; 3], r: [1.0; 3] }, &locked, 0.1, 800.0, glam::DVec3::ZERO);
+        apply(&mut c, Motion { t: [1.0; 3], r: [1.0; 3] }, &locked, 0.1, 800.0, glam::DVec3::ZERO, None);
         assert_eq!(before, (c.target, c.distance, c.forward()));
     }
 }

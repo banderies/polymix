@@ -234,7 +234,7 @@ Work queue: [docs/ROADMAP.md](docs/ROADMAP.md) · Meshmixer parity status: [docs
 | Navigation scheme | *View → Navigation*: Fusion 360 (default) or Meshmixer, as in Meshmixer's preferences, or Custom: *Preferences → General → Mouse buttons* sets Orbit / Pan / Zoom for each middle and right drag (plain, Shift, Alt) |
 | Brush size / strength (Select, Sculpt) | Shift + scroll (or Control / Option / Command: *Preferences → General → Brush size scroll*), Cmd + middle-drag or `[` `]` / Cmd + right-drag (a plain right-drag always navigates) |
 | `S` | Opens Select with nothing selected (accepting the open tool, e.g. Erase & Fill) |
-| 3D mouse (3Dconnexion SpaceMouse, macOS) | Move the cap the way you want the model to move; Menu button = Hotbox, Fit = focus. Settings and a live readout under *View → 3D mouse…*; needs the 3DxWare driver |
+| 3D mouse (3Dconnexion SpaceMouse, macOS) | Move the cap the way you want the model to move; Menu button = Hotbox, Fit = focus. Pan and zoom are measured at the centre of rotation and slow down as you close in on it (*Up close* speed). Settings and a live readout under *View → 3D mouse…*; needs the 3DxWare driver |
 | Fit / wireframe / hotbox | `F` or the *Fit* button beside the view cube (frames the visible objects) / `W` / `Space` |
 | Select / Inspector / Transform | `S` / `I` / `T` |
 | Accept / Cancel / Undo / Redo | `Enter` / `Esc` / `Cmd+Z` / `Shift+Cmd+Z` |

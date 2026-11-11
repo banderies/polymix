@@ -825,6 +825,9 @@ pub struct MeshWorkspace {
     brush: tools::BrushSize,
     /// What the 3D mouse's move going on turns about (chosen as it started).
     space_centre: Option<DVec3>,
+    /// The distance that showed all the visible objects as that move started (pan and zoom
+    /// slow down closer in; see [`spacemouse::near_factor`]).
+    space_full_view: Option<f64>,
     /// Where to show that centre, and when the 3D mouse last moved the view (it fades after).
     space_marker: Option<(DVec3, std::time::Instant)>,
     /// Space-bar hotbox position (Meshmixer-style quick view settings).
@@ -929,6 +932,7 @@ impl MeshWorkspace {
             space_key_capture: None,
             brush: tools::BrushSize::default(),
             space_centre: None,
+            space_full_view: None,
             space_marker: None,
             hotbox: None,
             show_objects: true,
@@ -3115,10 +3119,12 @@ impl MeshWorkspace {
             self.remember_view();
             // A move turns about one centre, chosen as it starts.
             self.space_centre = Some(self.space_move_centre(vp));
+            let b = self.scene.bounds();
+            self.space_full_view = (!b.is_empty()).then(|| self.camera.focus_distance(&b));
         }
         self.space_moving = moving;
         let pivot = self.space_centre.unwrap_or(self.camera.target);
-        if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64, pivot) {
+        if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64, pivot, self.space_full_view) {
             // Keep animating while the cap is deflected.
             ctx.request_repaint();
         }
@@ -3299,9 +3305,20 @@ impl MeshWorkspace {
             speed_row(ui, "Zoom", "Pushing the cap in or pulling it out", &mut c.zoom_speed, |v| {
                 format!("halves the distance in {:.2} s", std::f64::consts::LN_2 / (spacemouse::ZOOM_RATE * v))
             });
+            let hint = "Pan and zoom slow down as you close in on the centre of rotation: at a tenth of the distance that shows everything they move this share of their speed on screen, at a hundredth this share of that again. 100%: the same speed on screen at every distance.";
+            ui.label("Up close").on_hover_text(hint);
+            let range = spacemouse::NEAR_SPEED_RANGE;
+            let mut percent = c.near_speed * 100.0;
+            if ui.add(egui::Slider::new(&mut percent, range.start() * 100.0..=range.end() * 100.0).logarithmic(true).suffix("%").max_decimals(0)).on_hover_text(hint).changed() {
+                c.near_speed = percent / 100.0;
+            }
+            ui.weak(format!("at 1/10 the distance; {:.0}% at 1/100", spacemouse::near_factor(0.01, Some(1.0), c.near_speed) * 100.0))
+                .on_hover_text("Of the distance that shows all the objects");
+            ui.end_row();
         });
         if ui.small_button("Reset speeds").clicked() {
-            (c.orbit_speed, c.pan_speed, c.zoom_speed) = (1.0, 1.0, 1.0);
+            let d = spacemouse::Settings::default();
+            (c.orbit_speed, c.pan_speed, c.zoom_speed, c.near_speed) = (d.orbit_speed, d.pan_speed, d.zoom_speed, d.near_speed);
         }
         ui.horizontal(|ui| {
             ui.checkbox(&mut c.lock_rotation, "Lock rotation");

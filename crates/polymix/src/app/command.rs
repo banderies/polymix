@@ -863,7 +863,7 @@ pub(super) mod tests {
         // Turning about it keeps it where it is on the screen.
         let before = ws.camera.project(c, vp.aspect()).unwrap();
         let turn = crate::spacemouse::Motion { t: [0.0; 3], r: [0.4, 0.6, 0.2] };
-        crate::spacemouse::apply(&mut ws.camera, turn, &ws.space_cfg, 0.2, 600.0, c);
+        crate::spacemouse::apply(&mut ws.camera, turn, &ws.space_cfg, 0.2, 600.0, c, None);
         let after = ws.camera.project(c, vp.aspect()).unwrap();
         assert!((after - before).truncate().length() < 1e-6 && ws.camera.forward().dot(-DVec3::X) < 0.99, "{before} → {after}");
         // Looking at empty space just beside the cylinder: the wall nearest the middle.

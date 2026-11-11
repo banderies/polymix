@@ -275,7 +275,25 @@ impl Camera {
     }
 
     pub fn zoom(&mut self, factor: f64) {
-        self.distance = (self.distance * factor).clamp(self.scene_radius * 1e-4, self.scene_radius * 1e3);
+        self.distance = self.within_zoom_limits(self.distance * factor);
+    }
+
+    /// `d` as a distance to the target the zoom allows.
+    fn within_zoom_limits(&self, d: f64) -> f64 {
+        d.clamp(self.scene_radius * 1e-4, self.scene_radius * 1e3)
+    }
+
+    /// Put the target on the line of sight `d` from the eye (within the zoom's limits), the eye
+    /// staying where it is, so the view does not change: what pans and zooms at the target's
+    /// depth then does so at `d`. In an orthographic view the distance is the view's scale, so
+    /// it is left as it is.
+    pub fn retarget_at(&mut self, d: f64) {
+        if self.orthographic {
+            return;
+        }
+        let eye = self.eye();
+        self.distance = self.within_zoom_limits(d);
+        self.target = eye + self.forward() * self.distance;
     }
 
     /// Zoom toward a world point under the cursor so that point stays put.
@@ -317,7 +335,12 @@ impl Camera {
         let r = (b.diagonal() * 0.5).max(1e-6);
         self.target = b.center();
         self.scene_radius = self.scene_radius.max(r);
-        self.distance = r / (self.fov_y * 0.5).sin() * 1.1;
+        self.distance = self.focus_distance(b);
+    }
+
+    /// The distance from which [`Camera::focus`] shows all of `b`.
+    pub fn focus_distance(&self, b: &Aabb) -> f64 {
+        (b.diagonal() * 0.5).max(1e-6) / (self.fov_y * 0.5).sin() * 1.1
     }
 
     /// Frame `b` from the current direction for a viewport of `aspect` (width / height): the
