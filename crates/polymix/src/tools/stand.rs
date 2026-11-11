@@ -6,7 +6,9 @@
 //!
 //! The legs are built in the background as they change (`mm_edit::leg_mesh`, tens of
 //! milliseconds each); the preview shows each leg's latest build, its outline while one is
-//! under way. A leg's root sinks into the object's outer wall by less than half the wall's
+//! under way. While a leg's end or a number in the panel is being dragged only the outlines
+//! follow: the base and the legs are built again when it is let go (building them as it
+//! went made the view lag), and a number typed in takes effect on Enter. A leg's root sinks into the object's outer wall by less than half the wall's
 //! thickness, so uniting changes only the outer surface (see `mm_edit::stand`).
 
 use super::*;
@@ -112,6 +114,8 @@ pub struct StandTool {
     /// What the preview shows: the base's and the legs' meshes (by address).
     preview_key: Vec<usize>,
     drag: Option<Drag>,
+    /// A number in the panel being dragged (see [`StandTool::held`]).
+    panel_held: bool,
     pressed_at: Option<egui::Pos2>,
     job: Option<Job<Accepted>>,
     error: Option<String>,
@@ -152,6 +156,7 @@ impl StandTool {
             preview: None,
             preview_key: Vec::new(),
             drag: None,
+            panel_held: false,
             pressed_at: None,
             job: None,
             error: None,
@@ -295,14 +300,28 @@ impl StandTool {
         }
     }
 
+    /// Whether an edit is under way, a leg's end dragged in the view or a number dragged in
+    /// the panel: the legs' plans (and so the outlines) follow it, while the base's and the
+    /// legs' meshes and the preview wait for it to end.
+    fn held(&self) -> bool {
+        self.panel_held || matches!(self.drag, Some(Drag::Root(_) | Drag::Foot(_)))
+    }
+
+    /// The base's mesh, if it was built for the base as it is now.
+    fn current_base(&self) -> Option<&Result<Arc<Mesh>, String>> {
+        self.base_mesh.as_ref().filter(|(k, _)| *k == (self.base, self.base_params)).map(|(_, m)| m)
+    }
+
     /// Bring everything up to date: the base's mesh, each leg's plan, its build (started in
-    /// the background, collected when done) and the preview.
+    /// the background, collected when done) and the preview; while an edit is under way
+    /// ([`StandTool::held`]) only the plans.
     fn refresh(&mut self, ctx: &egui::Context) {
         if self.object.is_none() {
             return;
         }
+        let held = self.held();
         let key = (self.base, self.base_params);
-        if self.base_mesh.as_ref().is_none_or(|(k, _)| *k != key) {
+        if !held && self.base_mesh.as_ref().is_none_or(|(k, _)| *k != key) {
             let edge = (self.base_params.width.min(self.base_params.depth) / 30.0).max(0.2);
             let m = mm_edit::base_mesh(&self.base, &self.base_params, edge).map(Arc::new).map_err(|e| e.to_string());
             self.base_mesh = Some((key, m));
@@ -324,13 +343,15 @@ impl StandTool {
             }
             // One build at a time per leg: a newer spec waits for the one under way.
             let wanted = !leg.ready(&spec) && leg.failed.as_ref().is_none_or(|(s, _)| *s != spec);
-            if wanted && leg.job.is_none() {
+            if wanted && leg.job.is_none() && !held {
                 if let Some(plan) = leg.plan().cloned() {
                     leg.job = Some((spec, Job::spawn("Stand leg", ctx.clone(), move |p| mm_edit::leg_mesh(&plan, Some(p)).map_err(|e| anyhow::anyhow!("{e}")))));
                 }
             }
         }
-        self.refresh_preview();
+        if !held {
+            self.refresh_preview();
+        }
     }
 
     /// The meshes the preview shows: the base's, then each leg's latest build (none for a
@@ -390,7 +411,7 @@ impl StandTool {
                 return false;
             }
         };
-        let base = match self.base_mesh.as_ref().map(|(_, m)| m.clone()) {
+        let base = match self.current_base().cloned() {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
                 self.error = Some(format!("The base: {e}"));
@@ -567,7 +588,9 @@ impl StandTool {
         (1..=self.legs.len()).contains(&k).then_some(k - 1).ok_or_else(|| format!("there is no leg {k} (there are {})", self.legs.len()))
     }
 
-    fn base_ui(&mut self, ui: &mut egui::Ui, world_up: DVec3) {
+    /// The base's settings; true while one of its numbers is being dragged.
+    fn base_ui(&mut self, ui: &mut egui::Ui, world_up: DVec3) -> bool {
+        let mut held = false;
         ui_util::section(ui, "Base");
         let p = &mut self.base_params;
         ui.horizontal(|ui| {
@@ -576,28 +599,30 @@ impl StandTool {
             ui.selectable_value(&mut p.shape, BaseShape::Ellipse, "Ellipse");
         });
         fn size(v: &mut f64) -> egui::DragValue<'_> {
-            egui::DragValue::new(v).speed(0.1).range(0.1..=1e5).min_decimals(1).max_decimals(2).suffix(" mm")
+            egui::DragValue::new(v).speed(0.1).range(0.1..=1e5).min_decimals(1).max_decimals(2).suffix(" mm").update_while_editing(false)
         }
         egui::Grid::new("stand_base_size").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             ui.label("Width");
-            ui.add(size(&mut p.width));
+            held |= ui.add(size(&mut p.width)).dragged();
             ui.end_row();
             ui.label("Depth");
-            ui.add(size(&mut p.depth));
+            held |= ui.add(size(&mut p.depth)).dragged();
             ui.end_row();
             ui.label("Thickness");
-            ui.add(size(&mut p.thickness));
+            held |= ui.add(size(&mut p.thickness)).dragged();
             ui.end_row();
             if p.shape == BaseShape::Rectangle {
                 ui.label("Corner radius");
-                ui.add(egui::DragValue::new(&mut p.corner_radius).speed(0.1).range(0.0..=1e5).max_decimals(2).suffix(" mm"));
+                held |= ui.add(egui::DragValue::new(&mut p.corner_radius).speed(0.1).range(0.0..=1e5).max_decimals(2).suffix(" mm").update_while_editing(false)).dragged();
                 ui.end_row();
             }
         });
         let mut gap = self.gap();
         ui.horizontal(|ui| {
             ui.label("Below the object").on_hover_text("From the object's lowest point down to the base's top (negative: the base cuts into the object)");
-            if ui.add(egui::DragValue::new(&mut gap).speed(0.1).max_decimals(2).suffix(" mm")).changed() {
+            let r = ui.add(egui::DragValue::new(&mut gap).speed(0.1).max_decimals(2).suffix(" mm").update_while_editing(false));
+            held |= r.dragged();
+            if r.changed() {
                 self.set_gap(gap);
             }
         });
@@ -605,7 +630,7 @@ impl StandTool {
             if ui.button("Fit to object").on_hover_text("Centre the base under the object and its legs' feet, the margin all round").clicked() {
                 self.fit_base();
             }
-            ui.add(egui::DragValue::new(&mut self.margin).speed(0.1).range(0.0..=1e4).max_decimals(1).prefix("margin ").suffix(" mm"));
+            ui.add(egui::DragValue::new(&mut self.margin).speed(0.1).range(0.0..=1e4).max_decimals(1).prefix("margin ").suffix(" mm").update_while_editing(false));
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Turn");
@@ -619,12 +644,15 @@ impl StandTool {
                 self.level(world_up);
             }
         });
+        held
     }
 
-    fn legs_ui(&mut self, ui: &mut egui::Ui) {
+    /// The legs' settings; true while one of their numbers is being dragged.
+    fn legs_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut held = false;
         ui_util::section(ui, "Legs");
         fn drag(v: &mut f64) -> egui::DragValue<'_> {
-            egui::DragValue::new(v).speed(0.05).range(0.05..=1e4).min_decimals(1).max_decimals(2)
+            egui::DragValue::new(v).speed(0.05).range(0.05..=1e4).min_decimals(1).max_decimals(2).update_while_editing(false)
         }
         let mut remove = None;
         egui::Grid::new("stand_legs").num_columns(5).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -635,9 +663,9 @@ impl StandTool {
             ui.end_row();
             ui.label("All").on_hover_text("New legs take these; changing one sets it on every leg");
             let before = self.all;
-            ui.add(drag(&mut self.all.diameter));
-            ui.add(drag(&mut self.all.root));
-            ui.add(drag(&mut self.all.foot));
+            held |= ui.add(drag(&mut self.all.diameter)).dragged();
+            held |= ui.add(drag(&mut self.all.root)).dragged();
+            held |= ui.add(drag(&mut self.all.foot)).dragged();
             ui.end_row();
             for (field, changed) in [(0, self.all.diameter != before.diameter), (1, self.all.root != before.root), (2, self.all.foot != before.foot)] {
                 if changed {
@@ -665,9 +693,9 @@ impl StandTool {
                 if ui.selectable_label(self.current == Some(i), label).on_hover_text(info).clicked() {
                     self.current = Some(i);
                 }
-                ui.add(drag(&mut leg.sizes.diameter));
-                ui.add(drag(&mut leg.sizes.root));
-                ui.add(drag(&mut leg.sizes.foot));
+                held |= ui.add(drag(&mut leg.sizes.diameter)).dragged();
+                held |= ui.add(drag(&mut leg.sizes.root)).dragged();
+                held |= ui.add(drag(&mut leg.sizes.foot)).dragged();
                 if ui.small_button("✕").on_hover_text("Remove this leg").clicked() {
                     remove = Some(i);
                 }
@@ -679,19 +707,20 @@ impl StandTool {
         }
         egui::Grid::new("stand_legs_shape").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             ui.label("Root flare").on_hover_text("How far up the leg its root's flare runs");
-            ui.add(drag(&mut self.root_flare).suffix(" mm"));
+            held |= ui.add(drag(&mut self.root_flare).suffix(" mm")).dragged();
             ui.end_row();
             ui.label("Foot flare").on_hover_text("How far up the leg its foot's flare runs");
-            ui.add(drag(&mut self.foot_flare).suffix(" mm"));
+            held |= ui.add(drag(&mut self.foot_flare).suffix(" mm")).dragged();
             ui.end_row();
             ui.label("Bend").on_hover_text("How far a leg keeps to its root's direction (square to the object) before it turns down to the base; 0: straight");
-            ui.add(egui::Slider::new(&mut self.bend, 0.0..=1.0));
+            held |= ui.add(egui::Slider::new(&mut self.bend, 0.0..=1.0)).dragged();
             ui.end_row();
         });
         for (i, note, serious) in self.notes() {
             let colour = if serious { egui::Color32::from_rgb(240, 110, 90) } else { egui::Color32::from_rgb(230, 170, 70) };
             ui.colored_label(colour, format!("Leg {}: {note}", i + 1));
         }
+        held
     }
 }
 
@@ -824,7 +853,7 @@ impl Tool for StandTool {
                 j
             })
             .collect();
-        let ready = self.base_mesh.as_ref().is_some_and(|(_, m)| m.is_ok()) && (0..self.legs.len()).all(|i| self.legs[i].ready(&self.spec(i)));
+        let ready = self.current_base().is_some_and(|m| m.is_ok()) && (0..self.legs.len()).all(|i| self.legs[i].ready(&self.spec(i)));
         serde_json::json!({
             "object": self.object,
             "base": {"center_mm": vec3(self.base.center.to_array(), 4), "up": vec3(self.base.up.to_array(), 5), "below_object_mm": round(self.gap(), 3),
@@ -925,8 +954,9 @@ impl Tool for StandTool {
         ui.small("Drag a line under the object (seen from the side) to put the base's top there. Click the object to add a leg; drag a leg's ends to move them; right-click an end (or Delete) to remove the leg.");
         let world_up = cx.camera.world_up();
         ui.add_enabled_ui(!combining, |ui| {
-            self.base_ui(ui, world_up);
-            self.legs_ui(ui);
+            let base_held = self.base_ui(ui, world_up);
+            let legs_held = self.legs_ui(ui);
+            self.panel_held = base_held || legs_held;
             ui.add_space(4.0);
             egui::ComboBox::from_label("Combine mode")
                 .selected_text(match self.combine {
@@ -948,7 +978,7 @@ impl Tool for StandTool {
                 ui.label(if building == 1 { "Building a leg…".to_string() } else { format!("Building {building} legs…") });
             });
         }
-        if let Some(Err(e)) = self.base_mesh.as_ref().map(|(_, m)| m) {
+        if let Some(Err(e)) = self.current_base() {
             ui.colored_label(egui::Color32::from_rgb(240, 110, 90), format!("The base: {e}"));
         }
         if let Some(e) = &self.error {
@@ -1154,7 +1184,8 @@ mod tests {
         for _ in 0..frames {
             let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 1200.0))), ..Default::default() };
             let mut closed = false;
-            let _ = ctx.run_ui(raw, |ui| closed = matches!(t.panel(ui, cx), ToolOutcome::Close));
+            // The frame's texture changes are not shown anywhere: dropped on purpose.
+            ctx.run_ui(raw, |ui| closed = matches!(t.panel(ui, cx), ToolOutcome::Close)).textures_delta.clear();
             if closed {
                 return true;
             }
@@ -1270,6 +1301,41 @@ mod tests {
             let root = cx.project(t.legs[0].root).unwrap();
             t.secondary_click(root, cx);
             assert!(t.legs.is_empty());
+        });
+    }
+
+    #[test]
+    fn while_a_leg_or_a_number_is_dragged_only_the_outlines_follow() {
+        with_tool(|t, cx, _| {
+            t.act("add_leg", &serde_json::json!({"at": bottom(t).to_array()}), cx).unwrap();
+            settle(t, cx, 20_000);
+            let (key, base) = (t.preview_key.clone(), t.base_mesh.as_ref().map(|(k, _)| *k));
+            // Drag the leg's root across the ball's underside: its plan follows, nothing builds.
+            let at = cx.project(t.legs[0].root).unwrap();
+            t.pointer(&PointerInput { pos: Some(at), pressed: true, down: true, ..Default::default() }, cx);
+            let to = cx.project(bottom(t) * 0.7 + t.base.width_axis * 4.0).unwrap();
+            t.pointer(&PointerInput { pos: Some(to), down: true, ..Default::default() }, cx);
+            let root = t.legs[0].root;
+            assert!(root.distance(bottom(t)) > 1.0, "moved: {root}");
+            assert!(t.legs[0].plan.as_ref().is_some_and(|(s, _)| s.root == root), "the outline follows");
+            assert!(!t.pending() && t.preview_key == key, "nothing built while dragging");
+            // Let go: the leg is built where it is now.
+            t.pointer(&PointerInput { pos: Some(to), released: true, ..Default::default() }, cx);
+            assert!(t.pending(), "building");
+            settle(t, cx, 20_000);
+            assert!(t.legs[0].ready(&t.spec(0)) && t.preview_key != key);
+            // A number dragged in the panel: the base waits for it too, and the leg with it.
+            let key = t.preview_key.clone();
+            t.panel_held = true;
+            t.base_params.thickness += 1.0;
+            t.refresh(cx.egui);
+            assert!(t.current_base().is_none() && t.base_mesh.as_ref().map(|(k, _)| *k) == base, "the base waits");
+            assert!(!t.pending() && t.preview_key == key);
+            t.panel_held = false;
+            t.refresh(cx.egui);
+            assert!(t.current_base().is_some_and(|m| m.is_ok()) && t.pending());
+            settle(t, cx, 20_000);
+            assert_eq!(t.state(cx.scene)["preview_ready"], true);
         });
     }
 
