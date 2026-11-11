@@ -661,11 +661,41 @@ pub fn leg_mesh(plan: &LegPlan, progress: mm_solid::Progress) -> EditResult<Mesh
 }
 
 /// The base and the legs joined into one solid (exact unions): the base face group 0, leg
-/// `k` group `k + 1`.
-pub fn join_stand(base: &Mesh, legs: &[&Mesh]) -> EditResult<Mesh> {
+/// `k` group `k + 1`. Legs whose boxes are apart go in together, as separate shells of one
+/// union: a union per leg built the trees of the whole stand again for each leg, which took
+/// minutes with long legs. `progress` is told the share joined; the work stops when it
+/// returns false.
+pub fn join_stand(base: &Mesh, legs: &[&Mesh], progress: mm_solid::Progress) -> EditResult<Mesh> {
+    let boxes: Vec<Aabb> = legs.iter().map(|l| l.bounds()).collect();
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    for k in 0..legs.len() {
+        match batches.iter_mut().find(|b| b.iter().all(|&j| !boxes[j].intersects(&boxes[k]))) {
+            Some(b) => b.push(k),
+            None => batches.push(vec![k]),
+        }
+    }
     let mut stand = base.clone();
-    for leg in legs {
-        stand = mesh_boolean(&stand, leg, BooleanOp::Union)?.mesh;
+    for t in stand.triangle_ids().collect::<Vec<_>>() {
+        stand.set_tri_group(t, 0);
+    }
+    for (i, batch) in batches.iter().enumerate() {
+        if progress.is_some_and(|p| !p(i as f32 / batches.len() as f32)) {
+            return Err(EditError::Failed("cancelled".into()));
+        }
+        let mut shells = Mesh::new();
+        for &k in batch {
+            let g = legs[k].triangle_ids().map(|t| legs[k].tri_group(t)).min().unwrap_or(0);
+            shells.append_mesh(legs[k], k as i32 + 1 - g);
+        }
+        let top = stand.max_group_id();
+        let r = mesh_boolean(&stand, &shells, BooleanOp::Union)?;
+        stand = r.mesh;
+        // The union moves the legs' groups past the stand's: back to theirs.
+        let moved: Vec<u32> = stand.triangle_ids().filter(|&t| stand.tri_group(t) > top).collect();
+        for t in moved {
+            let g = stand.tri_group(t);
+            stand.set_tri_group(t, g - r.group_offset);
+        }
     }
     Ok(stand)
 }

@@ -79,7 +79,7 @@ fn a_leg_holds_a_ball_up_off_the_base() {
         let rim: Vec<f64> = leg.vertex_ids().map(|v| leg.vertex(v)).filter(|q| q.length() < 10.0 && (q - up * q.dot(up)).length() > 3.0).map(|q| 10.0 - q.length()).collect();
         assert!(!rim.is_empty() && rim.iter().all(|d| *d < plan.embed + tol + 0.05), "under the footprint's rim it follows the surface");
 
-        let stand = join_stand(&base_mesh(&base, &base_params, 2.0).unwrap(), &[&leg]).unwrap();
+        let stand = join_stand(&base_mesh(&base, &base_params, 2.0).unwrap(), &[&leg], None).unwrap();
         assert_eq!(stand.max_group_id(), 1, "base and leg groups");
         let all = mesh_boolean(&ball, &stand, BooleanOp::Union).unwrap().mesh;
         assert_valid(&all);
@@ -128,7 +128,7 @@ fn legs_on_a_hollow_vessel_change_only_its_outer_surface() {
         let deepest = leg.vertex_ids().map(|v| leg.vertex(v)).filter(|q| q.x.abs() < 19.0).map(radial).fold(f64::INFINITY, f64::min);
         assert!(deepest > 3.0 + 0.3, "{what}: a leg vertex {deepest} from the axis");
 
-        let stand = join_stand(&base_mesh, &[&leg]).unwrap();
+        let stand = join_stand(&base_mesh, &[&leg], None).unwrap();
         let all = mesh_boolean(&shell, &stand, BooleanOp::Union).unwrap().mesh;
         assert_valid(&all);
         assert!(all.is_closed(), "{what}");
@@ -170,4 +170,52 @@ fn a_column_running_into_the_object_is_reported() {
     assert!(plan.clearance < -1.0, "clearance {}", plan.clearance);
     let clear = plan_leg(&two, &bvh, DVec3::new(0.0, 0.0, -6.0), DVec3::new(9.0, 0.0, -25.0), &base_at(-25.0), 3.0, &LegParams { root_flare: 2.0, ..p });
     assert!(clear.is_ok());
+}
+
+#[test]
+fn legs_apart_join_the_base_in_one_union_and_keep_their_groups() {
+    let ball = primitives::icosphere(10.0, 4);
+    let bvh = Bvh::build(&ball);
+    let base = base_at(-22.0);
+    let bp = square(50.0, 4.0);
+    let p = LegParams { diameter: 2.0, root_diameter: 4.0, foot_diameter: 4.0, root_flare: 2.0, foot_flare: 2.0, bend: 0.0 };
+    // Two legs far apart, and a third beside the first (their boxes meet: a union of its own).
+    let roots = [DVec3::new(-5.0, 0.0, -8.66), DVec3::new(5.0, 0.0, -8.66), DVec3::new(-3.0, 2.5, -9.2)];
+    let legs: Vec<Mesh> = roots
+        .iter()
+        .map(|&r| {
+            let r = r.normalize() * 10.0;
+            let plan = plan_leg(&ball, &bvh, r, base.project(r), &base, bp.thickness, &p).unwrap();
+            leg_mesh(&plan, None).unwrap()
+        })
+        .collect();
+    assert!(legs[0].bounds().intersects(&legs[2].bounds()) && !legs[0].bounds().intersects(&legs[1].bounds()));
+    let base_m = base_mesh(&base, &bp, 2.0).unwrap();
+    let refs: Vec<&Mesh> = legs.iter().collect();
+    let calls = std::cell::Cell::new(Vec::new());
+    let report = |f: f32| {
+        let mut v = calls.take();
+        v.push(f);
+        calls.set(v);
+        true
+    };
+    let stand = join_stand(&base_m, &refs, Some(&report)).unwrap();
+    assert_eq!(calls.take(), vec![0.0, 0.5], "two unions");
+    assert_valid(&stand);
+    assert!(stand.is_closed());
+    let mut groups: Vec<i32> = stand.triangle_ids().map(|t| stand.tri_group(t)).collect();
+    groups.sort();
+    groups.dedup();
+    assert_eq!(groups, vec![0, 1, 2, 3], "the base 0, leg k k + 1");
+    // As a union per leg makes it.
+    let mut one_by_one = base_m.clone();
+    for leg in &legs {
+        one_by_one = mesh_boolean(&one_by_one, leg, BooleanOp::Union).unwrap().mesh;
+    }
+    assert!((volume(&stand) - volume(&one_by_one)).abs() < 1e-6 * volume(&stand));
+    // Each leg's triangles keep its group: leg 2's are below the ball's right side.
+    let right = stand.triangle_ids().filter(|&t| stand.tri_group(t) == 2).all(|t| stand.tri_centroid(t).x > 0.0);
+    assert!(right, "leg 2 where it was made");
+    // Stopped when told to.
+    assert!(join_stand(&base_m, &refs, Some(&|_| false)).is_err());
 }

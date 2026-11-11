@@ -443,8 +443,11 @@ impl StandTool {
                 });
             }
             let refs: Vec<&Mesh> = meshes.iter().map(|m| m.as_ref()).collect();
-            let stand = mm_edit::join_stand(&base, &refs).map_err(|e| anyhow::anyhow!("joining the legs to the base: {e}"))?;
-            progress(0.7);
+            let joining = |f: f32| progress(0.5 + 0.2 * f);
+            let stand = mm_edit::join_stand(&base, &refs, Some(&joining)).map_err(|e| anyhow::anyhow!("joining the legs to the base: {e}"))?;
+            if !progress(0.7) {
+                anyhow::bail!("cancelled");
+            }
             Ok(match combine {
                 Combine::Boolean => {
                     let r = mm_edit::mesh_boolean(&source, &stand, mm_edit::BooleanOp::Union).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -849,6 +852,7 @@ impl Tool for StandTool {
                     j["clearance_from_object_mm"] = if p.clearance.is_finite() { round(p.clearance, 3).into() } else { serde_json::Value::Null };
                 }
                 j["built"] = leg.ready(&spec).into();
+                j["triangles"] = leg.built.as_ref().map(|(_, m)| m.triangle_count()).into();
                 j["notes"] = notes.iter().filter(|n| n.0 == i).map(|n| n.1.clone()).collect::<Vec<_>>().into();
                 j
             })
@@ -857,6 +861,7 @@ impl Tool for StandTool {
         serde_json::json!({
             "object": self.object,
             "base": {"center_mm": vec3(self.base.center.to_array(), 4), "up": vec3(self.base.up.to_array(), 5), "below_object_mm": round(self.gap(), 3),
+                     "triangles": self.current_base().and_then(|m| m.as_ref().ok()).map(|m| m.triangle_count()),
                      "error": self.base_mesh.as_ref().and_then(|(_, m)| m.as_ref().err().cloned())},
             "legs": legs,
             "current_leg": self.current.map(|i| i + 1),
@@ -1460,7 +1465,7 @@ mod tests {
         let t0 = Instant::now();
         assert!(legs.len() >= 2, "too few legs could be made");
         let refs: Vec<&Mesh> = legs.iter().collect();
-        let stand = mm_edit::join_stand(&mm_edit::base_mesh(&base, &base_params, 3.0).unwrap(), &refs).unwrap();
+        let stand = mm_edit::join_stand(&mm_edit::base_mesh(&base, &base_params, 3.0).unwrap(), &refs, None).unwrap();
         let all = mm_edit::mesh_boolean(&shell, &stand, mm_edit::BooleanOp::Union).unwrap().mesh;
         eprintln!("joined and united in {:.1?}: {} triangles", t0.elapsed(), all.triangle_count());
         all.check_validity().unwrap();
