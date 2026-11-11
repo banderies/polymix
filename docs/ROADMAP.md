@@ -356,6 +356,27 @@ Hollow vessel models for printing and benchtop flow.
       geometry or running into the model are flagged and not made. Tests: closed slabs on a
       tilted plane, legs on a ball and on a hollow tube (lumen triangles all kept), short
       legs, collisions, the tool's clicks, drags, drawn base, settings and accept modes.
+- [x] **M18.4 Mic Pad** (`mm_edit::pad`; Edit → Mic Pad, Vessel → Mic Pad): a flat-topped
+      pad standing off the wall over a stenosis, for a contact microphone (with ultrasound
+      gel). A click places its centre; its line (the pad's length) runs along the vessel (the
+      direction least like the surface normals around the point) and is drawn on the wall;
+      dragging the line's ends turns it about the centre. The pad joins the wall over its
+      contact: the largest rectangle about the centre, within the base (length × width), over
+      which the surface turns away from the pad by no more than the contact slope (45° by
+      default) and has no sudden rise (found on a ray grid, refined about what was found); the
+      pad rises `height` to a flat top, its sides leaning out by the draft angle from the
+      base's size, and from a cut-back contact's edge straight to the top's (a wedge, so a
+      square pad on a narrow vessel does not wrap round it). The contact rests on the highest
+      point of the surface under it, square to the mean normal. It is an explicit mesh (a
+      grid underside on rays down the axis, flat sides and top): below the contact it goes
+      straight down into the wall and stops 60% of the way to the next surface (as a Stand
+      root), so an exact union changes only the outer wall. Flagged and not made: another
+      branch over the pad or rising into its contact (found past a sudden rise from the
+      centre), or its sides reaching more than 60% through the wall beside it. Tests: a ball,
+      a hollow tube along / across / on its side / wider than it (lumen triangles all kept), a
+      square pad on a tube (joins its crown only, 90° its whole width), a torus's inner rim
+      (rests on the line's ends), branches over and beside, the tool's click, end and centre
+      drags, settings and accept.
 
 ## M19 — The rest of Meshmixer parity
 

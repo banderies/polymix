@@ -341,7 +341,7 @@ fn hermite(p0: DVec3, m0: DVec3, p1: DVec3, m1: DVec3, t: f64) -> DVec3 {
 
 /// The object's outward direction around `p`: the area-weighted mean normal of the triangles
 /// within `radius` that face within 60° of `n` (the far side of a thin part is left out).
-fn root_axis(mesh: &Mesh, bvh: &Bvh, p: DVec3, n: DVec3, radius: f64) -> DVec3 {
+pub(crate) fn root_axis(mesh: &Mesh, bvh: &Bvh, p: DVec3, n: DVec3, radius: f64) -> DVec3 {
     let mut sum = DVec3::ZERO;
     bvh.query_sphere(mesh, p, radius, |t| {
         let c = mesh.tri_cross(t);

@@ -13,6 +13,7 @@
 //! * [`mod@mirror`], [`mod@bridge`] (bridge spans, join loops), [`mod@loft`] (tube between two
 //!   openings with G0 / G1 ends), [`smooth`] (smooth boundary),
 //!   [`transform`] (affine transforms, drop to ground, principal-axis alignment).
+//! * [`pad`] — a flat-topped pad standing off a surface (for a contact microphone).
 //! * [`stand`] — a base under an object and legs holding it up (to display a printed model).
 //! * [`stent`] — virtual stenting: place a bare or covered stent between two vessel
 //!   cross-sections and reshape the vessel around it.
@@ -41,6 +42,7 @@ pub mod region;
 pub mod smooth;
 pub mod soft;
 pub mod stamp;
+pub mod pad;
 pub mod stand;
 pub mod stencil;
 pub mod thicken;
@@ -79,6 +81,7 @@ pub use region::{discard, duplicate, flip_normals, separate};
 pub use smooth::smooth_boundary;
 pub use soft::{soft_deform, soft_region, warp, Continuity, SoftKind, SoftRegion};
 pub use stamp::{stamp_polygon, StampFrame, StampResult, Stencil};
+pub use pad::{pad_mesh, plan_pad, PadParams, PadPlan, PadRect};
 pub use stand::{base_mesh, default_foot, join_stand, leg_mesh, plan_leg, BaseFrame, BaseParams, BaseShape, LegParams, LegPlan};
 pub use stencil::{icon_stencils, shape_stencils, stamp_loops, text_stencil, validate_loops, LoopsStampResult, StencilShape};
 pub use stent::{apply_stent, place_stent, StentParams, StentPlacement, StentReport, StentSection, VesselPath};

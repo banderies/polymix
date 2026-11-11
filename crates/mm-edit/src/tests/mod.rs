@@ -9,6 +9,7 @@ mod flow_tests;
 mod local_cut_tests;
 mod loft_tests;
 mod misc_tests;
+mod pad_tests;
 mod perf;
 mod soft_tests;
 mod stand_tests;

@@ -27,6 +27,7 @@ pub mod measure;
 pub mod sculpt;
 pub mod stamp;
 pub mod stand;
+pub mod mic_pad;
 pub mod drop_part;
 pub mod pattern;
 pub mod unwrap;

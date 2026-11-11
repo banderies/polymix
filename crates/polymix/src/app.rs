@@ -645,6 +645,7 @@ pub(crate) fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "fitprimitive" => Box::new(tools::ops::FitPrimitiveTool::new(cx)),
         "addtube" => Box::new(tools::add_tube::AddTubeTool::new(cx)),
         "stand" => Box::new(tools::stand::StandTool::new(cx)),
+        "micpad" => Box::new(tools::mic_pad::MicPadTool::new(cx)),
         "units" => Box::new(tools::units::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
@@ -2317,6 +2318,9 @@ impl MeshWorkspace {
                     if ui.button("Stand").on_hover_text("A base under the object and legs holding it up off it (to set a printed model on a bench)").clicked() {
                         open = Some("stand");
                     }
+                    if ui.button("Mic Pad").on_hover_text("A flat-topped pad standing off the surface, joined to it along a line (to hold a contact microphone)").clicked() {
+                        open = Some("micpad");
+                    }
                     if ui.button("Close Cracks").on_hover_text("Zip open boundaries that lie on top of each other").clicked() {
                         open = Some("closecracks");
                     }
@@ -2367,6 +2371,9 @@ impl MeshWorkspace {
                     }
                     if ui.button("Stand").on_hover_text("A base under the printed model and legs holding it up off it; the legs join only the outer wall").clicked() {
                         open = Some("stand");
+                    }
+                    if ui.button("Mic Pad").on_hover_text("A flat-topped pad standing off the wall over a stenosis, for a contact microphone; it joins only the outer wall").clicked() {
+                        open = Some("micpad");
                     }
                     if ui.button("Measure diameter").clicked() {
                         open = Some("measure");

@@ -33,6 +33,7 @@ pub const TOOLS: &[ToolInfo] = &[
     t("aligntotarget", "Align To Target", "Register the object to the target surface (iterative closest point)"),
     t("fitprimitive", "Fit Primitive", "Fit a plane, sphere, cylinder, … to the selection"),
     t("addtube", "Add Tube", "A tube between two points on the surface (clicks)"),
+    t("micpad", "Mic Pad", "A flat-topped pad standing off the surface for a contact microphone, joined to it along a line (a click places it; dragging the line's ends turns it)"),
     t("stand", "Stand", "A base under the object and legs holding it up off it, united with it (clicks add legs; dragging a line places the base)"),
     t("units", "Units / Dimensions", "Read and set the object's size in millimetres"),
     t("measure", "Measure", "Distances, coordinates, thickness, cylinder fit and vessel diameter (clicks)"),

@@ -19,7 +19,7 @@ use mm_edit::{BaseFrame, BaseParams, BaseShape, LegParams, LegPlan};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Combine {
+pub(super) enum Combine {
     /// United with the object.
     Boolean,
     /// Added to the object as separate shells.

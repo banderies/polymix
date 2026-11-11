@@ -215,6 +215,20 @@ next surface below, so uniting the stand changes only the model's outer surface:
 vessel's lumen is left exactly as it was. Legs that would cut into the model (rooted in a
 crotch, or running into another branch) are flagged and not made.
 
+To listen to a stenosis with a contact microphone, **Edit → Mic Pad** (also under Vessel)
+adds a flat-topped pad standing off the wall: click the model where it goes and its line (the
+pad's length) is drawn on the wall, along the vessel; drag the line's ends to turn it about
+that point, or drag the point to move it. The panel sets the base's length and width (the
+most the pad joins the wall over), the height up to the flat top and a draft angle that
+leans the sides out, so the top is wider than the base (its size is shown). The pad joins
+the wall only where it faces the pad: where the wall turns away more steeply than the
+contact slope (45° by default; past a vessel's crown), the base is cut back and the pad's
+sides lean out from there to the top, so a square pad on a narrow vessel is a wedge rather
+than a block wrapped round it. Under that contact the pad goes straight down into the wall,
+its underside following the surface and stopping well short of the next surface below, as a
+Stand leg's root does: the lumen is untouched. Pads that another branch would lie over, or
+whose sides would reach into the wall beside them, are flagged and not made.
+
 Analysis extras: **Centerline** (vessel tree through the centres of the largest spheres inside
 the lumen, as VMTK's, with loops around fenestrations; every point and segment is checked to lie
 inside the lumen; per-branch length and inscribed diameters, CSV / VTK export for
@@ -252,8 +266,8 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 |---|---|
 | Select | Sphere brush (fixed size on the model), lasso and laser lasso (through or visible only), hole-border ring, grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
 | Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag, the draw and pinch brushes and the rest of Meshmixer's set; spacing, brush textures turned with the stroke, a screen stencil; symmetry across any plane; Stamp (a library of shapes, icons and text for labelling prints, plus your own) |
-| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid (colours from vertices or the texture), Remesh, Reduce, Smooth, Offset / Hollow (with escape holes), Thicken (a shell with open ends), Boolean (union/difference/intersection; exact or volumetric), Add Tube, Stand (a base and legs to display a print), Fit Primitive (`P` in Select; an adjust gizmo), Create Pivot (incl. from the last tool, symmetric, linked to the target, pivot-to-pivot Align), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
-| Vessel | Trim branch, Flow extensions, Cap open ends, Thicken into a shell, Stand, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
+| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid (colours from vertices or the texture), Remesh, Reduce, Smooth, Offset / Hollow (with escape holes), Thicken (a shell with open ends), Boolean (union/difference/intersection; exact or volumetric), Add Tube, Stand (a base and legs to display a print), Mic Pad (a flat pad off the wall for a contact microphone), Fit Primitive (`P` in Select; an adjust gizmo), Create Pivot (incl. from the last tool, symmetric, linked to the target, pivot-to-pivot Align), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
+| Vessel | Trim branch, Flow extensions, Cap open ends, Thicken into a shell, Stand, Mic Pad, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
 | Analysis | Inspector, Measure (distance, thickness, gaps, cylinder fit, vessel diameter, snapping), Mesh Query (normals, quality, curvature), Units / Dimensions (incl. scale from measurements), Clearance, Check for CFD, Deviation; centre of mass in the statistics |
 | View & files | Textures (OBJ `vt` and `map_Kd`, or right-click → Texture…), UV checker, X-ray, grid size, image slices from the Segmentation tab; Import reference (a see-through guide), Import parts folder, export one file per region or per object |
 
