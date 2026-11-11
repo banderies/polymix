@@ -11,6 +11,7 @@ mod loft_tests;
 mod misc_tests;
 mod perf;
 mod soft_tests;
+mod stand_tests;
 mod stent_tests;
 mod target_tests;
 mod thicken_tests;

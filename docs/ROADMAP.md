@@ -346,6 +346,16 @@ Hollow vessel models for printing and benchtop flow.
 - [x] **M18.2 Escape holes** (Edit → Offset / Hollow): clicked on the object, straight through
       the wall along the surface normal (radius, taper), or one at the lowest point; cut by
       exact booleans.
+- [x] **M18.3 Stand** (`mm_edit::stand`; Edit → Stand, Vessel → Stand): a base under the
+      model (drawn as a line across a side view, or sized in the panel, fit to the model) and
+      legs from clicked points down to it, to set a print on a bench — part of the model, not
+      print supports. A leg is a distance field (draped flared root, Hermite column, flared
+      foot) meshed on a grid; the root's plug stops 60% of the way to the next surface down
+      its axis, so an exact union changes only the outer wall (a thickened vessel's lumen is
+      untouched: tested on a tube shell and the synthetic vessel). Legs rooted under rising
+      geometry or running into the model are flagged and not made. Tests: closed slabs on a
+      tilted plane, legs on a ball and on a hollow tube (lumen triangles all kept), short
+      legs, collisions, the tool's clicks, drags, drawn base, settings and accept modes.
 
 ## M19 — The rest of Meshmixer parity
 

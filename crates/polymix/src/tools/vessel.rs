@@ -113,7 +113,7 @@ fn nearest_loop(mesh: &Mesh, p: DVec3) -> Option<Vec<u32>> {
 }
 
 /// Next free "outlet_N" style name.
-fn next_name(names: &std::collections::HashMap<i32, String>, prefix: &str) -> String {
+pub(crate) fn next_name(names: &std::collections::HashMap<i32, String>, prefix: &str) -> String {
     let mut k = 1;
     loop {
         let n = format!("{prefix}_{k}");

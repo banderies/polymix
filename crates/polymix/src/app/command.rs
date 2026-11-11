@@ -33,6 +33,7 @@ pub const TOOLS: &[ToolInfo] = &[
     t("aligntotarget", "Align To Target", "Register the object to the target surface (iterative closest point)"),
     t("fitprimitive", "Fit Primitive", "Fit a plane, sphere, cylinder, … to the selection"),
     t("addtube", "Add Tube", "A tube between two points on the surface (clicks)"),
+    t("stand", "Stand", "A base under the object and legs holding it up off it, united with it (clicks add legs; dragging a line places the base)"),
     t("units", "Units / Dimensions", "Read and set the object's size in millimetres"),
     t("measure", "Measure", "Distances, coordinates, thickness, cylinder fit and vessel diameter (clicks)"),
     t("meshquery", "Mesh Query", "Colour by normal, position, triangle quality or curvature (clicks for triangle info)"),

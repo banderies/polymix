@@ -644,6 +644,7 @@ pub(crate) fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "aligntotarget" => Box::new(tools::ops::AlignToTargetTool::new(cx)),
         "fitprimitive" => Box::new(tools::ops::FitPrimitiveTool::new(cx)),
         "addtube" => Box::new(tools::add_tube::AddTubeTool::new(cx)),
+        "stand" => Box::new(tools::stand::StandTool::new(cx)),
         "units" => Box::new(tools::units::UnitsTool::new(cx)),
         "measure" => Box::new(tools::measure::MeasureTool::new(cx)),
         "meshquery" => Box::new(tools::mesh_query::MeshQueryTool::new(cx)),
@@ -2309,6 +2310,9 @@ impl MeshWorkspace {
                     if ui.button("Add Tube").on_hover_text("A tube between two points on the surface (bypass, channel, handle)").clicked() {
                         open = Some("addtube");
                     }
+                    if ui.button("Stand").on_hover_text("A base under the object and legs holding it up off it (to set a printed model on a bench)").clicked() {
+                        open = Some("stand");
+                    }
                     if ui.button("Close Cracks").on_hover_text("Zip open boundaries that lie on top of each other").clicked() {
                         open = Some("closecracks");
                     }
@@ -2356,6 +2360,9 @@ impl MeshWorkspace {
                     }
                     if ui.button("Thicken into a shell").on_hover_text("A wall of a given thickness around the lumen (or inside it), the cut ends kept open with flat rims: a hollow model to print").clicked() {
                         open = Some("thicken");
+                    }
+                    if ui.button("Stand").on_hover_text("A base under the printed model and legs holding it up off it; the legs join only the outer wall").clicked() {
+                        open = Some("stand");
                     }
                     if ui.button("Measure diameter").clicked() {
                         open = Some("measure");

@@ -26,6 +26,7 @@ pub mod vessel;
 pub mod measure;
 pub mod sculpt;
 pub mod stamp;
+pub mod stand;
 pub mod drop_part;
 pub mod pattern;
 pub mod unwrap;

@@ -205,6 +205,16 @@ ends kept open with flat rims. The new side comes from a distance field, so it n
 into itself at a bifurcation or a tight bend as moving the surface along its normals would,
 and the result is a closed, manifold wall ready to print.
 
+To set the print on a bench, **Edit → Stand** (also under Vessel) adds a base under the model
+and legs holding it up off it: drag a line under the model (seen from the side) to put the
+base's top there, or size and place it in the panel (rounded rectangle or ellipse, fit to the
+model); click the model to add a leg and drag its root or foot to move it. Each leg is a
+column with a broad flared root and foot (column, root and foot diameters per leg). The root
+is draped over the surface and sunk only part way into the wall, stopping well short of the
+next surface below, so uniting the stand changes only the model's outer surface: a hollow
+vessel's lumen is left exactly as it was. Legs that would cut into the model (rooted in a
+crotch, or running into another branch) are flagged and not made.
+
 Analysis extras: **Centerline** (vessel tree through the centres of the largest spheres inside
 the lumen, as VMTK's, with loops around fenestrations; every point and segment is checked to lie
 inside the lumen; per-branch length and inscribed diameters, CSV / VTK export for
@@ -242,8 +252,8 @@ Smooth organic surfaces such as segmentations are unaffected; turn it off to smo
 |---|---|
 | Select | Sphere brush (fixed size on the model), lasso and laser lasso (through or visible only), hole-border ring, grow/shrink, connected, invert, groups, optimise boundary · Discard, Erase & Fill, Extrude / Offset, Separate, Duplicate, Flip normals, face groups · Smooth, Remesh, Reduce on the selection |
 | Sculpt | Robust smooth, Smooth, Inflate, Flatten, Drag, the draw and pinch brushes and the rest of Meshmixer's set; spacing, brush textures turned with the stroke, a screen stencil; symmetry across any plane; Stamp (a library of shapes, icons and text for labelling prints, plus your own) |
-| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid (colours from vertices or the texture), Remesh, Reduce, Smooth, Offset / Hollow (with escape holes), Thicken (a shell with open ends), Boolean (union/difference/intersection; exact or volumetric), Add Tube, Fit Primitive (`P` in Select; an adjust gizmo), Create Pivot (incl. from the last tool, symmetric, linked to the target, pivot-to-pivot Align), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
-| Vessel | Trim branch, Flow extensions, Cap open ends, Thicken into a shell, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
+| Edit | Transform (gizmo + numeric, local / world frame, sizes, snapping, centre, drop to ground, principal axes; Face Transform on a selection), Align (picked face to ground / origin / another surface), Plane Cut, Mirror, Make Solid (colours from vertices or the texture), Remesh, Reduce, Smooth, Offset / Hollow (with escape holes), Thicken (a shell with open ends), Boolean (union/difference/intersection; exact or volumetric), Add Tube, Stand (a base and legs to display a print), Fit Primitive (`P` in Select; an adjust gizmo), Create Pivot (incl. from the last tool, symmetric, linked to the target, pivot-to-pivot Align), Align / Attract To Target, Bridge, Separate Shells, Combine, Duplicate, Flip normals |
+| Vessel | Trim branch, Flow extensions, Cap open ends, Thicken into a shell, Stand, Measure diameter, Centerline, Virtual stent, Boundary patches / CFD export, Check for CFD |
 | Analysis | Inspector, Measure (distance, thickness, gaps, cylinder fit, vessel diameter, snapping), Mesh Query (normals, quality, curvature), Units / Dimensions (incl. scale from measurements), Clearance, Check for CFD, Deviation; centre of mass in the statistics |
 | View & files | Textures (OBJ `vt` and `map_Kd`, or right-click → Texture…), UV checker, X-ray, grid size, image slices from the Segmentation tab; Import reference (a see-through guide), Import parts folder, export one file per region or per object |
 
