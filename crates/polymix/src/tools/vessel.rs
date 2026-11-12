@@ -578,6 +578,12 @@ struct FlowParams {
     /// Sized by hand: how much of each extension tapers from its opening to its diameter, mm
     /// (all of a shorter one); the rest is straight.
     taper: f64,
+    /// Sized by hand: a barb near each extension's end for its hose to grip.
+    barb: bool,
+    /// How much wider than the extension its barb's crest is, on the diameter, mm.
+    barb_width: f64,
+    /// From the extension's end back to where its barb starts to rise, mm.
+    barb_setback: f64,
 }
 
 /// An extension's size set by hand, mm.
@@ -594,6 +600,17 @@ const SIZE_RANGE: std::ops::RangeInclusive<f64> = 0.1..=200.0;
 const STEEP: f64 = 45.0;
 /// Fewest rings a taper is built with (where the extension's length allows).
 const TAPER_RINGS: f64 = 8.0;
+/// What a barb's width (on the diameter) can be set to, mm.
+const BARB_WIDTH_RANGE: std::ops::RangeInclusive<f64> = 0.01..=50.0;
+/// How far back from the end a barb can be set, mm.
+const BARB_SETBACK_RANGE: std::ops::RangeInclusive<f64> = 0.0..=200.0;
+/// A barb's ramp, off the extension's axis, degrees: gentle enough to push a hose up.
+const BARB_RAMP: f64 = 15.0;
+
+/// Length of the ramp of a barb `width` wider than its extension (on the diameter), mm.
+fn barb_ramp(width: f64) -> f64 {
+    0.5 * width / BARB_RAMP.to_radians().tan()
+}
 
 /// `x` to the nearest `step`.
 fn to_step(x: f64, step: f64) -> f64 {
@@ -837,6 +854,9 @@ impl FlowExtensionTool {
                 by_hand: false,
                 sizes: Vec::new(),
                 taper: 5.0,
+                barb: false,
+                barb_width: 1.0,
+                barb_setback: 2.0,
             },
             job: None,
             preview: None,
@@ -886,7 +906,13 @@ impl FlowExtensionTool {
         (length, (0.5 * (s.diameter - self.ends[i].diameter).abs()).atan2(length).to_degrees())
     }
 
-    /// Sized by hand: what to point out about the chosen ends' tapers, by end.
+    /// The barb on the extensions (sized by hand, with a barb), mm.
+    fn barb(&self) -> Option<mm_edit::Barb> {
+        let p = &self.params;
+        (p.by_hand && p.barb).then(|| mm_edit::Barb { width: p.barb_width, setback: p.barb_setback, length: barb_ramp(p.barb_width) })
+    }
+
+    /// Sized by hand: what to point out about the chosen ends' tapers and barbs, by end.
     fn size_notes(&self) -> Vec<(usize, String)> {
         if !self.params.by_hand {
             return Vec::new();
@@ -901,6 +927,18 @@ impl FlowExtensionTool {
                 }
                 if angle > STEEP {
                     notes.push(format!("tapers steeply ({angle:.0}° off its axis): a longer taper is gentler"));
+                }
+                if let Some(b) = self.barb() {
+                    // From the opening to the barb's crest.
+                    let crest = self.params.sizes[i].length - b.setback - b.length;
+                    if crest <= 0.0 {
+                        notes.push(format!(
+                            "too short for the barb ({:.2} mm back from the end and {:.2} mm of ramp): lengthen it or bring the barb nearer the end",
+                            b.setback, b.length
+                        ));
+                    } else if crest < length {
+                        notes.push(format!("the barb's back is on the taper ({crest:.2} mm from the opening, the taper {length:.2} mm): it stands on a slope"));
+                    }
                 }
                 (!notes.is_empty()).then(|| (i, notes.join("; ")))
             })
@@ -944,6 +982,20 @@ impl FlowExtensionTool {
             ui.add(drag(&mut self.params.taper, 0.1).suffix(" mm"));
             ui.label("taper").on_hover_text("How much of each extension tapers from its opening to its diameter; the rest is a straight cylinder of that diameter");
         });
+        ui.checkbox(&mut self.params.barb, "Barb")
+            .on_hover_text("A barb near each extension's end for its hose to grip: it ramps out from the extension, then steps straight back down");
+        if self.params.barb {
+            let crests = chosen.iter().map(|&i| format!("End {}: ⌀ {:.2} mm", i + 1, self.params.sizes[i].diameter + self.params.barb_width)).collect::<Vec<_>>().join("\n");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.params.barb_width).speed(0.01).range(BARB_WIDTH_RANGE).min_decimals(2).max_decimals(3).suffix(" mm"));
+                ui.label("barb width").on_hover_text(format!("How much wider the barb's crest is than the extension, on the diameter. Across the crest:\n{crests}"));
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.params.barb_setback).speed(0.05).range(BARB_SETBACK_RANGE).min_decimals(2).max_decimals(3).suffix(" mm"));
+                ui.label("back from the end").on_hover_text("How far back from the extension's end the barb starts to rise (0: at the end)");
+            });
+            ui.weak(format!("It ramps out over {:.2} mm ({BARB_RAMP:.0}° off the axis), so its crest is {:.2} mm back from the end.", barb_ramp(self.params.barb_width), self.params.barb_setback + barb_ramp(self.params.barb_width)));
+        }
         for (i, note) in self.size_notes() {
             ui.colored_label(egui::Color32::from_rgb(230, 170, 70), format!("End {}: {note}", i + 1));
         }
@@ -1066,6 +1118,7 @@ impl FlowExtensionTool {
         }
         let p = self.params.clone();
         let p2 = p.clone();
+        let barb = self.barb();
         if let Some((_, j)) = &self.job {
             j.cancel();
         }
@@ -1157,6 +1210,7 @@ impl FlowExtensionTool {
                         params.length = mm_edit::ExtensionLength::Absolute(s.length);
                         params.diameter = Some(s.diameter);
                         params.transition = (p2.taper / s.length).min(1.0);
+                        params.barb = barb;
                         s.length
                     } else {
                         params.length = match p2.absolute {
@@ -1461,7 +1515,7 @@ impl Tool for FlowExtensionTool {
             Heading::CutNormal => "cut_normal",
             Heading::Centerline => "centerline",
         };
-        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap, "direction": direction, "fit_diameters": p.fit, "sized_by_hand": p.by_hand, "taper_mm": p.taper}))
+        Some(json!({"length_in_diameters": p.diameters, "length_mm": p.absolute, "circular": p.circular, "cap": p.cap, "direction": direction, "fit_diameters": p.fit, "sized_by_hand": p.by_hand, "taper_mm": p.taper, "barb": p.barb, "barb_width_mm": p.barb_width, "barb_setback_mm": p.barb_setback}))
     }
 
     fn settings_schema(&self) -> Option<Value> {
@@ -1471,6 +1525,9 @@ impl Tool for FlowExtensionTool {
             "circular": {"type": "boolean", "description": "Blend each extension to a circular cross-section (not sized by hand: those always end circular)"},
             "sized_by_hand": {"type": "boolean", "description": "Each extension a diameter and length of its own in mm (the action `size`; e.g. a hose to fit), tapering to that diameter from the opening, instead of as wide as its cut. Started from the cut's diameters and the length set, the first time"},
             "taper_mm": {"type": "number", "description": "Sized by hand: how much of each extension tapers from its opening to its diameter, mm (0.1..200; all of a shorter one); the rest is a straight cylinder"},
+            "barb": {"type": "boolean", "description": "Sized by hand: a barb near each extension's end for its hose to grip, ramping out (15° off the axis) and stepping straight back down"},
+            "barb_width_mm": {"type": "number", "description": "How much wider the barb's crest is than its extension, on the diameter, mm (0.01..50)"},
+            "barb_setback_mm": {"type": "number", "description": "From each extension's end back to where its barb starts to rise, mm (0..200; 0 = at the end)"},
             "cap": {"type": "boolean", "description": "Cap the extensions' ends"},
             "direction": {"type": "string", "enum": ["cut_normal", "centerline"], "description": "Which way the extensions run: square to each end's cut, or on along the vessel (a line fitted to its centerline just inside the end)"},
             "fit_diameters": {"type": "number", "description": "With direction centerline: the stretch of centerline inside each end the direction is fitted to, in diameters of the end (0.5..5; shorter where the vessel forks sooner)"},
@@ -1495,6 +1552,9 @@ impl Tool for FlowExtensionTool {
         };
         p.fit = v["fit_diameters"].as_f64().ok_or("fit_diameters must be a number")?.clamp(0.5, MAX_FIT);
         p.taper = v["taper_mm"].as_f64().ok_or("taper_mm must be a number")?.clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
+        p.barb = v["barb"].as_bool().ok_or("barb must be true or false")?;
+        p.barb_width = v["barb_width_mm"].as_f64().filter(|x| x.is_finite()).ok_or("barb_width_mm must be a number")?.clamp(*BARB_WIDTH_RANGE.start(), *BARB_WIDTH_RANGE.end());
+        p.barb_setback = v["barb_setback_mm"].as_f64().filter(|x| x.is_finite()).ok_or("barb_setback_mm must be a number")?.clamp(*BARB_SETBACK_RANGE.start(), *BARB_SETBACK_RANGE.end());
         let by_hand = v["sized_by_hand"].as_bool().ok_or("sized_by_hand must be true or false")?;
         let taper = p.taper;
         self.set_by_hand(by_hand);
@@ -1523,7 +1583,8 @@ impl Tool for FlowExtensionTool {
             "sized_by_hand": self.params.by_hand,
             "sizes": self.params.by_hand.then(|| (0..self.ends.len()).filter(|&i| self.params.selected[i]).map(|i| {
                 let (s, (taper, angle)) = (self.params.sizes[i], self.taper_of(i));
-                json!({"end": i + 1, "diameter_mm": round(s.diameter, 3), "length_mm": round(s.length, 3), "taper_mm": round(taper, 3), "taper_off_axis_deg": round(angle, 1), "cut_diameter_mm": round(self.ends[i].diameter, 3)})
+                let barb = self.barb().map(|b| json!({"crest_diameter_mm": round(s.diameter + b.width, 3), "starts_from_end_mm": round(b.setback, 3), "crest_from_end_mm": round(b.setback + b.length, 3), "ramp_mm": round(b.length, 3)}));
+                json!({"end": i + 1, "diameter_mm": round(s.diameter, 3), "length_mm": round(s.length, 3), "taper_mm": round(taper, 3), "taper_off_axis_deg": round(angle, 1), "cut_diameter_mm": round(self.ends[i].diameter, 3), "barb": barb})
             }).collect::<Vec<_>>()),
             "size_notes": self.size_notes().into_iter().map(|(i, note)| json!({"end": i + 1, "note": note})).collect::<Vec<_>>(),
             "aims": (0..self.ends.len()).filter_map(|i| self.params.aims[i].map(|d| json!({"end": i + 1, "direction": vec3(d.to_array(), 4), "off_cut_normal_deg": round(d.dot(self.ends[i].normal).clamp(-1.0, 1.0).acos().to_degrees(), 1), "picked": self.params.selected[i]}))).collect::<Vec<_>>(),
@@ -2531,6 +2592,74 @@ mod tests {
             let _ = ctx.run_ui(raw, |ui| assert!(matches!(tool.panel(ui, &mut cx), ToolOutcome::Continue)));
         }
         assert!(tool.params.by_hand && tool.params.sizes == before.sizes && tool.params.taper == before.taper);
+    }
+
+    #[test]
+    fn flow_extensions_sized_by_hand_take_a_barb() {
+        // A straight vessel along z, radius 1: the top end out to a 6.35 mm hose, 15 mm long
+        // with a 4 mm taper, and a barb 1 mm wider starting 2 mm back from the end.
+        let mut scene = Scene::default();
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.0, 0.5 * i as f64)).collect();
+        scene.add("vessel", primitives::tube_along(&path, &[1.0; 41], 32));
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        let top = tool.ends.iter().position(|e| e.center.z > 10.0).unwrap();
+        let settle = |tool: &mut FlowExtensionTool, cx: &mut ToolCx| {
+            let t0 = Instant::now();
+            while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && tool.error.is_none() && t0.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(5));
+                tool.update(cx);
+            }
+        };
+        tool.act("select", &json!({"ends": [top + 1]}), &mut cx).unwrap();
+        tool.act("size", &json!({"ends": [top + 1], "diameter_mm": 6.35, "length_mm": 15.0}), &mut cx).unwrap();
+        tool.set_settings(&json!({"taper_mm": 4.0, "barb": true, "barb_width_mm": 1.0, "barb_setback_mm": 2.0}), &mut cx).unwrap();
+        settle(&mut tool, &mut cx);
+        let (_, out) = tool.preview.as_ref().unwrap_or_else(|| panic!("{:?}", tool.error));
+        let m = &out.mesh;
+        m.check_validity().unwrap();
+        assert_eq!(mm_core::topology::boundary_loops(m).len(), 1, "only the bottom end, not extended, stays open");
+        let z1 = tool.ends[top].center.z;
+        let (ramp, end) = (barb_ramp(1.0), z1 + 15.0);
+        let crest = end - 2.0 - ramp;
+        // The widest of it is the barb's crest, 0.5 mm proud of the hose's 3.175 radius, a
+        // ring square to the axis; straight on from where it starts to rise to the end.
+        let pts: Vec<DVec3> = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| p.z > z1 + 4.0 + 1e-6).collect();
+        let widest = pts.iter().map(|p| p.truncate().length()).fold(0.0, f64::max);
+        assert!((widest - 3.675).abs() < 1e-9, "{widest}");
+        assert!(pts.iter().filter(|p| (p.truncate().length() - 3.675).abs() < 1e-9).all(|p| (p.z - crest).abs() < 1e-9));
+        assert!(pts.iter().filter(|p| p.z > end - 2.0 + 1e-6 && p.z < end - 1e-6).all(|p| (p.truncate().length() - 3.175).abs() < 1e-9));
+        assert!(pts.iter().filter(|p| p.z > z1 + 4.0 + 1e-6 && p.z < crest - 1e-6).all(|p| (p.truncate().length() - 3.175).abs() < 1e-9));
+        // Agents read it back.
+        let state = tool.state(cx.scene);
+        let b = &state["sizes"][0]["barb"];
+        assert_eq!(b["crest_diameter_mm"].as_f64(), Some(7.35));
+        assert_eq!(b["starts_from_end_mm"].as_f64(), Some(2.0));
+        assert!((b["crest_from_end_mm"].as_f64().unwrap() - (2.0 + ramp)).abs() < 1e-3);
+        assert_eq!(tool.settings().unwrap()["barb_width_mm"].as_f64(), Some(1.0));
+        assert!(state["size_notes"].as_array().unwrap().is_empty());
+        // Set back onto the taper it is pointed out; past the opening it does not fit, and the
+        // build says so.
+        tool.set_settings(&json!({"barb_setback_mm": 10.0}), &mut cx).unwrap();
+        assert!(tool.size_notes().iter().any(|(i, n)| *i == top && n.contains("on the taper")), "{:?}", tool.size_notes());
+        tool.set_settings(&json!({"barb_setback_mm": 14.0}), &mut cx).unwrap();
+        assert!(tool.size_notes().iter().any(|(i, n)| *i == top && n.contains("too short for the barb")));
+        settle(&mut tool, &mut cx);
+        assert!(tool.error.as_deref().is_some_and(|e| e.contains("does not fit")), "{:?}", tool.error);
+        // Only sized by hand: from the cut, no barb.
+        tool.set_settings(&json!({"barb_setback_mm": 2.0, "sized_by_hand": false}), &mut cx).unwrap();
+        assert!(tool.barb().is_none());
+        // The panel draws the barb's settings and leaves them be.
+        tool.set_settings(&json!({"sized_by_hand": true}), &mut cx).unwrap();
+        let before = tool.params.clone();
+        for _ in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| assert!(matches!(tool.panel(ui, &mut cx), ToolOutcome::Continue)));
+        }
+        assert!(tool.params.barb && tool.params.barb_width == before.barb_width && tool.params.barb_setback == before.barb_setback);
     }
 
     /// A real mesh (`POLYMIX_FLOW_MESH`, local only): every flat end extended along its

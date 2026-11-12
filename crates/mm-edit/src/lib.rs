@@ -74,7 +74,7 @@ pub use extrude::{
 };
 pub use hair::{hair_curves, hair_mesh, HairParams};
 pub use loft::{loft, loft_guided, AxisGuide, EndContinuity, EndDirection, LoftEnd, LoftParams, LoftShape};
-pub use flow::{extrude_boundary_loop, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
+pub use flow::{extrude_boundary_loop, Barb, ExtensionLength, FlowExtensionParams, FlowExtensionResult, Length};
 pub use mirror::{mirror, mirror_with_tolerance, MirrorResult};
 pub use part::{builtin_parts, drop_open_part, place_part, DropResult, Part, PartKind, Placement};
 pub use region::{discard, duplicate, flip_normals, separate};

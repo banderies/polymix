@@ -168,3 +168,83 @@ fn flow_extension_tapers_to_a_diameter_given() {
     let bad = FlowExtensionParams { diameter: Some(0.0), ..Default::default() };
     assert!(extrude_boundary_loop(&mut m, &lp, &bad).is_err());
 }
+
+#[test]
+fn flow_extension_barb_stands_where_asked() {
+    // Out to a hose 1.6 across over 4 (tapered over the first 1), with a barb 0.4 wider
+    // starting 0.5 back from the end and ramping over 0.6: along z from the cut at 1.5, the
+    // barb rises from z = 5.0 to its crest at 4.4, where it steps back down.
+    let barb = Barb { width: 0.4, setback: 0.5, length: 0.6 };
+    let (mut m, lp) = cut_tube(40, 1.0);
+    let r = extrude_boundary_loop(
+        &mut m,
+        &lp,
+        &FlowExtensionParams {
+            length: ExtensionLength::Absolute(4.0),
+            diameter: Some(1.6),
+            transition: 0.25,
+            segments: 16,
+            cap: true,
+            barb: Some(barb),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_valid(&m);
+    assert!(r.capped);
+    let wall: Vec<DVec3> = r.rings.iter().flatten().map(|&v| m.vertex(v)).collect();
+    let radial = |p: &DVec3| DVec3::new(p.x, p.y, 0.0).length();
+    let (crest, front) = (4.4, 5.0);
+    for p in &wall {
+        let want = if p.z > front - 1e-9 || (p.z > 2.5 && p.z < crest - 1e-9) {
+            Some(0.8)
+        } else if p.z > crest + 1e-9 {
+            Some(0.8 + 0.2 * (front - p.z) / 0.6)
+        } else {
+            None
+        };
+        if let Some(want) = want {
+            assert!((radial(p) - want).abs() < 1e-9, "{p}: {} not {want}", radial(p));
+        }
+    }
+    // The crest: a ring of its own at 1.0 across the radius, and the foot of the back face
+    // beside it at the hose's.
+    let at_crest: Vec<f64> = wall.iter().filter(|p| (p.z - crest).abs() < 1e-9).map(radial).collect();
+    assert_eq!(at_crest.len(), 80);
+    assert_eq!(at_crest.iter().filter(|&&x| (x - 1.0).abs() < 1e-9).count(), 40);
+    assert_eq!(at_crest.iter().filter(|&&x| (x - 0.8).abs() < 1e-9).count(), 40);
+    assert!(wall.iter().all(|p| radial(p) < 1.0 + 1e-9));
+    assert_eq!(wall.iter().filter(|p| (p.z - front).abs() < 1e-9).count(), 40, "a ring where the barb starts to rise");
+    for &t in &r.wall_triangles {
+        assert!(m.tri_area(t) > 1e-6);
+    }
+
+    // At the end (no setback), and aimed off the cut's normal: the barb still stands square
+    // to the extension's axis.
+    let dir = DVec3::new(0.35, 0.0, 1.0).normalize();
+    let (mut m, lp) = cut_tube(40, 1.0);
+    let barb = Barb { width: 0.3, setback: 0.0, length: 0.5 };
+    let r = extrude_boundary_loop(
+        &mut m,
+        &lp,
+        &FlowExtensionParams { length: ExtensionLength::Absolute(3.0), diameter: Some(1.0), direction: Some(dir), segments: 10, cap: true, barb: Some(barb), ..Default::default() },
+    )
+    .unwrap();
+    assert_valid(&m);
+    let along = |v: u32| (m.vertex(v) - r.start_center).dot(dir);
+    let off_axis = |v: u32| {
+        let d = m.vertex(v) - r.start_center;
+        (d - dir * d.dot(dir)).length()
+    };
+    let crest_rings: Vec<&Vec<u32>> = r.rings.iter().filter(|ring| ring.iter().all(|&v| (along(v) - 2.5).abs() < 1e-9)).collect();
+    assert_eq!(crest_rings.len(), 2, "the foot and the crest, square to the axis");
+    assert!(crest_rings[1].iter().all(|&v| (off_axis(v) - 0.65).abs() < 1e-9));
+    assert!(r.end_loop.iter().all(|&v| (off_axis(v) - 0.5).abs() < 1e-9 && (along(v) - 3.0).abs() < 1e-9));
+
+    // A barb must fit on the extension, and be a barb.
+    for barb in [Barb { width: 0.3, setback: 2.0, length: 1.0 }, Barb { width: 0.0, setback: 0.5, length: 0.5 }, Barb { width: 0.3, setback: -0.1, length: 0.5 }] {
+        let (mut m, lp) = cut_tube(24, 1.0);
+        let p = FlowExtensionParams { length: ExtensionLength::Absolute(3.0), diameter: Some(1.0), barb: Some(barb), ..Default::default() };
+        assert!(extrude_boundary_loop(&mut m, &lp, &p).is_err(), "{barb:?}");
+    }
+}

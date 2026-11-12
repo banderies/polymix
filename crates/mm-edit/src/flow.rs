@@ -1,6 +1,6 @@
 //! Flow extensions: extrude a (cut) boundary loop straight out of the mesh, optionally
 //! morphing the cross-section into a circle (of equal area, or of a diameter given, as for a
-//! hose to fit), and cap the end. This is the
+//! hose to fit, with a barb near the end for the hose to grip), and cap the end. This is the
 //! usual CFD pre-processing step that gives inlets/outlets a straight, developed section.
 
 use crate::cap::cap_oriented_loops;
@@ -44,6 +44,24 @@ pub struct FlowExtensionParams {
     pub cap: bool,
     /// Remesh the end cap to the ring's edge length (otherwise only ring vertices are used).
     pub cap_remesh: bool,
+    /// A barb near the end, for a hose pushed over it to grip.
+    pub barb: Option<Barb>,
+}
+
+/// A barb near an extension's end, for a hose pushed over the end to grip: from the end back,
+/// the extension runs on unchanged for `setback`, then the barb ramps out over `length` to
+/// `width / 2` proud of it (a cone the hose slides up), and steps straight back down to it (a
+/// face square to the axis, which the hose catches on). It stands out along the circle the
+/// extension blends into, so it is round on a circular extension.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Barb {
+    /// How much wider the barb's crest is than the extension, on the diameter, mesh units.
+    pub width: f64,
+    /// From the extension's end back to where the barb starts to rise, mesh units (0 = at the
+    /// end).
+    pub setback: f64,
+    /// Length of the ramp, mesh units: the crest is `setback + length` back from the end.
+    pub length: f64,
 }
 
 impl Default for FlowExtensionParams {
@@ -57,6 +75,7 @@ impl Default for FlowExtensionParams {
             transition: 0.5,
             cap: false,
             cap_remesh: true,
+            barb: None,
         }
     }
 }
@@ -141,6 +160,18 @@ pub fn extrude_boundary_loop(
         Some(d) if d.is_finite() && d > 0.0 => 0.5 * d,
         Some(_) => return Err(EditError::InvalidParameter("extension diameter must be positive".into())),
     };
+    if let Some(b) = params.barb {
+        let ok = |x: f64| x.is_finite() && x > 0.0;
+        if !(ok(b.width) && ok(b.length) && b.setback.is_finite() && b.setback >= 0.0) {
+            return Err(EditError::InvalidParameter("a barb's width and length must be positive, its setback not negative".into()));
+        }
+        if b.setback + b.length >= length {
+            return Err(EditError::InvalidParameter(format!(
+                "the barb ({:.3} back from the end, ramping over {:.3}) does not fit on an extension {length:.3} long",
+                b.setback, b.length
+            )));
+        }
+    }
     let circular = params.make_circular || params.diameter.is_some();
     let mut arc = vec![0.0; n + 1];
     for j in 0..n {
@@ -177,6 +208,10 @@ pub fn extrude_boundary_loop(
         .collect();
     let offset: Vec<f64> = pts.iter().map(|p| (*p - c).dot(dir)).collect();
     let transition = params.transition.clamp(1e-6, 1.0);
+    let stations = ring_stations(segs, length, params.barb);
+    // A slanted loop's rings come square to the direction by the end, or by a barb's back
+    // face (so that the barb stands square to the axis).
+    let square_by = params.barb.map_or(1.0, |b| (length - b.setback - b.length) / length);
 
     let wall_group = new_group(mesh);
     let mut res = FlowExtensionResult {
@@ -189,12 +224,12 @@ pub fn extrude_boundary_loop(
         ..Default::default()
     };
     let mut prev = lp.clone();
-    for k in 1..=segs {
-        let t = k as f64 / segs as f64;
+    for &(t, proud) in &stations {
         let b = if circular { smoothstep(t / transition) } else { 0.0 };
+        let skew = 1.0 - (t / square_by).min(1.0);
         let ring: Vec<u32> = (0..n)
             .map(|j| {
-                let p = c + dir * (length * t + offset[j] * (1.0 - t)) + inplane[j] * (1.0 - b) + circle[j] * b;
+                let p = c + dir * (length * t + offset[j] * skew) + inplane[j] * (1.0 - b) + circle[j] * (b + proud / radius);
                 mesh.append_vertex(p)
             })
             .collect();
@@ -221,4 +256,30 @@ pub fn extrude_boundary_loop(
         res.cap_triangles = cr.triangles;
     }
     Ok(res)
+}
+
+/// Where an extension `length` long with `segs` rings puts them: (fraction of the length,
+/// how far a barb stands proud of the extension there), from the opening out. The rings are
+/// even, except that a barb has rings of its own where it starts to rise and two at its crest
+/// (the foot of its back face, then the crest), and the even rings too near those are left out
+/// (they would make slivers).
+fn ring_stations(segs: usize, length: f64, barb: Option<Barb>) -> Vec<(f64, f64)> {
+    let even = (1..=segs).map(|k| k as f64 / segs as f64);
+    let Some(barb) = barb else { return even.map(|t| (t, 0.0)).collect() };
+    let (crest, front) = ((length - barb.setback - barb.length) / length, (length - barb.setback) / length);
+    let height = 0.5 * barb.width;
+    let proud = |t: f64| if t > crest && t < front { height * (front - t) / (front - crest) } else { 0.0 };
+    let near = 0.3 / segs as f64;
+    let at_end = front > 1.0 - 1e-9;
+    let mut stations: Vec<(f64, f64)> = even
+        .filter(|&t| t == 1.0 || ((t - crest).abs() > near && (t - front).abs() > near))
+        .map(|t| (t, proud(t)))
+        .collect();
+    stations.extend([(crest, 0.0), (crest, height)]);
+    if !at_end {
+        stations.push((front, 0.0));
+    }
+    // (Stable: the foot stays before the crest.)
+    stations.sort_by(|a, b| a.0.total_cmp(&b.0));
+    stations
 }
