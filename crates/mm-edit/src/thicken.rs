@@ -20,8 +20,16 @@
 //!    branches cut close together) it is cut along the cylinder. The kept surface is the
 //!    input itself, never cut: only its prolongation, a twentieth of the wall's thickness
 //!    long, stays on in front of each opening up to its rim.
+//!
+//! Barbs (for a hose pushed over an end to grip) are joined to the wall's outer solid by an
+//! exact union before the rims are cut, rather than offset from a barb on the surface (whose
+//! crest the distance field would round off by the wall's thickness): each a ring swept from
+//! a triangle about its opening's axis, its ramp and back face standing out of the wall's
+//! outside and the rest buried in the wall. They keep face groups of their own, which the
+//! smoothing and the remesh leave alone, so their edges stay sharp; the lumen is untouched.
 
 use crate::boolean::{mesh_boolean_with, mesh_boolean_with_trees, BooleanOp};
+use crate::flow::Barb;
 use crate::util::{loop_outward_direction, mean, positions};
 use crate::{EditError, EditResult};
 use mm_core::{measure, Bvh, DVec3, Mesh};
@@ -45,7 +53,7 @@ pub enum ThickenSide {
 }
 
 /// Parameters for [`thicken`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ThickenParams {
     /// Wall thickness (model units, mm).
     pub thickness: f64,
@@ -55,11 +63,16 @@ pub struct ThickenParams {
     pub cell_size: Option<f64>,
     /// Remesh the new wall to the surface's own edge length.
     pub remesh: bool,
+    /// Barbs on the wall's outside, by open end (an index into [`openings`]): the barb's
+    /// width is on the diameter of the wall's outside there, and its setback is from the rim.
+    /// The surface must run on as a straight round tube behind the end for the barb's length
+    /// (a flow extension's end, behind its taper).
+    pub barbs: Vec<(usize, Barb)>,
 }
 
 impl Default for ThickenParams {
     fn default() -> Self {
-        Self { thickness: 2.0, side: ThickenSide::Outward, cell_size: None, remesh: true }
+        Self { thickness: 2.0, side: ThickenSide::Outward, cell_size: None, remesh: true, barbs: Vec::new() }
     }
 }
 
@@ -94,6 +107,8 @@ pub struct ThickenResult {
     /// The surface ran into itself, so its side of the wall was rebuilt from the distance
     /// field (within a small fraction of the grid spacing of it) rather than kept exactly.
     pub rebuilt: bool,
+    /// Face group of each barb, in the order of [`ThickenParams::barbs`].
+    pub barb_groups: Vec<i32>,
 }
 
 /// How far a rim may stray from flat (over its radius) before it is reported.
@@ -162,6 +177,8 @@ pub struct ThickenShell {
     pub cell_size: f64,
     /// The surface's side of the wall was rebuilt from the distance field.
     pub rebuilt: bool,
+    /// Face group of each barb, in the order of [`ThickenParams::barbs`].
+    pub barb_groups: Vec<i32>,
     /// Triangles of `mesh` (by id) within three rings of a rim, which the remesh leaves alone.
     near: Vec<bool>,
     /// The input surface's average edge length, which the remesh aims for.
@@ -172,9 +189,9 @@ impl ThickenShell {
     /// The shell as a finished result without the remesh (what [`thicken`] gives with
     /// `remesh` off).
     pub fn into_result(self) -> ThickenResult {
-        let ThickenShell { mut mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt, .. } = self;
+        let ThickenShell { mut mesh, openings, wall_group, rim_group, measured, cell_size, rebuilt, barb_groups, .. } = self;
         let rim_groups = split_rims(&mut mesh, rim_group, &openings);
-        ThickenResult { mesh, openings, wall_group, rim_groups, measured, cell_size, rebuilt }
+        ThickenResult { mesh, openings, wall_group, rim_groups, measured, cell_size, rebuilt, barb_groups }
     }
 }
 
@@ -213,6 +230,10 @@ fn make_shell(mesh: &Mesh, params: &ThickenParams, report: &dyn Fn(f32) -> bool)
     let (prolonged, closing, new_side, wall_group, rim_group) = (top + 1, top + 2, top + 3, top + 4, top + 5);
     // (Far enough that the offset near the opening does not see the closing cap.)
     let reach = t + 4.0 * h;
+    // Each opening's rim stands this far in front of its plane.
+    let ahead = 0.05 * t;
+    let barbs = barb_rings(mesh, &ends, params, ahead, h, top + 6)?;
+    let barb_groups: Vec<i32> = barbs.iter().map(|b| b.1).collect();
     let mut closed = mesh.clone();
     for (lp, o) in &ends {
         let n = lp.len();
@@ -255,8 +276,6 @@ fn make_shell(mesh: &Mesh, params: &ThickenParams, report: &dyn Fn(f32) -> bool)
         ThickenSide::Inward => (Cow::Borrowed(&closed), Cow::Owned(offset(-t, 0.05, 0.7)?)),
         ThickenSide::Centered => (Cow::Owned(offset(0.5 * t, 0.05, 0.4)?), Cow::Owned(offset(-0.5 * t, 0.4, 0.7)?)),
     };
-    // Each opening's rim stands this far in front of its plane.
-    let ahead = 0.05 * t;
     // An inner solid that does not reach through an opening would close it.
     let inner_ids: Vec<u32> = inner.vertex_ids().collect();
     for (i, (_, o)) in ends.iter().enumerate() {
@@ -273,7 +292,7 @@ fn make_shell(mesh: &Mesh, params: &ThickenParams, report: &dyn Fn(f32) -> bool)
 
     // 3. The outer solid cut back by a cylinder standing on each opening, then the inner
     // solid taken out of it. The wall is measured meanwhile.
-    let carver = Carver { ends: &ends, t, h, ahead, reach, prolonged, closing, new_side, wall_group, rim_group, main, report };
+    let carver = Carver { ends: &ends, barbs: &barbs, t, h, ahead, reach, prolonged, closing, new_side, wall_group, rim_group, main, report };
     // The lumen's trees serve whichever solid is the lumen itself.
     let outer_trees = if side == ThickenSide::Inward { lumen } else { None };
     let inner_trees = if side == ThickenSide::Outward { lumen } else { None };
@@ -397,7 +416,7 @@ fn make_shell(mesh: &Mesh, params: &ThickenParams, report: &dyn Fn(f32) -> bool)
         Crossing::Clear => {}
         Crossing::Cancelled => return Err(cancelled()),
     }
-    Ok(ThickenShell { mesh: out, openings: ends.into_iter().map(|(_, o)| o).collect(), wall_group, rim_group, measured, cell_size: h, rebuilt, near, edge_length })
+    Ok(ThickenShell { mesh: out, openings: ends.into_iter().map(|(_, o)| o).collect(), wall_group, rim_group, measured, cell_size: h, rebuilt, barb_groups, near, edge_length })
 }
 
 /// The remesh of the shell's new wall and the result; `report` gets [`thicken`]'s progress.
@@ -405,7 +424,7 @@ fn finish(shell: ThickenShell, remesh: bool, report: &dyn Fn(f32) -> bool) -> Ed
     if !report(SHELL_DONE) {
         return Err(cancelled());
     }
-    let ThickenShell { mesh: mut out, openings, wall_group, rim_group, measured, cell_size, rebuilt, near, edge_length } = shell;
+    let ThickenShell { mesh: mut out, openings, wall_group, rim_group, measured, cell_size, rebuilt, barb_groups, near, edge_length } = shell;
     if remesh {
         let part: Vec<u32> = out.triangle_ids().filter(|&tr| out.tri_group(tr) == wall_group && !near[tr as usize]).collect();
         let rp = mm_remesh::RemeshParams {
@@ -431,7 +450,7 @@ fn finish(shell: ThickenShell, remesh: bool, report: &dyn Fn(f32) -> bool) -> Ed
     }
     report(1.0);
     let rim_groups = split_rims(&mut out, rim_group, &openings);
-    Ok(ThickenResult { mesh: out, openings, wall_group, rim_groups, measured, cell_size, rebuilt })
+    Ok(ThickenResult { mesh: out, openings, wall_group, rim_groups, measured, cell_size, rebuilt, barb_groups })
 }
 
 /// Give each opening's rim a face group of its own (a patch each, like the caps of a vessel's
@@ -487,6 +506,8 @@ fn split_rims(mesh: &mut Mesh, rim_group: i32, openings: &[Opening]) -> Vec<i32>
 /// The booleans of step 3, with what they share.
 struct Carver<'a> {
     ends: &'a [(Vec<u32>, Opening)],
+    /// The barbs to join to the outer solid, with their groups ([`barb_rings`]).
+    barbs: &'a [(Mesh, i32)],
     t: f64,
     h: f64,
     ahead: f64,
@@ -502,18 +523,35 @@ struct Carver<'a> {
 }
 
 impl Carver<'_> {
-    /// `outer` cut back by a cylinder standing on each opening; the cylinders' bases become
-    /// the rims. (After each boolean the cylinder's triangles, whose groups follow the
+    /// `outer` with the barbs joined to it, then cut back by a cylinder standing on each
+    /// opening; the cylinders' bases become the rims (cutting through a barb at its rim too).
+    /// (After each boolean the barb's or cylinder's triangles, whose groups follow the
     /// shell's, are told apart by group and relabelled at once.) `outer_trees` are the trees
     /// of `outer` itself. Progress goes from `from` to `to`.
     fn cut_rims<'m>(&self, outer: &'m Mesh, outer_trees: Trees, from: f32, to: f32) -> EditResult<Cow<'m, Mesh>> {
         let (t, h) = (self.t, self.h);
         let mut shell: Cow<Mesh> = Cow::Borrowed(outer);
+        // Only the first boolean takes `outer` itself.
+        let mut trees = outer_trees;
+        for (k, (barb, g)) in self.barbs.iter().enumerate() {
+            let before = shell.max_group_id();
+            let joined = mesh_boolean_with_trees(&shell, barb, BooleanOp::Union, trees.take(), None)
+                .map_err(|e| EditError::Failed(format!("joining barb {} to the wall: {e}", k + 1)))?;
+            let mut m = joined.mesh;
+            for tr in m.triangle_ids().collect::<Vec<_>>() {
+                if m.tri_group(tr) > before {
+                    m.set_tri_group(tr, *g);
+                }
+            }
+            shell = Cow::Owned(m);
+            if !(self.report)(from) {
+                return Err(cancelled());
+            }
+        }
         for (i, (_, o)) in self.ends.iter().enumerate() {
             let cyl = cylinder(o.centre + o.normal * self.ahead, o.normal, o.extent + t + 4.0 * h, self.reach + t + 4.0 * h, h);
             let before = shell.max_group_id();
-            let trees = if i == 0 { outer_trees } else { None };
-            let cut = mesh_boolean_with_trees(&shell, &cyl, BooleanOp::Difference, trees, None)
+            let cut = mesh_boolean_with_trees(&shell, &cyl, BooleanOp::Difference, trees.take(), None)
                 .map_err(|e| EditError::Failed(format!("cutting the wall back at opening {}: {e}", i + 1)))?;
             let mut m = cut.mesh;
             for tr in m.triangle_ids().collect::<Vec<_>>() {
@@ -557,6 +595,116 @@ impl Carver<'_> {
         }
         Ok(out)
     }
+}
+
+/// The barbs `params` asks for, checked against their openings and built: each a closed ring
+/// (a profile swept round its opening's axis, of triangles about `spacing` across) to join
+/// to the wall's outer solid, with its face group (from `first_group` on). `ahead` is how far
+/// in front of its opening's plane a rim stands.
+fn barb_rings(mesh: &Mesh, ends: &[(Vec<u32>, Opening)], params: &ThickenParams, ahead: f64, spacing: f64, first_group: i32) -> EditResult<Vec<(Mesh, i32)>> {
+    let t = params.thickness;
+    let mut out = Vec::with_capacity(params.barbs.len());
+    for (k, &(i, b)) in params.barbs.iter().enumerate() {
+        let Some((lp, o)) = ends.get(i) else {
+            return Err(EditError::InvalidParameter(format!("there is no open end {} for a barb (the surface has {})", i + 1, ends.len())));
+        };
+        let ok = |x: f64| x.is_finite() && x > 0.0;
+        if !(ok(b.width) && ok(b.length) && b.setback.is_finite() && b.setback >= 0.0) {
+            return Err(EditError::InvalidParameter("a barb's width and length must be positive, its setback not negative".into()));
+        }
+        if params.barbs[..k].iter().any(|x| x.0 == i) {
+            return Err(EditError::InvalidParameter(format!("open end {} has two barbs", i + 1)));
+        }
+        // Positions along the opening's axis (out of the surface, from its plane) and off it.
+        let (c, n) = (o.centre, o.normal);
+        let along = |p: DVec3| (p - c).dot(n);
+        let radial = |p: DVec3| {
+            let q = p - c;
+            (q - n * q.dot(n)).length()
+        };
+        let r = lp.iter().map(|&v| radial(mesh.vertex(v))).sum::<f64>() / lp.len() as f64;
+        let outside = match params.side {
+            ThickenSide::Outward => r + t,
+            ThickenSide::Centered => r + 0.5 * t,
+            ThickenSide::Inward => r,
+        };
+        // The barb rises `rise` off the outside; below it, it reaches halfway into the wall.
+        let (rise, depth) = (0.5 * b.width, 0.5 * t);
+        let front = ahead - b.setback;
+        let crest = front - b.length;
+        // Behind the opening the surface must be a straight round tube for the barb's length
+        // and the depth more (the wall's outside there sees that much of it); nothing else
+        // may come within the barb's reach of its axis there.
+        let back = crest - depth;
+        let reach = outside + rise + t;
+        let tol = 0.02 * r;
+        for e in mesh.edge_ids() {
+            let [p, q] = mesh.edge_vertices(e).map(|v| mesh.vertex(v));
+            let (ap, aq) = (along(p), along(q));
+            if ap.max(aq) < back || ap.min(aq) > tol {
+                continue;
+            }
+            let (rp, rq) = (radial(p), radial(q));
+            if rp.min(rq) > reach {
+                continue;
+            }
+            if (rp - r).abs() > tol || (rq - r).abs() > tol {
+                return Err(EditError::InvalidParameter(format!(
+                    "open end {} does not run on as a straight round tube for the {:.2} mm behind its rim that its barb needs: barbs go on flow extensions, behind their taper (lengthen the extension, shorten its taper, or bring the barb nearer the end)",
+                    i + 1,
+                    ahead - back
+                )));
+            }
+        }
+        // The profile, (along, off the axis), counter-clockwise: the ramp carried on down into
+        // the wall (crossing the outside at an angle, not touching it along a line), the
+        // crest, the foot of the back face, and (where the ramp carried down would run far
+        // past the rim) a front face in front of the rim, which cuts it away.
+        let tip = front + b.length * depth / rise;
+        let limit = ahead + 0.5 * t;
+        let ramp_at = |a: f64| outside + rise * (front - a) / b.length;
+        let mut profile = vec![(crest, outside + rise), (crest, outside - depth)];
+        if tip > limit {
+            profile.extend([(limit, outside - depth), (limit, ramp_at(limit))]);
+        } else {
+            profile.push((tip, outside - depth));
+        }
+        let count = ((TAU * (outside + rise) / spacing).ceil() as usize).clamp(48, 2000);
+        out.push((swept(c, n, &profile, spacing, count), first_group + k as i32));
+    }
+    Ok(out)
+}
+
+/// The closed ring swept by the polygon `profile` ((along `n`, off the axis) from `c`,
+/// counter-clockwise, off the axis throughout) round the axis through `c` along `n`: rings of
+/// `count` points about `spacing` apart along the profile.
+fn swept(c: DVec3, n: DVec3, profile: &[(f64, f64)], spacing: f64, count: usize) -> Mesh {
+    let n = n.normalize();
+    let u = n.any_orthonormal_vector();
+    let mut b = Builder { u, v: n.cross(u), pos: Vec::new(), tris: Vec::new(), groups: Vec::new() };
+    // The points round the profile, each with the outward normal (along, off) of its side
+    // toward the next.
+    let mut points: Vec<((f64, f64), (f64, f64))> = Vec::new();
+    for i in 0..profile.len() {
+        let (p, q) = (profile[i], profile[(i + 1) % profile.len()]);
+        let (da, dr) = (q.0 - p.0, q.1 - p.1);
+        let len = da.hypot(dr);
+        let steps = ((len / spacing).ceil() as usize).max(1);
+        for j in 0..steps {
+            let f = j as f64 / steps as f64;
+            points.push(((p.0 + da * f, p.1 + dr * f), (dr / len, -da / len)));
+        }
+    }
+    let rings: Vec<Vec<(f64, u32)>> = points.iter().map(|&((a, r), _)| b.ring(c + n * a, r, count)).collect();
+    for i in 0..rings.len() {
+        let (na, nr) = points[i].1;
+        let out = |m: DVec3| {
+            let q = m - c;
+            n * na + (q - n * q.dot(n)).normalize_or_zero() * nr
+        };
+        b.zip(&rings[i], &rings[(i + 1) % rings.len()], &out, 0);
+    }
+    Mesh::from_triangles(&b.pos, &b.tris, Some(&b.groups)).0
 }
 
 /// A closed cylinder standing on the disk of radius `r` about `c` square to `n`, `len` long
@@ -785,7 +933,7 @@ mod tests {
         let m = tube(0.0, 3.0);
         for side in [ThickenSide::Outward, ThickenSide::Inward, ThickenSide::Centered] {
             for remesh in [true, false] {
-                let params = ThickenParams { thickness: 1.5, side, cell_size: Some(0.3), remesh };
+                let params = ThickenParams { thickness: 1.5, side, cell_size: Some(0.3), remesh, ..Default::default() };
                 let whole = thicken(&m, &params, None).unwrap();
                 let shell = thicken_shell(&m, &params, None).unwrap();
                 if !remesh {

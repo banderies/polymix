@@ -177,7 +177,8 @@ cargo run -p polymix --example gen_test_meshes --release -- test_meshes
    diameters or mm) from the selected ends, or size each by hand (*Set by hand*: a diameter and
    length in mm per end, e.g. to fit a hose, tapering to it from the opening over a set
    length, then straight, optionally with a barb for the hose to grip: its width on top of
-   the diameter and how far back from the end it sits are set), either square to each cut or on along the vessel (a line
+   the diameter and how far back from the end it sits are set; for a model you will thicken,
+   add the barb in Thicken instead), either square to each cut or on along the vessel (a line
    fitted to its centerline over the last few diameters inside the end, so a slanted cut still
    runs straight on), and any end aimed by hand by dragging the tip of its arrow; caps keep
    their patch names, and each extension's wall becomes a patch of its own (`extension_N`),
@@ -204,7 +205,11 @@ Cut), then **Vessel → Thicken into a shell** (also **Edit → Thicken**): a wa
 thickness (e.g. 2 mm) grown outward (the lumen keeps its shape), inward or centred, the cut
 ends kept open with flat rims. The new side comes from a distance field, so it never folds
 into itself at a bifurcation or a tight bend as moving the surface along its normals would,
-and the result is a closed, manifold wall ready to print.
+and the result is a closed, manifold wall ready to print. For a hose pushed over a flow
+extension's end (extended open, uncapped), tick that end under *Barbs*: a barb of the width
+(on top of the wall's outside diameter) and setback from the rim you set is joined to the
+wall's outside by an exact boolean, so its crest and back face stay sharp, and the lumen
+keeps its shape.
 
 To set the print on a bench, **Edit → Stand** (also under Vessel) adds a base under the model
 and legs holding it up off it: drag a line under the model (seen from the side) to put the

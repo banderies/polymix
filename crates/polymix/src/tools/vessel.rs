@@ -601,14 +601,14 @@ const STEEP: f64 = 45.0;
 /// Fewest rings a taper is built with (where the extension's length allows).
 const TAPER_RINGS: f64 = 8.0;
 /// What a barb's width (on the diameter) can be set to, mm.
-const BARB_WIDTH_RANGE: std::ops::RangeInclusive<f64> = 0.01..=50.0;
+pub(crate) const BARB_WIDTH_RANGE: std::ops::RangeInclusive<f64> = 0.01..=50.0;
 /// How far back from the end a barb can be set, mm.
-const BARB_SETBACK_RANGE: std::ops::RangeInclusive<f64> = 0.0..=200.0;
+pub(crate) const BARB_SETBACK_RANGE: std::ops::RangeInclusive<f64> = 0.0..=200.0;
 /// A barb's ramp, off the extension's axis, degrees: gentle enough to push a hose up.
-const BARB_RAMP: f64 = 15.0;
+pub(crate) const BARB_RAMP: f64 = 15.0;
 
 /// Length of the ramp of a barb `width` wider than its extension (on the diameter), mm.
-fn barb_ramp(width: f64) -> f64 {
+pub(crate) fn barb_ramp(width: f64) -> f64 {
     0.5 * width / BARB_RAMP.to_radians().tan()
 }
 
@@ -982,8 +982,9 @@ impl FlowExtensionTool {
             ui.add(drag(&mut self.params.taper, 0.1).suffix(" mm"));
             ui.label("taper").on_hover_text("How much of each extension tapers from its opening to its diameter; the rest is a straight cylinder of that diameter");
         });
-        ui.checkbox(&mut self.params.barb, "Barb")
-            .on_hover_text("A barb near each extension's end for its hose to grip: it ramps out from the extension, then steps straight back down");
+        ui.checkbox(&mut self.params.barb, "Barb").on_hover_text(
+            "A barb near each extension's end for its hose to grip: it ramps out from the extension, then steps straight back down. For a model you will thicken into a wall, leave this off and add the barb in Thicken instead: there it stands sharp on the wall's outside and the lumen stays smooth",
+        );
         if self.params.barb {
             let crests = chosen.iter().map(|&i| format!("End {}: ⌀ {:.2} mm", i + 1, self.params.sizes[i].diameter + self.params.barb_width)).collect::<Vec<_>>().join("\n");
             ui.horizontal(|ui| {
@@ -2660,6 +2661,70 @@ mod tests {
             let _ = ctx.run_ui(raw, |ui| assert!(matches!(tool.panel(ui, &mut cx), ToolOutcome::Continue)));
         }
         assert!(tool.params.barb && tool.params.barb_width == before.barb_width && tool.params.barb_setback == before.barb_setback);
+    }
+
+    #[test]
+    fn thicken_puts_a_sharp_barb_on_a_flow_extensions_end() {
+        // A straight vessel along z, radius 1: the top end out to a 6.35 mm connector, 15 mm
+        // long, left open; accepted, its wall is extension_1.
+        let mut scene = Scene::default();
+        let path: Vec<DVec3> = (0..=40).map(|i| DVec3::new(0.0, 0.0, 0.5 * i as f64)).collect();
+        scene.add("vessel", primitives::tube_along(&path, &[1.0; 41], 32));
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let vp = Viewport { rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)) };
+        let mut cx = ToolCx { scene: &mut scene, history: &mut history, camera: &mut camera, status: &mut status, egui: &ctx, vp, brush_scroll: crate::navigation::BrushScroll::Shift };
+        let mut tool = FlowExtensionTool::new(&mut cx);
+        let top = tool.ends.iter().position(|e| e.center.z > 10.0).unwrap();
+        tool.act("select", &json!({"ends": [top + 1]}), &mut cx).unwrap();
+        tool.act("size", &json!({"ends": [top + 1], "diameter_mm": 6.35, "length_mm": 15.0}), &mut cx).unwrap();
+        tool.set_settings(&json!({"taper_mm": 4.0, "cap": false}), &mut cx).unwrap();
+        let t0 = Instant::now();
+        while tool.preview.as_ref().is_none_or(|(p, _)| *p != tool.params) && tool.error.is_none() && t0.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+            tool.update(&mut cx);
+        }
+        assert!(tool.accept(&mut cx), "{:?}", tool.error);
+        let end = 20.0 + 15.0;
+        let o = cx.scene.active().unwrap();
+        let mesh = o.mesh.clone();
+        let o_names = |cx: &ToolCx| cx.scene.active().unwrap().group_names.clone();
+        // Thicken finds the flow extension's end by its group's name, and only that one.
+        let ends = crate::tools::ops::OpenEnds::of(&mesh, Some(&o.group_names));
+        assert_eq!(ends.extensions.len(), 1, "{:?}", ends.extensions);
+        let (k, name, r) = ends.extensions[0].clone();
+        assert!(name.starts_with("extension") && (r - 3.175).abs() < 1e-9, "{name} {r}");
+        // A 1.5 mm wall outward with a barb 1 mm wider than its 9.35 mm outside, 2 mm back from
+        // the rim: its crest exactly 0.5 proud of the outside, where it was put.
+        use crate::tools::ops::{OpSpec, ThickenSpec, ThickenUi};
+        let info = crate::tools::ops::OpInfo::new(&mesh, None);
+        let p = ThickenUi { thickness: 1.5, barbs: vec![k], barb_width: 1.0, barb_setback: 2.0, ..ThickenSpec::defaults(&info) };
+        let out = ThickenSpec::run(&mesh, None, &p, &|_| true).unwrap();
+        let m = &out.mesh;
+        m.check_validity().unwrap();
+        assert!(m.is_closed());
+        let crest_z = end + 0.05 * 1.5 - 2.0 - barb_ramp(1.0);
+        let crest: Vec<DVec3> = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| (p.truncate().length() - 5.175).abs() < 1e-9).collect();
+        assert!(crest.len() >= 48 && crest.iter().all(|p| (p.z - crest_z).abs() < 1e-9), "{} crest points", crest.len());
+        assert!(m.vertex_ids().all(|v| m.vertex(v).truncate().length() < 5.175 + 1e-9));
+        assert!(out.message.contains(&format!("a barb on end {k}")), "{}", out.message);
+        // The connector's lumen is the extension itself, untouched.
+        let lumen: Vec<f64> = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| p.z > 20.0 + 4.0 + 1e-6 && p.z < end - 1e-6 && p.truncate().length() < 4.0).map(|p| p.truncate().length()).collect();
+        assert!(!lumen.is_empty() && lumen.iter().all(|r| (r - 3.175).abs() < 1e-9));
+        // The panel lists the flow extension's end with its outside, and leaves the barbs be.
+        let names = o_names(&cx);
+        let info = crate::tools::ops::OpInfo { group_names: Some(&names), ..crate::tools::ops::OpInfo::new(&mesh, None) };
+        let memo = crate::tools::ops::SourceMemo::default();
+        let mut shown = p.clone();
+        for _ in 0..2 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+            let _ = ctx.run_ui(raw, |ui| ThickenSpec::ui_memo(ui, &mut shown, &info, &memo));
+        }
+        assert_eq!(shown, p);
+        // Set back past the straight part, it is refused with the reason.
+        let p = ThickenUi { barb_setback: 12.0, ..p };
+        let e = ThickenSpec::run(&mesh, None, &p, &|_| true).err().unwrap();
+        assert!(e.to_string().contains("straight round tube"), "{e}");
     }
 
     /// A real mesh (`POLYMIX_FLOW_MESH`, local only): every flat end extended along its

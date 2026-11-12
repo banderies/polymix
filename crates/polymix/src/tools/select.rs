@@ -1491,7 +1491,7 @@ mod tests {
         let m = primitives::cylinder(1.0, 2.0, 24, 6, false);
         let rim_tri = m.triangle_ids().find(|&t| m.triangle(t).iter().any(|&v| m.vertex(v).z == 0.0)).unwrap();
         let ring = hole_ring(&m, rim_tri);
-        let info = OpInfo { mesh: &m, selection: Some(&ring), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None };
+        let info = OpInfo { mesh: &m, selection: Some(&ring), avg_edge: m.average_edge_length(), bbox_diag: m.bounds().diagonal(), target: None, group_names: None };
         let out = EraseFillSpec::run(&m, Some(&ring), &EraseFillSpec::defaults(&info), &|_| true).unwrap();
         assert_eq!(mm_core::topology::boundary_loops(&out.mesh).len(), 1, "only the top rim stays open");
         out.mesh.check_validity().unwrap();

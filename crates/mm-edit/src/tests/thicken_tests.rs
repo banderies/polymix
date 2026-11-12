@@ -118,3 +118,63 @@ fn a_closed_surface_gets_a_hollow_wall() {
     let want = 4.0 / 3.0 * PI * (6f64.powi(3) - 5f64.powi(3));
     assert!((volume(&res.mesh) - want).abs() < 0.03 * want, "volume {:.0} vs {want:.0}", volume(&res.mesh));
 }
+
+#[test]
+fn a_barb_on_the_wall_stays_sharp_and_the_lumen_keeps_its_shape() {
+    // Radius 3, 30 long, a 2 mm wall outward: a barb 1 mm wider than the 10 mm outside at the
+    // top end, 2 mm back from the rim, ramping over 1.866 (15°).
+    let m0 = tube(straight, 30.0, 3.0);
+    let top = openings(&m0).iter().position(|(_, o)| o.normal.z > 0.9).unwrap();
+    let barb = crate::Barb { width: 1.0, setback: 2.0, length: 0.5 / 15f64.to_radians().tan() };
+    let res = thicken(&m0, &ThickenParams { thickness: 2.0, barbs: vec![(top, barb)], ..Default::default() }, None).unwrap();
+    let m = &res.mesh;
+    assert_valid(m);
+    assert!(m.is_closed());
+    assert_eq!(crossings(m), 0);
+    assert_eq!(res.barb_groups.len(), 1);
+    let g = res.barb_groups[0];
+    let barb_points: Vec<DVec3> = m.triangle_ids().filter(|&t| m.tri_group(t) == g).flat_map(|t| m.triangle(t)).map(|v| m.vertex(v)).collect();
+    assert!(!barb_points.is_empty(), "the barb has a group of its own");
+    // The crest: a ring exactly 5.5 off the axis, where it was put (the rim stands a
+    // twentieth of the wall in front of the opening), and nothing of the wall wider.
+    let crest_z = 30.0 + 0.1 - 2.0 - barb.length;
+    let crest: Vec<&DVec3> = barb_points.iter().filter(|p| (p.truncate().length() - 5.5).abs() < 1e-9).collect();
+    assert!(crest.len() >= 48, "{} crest points", crest.len());
+    assert!(crest.iter().all(|p| (p.z - crest_z).abs() < 1e-9));
+    assert!(m.vertex_ids().all(|v| m.vertex(v).truncate().length() < 5.5 + 1e-9));
+    // The back face, square to the axis toward the vessel, from the outside (about 5) out to
+    // the crest.
+    let back: f64 = m.triangle_ids().filter(|&t| m.tri_group(t) == g && m.tri_normal(t).z < -0.999).map(|t| m.tri_area(t)).sum();
+    let want = PI * (5.5f64.powi(2) - 5.0f64.powi(2));
+    assert!((back - want).abs() < 0.05 * want, "back face {back:.3} vs {want:.3}");
+    // The lumen is the surface itself, untouched.
+    let lumen: Vec<f64> = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| p.truncate().length() < 4.0 && p.z > 0.5 && p.z < 29.5).map(|p| p.truncate().length()).collect();
+    assert!(!lumen.is_empty() && lumen.iter().all(|r| (r - 3.0).abs() < 1e-9));
+
+    // Inward and centred, the barb stands on the wall's outside there; at the end itself (no
+    // setback) it is cut flat with the rim.
+    for (side, outside) in [(ThickenSide::Inward, 3.0), (ThickenSide::Centered, 4.0)] {
+        let barb = crate::Barb { setback: 0.0, ..barb };
+        let res = thicken(&m0, &ThickenParams { thickness: 2.0, side, barbs: vec![(top, barb)], ..Default::default() }, None).unwrap();
+        let m = &res.mesh;
+        assert_valid(m);
+        assert!(m.is_closed(), "{side:?}");
+        assert_eq!(crossings(m), 0, "{side:?}");
+        let crest: Vec<DVec3> = m.vertex_ids().map(|v| m.vertex(v)).filter(|p| (p.truncate().length() - (outside + 0.5)).abs() < 1e-9).collect();
+        assert!(crest.len() >= 48 && crest.iter().all(|p| (p.z - (30.1 - barb.length)).abs() < 1e-9), "{side:?}");
+        let zmax = m.vertex_ids().map(|v| m.vertex(v).z).fold(f64::MIN, f64::max);
+        assert!((zmax - 30.1).abs() < 1e-9, "{side:?}: the rim cuts the barb flat ({zmax})");
+    }
+
+    // A barb needs a straight round tube behind its end: not one widening there.
+    let n = 120;
+    let points: Vec<DVec3> = (0..=n).map(|k| straight(30.0 * k as f64 / n as f64)).collect();
+    let radii: Vec<f64> = points.iter().map(|p| if p.z > 27.0 { 3.0 + (p.z - 27.0) / 3.0 } else { 3.0 }).collect();
+    let flared = primitives::tube_along(&points, &radii, 48);
+    let top = openings(&flared).iter().position(|(_, o)| o.normal.z > 0.9).unwrap();
+    let e = thicken(&flared, &ThickenParams { thickness: 2.0, barbs: vec![(top, barb)], ..Default::default() }, None).unwrap_err();
+    assert!(e.to_string().contains("straight round tube"), "{e}");
+    // Nor on an end that is not there, nor two on one end.
+    assert!(thicken(&m0, &ThickenParams { barbs: vec![(7, barb)], ..Default::default() }, None).is_err());
+    assert!(thicken(&m0, &ThickenParams { barbs: vec![(0, barb), (0, barb)], ..Default::default() }, None).is_err());
+}

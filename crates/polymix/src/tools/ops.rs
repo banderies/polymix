@@ -75,13 +75,18 @@ pub struct OpInfo<'a> {
     pub bbox_diag: f64,
     /// The scene's target surface, if one is set (and is not this object).
     pub target: Option<&'a TargetSurface>,
+    /// The object's face group names (patch names, `extension_N`, ...), where known.
+    pub group_names: Option<&'a GroupNames>,
 }
+
+/// An object's face group names.
+pub type GroupNames = std::collections::HashMap<i32, String>;
 
 impl<'a> OpInfo<'a> {
     /// The context for `mesh` and `selection`, with its sizes measured and no target.
     pub fn new(mesh: &'a Mesh, selection: Option<&'a [u32]>) -> Self {
         let (avg_edge, bbox_diag) = source_sizes(mesh);
-        Self { mesh, selection, avg_edge, bbox_diag, target: None }
+        Self { mesh, selection, avg_edge, bbox_diag, target: None, group_names: None }
     }
 }
 
@@ -218,6 +223,8 @@ pub struct OpTool<S: OpSpec> {
     look: Option<SourceLook>,
     /// Facts about the source and work kept between runs; a new one with each new source.
     memo: Arc<SourceMemo>,
+    /// The object's face group names, as the source was taken.
+    group_names: GroupNames,
 }
 
 impl<S: OpSpec> OpTool<S> {
@@ -228,7 +235,7 @@ impl<S: OpSpec> OpTool<S> {
         };
         let selection = if S::USES_SELECTION && !o.selection.is_empty() { Some(Arc::new(o.selection.to_vec())) } else { None };
         let source = o.mesh.clone();
-        let info = OpInfo { target: target.as_ref(), ..OpInfo::new(&source, selection.as_deref().map(|v| v.as_slice())) };
+        let info = OpInfo { target: target.as_ref(), group_names: Some(&o.group_names), ..OpInfo::new(&source, selection.as_deref().map(|v| v.as_slice())) };
         let params = S::defaults(&info);
         let (avg_edge, bbox_diag) = (info.avg_edge, info.bbox_diag);
         Self {
@@ -249,6 +256,7 @@ impl<S: OpSpec> OpTool<S> {
             drag: None,
             look: SourceLook::of(o),
             memo: Arc::default(),
+            group_names: o.group_names.clone(),
         }
     }
 
@@ -259,6 +267,7 @@ impl<S: OpSpec> OpTool<S> {
         (self.avg_edge, self.bbox_diag) = source_sizes(&self.source);
         self.look = SourceLook::of(o);
         self.memo = Arc::default();
+        self.group_names = o.group_names.clone();
     }
 
     /// The mesh `out` leaves the object with.
@@ -271,7 +280,7 @@ impl<S: OpSpec> OpTool<S> {
     }
 
     fn invalid() -> Self {
-        let info = OpInfo { mesh: &Mesh::new(), selection: None, avg_edge: 1.0, bbox_diag: 1.0, target: None };
+        let info = OpInfo { mesh: &Mesh::new(), selection: None, avg_edge: 1.0, bbox_diag: 1.0, target: None, group_names: None };
         let params = S::defaults(&info);
         Self {
             object: 0,
@@ -291,6 +300,7 @@ impl<S: OpSpec> OpTool<S> {
             drag: None,
             look: None,
             memo: Arc::default(),
+            group_names: GroupNames::new(),
         }
     }
 
@@ -493,6 +503,7 @@ impl<S: OpSpec> Tool for OpTool<S> {
                 avg_edge: self.avg_edge,
                 bbox_diag: self.bbox_diag,
                 target: self.target.as_ref(),
+                group_names: Some(&self.group_names),
             };
             S::ui_memo(ui, &mut self.params, &info, &self.memo);
         }
@@ -2124,7 +2135,7 @@ pub enum ThickenWay {
     Centered,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ThickenUi {
     /// Wall thickness, mm (0.1..20).
     pub thickness: f64,
@@ -2135,20 +2146,45 @@ pub struct ThickenUi {
     pub accuracy: f64,
     /// Remesh the new wall and the rims to the surface's own edge length.
     pub remesh: bool,
+    /// Barbs on the wall's outside, for a hose pushed over an end to grip, at these open ends
+    /// (numbers from 1, as the preview labels them): flow extensions' ends, where the
+    /// extension runs straight and round behind its taper. Sharp, and the lumen keeps its
+    /// shape (unlike a barb made on the surface before it is thickened).
+    pub barbs: Vec<usize>,
+    /// How much wider a barb's crest is than the wall's outside, on the diameter, mm
+    /// (0.01..50). It ramps out at 15° off the axis.
+    pub barb_width: f64,
+    /// From the rim back to where a barb starts to rise, mm (0..200; 0 = at the rim).
+    pub barb_setback: f64,
 }
 
-/// What Thicken's panel says about the source's open ends: how many, and the numbers
-/// (from 1) of those that are not flat.
-struct OpenEnds {
+/// What Thicken's panel says about the source's open ends: how many, the numbers (from 1)
+/// of those that are not flat, and the flow extensions' ends.
+pub(crate) struct OpenEnds {
     count: usize,
     rough: Vec<String>,
+    /// The ends whose wall is a flow extension's (a face group named `extension_N`): number
+    /// (from 1), the group's name and the radius of the end.
+    pub(crate) extensions: Vec<(usize, String, f64)>,
 }
 
 impl OpenEnds {
-    fn of(mesh: &Mesh) -> Self {
+    pub(crate) fn of(mesh: &Mesh, names: Option<&GroupNames>) -> Self {
         let ends = mm_edit::thicken::openings(mesh);
         let rough = ends.iter().enumerate().filter(|(_, (_, o))| o.flatness > mm_edit::thicken::FLAT_ENOUGH).map(|(i, _)| (i + 1).to_string()).collect();
-        Self { count: ends.len(), rough }
+        let extensions = ends
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (lp, o))| {
+                // The group of the triangles along the end.
+                let mut groups: Vec<i32> = lp.iter().flat_map(|&v| mesh.vertex_triangles(v)).map(|t| mesh.tri_group(t)).collect();
+                groups.sort_unstable();
+                let group = groups.chunk_by(|a, b| a == b).max_by_key(|run| run.len())?[0];
+                let name = names?.get(&group)?;
+                name.starts_with("extension").then(|| (i + 1, name.clone(), o.radius))
+            })
+            .collect();
+        Self { count: ends.len(), rough, extensions }
     }
 }
 
@@ -2158,7 +2194,7 @@ impl OpSpec for ThickenSpec {
     const NAME: &'static str = "Thicken";
     const USES_SELECTION: bool = false;
     fn defaults(_: &OpInfo) -> Self::Params {
-        ThickenUi { thickness: 2.0, side: ThickenWay::Outward, accuracy: 0.33, remesh: true }
+        ThickenUi { thickness: 2.0, side: ThickenWay::Outward, accuracy: 0.33, remesh: true, barbs: Vec::new(), barb_width: 1.0, barb_setback: 2.0 }
     }
     fn ui(ui: &mut egui::Ui, p: &mut Self::Params, info: &OpInfo) {
         Self::ui_memo(ui, p, info, &SourceMemo::default());
@@ -2173,8 +2209,8 @@ impl OpSpec for ThickenSpec {
         ui.add(egui::Slider::new(&mut p.accuracy, 0.0..=1.0).text("Accuracy")).on_hover_text("How closely the new side follows the surface; finer is slower");
         ui.checkbox(&mut p.remesh, "Remesh the new wall").on_hover_text("Even triangles of the surface's own size on the new side and the rims");
         // The open ends are found by a walk over every edge: once per source, not every frame.
-        memo.facts(
-            || OpenEnds::of(info.mesh),
+        let extensions = memo.facts(
+            || OpenEnds::of(info.mesh, info.group_names),
             |ends| {
                 ui.small(match ends.count {
                     0 => "No open ends: the wall encloses a sealed cavity.".to_string(),
@@ -2185,8 +2221,10 @@ impl OpSpec for ThickenSpec {
                 if !rough.is_empty() {
                     ui.colored_label(egui::Color32::from_rgb(240, 180, 60), format!("Open end{} {} {} not flat: cut {} square first (Vessel → Trim branch, or Plane Cut) for a clean rim.", if rough.len() == 1 { "" } else { "s" }, rough.join(", "), if rough.len() == 1 { "is" } else { "are" }, if rough.len() == 1 { "it" } else { "them" }));
                 }
+                ends.extensions.clone()
             },
         );
+        Self::barbs_ui(ui, p, &extensions);
         ui.small("The new side lies the thickness from the surface everywhere (it never folds into itself, unlike moving the surface along its normals), so the result is a closed wall ready to print.");
     }
     fn run(mesh: &Mesh, _: Option<&[u32]>, p: &Self::Params, progress: ProgressFn) -> anyhow::Result<OpOutput> {
@@ -2195,11 +2233,26 @@ impl OpSpec for ThickenSpec {
             ThickenWay::Inward => mm_edit::ThickenSide::Inward,
             ThickenWay::Centered => mm_edit::ThickenSide::Centered,
         };
-        let params = mm_edit::ThickenParams { thickness: p.thickness, side, cell_size: Some(p.thickness / (3.0 + 9.0 * p.accuracy.clamp(0.0, 1.0))), remesh: p.remesh };
+        if let Some(&k) = p.barbs.iter().find(|&&k| k == 0) {
+            anyhow::bail!("{k} is not an open end's number (they start at 1)");
+        }
+        let barb = mm_edit::Barb { width: p.barb_width, setback: p.barb_setback, length: crate::tools::vessel::barb_ramp(p.barb_width) };
+        let params = mm_edit::ThickenParams {
+            thickness: p.thickness,
+            side,
+            cell_size: Some(p.thickness / (3.0 + 9.0 * p.accuracy.clamp(0.0, 1.0))),
+            remesh: p.remesh,
+            barbs: p.barbs.iter().map(|&k| (k - 1, barb)).collect(),
+        };
         let res = mm_edit::thicken(mesh, &params, Some(&|f| progress(f))).map_err(|e| anyhow::anyhow!("{e}"))?;
         let [lo, mean, hi] = res.measured;
+        let barbs = match p.barbs.len() {
+            0 => String::new(),
+            1 => format!(", a barb on end {}", p.barbs[0]),
+            _ => format!(", barbs on ends {}", p.barbs.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ")),
+        };
         let message = format!(
-            "Wall {:.2} mm (measured {lo:.2}–{hi:.2}, mean {mean:.2}); {} open end{} with flat rims; {} triangles{}",
+            "Wall {:.2} mm (measured {lo:.2}–{hi:.2}, mean {mean:.2}); {} open end{} with flat rims{barbs}; {} triangles{}",
             p.thickness,
             res.openings.len(),
             if res.openings.len() == 1 { "" } else { "s" },
@@ -2218,8 +2271,58 @@ impl OpSpec for ThickenSpec {
             "centered" => p.side = ThickenWay::Centered,
             "accuracy" => p.accuracy = v.parse().unwrap_or(p.accuracy),
             "remesh" => p.remesh = v != "off",
+            // barbs:2,3 (open ends), barbwidth:1, barbsetback:2
+            "barbs" => p.barbs = v.split(',').filter_map(|k| k.trim().parse().ok()).collect(),
+            "barbwidth" => p.barb_width = v.parse().unwrap_or(p.barb_width),
+            "barbsetback" => p.barb_setback = v.parse().unwrap_or(p.barb_setback),
             _ => {}
         }
+    }
+}
+
+impl ThickenSpec {
+    /// The panel's barbs: a tick for each flow extension's end (`extensions`, from
+    /// [`OpenEnds`]), and the barbs' width and setback.
+    fn barbs_ui(ui: &mut egui::Ui, p: &mut ThickenUi, extensions: &[(usize, String, f64)]) {
+        use crate::tools::vessel::{barb_ramp, BARB_RAMP, BARB_SETBACK_RANGE, BARB_WIDTH_RANGE};
+        if extensions.is_empty() {
+            if !p.barbs.is_empty() {
+                ui.small(format!("Barbs on open ends {}.", p.barbs.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ")));
+            }
+            return;
+        }
+        ui_util::section(ui, "Barbs");
+        ui.small("On the wall's outside at flow extensions' ends, for a hose pushed over them to grip: sharp, and the lumen keeps its shape.");
+        // The wall's outside at an end of radius `r`.
+        let outside = |r: f64| match p.side {
+            ThickenWay::Outward => 2.0 * (r + p.thickness),
+            ThickenWay::Centered => 2.0 * r + p.thickness,
+            ThickenWay::Inward => 2.0 * r,
+        };
+        for (k, name, r) in extensions {
+            let mut on = p.barbs.contains(k);
+            let text = format!("End {k}: {name}, ⌀ {:.2} outside", outside(*r));
+            if ui.checkbox(&mut on, text).on_hover_text(format!("Across the crest ⌀ {:.2}", outside(*r) + p.barb_width)).changed() {
+                p.barbs.retain(|x| x != k);
+                if on {
+                    p.barbs.push(*k);
+                    p.barbs.sort_unstable();
+                }
+            }
+        }
+        if p.barbs.is_empty() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut p.barb_width).speed(0.01).range(BARB_WIDTH_RANGE).min_decimals(2).max_decimals(3).suffix(" mm"));
+            ui.label("barb width").on_hover_text("How much wider the barb's crest is than the wall's outside, on the diameter");
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut p.barb_setback).speed(0.05).range(BARB_SETBACK_RANGE).min_decimals(2).max_decimals(3).suffix(" mm"));
+            ui.label("back from the rim").on_hover_text("How far back from the end's rim the barb starts to rise (0: at the rim)");
+        });
+        let ramp = barb_ramp(p.barb_width);
+        ui.weak(format!("It ramps out over {ramp:.2} mm ({BARB_RAMP:.0}° off the axis), so its crest is {:.2} mm back from the rim.", p.barb_setback + ramp));
     }
 }
 pub type ThickenTool = OpTool<ThickenSpec>;
@@ -4343,7 +4446,7 @@ mod memo_tests {
         r.remove_triangles(ragged);
         let want: Vec<String> = mm_edit::thicken::openings(&r).iter().enumerate().filter(|(_, (_, o))| o.flatness > mm_edit::thicken::FLAT_ENOUGH).map(|(i, _)| (i + 1).to_string()).collect();
         assert!(!want.is_empty());
-        assert_eq!(OpenEnds::of(&r).rough, want);
+        assert_eq!(OpenEnds::of(&r, None).rough, want);
 
         let memo = SourceMemo::default();
         let mut c = CloseCracksSpec::defaults(&info);
