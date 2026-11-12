@@ -23,6 +23,70 @@ pub struct FrameInfo {
     pub echo_time: Option<f64>,
 }
 
+/// One region of an ultrasound image (Sequence of Ultrasound Regions): where it is in the
+/// image, what it shows, and its calibration.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsRegion {
+    /// 0 none, 1 2D (tissue or flow), 2 M-mode, 3 spectral, 4 waveform, 5 graphics.
+    pub spatial_format: u16,
+    /// 1 tissue, 2 colour flow, 3 PW spectral Doppler, 4 CW spectral Doppler, … (see [`UsRegion::what`]).
+    pub data_type: u16,
+    /// Columns and rows it covers: min x, min y, max x, max y (inclusive).
+    pub bounds: [u32; 4],
+    /// Units along x and y: 3 cm, 4 seconds, 7 cm/s, … (0 none).
+    pub units: [u16; 2],
+    /// Physical units per pixel along x and y.
+    pub delta: [f64; 2],
+}
+
+impl UsRegion {
+    /// What the region shows.
+    pub fn what(&self) -> &'static str {
+        match self.data_type {
+            1 => "tissue",
+            2 => "colour flow",
+            3 => "PW spectral Doppler",
+            4 => "CW spectral Doppler",
+            5 => "Doppler mean trace",
+            6 => "Doppler mode trace",
+            7 => "Doppler max trace",
+            8 => "volume trace",
+            0xA => "ECG trace",
+            0xB => "pulse trace",
+            0xC => "phonocardiogram trace",
+            0xD => "grey bar",
+            0xE => "colour bar",
+            0xF => "integrated backscatter",
+            0x10 => "area trace",
+            0x11 => "d(area)/dt",
+            0x12 => "other physiological input",
+            _ => "other data",
+        }
+    }
+
+    /// Millimetres per pixel (across, down) of a 2D region calibrated in centimetres.
+    pub fn mm_per_pixel(&self) -> Option<[f64; 2]> {
+        let ok = self.spatial_format == 1 && self.units == [3, 3] && self.delta.iter().all(|d| d.is_finite() && *d > 0.0);
+        ok.then(|| [self.delta[0].abs() * 10.0, self.delta[1].abs() * 10.0])
+    }
+
+    /// Pixels it covers.
+    pub fn area(&self) -> u64 {
+        let [x0, y0, x1, y1] = self.bounds;
+        (x1.saturating_sub(x0) as u64 + 1) * (y1.saturating_sub(y0) as u64 + 1)
+    }
+}
+
+/// The pixel spacing of an ultrasound image from its regions, in DICOM's Pixel Spacing order
+/// (row spacing, column spacing; millimetres): that of the largest 2D region calibrated in
+/// centimetres, and whether other such regions are calibrated differently.
+pub fn us_pixel_spacing(regions: &[UsRegion]) -> Option<([f64; 2], bool)> {
+    let spatial: Vec<(&UsRegion, [f64; 2])> = regions.iter().filter_map(|r| r.mm_per_pixel().map(|mm| (r, mm))).collect();
+    let (_, [across, down]) = spatial.iter().max_by_key(|(r, _)| r.area())?;
+    let differ = spatial.iter().any(|(_, [a, d])| (a - across).abs() > 1e-6 * across || (d - down).abs() > 1e-6 * down);
+    Some(([*down, *across], differ))
+}
+
 /// What one DICOM file says about itself (no pixels).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Instance {
@@ -74,6 +138,17 @@ pub struct Instance {
     pub frame_of_reference: String,
     pub gantry_tilt: Option<f64>,
     pub burned_in_annotation: bool,
+    /// Ultrasound: the image's regions and their calibration.
+    #[serde(default)]
+    pub us_regions: Vec<UsRegion>,
+    /// Multi-frame files: milliseconds from one frame to the next (Frame Time, else the mean
+    /// of the Frame Time Vector, else from the Cine Rate or the Recommended Display Frame Rate).
+    #[serde(default)]
+    pub frame_time_ms: Option<f64>,
+    /// Multi-frame files whose Frame Increment Pointer steps through time (a cine clip), not
+    /// through space.
+    #[serde(default)]
+    pub frames_in_time: bool,
     /// Equipment and acquisition fields, for display.
     pub fields: Vec<Field>,
 }
@@ -100,6 +175,45 @@ fn int(obj: &InMemDicomObject, tag: Tag) -> Option<i64> {
 
 fn arr<const N: usize>(v: Vec<f64>) -> Option<[f64; N]> {
     (v.len() >= N && v.iter().take(N).all(|x| x.is_finite())).then(|| std::array::from_fn(|i| v[i]))
+}
+
+/// The tags of an attribute of VR AT (e.g. Frame Increment Pointer), also when it was read
+/// as plain bytes.
+fn tag_values(obj: &InMemDicomObject, tag: Tag) -> Vec<Tag> {
+    use dicom_core::value::{PrimitiveValue, Value};
+    let Some(e) = obj.get(tag) else { return Vec::new() };
+    match e.value() {
+        Value::Primitive(PrimitiveValue::Tags(t)) => t.to_vec(),
+        _ => e.to_bytes().map(|b| b.as_chunks::<4>().0.iter().map(|c| Tag(u16::from_le_bytes([c[0], c[1]]), u16::from_le_bytes([c[2], c[3]]))).collect()).unwrap_or_default(),
+    }
+}
+
+/// Milliseconds between frames, from the cine attributes.
+fn frame_time(obj: &InMemDicomObject) -> Option<f64> {
+    let positive = |v: f64| (v.is_finite() && v > 0.0).then_some(v);
+    float(obj, tags::FRAME_TIME).and_then(positive).or_else(|| {
+        // The vector's first entry is 0 (the first frame); the rest are the gaps.
+        let v = floats(obj, tags::FRAME_TIME_VECTOR);
+        let gaps: Vec<f64> = v.iter().skip(1).copied().filter(|g| g.is_finite() && *g > 0.0).collect();
+        (!gaps.is_empty()).then(|| gaps.iter().sum::<f64>() / gaps.len() as f64)
+    }).or_else(|| [tags::CINE_RATE, tags::RECOMMENDED_DISPLAY_FRAME_RATE].iter().find_map(|&t| float(obj, t).and_then(positive)).map(|fps| 1000.0 / fps))
+}
+
+/// The ultrasound regions of an image.
+fn us_regions(obj: &InMemDicomObject) -> Vec<UsRegion> {
+    let Some(items) = obj.get(tags::SEQUENCE_OF_ULTRASOUND_REGIONS).and_then(|e| e.items()) else { return Vec::new() };
+    let u16_of = |r: &InMemDicomObject, t: Tag| int(r, t).unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
+    let u32_of = |r: &InMemDicomObject, t: Tag| int(r, t).unwrap_or(0).clamp(0, u32::MAX as i64) as u32;
+    items
+        .iter()
+        .map(|r| UsRegion {
+            spatial_format: u16_of(r, tags::REGION_SPATIAL_FORMAT),
+            data_type: u16_of(r, tags::REGION_DATA_TYPE),
+            bounds: [u32_of(r, tags::REGION_LOCATION_MIN_X0), u32_of(r, tags::REGION_LOCATION_MIN_Y0), u32_of(r, tags::REGION_LOCATION_MAX_X1), u32_of(r, tags::REGION_LOCATION_MAX_Y1)],
+            units: [u16_of(r, tags::PHYSICAL_UNITS_X_DIRECTION), u16_of(r, tags::PHYSICAL_UNITS_Y_DIRECTION)],
+            delta: [float(r, tags::PHYSICAL_DELTA_X).unwrap_or(0.0), float(r, tags::PHYSICAL_DELTA_Y).unwrap_or(0.0)],
+        })
+        .collect()
 }
 
 /// The first item of a sequence.
@@ -191,8 +305,18 @@ fn from_object(obj: &InMemDicomObject, path: &Path, bytes: u64, transfer_syntax:
         frame_of_reference: text(obj, tags::FRAME_OF_REFERENCE_UID),
         gantry_tilt: float(obj, tags::GANTRY_DETECTOR_TILT),
         burned_in_annotation: text(obj, tags::BURNED_IN_ANNOTATION).eq_ignore_ascii_case("YES"),
+        us_regions: us_regions(obj),
+        frame_time_ms: None,
+        frames_in_time: false,
         fields: Vec::new(),
     };
+    if i.frames > 1 {
+        i.frame_time_ms = frame_time(obj);
+        // Cine: the frames step through Frame Time (Vector). Without the pointer, a frame time
+        // alone says the same.
+        let pointer = tag_values(obj, tags::FRAME_INCREMENT_POINTER);
+        i.frames_in_time = if pointer.is_empty() { i.frame_time_ms.is_some() && obj.get(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE).is_none() } else { pointer.iter().any(|&t| t == tags::FRAME_TIME || t == tags::FRAME_TIME_VECTOR) };
+    }
     // Enhanced multi-frame: geometry per frame from the functional groups.
     let per_frame = obj.get(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE).and_then(|e| e.items());
     if let Some(items) = per_frame.filter(|f| !f.is_empty()) {
@@ -252,6 +376,13 @@ fn from_object(obj: &InMemDicomObject, path: &Path, bytes: u64, transfer_syntax:
     push("Acquisition", "Contrast agent", tags::CONTRAST_BOLUS_AGENT);
     push("Acquisition", "Slice thickness (mm)", tags::SLICE_THICKNESS);
     push("Acquisition", "Spacing between slices (mm)", tags::SPACING_BETWEEN_SLICES);
+    push("Ultrasound", "Transducer", tags::TRANSDUCER_DATA);
+    push("Ultrasound", "Transducer type", tags::TRANSDUCER_TYPE);
+    push("Ultrasound", "Processing", tags::PROCESSING_FUNCTION);
+    push("Ultrasound", "Depth of scan field (mm)", tags::DEPTH_OF_SCAN_FIELD);
+    push("Ultrasound", "Stage", tags::STAGE_NAME);
+    push("Ultrasound", "View", tags::VIEW_NAME);
+    push("Ultrasound", "Heart rate (/min)", tags::HEART_RATE);
     i
 }
 

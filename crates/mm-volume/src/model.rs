@@ -51,6 +51,8 @@ pub enum Kind {
     VectorField,
     /// Several volumes over time or another dimension (4D).
     TimeSeries,
+    /// A 2D image over time: an ultrasound or angiography clip, played at its frame rate.
+    Cine,
     /// Scout / localizer images.
     Localizer,
     /// Computed from other images (reformats, projections, maps).
@@ -65,6 +67,7 @@ impl Kind {
             Kind::Segmentation => "Segmentation",
             Kind::VectorField => "Vector field",
             Kind::TimeSeries => "Time series",
+            Kind::Cine => "Cine clip",
             Kind::Localizer => "Localizer",
             Kind::Derived => "Derived",
         }
@@ -192,6 +195,9 @@ pub struct Volume {
     pub photometric: Option<String>,
     /// Identifiers carried by a non-DICOM file (sidecar, header), for exact matching.
     pub patient: Option<PatientKey>,
+    /// Milliseconds from one time point to the next, when the file says (cine clips).
+    #[serde(default)]
+    pub frame_time_ms: Option<f64>,
 }
 
 /// A DICOM object that is not part of an image volume (report, PDF, screenshot, …).

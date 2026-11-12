@@ -524,7 +524,7 @@ pub fn volume(path: &Path, gzip: bool, h: &Header) -> Result<Volume> {
     }
     let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
     let window = (h.cal_max > h.cal_min).then_some(((h.cal_max + h.cal_min) * 0.5, h.cal_max - h.cal_min));
-    Ok(Volume { format, kind, name, files, bytes, geometry: Some(geometry), data_type: dtype, fields, warnings, voxels, window, photometric: None, patient })
+    Ok(Volume { format, kind, name, files, bytes, geometry: Some(geometry), data_type: dtype, fields, warnings, voxels, window, photometric: None, patient, frame_time_ms: None })
 }
 
 #[cfg(test)]

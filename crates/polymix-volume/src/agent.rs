@@ -44,6 +44,11 @@ pub fn actions() -> Vec<Action> {
         Action::new("select", "Select and preview a volume; the Segmentation workspace then shows it", json!({"volume": volume("Volume number")})).required(&["volume"]),
         Action::new("slice", "Show a slice of the previewed volume", json!({"slice": arg::integer("Slice number from 0")})).required(&["slice"]),
         Action::new(
+            "frame",
+            "Images with several time points (cine clips, 4D series): show a time point of the previewed one, or play them at the file's frame rate",
+            json!({"frame": arg::integer("Time point (frame) from 0"), "play": arg::boolean("Play (true) or pause (false)"), "speed": arg::number("Playback speed, 1 = the file's frame rate (0.25–4)")}),
+        ),
+        Action::new(
             "window",
             "The preview's window / level",
             json!({"centre": arg::number("Window centre (level)"), "width": arg::number("Window width"), "auto": arg::boolean("Back to the automatic window (1st–99th percentile of the slice)"), "file": arg::boolean("The window stored in the file")}),
@@ -159,6 +164,27 @@ fn act_now(ws: &mut VolumeWorkspace, action: &str, a: &Args, ctx: &egui::Context
             }
             p.go_to(n, &c.volumes[p.volume], ctx);
             Ok(format!("Slice {n} of {}", p.slices))
+        }
+        "frame" => {
+            let c = catalog(ws)?;
+            let p = ws.preview.as_mut().ok_or("No volume is previewed: select one first")?;
+            if p.frames < 2 {
+                return Err("The previewed image has one time point".into());
+            }
+            if let Some(t) = a.opt_usize("frame") {
+                if t >= p.frames {
+                    return Err(format!("No frame {t}: the image has {}", p.frames));
+                }
+                p.set_playing(false);
+                p.go_to_frame(t, &c.volumes[p.volume], ctx);
+            }
+            if let Some(s) = a.opt_f64("speed") {
+                p.speed = s.clamp(0.25, 4.0);
+            }
+            if let Some(on) = a.opt_bool("play") {
+                p.set_playing(on);
+            }
+            Ok(format!("Frame {} of {}{}", p.frame, p.frames, if p.playing { ", playing" } else { "" }))
         }
         "window" => {
             let p = ws.preview.as_mut().ok_or("No volume is previewed: select one first")?;
@@ -312,7 +338,15 @@ pub fn call(ws: &mut VolumeWorkspace, tool: &str, args: &Value) -> AgentReply {
         },
         previewed: ws.preview.as_ref().map_or(Value::Null, |p| {
             let (c, w) = p.shown_window();
-            json!({"volume": p.volume, "slice": p.slice, "slices": p.slices, "window": {"centre": round(c, 3), "width": round(w, 3)}})
+            let mut j = json!({"volume": p.volume, "slice": p.slice, "slices": p.slices, "window": {"centre": round(c, 3), "width": round(w, 3)}});
+            if p.frames > 1 {
+                j["frame"] = json!(p.frame);
+                j["frames"] = json!(p.frames);
+                j["playing"] = json!(p.playing);
+                j["speed"] = json!(p.speed);
+                j["frame_ms"] = if p.frame_ms_known { json!(round(p.frame_ms, 3)) } else { Value::Null };
+            }
+            j
         }),
         prepare: ws.prepare.agent_state(),
         viewer: json!({
@@ -484,6 +518,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         });
         let series = Series { uid: "1.2".into(), number: Some(3), modality: "MR".into(), description: "TOF 3D".into(), date: "20240305".into(), time: String::new(), instances: 1, volumes: vec![0], objects: vec![] };
         let study = Study { uid: "1".into(), date: "20240305".into(), time: String::new(), description: "MRA HEAD".into(), accession: "ACC777".into(), series: vec![series] };

@@ -8,9 +8,12 @@
 //! - a **series** is a Series Instance UID, split into volumes by orientation, image size,
 //!   image type, echo and stack; frames at the same position become a 4th dimension;
 //! - slices are ordered by their position along the slice normal (Image Position · normal),
-//!   and the spacing comes from those positions, never from Slice Thickness.
+//!   and the spacing comes from those positions, never from Slice Thickness;
+//! - a cine clip (a multi-frame file whose frames step through time) and an ultrasound image
+//!   not placed in the patient are images of their own (2D, or 2D over time), never slices of
+//!   a volume, sized by the ultrasound regions' calibration when there is no Pixel Spacing.
 
-use crate::dicom::{non_image_kind, transfer_syntax_name, Instance};
+use crate::dicom::{non_image_kind, transfer_syntax_name, us_pixel_spacing, Instance};
 use crate::geometry::{lps_to_ras, Geometry};
 use crate::model::{DataType, DicomObject, Field, Format, Kind, Patient, PatientKey, Series, Study, Volume, Voxels};
 use glam::DVec3;
@@ -88,9 +91,14 @@ fn one_series(uid: String, insts: &[&Instance], volumes: &mut Vec<Volume>) -> Se
     let first = insts[0];
     let mut objects = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
+    let mut alone: Vec<&Instance> = Vec::new();
     for &i in insts {
         if let Some(what) = non_image_kind(&i.sop_class, i.rows) {
             objects.push(DicomObject { path: i.path.clone(), what: what.to_string() });
+            continue;
+        }
+        if stands_alone(i) {
+            alone.push(i);
             continue;
         }
         if !i.frame_info.is_empty() {
@@ -115,7 +123,7 @@ fn one_series(uid: String, insts: &[&Instance], volumes: &mut Vec<Volume>) -> Se
                     frame: k,
                     position: if k == 0 { i.position.map(DVec3::from_array) } else { None },
                     orientation: i.orientation,
-                    spacing: i.pixel_spacing,
+                    spacing: i.pixel_spacing.or_else(|| us_pixel_spacing(&i.us_regions).map(|(s, _)| s)),
                     stack: if i.frames > 1 { i.sop_uid.clone() } else { String::new() },
                     temporal: i.temporal_position,
                     echo: i.echo_number.map(|e| e.to_string()).unwrap_or_default(),
@@ -154,6 +162,23 @@ fn one_series(uid: String, insts: &[&Instance], volumes: &mut Vec<Volume>) -> Se
             vols.push(volumes.len());
             volumes.push(v);
         }
+    }
+    // Stand-alone images and clips, in instance order, each named by its instance number when
+    // those tell them apart.
+    alone.sort_by(|a, b| (a.instance_number.unwrap_or(i64::MAX), a.acquisition_number, &a.path).cmp(&(b.instance_number.unwrap_or(i64::MAX), b.acquisition_number, &b.path)));
+    let mut numbers: Vec<i64> = alone.iter().filter_map(|i| i.instance_number).collect();
+    numbers.dedup();
+    let by_number = numbers.len() == alone.len();
+    let named = alone.len() > 1 || n_groups > 0;
+    for (k, i) in alone.iter().enumerate() {
+        let suffix = if named {
+            let what = if i.frames > 1 { "clip" } else { "image" };
+            format!(" · {what} {}", if by_number { i.instance_number.unwrap_or(0) } else { k as i64 + 1 })
+        } else {
+            String::new()
+        };
+        vols.push(volumes.len());
+        volumes.push(stand_alone_volume(i, &suffix));
     }
     Series {
         uid,
@@ -286,9 +311,7 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
     }
 
     let kind = kind_of(first, localizer_series, t);
-    let number = first.series_number.map(|n| format!("Series {n}")).unwrap_or_else(|| "Series".into());
-    let desc = if first.series_description.is_empty() { first.modality.clone() } else { first.series_description.clone() };
-    let name = format!("{number} · {desc}{suffix}");
+    let name = format!("{}{suffix}", series_name(first));
     let mut files: Vec<std::path::PathBuf> = frames.iter().map(|f| f.inst.path.clone()).collect();
     files.dedup();
     let mut sizes: BTreeMap<&std::path::Path, u64> = BTreeMap::new();
@@ -296,7 +319,61 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
         sizes.insert(&f.inst.path, f.inst.bytes);
     }
     let bytes = sizes.values().sum();
-    let data_type = match (first.bits_allocated, first.pixel_representation, first.samples_per_pixel) {
+
+    let mut fields = header_fields(first);
+    fields.extend([
+        Field::new("Geometry", "Dimensions", if t > 1 { format!("{} × {} × {} × {t}", dims[0], dims[1], n) } else { format!("{} × {} × {}", dims[0], dims[1], n) }),
+        Field::new("Geometry", "Voxel size", format!("{:.4} × {:.4} × {:.4} mm", ps[1], ps[0], slice_spacing)),
+        Field::new("Geometry", "Orientation", {
+            let ob = geometry.obliquity_deg();
+            if ob > 0.5 { format!("{} (oblique {ob:.1}°)", geometry.orientation()) } else { geometry.orientation() }
+        }),
+        Field::new("Geometry", "Slices", format!("{n} from {} file(s){}", files.len(), if t > 1 { format!(", {t} per position") } else { String::new() })),
+    ]);
+    fields.extend(pixel_fields(first));
+    fields.retain(|f| !f.value.is_empty());
+    Vec::from([Volume {
+        format: Format::Dicom,
+        kind,
+        name,
+        files,
+        bytes,
+        geometry: Some(geometry),
+        data_type: data_type_of(first),
+        fields,
+        warnings,
+        // Every volume of a 4D set, one after the other (time point 0 first).
+        voxels: Voxels::Dicom {
+            slices: (0..t).flat_map(|v| positions.iter().map(move |(_, idx)| idx[v.min(idx.len() - 1)])).map(|k| (frames[k].inst.path.clone(), frames[k].frame)).collect(),
+        },
+        window: first.window,
+        photometric: Some(first.photometric.clone()),
+        patient: None,
+        frame_time_ms: None,
+    }])
+}
+
+/// Whether a file is an image (or a clip) of its own rather than a slice of a volume: a cine
+/// clip, or an ultrasound image not placed in the patient. Enhanced multi-frame files (with
+/// per-frame geometry) are volumes.
+fn stands_alone(i: &Instance) -> bool {
+    i.frame_info.is_empty() && (i.frames_in_time || (is_ultrasound(i) && i.position.is_none()))
+}
+
+fn is_ultrasound(i: &Instance) -> bool {
+    // Ultrasound Image (and its retired forms), Ultrasound Multi-frame Image (and retired).
+    i.modality.eq_ignore_ascii_case("US") || matches!(i.sop_class.as_str(), "1.2.840.10008.5.1.4.1.1.6" | "1.2.840.10008.5.1.4.1.1.6.1" | "1.2.840.10008.5.1.4.1.1.3" | "1.2.840.10008.5.1.4.1.1.3.1")
+}
+
+/// "Series 8 · T2 AX" (the modality when there is no description).
+fn series_name(first: &Instance) -> String {
+    let number = first.series_number.map(|n| format!("Series {n}")).unwrap_or_else(|| "Series".into());
+    let desc = if first.series_description.is_empty() { first.modality.clone() } else { first.series_description.clone() };
+    format!("{number} · {desc}")
+}
+
+fn data_type_of(first: &Instance) -> Option<DataType> {
+    match (first.bits_allocated, first.pixel_representation, first.samples_per_pixel) {
         (_, _, 3) => Some(DataType::Rgb24),
         (8, 0, _) => Some(DataType::U8),
         (8, _, _) => Some(DataType::I8),
@@ -305,8 +382,11 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
         (32, 0, _) => Some(DataType::U32),
         (32, _, _) => Some(DataType::I32),
         _ => None,
-    };
+    }
+}
 
+/// Patient, study and series fields, then the file's equipment and acquisition fields.
+fn header_fields(first: &Instance) -> Vec<Field> {
     let mut fields = vec![
         Field::new("Patient", "Name", first.patient_name.replace('^', " ").trim().to_string()),
         Field::new("Patient", "ID", first.patient_id.clone()),
@@ -324,44 +404,114 @@ fn build_volumes(mut frames: Vec<Frame>, suffix: &str, localizer_series: bool) -
         Field::new("Series", "Image type", first.image_type.join(" \\ ")),
     ];
     fields.extend(first.fields.iter().cloned());
-    fields.extend([
-        Field::new("Geometry", "Dimensions", if t > 1 { format!("{} × {} × {} × {t}", dims[0], dims[1], n) } else { format!("{} × {} × {}", dims[0], dims[1], n) }),
-        Field::new("Geometry", "Voxel size", format!("{:.4} × {:.4} × {:.4} mm", ps[1], ps[0], slice_spacing)),
-        Field::new("Geometry", "Orientation", {
-            let ob = geometry.obliquity_deg();
-            if ob > 0.5 { format!("{} (oblique {ob:.1}°)", geometry.orientation()) } else { geometry.orientation() }
-        }),
-        Field::new("Geometry", "Slices", format!("{n} from {} file(s){}", files.len(), if t > 1 { format!(", {t} per position") } else { String::new() })),
+    fields
+}
+
+/// How the pixels are stored.
+fn pixel_fields(first: &Instance) -> Vec<Field> {
+    let (ts_name, viewable) = transfer_syntax_name(&first.transfer_syntax);
+    let mut fields = vec![
         Field::new("Pixel", "Bits", format!("{} stored of {}{}", first.bits_stored, first.bits_allocated, if first.pixel_representation == 1 { ", signed" } else { "" })),
         Field::new("Pixel", "Photometric", first.photometric.clone()),
         Field::new("Pixel", "Transfer syntax", format!("{ts_name}{}", if viewable { "" } else { " (not viewable yet)" })),
         Field::new("Pixel", "SOP class", sop_class_name(&first.sop_class).to_string()),
-    ]);
+    ];
     if let Some((s, i)) = first.rescale {
         fields.push(Field::new("Pixel", "Rescale", format!("{s} · v + {i}")));
     }
     if let Some((c, w)) = first.window {
         fields.push(Field::new("Pixel", "Window", format!("centre {c}, width {w}")));
     }
+    fields
+}
+
+/// What an ultrasound region's layout is.
+fn spatial_format_name(f: u16) -> &'static str {
+    match f {
+        1 => "2D",
+        2 => "M-mode",
+        3 => "Spectral",
+        4 => "Waveform",
+        5 => "Graphics",
+        _ => "Region",
+    }
+}
+
+/// One file as an image of its own: a 2D image, or a 2D image over time (a cine clip, its
+/// frames the time points).
+fn stand_alone_volume(i: &Instance, suffix: &str) -> Volume {
+    let frames = i.frames.max(1) as usize;
+    let mut warnings = Vec::new();
+    // Pixel Spacing, else the calibration of the ultrasound regions.
+    let us = us_pixel_spacing(&i.us_regions);
+    let (ps, calibration) = match (i.pixel_spacing, us) {
+        (Some(ps), _) => (ps, "Pixel Spacing".to_string()),
+        (None, Some((ps, differ))) => {
+            if differ {
+                warnings.push(format!("Ultrasound regions are calibrated differently: sizes follow the largest image region ({:.4} mm per pixel)", ps[1]));
+            }
+            (ps, "Ultrasound region calibration".to_string())
+        }
+        (None, None) => {
+            warnings.push(if i.us_regions.is_empty() { "No pixel spacing: assuming 1 mm".to_string() } else { "No calibrated ultrasound region: assuming 1 mm pixels".to_string() });
+            ([1.0, 1.0], String::new())
+        }
+    };
+    let (ts_name, viewable) = transfer_syntax_name(&i.transfer_syntax);
+    if !viewable {
+        warnings.push(format!("Pixels compressed as {ts_name}: not viewable yet"));
+    }
+    let (row, col) = match i.orientation {
+        Some(o) => (DVec3::new(o[0], o[1], o[2]).normalize_or_zero(), DVec3::new(o[3], o[4], o[5]).normalize_or_zero()),
+        None => (DVec3::X, DVec3::Y),
+    };
+    let normal = row.cross(col).normalize_or_zero();
+    let dims = [i.columns as usize, i.rows as usize, 1, frames];
+    // One slice: as thick as a pixel is wide, so the voxels are as square as the pixels.
+    let geometry = Geometry::from_axes(dims, [ps[1], ps[0], ps[1]], [lps_to_ras(row), lps_to_ras(col), lps_to_ras(normal)], i.position.map(|p| lps_to_ras(DVec3::from_array(p))).unwrap_or(DVec3::ZERO));
+    let kind = if frames > 1 { Kind::Cine } else { kind_of(i, false, 1) };
+
+    let mut fields = header_fields(i);
+    fields.push(Field::new("Geometry", "Dimensions", if frames > 1 { format!("{} × {} × {frames} frames", dims[0], dims[1]) } else { format!("{} × {}", dims[0], dims[1]) }));
+    fields.push(Field::new("Geometry", "Pixel size", format!("{:.4} × {:.4} mm", ps[1], ps[0])));
+    if !calibration.is_empty() {
+        fields.push(Field::new("Geometry", "Pixel size from", calibration));
+    }
+    fields.push(Field::new("Geometry", "Orientation", if i.orientation.is_some() { geometry.orientation() } else { "None: not placed in the patient".to_string() }));
+    if frames > 1 {
+        if let Some(ms) = i.frame_time_ms {
+            fields.push(Field::new("Geometry", "Frame rate", format!("{:.1} frames/s ({ms:.1} ms per frame)", 1000.0 / ms)));
+            fields.push(Field::new("Geometry", "Duration", format!("{:.2} s", ms * (frames - 1) as f64 / 1000.0)));
+        } else {
+            fields.push(Field::new("Geometry", "Frame rate", "not in the file".to_string()));
+        }
+    }
+    for (k, r) in i.us_regions.iter().enumerate().take(8) {
+        let [x0, y0, x1, y1] = r.bounds;
+        let size = match r.mm_per_pixel() {
+            Some([a, d]) => format!(", {:.1} × {:.1} mm at {a:.4} mm per pixel", (x1.saturating_sub(x0) + 1) as f64 * a, (y1.saturating_sub(y0) + 1) as f64 * d),
+            None => String::new(),
+        };
+        fields.push(Field::new("Ultrasound", &format!("Region {}", k + 1), format!("{} {}: columns {x0}–{x1}, rows {y0}–{y1}{size}", spatial_format_name(r.spatial_format), r.what())));
+    }
+    fields.extend(pixel_fields(i));
     fields.retain(|f| !f.value.is_empty());
-    Vec::from([Volume {
+    Volume {
         format: Format::Dicom,
         kind,
-        name,
-        files,
-        bytes,
+        name: format!("{}{suffix}", series_name(i)),
+        files: vec![i.path.clone()],
+        bytes: i.bytes,
         geometry: Some(geometry),
-        data_type,
+        data_type: data_type_of(i),
         fields,
         warnings,
-        // Every volume of a 4D set, one after the other (time point 0 first).
-        voxels: Voxels::Dicom {
-            slices: (0..t).flat_map(|v| positions.iter().map(move |(_, idx)| idx[v.min(idx.len() - 1)])).map(|k| (frames[k].inst.path.clone(), frames[k].frame)).collect(),
-        },
-        window: first.window,
-        photometric: Some(first.photometric.clone()),
+        voxels: Voxels::Dicom { slices: (0..frames as u32).map(|k| (i.path.clone(), k)).collect() },
+        window: i.window,
+        photometric: Some(i.photometric.clone()),
         patient: None,
-    }])
+        frame_time_ms: if frames > 1 { i.frame_time_ms } else { None },
+    }
 }
 
 /// DICOM date and time (`20250902`, `111146.2`) as `2025-09-02 11:11`.
@@ -580,6 +730,183 @@ mod tests {
         assert_eq!(s2.series[0].objects[0].what, "Secondary capture");
         assert!(s2.series[0].volumes.is_empty());
         assert!(p.iter().any(|p| p.name == "Müller Zoë"));
+    }
+
+    /// A 2D ultrasound region calibrated in cm (`delta` cm per pixel), covering `bounds`.
+    fn region(data_type: u16, bounds: [u32; 4], delta: f64) -> crate::dicom::UsRegion {
+        crate::dicom::UsRegion { spatial_format: 1, data_type, bounds, units: [3, 3], delta: [delta, delta] }
+    }
+
+    /// An ultrasound image as a GE scanner stores it: no position, orientation or Pixel
+    /// Spacing; calibrated by its regions.
+    fn ultrasound(number: i64) -> Instance {
+        let mut i = axial("US1", 0.0, number);
+        i.sop_class = "1.2.840.10008.5.1.4.1.1.6.1".into();
+        i.modality = "US".into();
+        i.series_description.clear();
+        i.series_number = Some(1);
+        i.image_type = vec!["ORIGINAL".into(), "PRIMARY".into(), "SMALL PARTS".into()];
+        i.position = None;
+        i.orientation = None;
+        i.pixel_spacing = None;
+        i.bits_allocated = 8;
+        i.bits_stored = 8;
+        i.us_regions = vec![region(1, [2, 5, 40, 60], 0.007)];
+        i
+    }
+
+    #[test]
+    fn ultrasound_stills_are_images_of_their_own() {
+        // B-mode and colour Doppler stills of one series, files out of order.
+        let mut insts: Vec<Instance> = [3, 1, 2].into_iter().map(ultrasound).collect();
+        insts[2].samples_per_pixel = 3;
+        insts[2].photometric = "RGB".into();
+        insts[2].us_regions[0].data_type = 2;
+        let mut vols = Vec::new();
+        let p = organize(&insts, &mut vols);
+        assert_eq!(p[0].studies[0].series[0].volumes, vec![0, 1, 2]);
+        let names: Vec<&str> = vols.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["Series 1 · US · image 1", "Series 1 · US · image 2", "Series 1 · US · image 3"]);
+        for v in &vols {
+            assert!(v.warnings.is_empty(), "{}: {:?}", v.name, v.warnings);
+            assert_eq!(v.kind, Kind::Image);
+            let g = v.geometry.as_ref().unwrap();
+            assert_eq!(g.dims, [48, 64, 1, 1]);
+            assert!((g.spacing[0] - 0.07).abs() < 1e-12 && (g.spacing[1] - 0.07).abs() < 1e-12, "{:?}", g.spacing);
+            assert_eq!(v.files.len(), 1);
+            assert!(v.fields.iter().any(|f| f.name == "Pixel size from" && f.value == "Ultrasound region calibration"));
+        }
+        assert_eq!(vols[1].data_type, Some(DataType::Rgb24));
+        assert!(vols[1].fields.iter().any(|f| f.group == "Ultrasound" && f.value.starts_with("2D colour flow")), "{:?}", vols[1].fields);
+        // One image alone keeps the series' name; one without calibration says so.
+        let mut lone = ultrasound(7);
+        lone.us_regions.clear();
+        vols.clear();
+        organize(&[lone], &mut vols);
+        assert_eq!(vols[0].name, "Series 1 · US");
+        assert_eq!(vols[0].warnings, ["No pixel spacing: assuming 1 mm"]);
+        // Regions calibrated differently: the largest image region wins, with a warning.
+        let mut dual = ultrasound(8);
+        dual.us_regions.push(region(1, [0, 0, 10, 10], 0.01));
+        dual.us_regions.push(crate::dicom::UsRegion { spatial_format: 3, data_type: 3, bounds: [0, 0, 400, 100], units: [4, 7], delta: [0.002, 1.5] });
+        vols.clear();
+        organize(&[dual], &mut vols);
+        assert!((vols[0].geometry.as_ref().unwrap().spacing[0] - 0.07).abs() < 1e-12);
+        assert!(vols[0].warnings[0].starts_with("Ultrasound regions are calibrated differently"), "{:?}", vols[0].warnings);
+    }
+
+    #[test]
+    fn cine_clips_are_2d_over_time() {
+        let mut clip = ultrasound(4);
+        clip.sop_class = "1.2.840.10008.5.1.4.1.1.3.1".into();
+        clip.frames = 10;
+        clip.frames_in_time = true;
+        clip.frame_time_ms = Some(20.0);
+        // An X-ray angiography run: a cine too, with a position.
+        let mut xa = axial("XA", 0.0, 1);
+        xa.modality = "XA".into();
+        xa.frames = 6;
+        xa.frames_in_time = true;
+        // A classic multi-frame MR file without time: still a stack of slices.
+        let mut mr = axial("MR", 0.0, 1);
+        mr.frames = 4;
+        let mut vols = Vec::new();
+        let p = organize(&[clip, ultrasound(5), xa, mr], &mut vols);
+        let by_name = |n: &str| vols.iter().find(|v| v.name.contains(n)).unwrap_or_else(|| panic!("{n}: {:?}", vols.iter().map(|v| &v.name).collect::<Vec<_>>()));
+        let c = by_name("clip 4");
+        assert_eq!(c.kind, Kind::Cine);
+        assert_eq!(c.geometry.as_ref().unwrap().dims, [48, 64, 1, 10]);
+        assert_eq!(c.frame_time_ms, Some(20.0));
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert!(c.fields.iter().any(|f| f.name == "Frame rate" && f.value.starts_with("50.0 frames/s")));
+        let Voxels::Dicom { slices } = &c.voxels else { panic!() };
+        assert_eq!(slices.iter().map(|s| s.1).collect::<Vec<_>>(), (0..10).collect::<Vec<u32>>());
+        assert_eq!((crate::load::volume_count(c), crate::slice::slice_count(c)), (10, 1));
+        assert_eq!(by_name("image 5").kind, Kind::Image);
+        let x = vols.iter().find(|v| v.name.starts_with("Series 3 · T1 AX") && v.kind == Kind::Cine).expect("XA cine");
+        assert_eq!(x.geometry.as_ref().unwrap().dims, [48, 64, 1, 6]);
+        let m = vols.iter().find(|v| v.geometry.as_ref().unwrap().dims[2] == 4).expect("MR stack");
+        assert_eq!(m.kind, Kind::Image);
+        assert_eq!(p.len(), 1);
+    }
+
+    /// A native ultrasound cine file: `frames` RGB frames of 4 × 3 pixels, stored by colour
+    /// plane, frame `f`'s pixel `i` being (10 f + i, 100 + i, 200 − f).
+    fn write_cine(path: &std::path::Path, frames: usize) {
+        use dicom_core::value::DataSetSequence;
+        use dicom_core::{DataElement, PrimitiveValue, VR};
+        use dicom_dictionary_std::tags;
+        use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+        let class = "1.2.840.10008.5.1.4.1.1.3.1";
+        let mut o = InMemDicomObject::new_empty();
+        let s = |o: &mut InMemDicomObject, tag, vr, v: &str| o.put(DataElement::new(tag, vr, PrimitiveValue::from(v)));
+        s(&mut o, tags::SOP_CLASS_UID, VR::UI, class);
+        s(&mut o, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.88");
+        s(&mut o, tags::STUDY_INSTANCE_UID, VR::UI, "1.2.3.80");
+        s(&mut o, tags::SERIES_INSTANCE_UID, VR::UI, "1.2.3.81");
+        s(&mut o, tags::MODALITY, VR::CS, "US");
+        s(&mut o, tags::INSTANCE_NUMBER, VR::IS, "3");
+        s(&mut o, tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "RGB");
+        s(&mut o, tags::NUMBER_OF_FRAMES, VR::IS, &frames.to_string());
+        s(&mut o, tags::FRAME_TIME, VR::DS, "33.3");
+        o.put(DataElement::new(tags::FRAME_INCREMENT_POINTER, VR::AT, PrimitiveValue::Tags(vec![tags::FRAME_TIME].into())));
+        for (tag, v) in [(tags::ROWS, 3u16), (tags::COLUMNS, 4), (tags::BITS_ALLOCATED, 8), (tags::BITS_STORED, 8), (tags::HIGH_BIT, 7), (tags::PIXEL_REPRESENTATION, 0), (tags::SAMPLES_PER_PIXEL, 3), (tags::PLANAR_CONFIGURATION, 1)] {
+            o.put(DataElement::new(tag, VR::US, PrimitiveValue::from(v)));
+        }
+        let mut tissue = InMemDicomObject::new_empty();
+        tissue.put(DataElement::new(tags::REGION_SPATIAL_FORMAT, VR::US, PrimitiveValue::from(1u16)));
+        tissue.put(DataElement::new(tags::REGION_DATA_TYPE, VR::US, PrimitiveValue::from(1u16)));
+        for (tag, v) in [(tags::REGION_LOCATION_MIN_X0, 0u32), (tags::REGION_LOCATION_MIN_Y0, 0), (tags::REGION_LOCATION_MAX_X1, 3), (tags::REGION_LOCATION_MAX_Y1, 2)] {
+            tissue.put(DataElement::new(tag, VR::UL, PrimitiveValue::from(v)));
+        }
+        for tag in [tags::PHYSICAL_UNITS_X_DIRECTION, tags::PHYSICAL_UNITS_Y_DIRECTION] {
+            tissue.put(DataElement::new(tag, VR::US, PrimitiveValue::from(3u16)));
+        }
+        for tag in [tags::PHYSICAL_DELTA_X, tags::PHYSICAL_DELTA_Y] {
+            tissue.put(DataElement::new(tag, VR::FD, PrimitiveValue::from(0.025f64)));
+        }
+        o.put(DataElement::new(tags::SEQUENCE_OF_ULTRASOUND_REGIONS, VR::SQ, DataSetSequence::from(vec![tissue])));
+        let mut pixels = Vec::new();
+        for f in 0..frames {
+            for c in 0..3 {
+                pixels.extend((0..12).map(|i| [10 * f + i, 100 + i, 200 - f][c] as u8));
+            }
+        }
+        o.put(DataElement::new(tags::PIXEL_DATA, VR::OB, PrimitiveValue::from(pixels)));
+        let file = o.with_meta(FileMetaTableBuilder::new().transfer_syntax("1.2.840.10008.1.2.1").media_storage_sop_class_uid(class).media_storage_sop_instance_uid("1.2.3.88")).unwrap();
+        file.write_to_file(path).unwrap();
+    }
+
+    #[test]
+    fn ultrasound_cine_file_reads_plays_and_loads() {
+        let dir = std::env::temp_dir().join(format!("mmv-cine-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cine.dcm");
+        write_cine(&path, 5);
+        let inst = crate::dicom::read(&path).unwrap();
+        assert_eq!((inst.frames, inst.frames_in_time, inst.frame_time_ms), (5, true, Some(33.3)));
+        assert_eq!(inst.us_regions.len(), 1);
+        assert_eq!(crate::dicom::us_pixel_spacing(&inst.us_regions), Some(([0.25, 0.25], false)));
+        let mut vols = Vec::new();
+        organize(&[inst], &mut vols);
+        let v = &vols[0];
+        assert_eq!(v.kind, Kind::Cine);
+        assert_eq!(v.geometry.as_ref().unwrap().dims, [4, 3, 1, 5]);
+        assert_eq!(v.geometry.as_ref().unwrap().spacing, [0.25, 0.25, 0.25]);
+        // Frame 3 in colour (stored by colour plane), and its luminance.
+        let s = crate::slice::file_slice(v, 3).unwrap();
+        let rgb = s.rgb.as_ref().unwrap();
+        assert_eq!(rgb.len(), 12);
+        for (i, p) in rgb.iter().enumerate() {
+            assert_eq!(*p, [30 + i as u8, 100 + i as u8, 197], "pixel {i}");
+        }
+        assert!((s.values[5] - (0.299 * 35.0 + 0.587 * 105.0 + 0.114 * 197.0)).abs() < 1e-3);
+        assert_eq!(s.mm_per_pixel, [0.25, 0.25]);
+        // The full loader (the Segmentation workspace) reads frame 3 the same.
+        let l = crate::load::load_volume_at(v, 3, usize::MAX, &|_| true).unwrap();
+        assert_eq!(l.dims, [4, 3, 1]);
+        assert!(l.values.iter().zip(&s.values).all(|(a, b)| (a - b).abs() < 1e-3), "{:?} / {:?}", l.values, s.values);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

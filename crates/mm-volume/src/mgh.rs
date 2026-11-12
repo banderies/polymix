@@ -107,7 +107,7 @@ pub fn volume(path: &Path, gzip: bool, h: &Header) -> Result<Volume> {
         Field::new("Pixel", "Data type", dtype.map(|t| t.label().to_string()).unwrap_or_else(|| format!("type {}", h.type_code))),
     ];
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    Ok(Volume { format: Format::Mgh, kind, name, files: vec![path.to_path_buf()], bytes, geometry: Some(geometry), data_type: dtype, fields, warnings, voxels, window: None, photometric: None, patient: None })
+    Ok(Volume { format: Format::Mgh, kind, name, files: vec![path.to_path_buf()], bytes, geometry: Some(geometry), data_type: dtype, fields, warnings, voxels, window: None, photometric: None, patient: None, frame_time_ms: None })
 }
 
 #[cfg(test)]

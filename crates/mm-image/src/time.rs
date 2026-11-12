@@ -83,6 +83,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         };
         let any = &|_| true;
         assert_eq!(combine(&v, Combine::Mean, 100, any).unwrap().values, vec![2.0, 10.0]);

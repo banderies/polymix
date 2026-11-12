@@ -300,6 +300,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         }
     }
 
@@ -455,6 +456,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         };
         (dir, values, ramp)
     }

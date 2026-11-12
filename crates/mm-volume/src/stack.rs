@@ -191,7 +191,7 @@ fn build(name: String, format: Format, slices: Vec<(PathBuf, u32)>, files: Vec<P
         fields.push(Field::new("File", "Description", short));
     }
     let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
-    Volume { format, kind: Kind::Image, name, files, bytes, geometry: Some(geometry), data_type: Some(info.dtype), fields, warnings, voxels: Voxels::Images { slices }, window: None, photometric: None, patient: None }
+    Volume { format, kind: Kind::Image, name, files, bytes, geometry: Some(geometry), data_type: Some(info.dtype), fields, warnings, voxels: Voxels::Images { slices }, window: None, photometric: None, patient: None, frame_time_ms: None }
 }
 
 /// A folder's images of one type as a volume, in natural name order.

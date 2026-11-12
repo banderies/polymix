@@ -285,7 +285,7 @@ pub fn volume(path: &Path, h: &Header) -> Result<Volume> {
         files.push(d.clone());
     }
     let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
-    Ok(Volume { format: Format::Nrrd, kind, name, files, bytes, geometry, data_type: dtype, fields, warnings, voxels, window: None, photometric: None, patient: None })
+    Ok(Volume { format: Format::Nrrd, kind, name, files, bytes, geometry, data_type: dtype, fields, warnings, voxels, window: None, photometric: None, patient: None, frame_time_ms: None })
 }
 
 /// Read and parse the header of a NRRD file (up to `max` bytes).

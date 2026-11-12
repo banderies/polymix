@@ -280,7 +280,7 @@ impl VolumeWorkspace {
 
     fn kind_shown(&self, k: Kind) -> bool {
         match k {
-            Kind::Image | Kind::TimeSeries => self.show.images,
+            Kind::Image | Kind::TimeSeries | Kind::Cine => self.show.images,
             Kind::LabelMap | Kind::Segmentation => self.show.labels,
             Kind::VectorField | Kind::Localizer | Kind::Derived => self.show.other,
         }
@@ -310,6 +310,16 @@ impl VolumeWorkspace {
             "vol.slice" => {
                 if let (Some(p), Some(c), Ok(k)) = (&mut self.preview, &self.catalog, arg.parse::<usize>()) {
                     p.go_to(k, &c.volumes[p.volume], ctx);
+                }
+            }
+            "vol.frame" => {
+                if let (Some(p), Some(c), Ok(t)) = (&mut self.preview, &self.catalog, arg.parse::<usize>()) {
+                    p.go_to_frame(t, &c.volumes[p.volume], ctx);
+                }
+            }
+            "vol.play" => {
+                if let Some(p) = &mut self.preview {
+                    p.set_playing(arg != "off");
                 }
             }
             "vol.show" => {
@@ -357,7 +367,7 @@ impl VolumeWorkspace {
                 match &self.catalog {
                     Some(c) => {
                         let series: usize = c.patients.iter().flat_map(|p| &p.studies).map(|s| s.series.len()).sum();
-                        let sel = self.preview.as_ref().map(|p| format!("{} slice {}/{}", c.volumes[p.volume].name, p.slice, p.slices)).unwrap_or_default();
+                        let sel = self.preview.as_ref().map(|p| format!("{} slice {}/{}{}", c.volumes[p.volume].name, p.slice, p.slices, if p.frames > 1 { format!(" frame {}/{}{}", p.frame, p.frames, if p.playing { " playing" } else { "" }) } else { String::new() })).unwrap_or_default();
                         println!(
                             "[volume] {arg} roots={} files={} patients={} series={} volumes={} other_files={} recognised={} problems={} skipped={} selected={sel}",
                             self.roots.len(),
@@ -499,7 +509,13 @@ impl VolumeWorkspace {
     fn volume_row(&mut self, ui: &mut egui::Ui, c: &Catalog, k: usize, label: Option<String>) {
         let v = &c.volumes[k];
         let selected = self.selection == Selection::Volume(k);
-        let dims = v.geometry.as_ref().map(|g| if g.dims[3] > 1 { format!("{}×{}×{}×{}", g.dims[0], g.dims[1], g.dims[2], g.dims[3]) } else { format!("{}×{}×{}", g.dims[0], g.dims[1], g.dims[2]) }).unwrap_or_default();
+        let dims = v.geometry.as_ref().map(|g| match (g.dims[2], g.dims[3]) {
+            // 2D images, and 2D images over time (cine clips).
+            (1, 1) => format!("{}×{}", g.dims[0], g.dims[1]),
+            (1, t) if v.kind == Kind::Cine => format!("{}×{} · {t} frames", g.dims[0], g.dims[1]),
+            (_, 1) => format!("{}×{}×{}", g.dims[0], g.dims[1], g.dims[2]),
+            _ => format!("{}×{}×{}×{}", g.dims[0], g.dims[1], g.dims[2], g.dims[3]),
+        }).unwrap_or_default();
         let name = label.unwrap_or_else(|| self.privacy.path(&v.name));
         let mut text = egui::text::LayoutJob::default();
         let fmt = |color: egui::Color32| egui::TextFormat { color, ..Default::default() };
@@ -762,7 +778,7 @@ impl VolumeWorkspace {
         let privacy = self.privacy.clone();
         self.prepare.ui(ui, c, k, &privacy);
         ui.add_space(4.0);
-        let groups = ["Patient", "Study", "Series", "Equipment", "Acquisition", "Geometry", "Pixel", "Segmentation", "File"];
+        let groups = ["Patient", "Study", "Series", "Equipment", "Acquisition", "Ultrasound", "Geometry", "Pixel", "Segmentation", "File"];
         for g in groups {
             let rows: Vec<(String, String)> = v.fields.iter().filter(|f| f.group == g).map(|f| (f.name.clone(), self.privacy.field(f))).collect();
             if rows.is_empty() {
@@ -1087,6 +1103,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         });
         let ctx = egui::Context::default();
         let mut ws = VolumeWorkspace::new(&ctx, None);
@@ -1132,6 +1149,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         }
     }
 

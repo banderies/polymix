@@ -258,18 +258,10 @@ fn frames_into_caught(frames: &[(usize, u32)], out: &mut [f32], ctx: &Planes, ti
     })
 }
 
-/// Colour samples to grey (ITU-R 601 luma); grey samples as they are.
-fn grey(raw: Vec<f32>, n: usize) -> Vec<f32> {
-    let samples = (raw.len() / n.max(1)).max(1);
-    if samples >= 3 { raw.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else { raw }
-}
-
 /// Grey values (modality LUT applied) of frame `f` of a DICOM file, decoded on its own.
 fn frame_alone(obj: &DefaultDicomObject, path: &Path, f: u32) -> Result<Vec<f32>> {
     let px = obj.decode_pixel_data_frame(f).map_err(|e| anyhow!("cannot decode {}: {e}", path.display()))?;
-    let n = px.columns() as usize * px.rows() as usize;
-    let raw: Vec<f32> = px.to_vec_frame(0).map_err(|e| anyhow!("cannot convert the pixels: {e}"))?;
-    Ok(grey(raw, n))
+    Ok(crate::slice::frame_values(&px, 0)?.0)
 }
 
 /// How many frames of a multi-frame file to decode at a time, each on its own, when that gives
@@ -370,11 +362,7 @@ fn dicom_group(path: &Path, frames: &[(usize, u32)], out: &mut [f32], ctx: &Plan
             &local
         }
     };
-    let n = px.columns() as usize * px.rows() as usize;
-    let convert = |f: u32| {
-        let raw: Vec<f32> = px.to_vec_frame(f).map_err(|e| anyhow!("cannot convert frame {f}: {e}"))?;
-        Ok(grey(raw, n))
-    };
+    let convert = |f: u32| Ok(crate::slice::frame_values(px, f).with_context(|| format!("frame {f}"))?.0);
     match counted {
         None => frames_into(frames, out, ctx, &tick, &convert),
         Some(c) => {
@@ -752,6 +740,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         };
         let l = load_volume(&v, 1000, &|_| true).unwrap();
         assert_eq!(l.get(3, 2, 1), 23.0);
@@ -806,6 +795,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         }
     }
 

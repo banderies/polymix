@@ -20,8 +20,12 @@ pub struct SliceImage {
     pub mm_per_pixel: [f64; 2],
     /// Show inverted (DICOM MONOCHROME1).
     pub invert: bool,
-    /// Window (centre, width) from the 1st to the 99th percentile of the values.
+    /// Window (centre, width) from the 1st to the 99th percentile of the values (the full
+    /// 0–255 range for colour images).
     pub auto_window: (f64, f64),
+    /// Colour images (RGB, YBR: e.g. ultrasound Doppler): the colours, laid out as `values`
+    /// (which then hold their luminance).
+    pub rgb: Option<Vec<[u8; 3]>>,
 }
 
 /// The first 3D volume of a raw-format file, in memory.
@@ -272,9 +276,9 @@ pub fn plane_axes(g: &Geometry, plane: Plane) -> PlaneAxes {
 }
 
 /// Lay out slice values (`nx` × `ny`, x fastest) for the screen.
-fn orient(values: &[f32], nx: usize, ny: usize, axes: DisplayAxes, spacing: [f64; 2]) -> (usize, usize, Vec<f32>, [f64; 2]) {
+fn orient<T: Copy + Default>(values: &[T], nx: usize, ny: usize, axes: DisplayAxes, spacing: [f64; 2]) -> (usize, usize, Vec<T>, [f64; 2]) {
     let (w, h) = if axes.across == 0 { (nx, ny) } else { (ny, nx) };
-    let mut out = vec![0.0f32; w * h];
+    let mut out = vec![T::default(); w * h];
     for y in 0..h {
         let v = if axes.flip_down { h - 1 - y } else { y };
         for x in 0..w {
@@ -327,15 +331,22 @@ pub fn raw_slice(v: &Volume, data: &VolumeData, k: usize) -> Result<SliceImage> 
     let spacing = g.map(|g| [g.spacing[0], g.spacing[1]]).unwrap_or([1.0, 1.0]);
     let (width, height, values, mm_per_pixel) = orient(plane, nx, ny, display_axes(g), spacing);
     let auto_window = auto_window(&values);
-    Ok(SliceImage { width, height, values, mm_per_pixel, invert: false, auto_window })
+    Ok(SliceImage { width, height, values, mm_per_pixel, invert: false, auto_window, rgb: None })
+}
+
+/// A DICOM file open for reading its slices one after another ([`dicom_slice_from`]).
+pub type DicomFile = dicom_object::DefaultDicomObject;
+
+/// Open a DICOM file for [`dicom_slice_from`].
+pub fn open_dicom(path: &std::path::Path) -> Result<DicomFile> {
+    dicom_object::open_file(path).with_context(|| format!("cannot read {}", path.display()))
 }
 
 /// Decode slice `k` of a DICOM volume.
 pub fn dicom_slice(v: &Volume, k: usize) -> Result<SliceImage> {
     let Voxels::Dicom { slices } = &v.voxels else { bail!("not a DICOM volume") };
     let (path, _) = slices.get(k).context("slice out of range")?;
-    let obj = dicom_object::open_file(path).with_context(|| format!("cannot read {}", path.display()))?;
-    dicom_slice_from(&obj, v, k)
+    dicom_slice_from(&open_dicom(path)?, v, k)
 }
 
 /// Decode slice `k` of a DICOM volume from its file, already open (so a multi-frame file can
@@ -344,20 +355,83 @@ pub fn dicom_slice_from(obj: &dicom_object::DefaultDicomObject, v: &Volume, k: u
     use dicom_pixeldata::PixelDecoder;
     let Voxels::Dicom { slices } = &v.voxels else { bail!("not a DICOM volume") };
     let (_, frame) = slices.get(k).context("slice out of range")?;
+    let mut colours = None;
     let (nx, ny, grey) = if crate::dicom::is_jpegls(obj.meta().transfer_syntax()) {
         crate::dicom::jpegls_frame(obj, *frame)?
     } else {
         let px = obj.decode_pixel_data_frame(*frame).map_err(|e| anyhow::anyhow!("cannot decode the pixels: {e}"))?;
-        let (nx, ny) = (px.columns() as usize, px.rows() as usize);
-        let raw: Vec<f32> = px.to_vec_frame(0).map_err(|e| anyhow::anyhow!("cannot convert the pixels: {e}"))?;
-        let samples = (raw.len() / (nx * ny).max(1)).max(1);
-        (nx, ny, if samples >= 3 { raw.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else { raw })
+        let (grey, rgb) = frame_values(&px, 0)?;
+        colours = rgb;
+        (px.columns() as usize, px.rows() as usize, grey)
     };
     let g = v.geometry.as_ref();
     let spacing = g.map(|g| [g.spacing[0], g.spacing[1]]).unwrap_or([1.0, 1.0]);
-    let (width, height, values, mm_per_pixel) = orient(&grey, nx, ny, display_axes(g), spacing);
-    let auto_window = auto_window(&values);
-    Ok(SliceImage { width, height, values, mm_per_pixel, invert: v.photometric.as_deref() == Some("MONOCHROME1"), auto_window })
+    let axes = display_axes(g);
+    let (width, height, values, mm_per_pixel) = orient(&grey, nx, ny, axes, spacing);
+    let rgb = colours.map(|c| orient(&c, nx, ny, axes, spacing).2);
+    // Colour images show as stored; grey ones from the 1st to the 99th percentile.
+    let auto_window = if rgb.is_some() { (127.5, 255.0) } else { auto_window(&values) };
+    Ok(SliceImage { width, height, values, mm_per_pixel, invert: v.photometric.as_deref() == Some("MONOCHROME1"), auto_window, rgb })
+}
+
+/// RGB colours of a slice's pixels.
+type Colours = Vec<[u8; 3]>;
+
+/// Grey values (modality LUT applied) of frame `f` of decoded pixels, with the colours of
+/// 8-bit colour images (whose grey values are then their luminance). Colour planes and YBR are
+/// handled here: the conversion to values handles neither.
+pub(crate) fn frame_values(px: &dicom_pixeldata::DecodedPixelData, f: u32) -> Result<(Vec<f32>, Option<Colours>)> {
+    let n = px.columns() as usize * px.rows() as usize;
+    if px.samples_per_pixel() == 3 && px.bits_allocated() == 8 {
+        let data = px.frame_data(f).map_err(|e| anyhow::anyhow!("cannot read the pixels: {e}"))?;
+        let rgb = colour_pixels(data, n, px.planar_configuration() == dicom_pixeldata::PlanarConfiguration::PixelFirst, px.photometric_interpretation().as_str())?;
+        return Ok((rgb.iter().map(|p| luminance(*p)).collect(), Some(rgb)));
+    }
+    let raw: Vec<f32> = px.to_vec_frame(f).map_err(|e| anyhow::anyhow!("cannot convert the pixels: {e}"))?;
+    let samples = (raw.len() / n.max(1)).max(1);
+    Ok((if samples >= 3 { raw.chunks(samples).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect() } else { raw }, None))
+}
+
+/// Luminance of an RGB colour (ITU-R BT.601), as the grey values of colour images.
+fn luminance(p: [u8; 3]) -> f32 {
+    0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32
+}
+
+/// The `n` pixels of an 8-bit colour frame as RGB: interleaved (R G B R G B …) or by plane
+/// (all R, all G, all B: `planar`), and RGB, YBR_FULL or YBR_FULL_422 (two pixels share one
+/// Cb and Cr when stored uncompressed).
+fn colour_pixels(data: &[u8], n: usize, planar: bool, photometric: &str) -> Result<Vec<[u8; 3]>> {
+    let photometric = photometric.trim();
+    let ybr = photometric.starts_with("YBR_FULL");
+    if photometric == "YBR_FULL_422" && data.len() >= 2 * n && data.len() < 3 * n {
+        // Y1 Y2 Cb Cr for each pair of pixels.
+        let mut out = Vec::with_capacity(n);
+        for q in data.as_chunks::<4>().0.iter().take(n.div_ceil(2)) {
+            out.push(ybr_to_rgb(q[0], q[2], q[3]));
+            if out.len() < n {
+                out.push(ybr_to_rgb(q[1], q[2], q[3]));
+            }
+        }
+        if out.len() < n {
+            bail!("the colour pixels are cut short");
+        }
+        return Ok(out);
+    }
+    if data.len() < 3 * n {
+        bail!("the colour pixels are cut short");
+    }
+    let sample = |i: usize, c: usize| if planar { data[c * n + i] } else { data[3 * i + c] };
+    Ok((0..n).map(|i| {
+        let (a, b, c) = (sample(i, 0), sample(i, 1), sample(i, 2));
+        if ybr { ybr_to_rgb(a, b, c) } else { [a, b, c] }
+    }).collect())
+}
+
+/// Full-range YCbCr (DICOM YBR_FULL) to RGB.
+fn ybr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let (y, cb, cr) = (y as f32, cb as f32 - 128.0, cr as f32 - 128.0);
+    let c = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    [c(y + 1.402 * cr), c(y - 0.344_136 * cb - 0.714_136 * cr), c(y + 1.772 * cb)]
 }
 
 /// Decode slice `k` of a volume made of 2D images.
@@ -369,7 +443,7 @@ pub fn image_slice(v: &Volume, k: usize) -> Result<SliceImage> {
     let spacing = g.map(|g| [g.spacing[0], g.spacing[1]]).unwrap_or([1.0, 1.0]);
     let (width, height, values, mm_per_pixel) = orient(&grey, nx, ny, display_axes(g), spacing);
     let auto_window = auto_window(&values);
-    Ok(SliceImage { width, height, values, mm_per_pixel, invert: false, auto_window })
+    Ok(SliceImage { width, height, values, mm_per_pixel, invert: false, auto_window, rgb: None })
 }
 
 /// Decode slice `k` of a volume stored slice by slice (DICOM files or 2D images).
@@ -382,16 +456,30 @@ pub fn file_slice(v: &Volume, k: usize) -> Result<SliceImage> {
 
 /// Map a slice to 8-bit grey with a window (centre, width).
 pub fn to_grey8(s: &SliceImage, window: (f64, f64)) -> Vec<u8> {
-    let (c, w) = window;
-    let lo = c - w * 0.5;
-    let scale = 255.0 / w.max(f64::MIN_POSITIVE);
+    let map = window_map(window);
     s.values
         .iter()
         .map(|&x| {
-            let g = ((x as f64 - lo) * scale).round().clamp(0.0, 255.0) as u8;
+            let g = map(x);
             if s.invert { 255 - g } else { g }
         })
         .collect()
+}
+
+/// Map a colour slice to 8-bit RGB (R G B R G B …), each channel through the window; `None`
+/// for a grey slice.
+pub fn to_rgb8(s: &SliceImage, window: (f64, f64)) -> Option<Vec<u8>> {
+    let map = window_map(window);
+    // 256 entries: every channel value once.
+    let lut: Vec<u8> = (0..=255u8).map(|v| map(v as f32)).collect();
+    s.rgb.as_ref().map(|rgb| rgb.iter().flat_map(|p| p.map(|c| lut[c as usize])).collect())
+}
+
+fn window_map(window: (f64, f64)) -> impl Fn(f32) -> u8 {
+    let (c, w) = window;
+    let lo = c - w * 0.5;
+    let scale = 255.0 / w.max(f64::MIN_POSITIVE);
+    move |x: f32| ((x as f64 - lo) * scale).round().clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
@@ -414,6 +502,7 @@ mod tests {
             window: None,
             photometric: None,
             patient: None,
+            frame_time_ms: None,
         }
     }
 
@@ -497,6 +586,25 @@ mod tests {
     }
 
     #[test]
+    fn colour_layouts_and_ybr() {
+        // Two pixels, interleaved and by plane.
+        assert_eq!(colour_pixels(&[1, 2, 3, 4, 5, 6], 2, false, "RGB").unwrap(), [[1, 2, 3], [4, 5, 6]]);
+        assert_eq!(colour_pixels(&[1, 4, 2, 5, 3, 6], 2, true, "RGB").unwrap(), [[1, 2, 3], [4, 5, 6]]);
+        // YBR: grey stays grey; pure red and blue come back.
+        assert_eq!(colour_pixels(&[90, 128, 128], 1, false, "YBR_FULL").unwrap(), [[90, 90, 90]]);
+        assert_eq!(colour_pixels(&[76, 85, 255], 1, false, "YBR_FULL").unwrap()[0].map(|c| c / 8), [255 / 8, 0, 0]);
+        let blue = colour_pixels(&[29, 255, 107], 1, false, "YBR_FULL").unwrap()[0];
+        assert!(blue[0] < 4 && blue[1] < 4 && blue[2] > 250, "{blue:?}");
+        // Uncompressed 4:2:2: Y1 Y2 Cb Cr per pair of pixels (three pixels: one pair and a half).
+        assert_eq!(colour_pixels(&[10, 20, 128, 128, 30, 0, 128, 128], 3, false, "YBR_FULL_422").unwrap(), [[10, 10, 10], [20, 20, 20], [30, 30, 30]]);
+        assert!(colour_pixels(&[1, 2, 3], 2, false, "RGB").is_err());
+        // Colour slices map each channel through the window.
+        let s = SliceImage { width: 2, height: 1, values: vec![0.0, 0.0], mm_per_pixel: [1.0; 2], invert: false, auto_window: (127.5, 255.0), rgb: Some(vec![[0, 128, 255], [10, 20, 30]]) };
+        assert_eq!(to_rgb8(&s, (127.5, 255.0)).unwrap(), [0, 128, 255, 10, 20, 30]);
+        assert_eq!(to_rgb8(&s, (64.0, 128.0)).unwrap()[..3], [0, 255, 255]);
+    }
+
+    #[test]
     fn windows() {
         let mut v: Vec<f32> = (0..1000).map(|x| x as f32).collect();
         let (c, w) = auto_window(&v);
@@ -505,7 +613,7 @@ mod tests {
         v.extend(std::iter::repeat_n(0.0, 5000));
         let (c2, _) = auto_window(&v);
         assert!((c2 - c).abs() < 5.0);
-        let s = SliceImage { width: 3, height: 1, values: vec![0.0, 50.0, 100.0], mm_per_pixel: [1.0; 2], invert: true, auto_window: (50.0, 100.0) };
+        let s = SliceImage { width: 3, height: 1, values: vec![0.0, 50.0, 100.0], mm_per_pixel: [1.0; 2], invert: true, auto_window: (50.0, 100.0), rgb: None };
         let g = to_grey8(&s, (50.0, 100.0));
         assert_eq!((g[0], g[2]), (255, 0));
         assert!((127..=128).contains(&g[1]));

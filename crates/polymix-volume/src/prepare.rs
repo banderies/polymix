@@ -27,7 +27,7 @@ pub fn derived_dir() -> Option<PathBuf> {
 
 /// Whether image operations apply to this volume (readable intensity images).
 pub fn applies_to(v: &Volume) -> bool {
-    matches!(v.kind, Kind::Image | Kind::Derived | Kind::TimeSeries | Kind::Localizer) && !matches!(v.voxels, Voxels::Unsupported(_))
+    matches!(v.kind, Kind::Image | Kind::Derived | Kind::TimeSeries | Kind::Cine | Kind::Localizer) && !matches!(v.voxels, Voxels::Unsupported(_))
 }
 
 /// Run `f` (which reports progress from any thread) on its own thread, forwarding its
