@@ -26,8 +26,11 @@ pub struct Camera {
     pub fov_y: f64,
     pub orthographic: bool,
     pub up_axis: UpAxis,
-    /// Radius of the scene, used for clip planes.
+    /// Radius of the scene, for the zoom limits and the orthographic far plane: it reaches out
+    /// to the view target when that has drifted away from the objects.
     pub scene_radius: f64,
+    /// Radius of the objects themselves (their bounds), for the near plane.
+    pub model_radius: f64,
 }
 
 impl Default for Camera {
@@ -41,6 +44,7 @@ impl Default for Camera {
             orthographic: false,
             up_axis: UpAxis::Y,
             scene_radius: 1.0,
+            model_radius: 1.0,
         }
     }
 }
@@ -168,10 +172,16 @@ impl Camera {
         camview::look_at_mat4(self.eye(), self.target, self.up())
     }
 
-    /// Near plane for the reversed-Z infinite projection: depth precision is excellent
-    /// everywhere, so the near plane can sit close to the eye.
+    /// Near plane for the reversed-Z infinite projection: a millionth of the objects' size, so
+    /// only a surface the eye is all but touching is cut. Depth precision (32-bit float, reversed)
+    /// is the same at every distance whatever the near plane, so it need not move out with the
+    /// view. It must not follow the view target: a 3D mouse move puts the target as far ahead
+    /// as its centre of rotation is from the eye, which grows without end once the camera has
+    /// flown past it, and orbiting, panning and wheel zooms keep that distance; a near plane
+    /// tied to it cut through the model in front of the camera, and kept cutting as the view
+    /// zoomed away, until Fit brought the target back.
     fn near_plane(&self) -> f64 {
-        (self.distance * 1e-3).max(self.scene_radius * 1e-6).max(1e-9)
+        (self.model_radius * 1e-6).max(1e-9)
     }
 
     /// Reversed-Z projection (depth 1 at the near plane, 0 at infinity / far).
@@ -335,6 +345,7 @@ impl Camera {
         let r = (b.diagonal() * 0.5).max(1e-6);
         self.target = b.center();
         self.scene_radius = self.scene_radius.max(r);
+        self.model_radius = r;
         self.distance = self.focus_distance(b);
     }
 
@@ -353,6 +364,7 @@ impl Camera {
         let r = (b.diagonal() * 0.5).max(1e-6);
         self.target = b.center();
         self.scene_radius = self.scene_radius.max(r);
+        self.model_radius = r;
         let (right, up, fwd) = (self.right(), self.up(), self.forward());
         let ty = (self.fov_y * 0.5).tan() * 0.9;
         let tx = ty * aspect.max(1e-3);
@@ -455,6 +467,30 @@ mod tests {
                 .collect();
             let reach = ndc.iter().map(|p| p.x.abs().max(p.y.abs())).fold(0.0, f64::max);
             assert!(reach <= 0.9 + 1e-9 && reach > 0.85, "ortho {ortho}, aspect {aspect}: the box fills 90 % of the view ({reach:.3})");
+        }
+    }
+
+    #[test]
+    fn the_near_plane_does_not_follow_the_view_target() {
+        // A 3D mouse move that flies past its centre of rotation leaves the view target far
+        // ahead of the eye (and orbits, pans and wheel zooms keep it there): a surface just in
+        // front of the eye is still drawn, and picked where it is drawn.
+        let aspect = 1.5;
+        for (far, eye_at) in [(10.0, DVec3::ZERO), (1e3, DVec3::ZERO), (1e6, DVec3::ZERO), (1e3, DVec3::new(3e4, -2e4, 1e4))] {
+            let mut c = Camera { model_radius: 50.0, scene_radius: 1e9, ..Default::default() };
+            c.tumble(40.0, 25.0);
+            c.distance = far;
+            c.target = eye_at + c.forward() * far;
+            assert!(c.eye().distance(eye_at) < 1e-6 * far.max(eye_at.length()));
+            assert_eq!(c.near_plane(), 50.0 * 1e-6, "target {far} ahead");
+            for (ahead, side) in [(0.01, 0.002), (0.5, -0.1), (40.0, 9.0)] {
+                let p = c.eye() + c.forward() * ahead + c.right() * side + c.up() * side * 0.5;
+                let ndc = c.project(p, aspect).unwrap();
+                assert!(ndc.z > 0.0 && ndc.z <= 1.0, "target {far} ahead: a surface {ahead} ahead is drawn (depth {})", ndc.z);
+                let ray = c.ray_from_ndc(ndc.truncate(), aspect);
+                let off = (p - ray.origin) - ray.dir * (p - ray.origin).dot(ray.dir);
+                assert!(off.length() < 1e-6 * ahead, "target {far} ahead: picked {} off a surface {ahead} ahead", off.length());
+            }
         }
     }
 

@@ -833,8 +833,11 @@ pub struct MeshWorkspace {
     /// The brush size every brush tool shares (see [`tools::BrushSize`]), kept with the
     /// preferences.
     brush: tools::BrushSize,
-    /// What the 3D mouse's move going on turns about (chosen as it started).
+    /// What the 3D mouse's move going on turns about (chosen as it started, and again each time
+    /// it leaves the view; see [`Self::space_motion`]).
     space_centre: Option<DVec3>,
+    /// Whether that centre was in view last frame.
+    space_centre_seen: bool,
     /// The distance that showed all the visible objects as that move started (pan and zoom
     /// slow down closer in; see [`spacemouse::near_factor`]).
     space_full_view: Option<f64>,
@@ -946,6 +949,7 @@ impl MeshWorkspace {
             space_key_capture: None,
             brush: tools::BrushSize::default(),
             space_centre: None,
+            space_centre_seen: false,
             space_full_view: None,
             space_marker: None,
             hotbox: None,
@@ -3157,22 +3161,9 @@ impl MeshWorkspace {
             return;
         }
         let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.05) as f64;
-        let moving = !motion.is_zero();
-        if moving && !self.space_moving {
-            self.remember_view();
-            // A move turns about one centre, chosen as it starts.
-            self.space_centre = Some(self.space_move_centre(vp));
-            let b = self.scene.bounds();
-            self.space_full_view = (!b.is_empty()).then(|| self.camera.focus_distance(&b));
-        }
-        self.space_moving = moving;
-        let pivot = self.space_centre.unwrap_or(self.camera.target);
-        if spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64, pivot, self.space_full_view) {
+        if self.space_motion(motion, dt, vp) {
             // Keep animating while the cap is deflected.
             ctx.request_repaint();
-        }
-        if moving && self.space_cfg.show_centre && !self.space_cfg.lock_rotation {
-            self.space_marker = Some((pivot, std::time::Instant::now()));
         }
         // Capturing a button for the settings stops when they are put away.
         if !(self.show_prefs && self.prefs_tab == PREFS_TAB_3D_MOUSE) {
@@ -3182,6 +3173,48 @@ impl MeshWorkspace {
         for b in pressed {
             self.space_button(b, ctx, vp);
         }
+    }
+
+    /// Move the view for `dt` seconds of 3D mouse `motion`; true if it moved.
+    ///
+    /// A move turns about a centre chosen as it starts, and pan and zoom go at a pace measured
+    /// there (see [`spacemouse::apply`]). Once the camera has gone past that centre, or panned
+    /// it out of view, a new one is chosen from what is in view: measured at a point left
+    /// behind, the pace grew with the distance to it, and flying on sped up without end. A
+    /// centre chosen out of view (the centre of mass behind the camera) is kept until it has
+    /// come into view and left it again.
+    fn space_motion(&mut self, motion: spacemouse::Motion, dt: f64, vp: Viewport) -> bool {
+        let moving = !motion.is_zero();
+        if moving && !self.space_moving {
+            self.remember_view();
+            self.space_centre = Some(self.space_move_centre(vp));
+            let b = self.scene.bounds();
+            self.space_full_view = (!b.is_empty()).then(|| self.camera.focus_distance(&b));
+        } else if moving && self.space_centre_seen && self.space_centre.is_some_and(|c| !self.shows(c, vp)) {
+            self.space_centre = Some(self.space_move_centre(vp));
+        }
+        self.space_moving = moving;
+        self.space_centre_seen = self.space_centre.is_some_and(|c| self.shows(c, vp));
+        let pivot = self.space_centre.unwrap_or(self.camera.target);
+        let moved = spacemouse::apply(&mut self.camera, motion, &self.space_cfg, dt, vp.rect.height() as f64, pivot, self.space_full_view);
+        if moving && self.space_cfg.show_centre && !self.space_cfg.lock_rotation {
+            self.space_marker = Some((pivot, std::time::Instant::now()));
+        }
+        moved
+    }
+
+    /// Tell the camera how big the scene is (its near plane, zoom limits and far plane).
+    fn update_camera_radii(&mut self) {
+        let b = self.scene.bounds();
+        if !b.is_empty() {
+            self.camera.model_radius = (b.diagonal() * 0.5).max(1e-6);
+            self.camera.scene_radius = self.camera.model_radius.max((self.camera.target - b.center()).length());
+        }
+    }
+
+    /// Whether `p` is in the view (in front of the camera, inside the viewport).
+    fn shows(&self, p: DVec3, vp: Viewport) -> bool {
+        self.camera.project(p, vp.aspect()).is_some_and(|n| n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && n.z > 0.0 && n.z <= 1.0)
     }
 
     /// What a 3D mouse move starting now turns about (see [`spacemouse::Centre`]).
@@ -3597,10 +3630,7 @@ impl MeshWorkspace {
                 ctx.request_repaint();
             }
         }
-        let b = self.scene.bounds();
-        if !b.is_empty() {
-            self.camera.scene_radius = (b.diagonal() * 0.5).max(1e-6).max((self.camera.target - b.center()).length());
-        }
+        self.update_camera_radii();
 
         // --- tool pointer input -------------------------------------------
         let (pressed, down, released) = ctx.input(|i| {
@@ -5579,5 +5609,43 @@ mod browser_tests {
         assert!(!egui::Popup::is_any_open(&ctx));
         let (_, widgets, _) = draw(&mut ws, &ctx, 3000.0, false, Vec::new());
         assert!(widgets * 5 < full_widgets, "{widgets} of {full_widgets}");
+    }
+}
+
+#[cfg(test)]
+mod space_mouse_tests {
+    use super::*;
+
+    /// Down a vessel (radius 5, 400 long, along z) with the 3D mouse pushed half-way in: the
+    /// centre of rotation, a wall point ahead, is passed again and again, and each time a new
+    /// one ahead is taken, so the camera flies on at a steady pace inside the vessel.
+    #[test]
+    fn flying_past_the_centre_of_rotation_takes_a_new_one_and_keeps_the_pace() {
+        let (mut ws, _ctx, vp) = super::command::tests::workspace();
+        ws.scene.add("vessel", mm_core::primitives::cylinder(5.0, 400.0, 48, 400, false));
+        ws.space_cfg = spacemouse::Settings::from_pref("1 2 3 3 000000 0 0 view 1 0.7").expect("settings");
+        ws.camera.look_along(DVec3::Z);
+        ws.camera.distance = 10.0;
+        ws.camera.target = DVec3::new(0.0, 0.0, 10.0) + ws.camera.forward() * 10.0;
+        ws.update_camera_radii();
+        let push = spacemouse::Motion { t: [0.0, 0.0, 0.5], r: [0.0; 3] };
+        let (mut centres, mut fastest) = (Vec::new(), 0.0_f64);
+        let mut eye = ws.camera.eye();
+        for _ in 0..(60 * 5) {
+            ws.space_motion(push, 1.0 / 60.0, vp);
+            ws.update_camera_radii();
+            let c = ws.space_centre.expect("a centre");
+            if centres.last() != Some(&c) {
+                assert!(ws.shows(c, vp), "a new centre is one in view");
+                centres.push(c);
+            }
+            let e = ws.camera.eye();
+            fastest = fastest.max(e.distance(eye) * 60.0);
+            eye = e;
+        }
+        assert!(centres.len() >= 3, "a new centre each time one is passed ({} centres)", centres.len());
+        assert!(eye.truncate().length() < 5.0 && eye.z < 400.0, "still inside the vessel at {eye}");
+        assert!(eye.z > 150.0, "flew on down it ({})", eye.z);
+        assert!(fastest < 150.0, "never faster than the vessel's length in a few seconds ({fastest:.0} a second)");
     }
 }
