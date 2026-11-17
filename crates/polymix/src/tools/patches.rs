@@ -6,6 +6,7 @@ use super::*;
 use crate::jobs::Job;
 use crate::scene::SceneObject;
 use crate::ui_util;
+use polymix_workspace::file_dialog;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::{Arc, Weak};
@@ -372,23 +373,27 @@ impl Tool for PatchesTool {
         }
         ui_util::section(ui, "Export");
         let idle = self.export.is_none();
+        // The panels' keys (see [`file_dialog`]); their answers come back in a later frame.
+        const STL_DIALOG: &str = "patches.multisolid_stl";
+        const FOLDER_DIALOG: &str = "patches.stl_per_patch";
         if ui.add_enabled(idle, egui::Button::new("Multi-solid ASCII STL…")).clicked() {
             let o = cx.scene.get(id).unwrap();
-            if let Some(path) = rfd::FileDialog::new().add_filter("STL", &["stl"]).set_file_name(format!("{}_patches.stl", o.name)).save_file() {
-                self.start_export(o, cx, move |mesh, names| match write_multisolid_stl_of(&path, mesh, names) {
-                    Ok(n) => format!("Wrote {n} patches to {}", path.display()),
-                    Err(e) => format!("Export failed: {e:#}"),
-                });
-            }
+            file_dialog::save_file(ui.ctx(), STL_DIALOG, file_dialog::FileDialog::new().add_filter("STL", &["stl"]).set_file_name(format!("{}_patches.stl", o.name)));
+        }
+        if let Some(path) = file_dialog::take(ui.ctx(), STL_DIALOG) {
+            self.start_export(cx.scene.get(id).unwrap(), cx, move |mesh, names| match write_multisolid_stl_of(&path, mesh, names) {
+                Ok(n) => format!("Wrote {n} patches to {}", path.display()),
+                Err(e) => format!("Export failed: {e:#}"),
+            });
         }
         if ui.add_enabled(idle, egui::Button::new("One STL per patch…")).clicked() {
-            let o = cx.scene.get(id).unwrap();
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                self.start_export(o, cx, move |mesh, names| match write_patch_files_of(&dir, mesh, names) {
-                    Ok(n) => format!("Wrote {n} files to {}", dir.display()),
-                    Err(e) => format!("Export failed: {e:#}"),
-                });
-            }
+            file_dialog::pick_folder(ui.ctx(), FOLDER_DIALOG, file_dialog::FileDialog::new());
+        }
+        if let Some(dir) = file_dialog::take(ui.ctx(), FOLDER_DIALOG) {
+            self.start_export(cx.scene.get(id).unwrap(), cx, move |mesh, names| match write_patch_files_of(&dir, mesh, names) {
+                Ok(n) => format!("Wrote {n} files to {}", dir.display()),
+                Err(e) => format!("Export failed: {e:#}"),
+            });
         }
         if !idle {
             ui.horizontal(|ui| {

@@ -8,6 +8,10 @@ use crate::centerline::{self, Anchor, LumenCenterline, LumenEnd, LumenInput, Lum
 use crate::jobs::Job;
 use crate::tools::vessel::{find_vessel_ends, EndKind, VesselEnd};
 use crate::ui_util;
+use polymix_workspace::file_dialog;
+
+/// The key of the Export CSV / VTK panel (see [`file_dialog`]).
+const EXPORT_DIALOG: &str = "centerline.export";
 
 pub struct CenterlineTool {
     object: Option<ObjectId>,
@@ -122,14 +126,13 @@ impl CenterlineTool {
         }));
     }
 
-    fn save(&mut self, csv: bool) {
+    /// Export CSV / VTK…: the file comes back at the top of [`Tool::panel`].
+    fn save(&mut self, ctx: &egui::Context, csv: bool) {
         let ext = if csv { "csv" } else { "vtk" };
         if self.result.is_none() {
             return;
         }
-        if let Some(path) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("centerline.{ext}")).save_file() {
-            self.message = Some(self.save_to(&path).unwrap_or_else(|e| e));
-        }
+        file_dialog::save_file(ctx, EXPORT_DIALOG, file_dialog::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("centerline.{ext}")));
     }
 
     /// Write the centerline as CSV or VTK (by the extension).
@@ -170,6 +173,9 @@ impl Tool for CenterlineTool {
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
         ui_util::section(ui, "Centerline");
+        if let Some(path) = file_dialog::take(ui.ctx(), EXPORT_DIALOG) {
+            self.message = Some(self.save_to(&path).unwrap_or_else(|e| e));
+        }
         if self.object.and_then(|id| cx.scene.get(id)).is_none() {
             ui.label("No active object.");
             return if ui.button("Close").clicked() { ToolOutcome::Close } else { ToolOutcome::Continue };
@@ -236,10 +242,10 @@ impl Tool for CenterlineTool {
             }
             ui.horizontal(|ui| {
                 if ui.button("Export CSV…").clicked() {
-                    self.save(true);
+                    self.save(ui.ctx(), true);
                 }
                 if ui.button("Export VTK…").on_hover_text("Polyline with Radius point data (ParaView, VMTK)").clicked() {
-                    self.save(false);
+                    self.save(ui.ctx(), false);
                 }
             });
         }

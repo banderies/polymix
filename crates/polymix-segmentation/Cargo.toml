@@ -20,5 +20,4 @@ glam.workspace = true
 anyhow.workspace = true
 log.workspace = true
 rayon.workspace = true
-rfd = "0.17"
 serde_json = "1"

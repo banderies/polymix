@@ -30,6 +30,7 @@ use mm_volume::load::{load_volume, LoadedVolume};
 use mm_volume::model::Volume;
 use mm_volume::slice::{plane_axes, Plane};
 use polymix_imaging::{LabelOverlay, SliceOptions, SliceResponse, SliceView, ViewState, VolumeView3d};
+use polymix_workspace::file_dialog;
 use polymix_workspace::jobs::Job;
 use polymix_workspace::Workspace;
 use rayon::prelude::*;
@@ -42,6 +43,9 @@ use std::sync::Arc;
 /// Largest volume loaded (voxels; 4 bytes each in memory).
 const MAX_VOXELS: usize = 400_000_000;
 const WARN: Color32 = Color32::from_rgb(240, 170, 90);
+/// Keys of the Load and Save segmentation panels (see [`file_dialog`]).
+const LOAD_DIALOG: &str = "segmentation.load";
+const SAVE_DIALOG: &str = "segmentation.save";
 /// Behind and between the views.
 const BACKDROP: Color32 = Color32::from_rgb(12, 12, 14);
 /// The planes, in the order of [`SegmentationWorkspace::views`].
@@ -450,13 +454,21 @@ impl SegmentationWorkspace {
         self.running = Some(Running { what: "Loading segmentation".into(), job, bypass: false });
     }
 
+    /// Load segmentation…: the file comes back in [`Self::file_dialog_answers`].
     fn load_dialog(&mut self, ctx: &egui::Context) {
-        let path = rfd::FileDialog::new()
+        let dialog = file_dialog::FileDialog::new()
             .set_title("Load segmentation")
-            .add_filter("Segmentation or label map (.seg.nrrd, .nrrd, .nii, .nii.gz)", &["nrrd", "nhdr", "nii", "gz"])
-            .pick_file();
-        if let Some(p) = path {
+            .add_filter("Segmentation or label map (.seg.nrrd, .nrrd, .nii, .nii.gz)", &["nrrd", "nhdr", "nii", "gz"]);
+        file_dialog::pick_file(ctx, LOAD_DIALOG, dialog);
+    }
+
+    /// What the Load and Save segmentation panels chose, once they close.
+    fn file_dialog_answers(&mut self, ctx: &egui::Context) {
+        if let Some(p) = file_dialog::take(ctx, LOAD_DIALOG) {
             self.load_segmentation(p, ctx);
+        }
+        if let Some(p) = file_dialog::take(ctx, SAVE_DIALOG) {
+            self.save_to(p, ctx);
         }
     }
 
@@ -1045,17 +1057,15 @@ impl SegmentationWorkspace {
         self.running = Some(Running { what: "Making meshes".into(), job, bypass: false });
     }
 
+    /// Save segmentation…: the file comes back in [`Self::file_dialog_answers`].
     fn save_dialog(&mut self, ctx: &egui::Context) {
         let name: String = self.source.as_ref().map_or("Segmentation".into(), |s| s.label.chars().map(|c| if c.is_alphanumeric() || " -_.".contains(c) { c } else { '_' }).collect());
-        let path = rfd::FileDialog::new()
+        let dialog = file_dialog::FileDialog::new()
             .set_title("Save segmentation")
             .set_file_name(format!("{name}.seg.nrrd"))
             .add_filter("3D Slicer segmentation (.seg.nrrd)", &["nrrd"])
-            .add_filter("NIfTI label map (.nii.gz)", &["gz", "nii"])
-            .save_file();
-        if let Some(p) = path {
-            self.save_to(p, ctx);
-        }
+            .add_filter("NIfTI label map (.nii.gz)", &["gz", "nii"]);
+        file_dialog::save_file(ctx, SAVE_DIALOG, dialog);
     }
 
     fn save_to(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -1778,6 +1788,7 @@ impl Workspace for SegmentationWorkspace {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.file_dialog_answers(&ctx);
         self.keys(&ctx);
         egui::Panel::top("segmentation.toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("segmentation.status").show(ui, |ui| self.status(ui));

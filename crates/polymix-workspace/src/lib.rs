@@ -4,9 +4,11 @@
 //! `polymix` binary draws the tab bar and calls the workspaces through [`guard::run_guarded`],
 //! so a panic in one workspace stops only that workspace. This crate holds what they all
 //! need: the trait, the crash guard, background [`jobs`], what workspaces show [`agent`]s,
-//! the per-user [`data_dir`] and a [`spinner`] that does not redraw every frame.
+//! [`file_dialog`]s that do not block the frame, the per-user [`data_dir`] and a [`spinner`]
+//! that does not redraw every frame.
 
 pub mod agent;
+pub mod file_dialog;
 pub mod guard;
 pub mod jobs;
 mod spinner;

@@ -15,6 +15,7 @@ mod scan_task;
 
 use mm_volume::model::{Catalog, Kind, Volume};
 use mm_volume::scan::Progress;
+use polymix_workspace::file_dialog;
 use polymix_workspace::style::{format_count, section};
 use polymix_workspace::Workspace;
 use preview::Preview;
@@ -28,6 +29,8 @@ use std::sync::Arc;
 /// often have none; folders are always accepted.)
 const VOLUME_EXTENSIONS: [&str; 14] = ["nii", "gz", "dcm", "ima", "nrrd", "nhdr", "hdr", "img", "mha", "mhd", "mgz", "mgh", "tif", "tiff"];
 const WARN: egui::Color32 = egui::Color32::from_rgb(240, 170, 90);
+/// The Add folder… panel's key (see [`file_dialog`]).
+const ADD_FOLDER: &str = "volume.add_folder";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Selection {
@@ -394,9 +397,7 @@ impl VolumeWorkspace {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             if ui.button("Add folder…").on_hover_text("Find the images in a folder and everything under it").clicked() {
-                if let Some(dir) = rfd::FileDialog::new().set_title("Folder with images").pick_folder() {
-                    self.add_roots(vec![dir], &ctx);
-                }
+                pick_images_folder(&ctx);
             }
             if ui.add_enabled(!self.roots.is_empty() && self.scan.is_none(), egui::Button::new("Rescan")).on_hover_text("Look again (unchanged files are not read again)").clicked() {
                 self.start_scan(&ctx);
@@ -547,9 +548,7 @@ impl VolumeWorkspace {
                     ui.heading("Volume");
                     ui.label("Add a folder: Polymix finds the DICOM, NIfTI, Analyze and NRRD data in it, however it is organised.");
                     if ui.button("Add folder…").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().set_title("Folder with images").pick_folder() {
-                            self.add_roots(vec![dir], &ctx);
-                        }
+                        pick_images_folder(&ctx);
                     }
                 }
             });
@@ -812,6 +811,11 @@ impl VolumeWorkspace {
     }
 }
 
+/// Add folder…: the folder comes back in [`VolumeWorkspace::ui`].
+fn pick_images_folder(ctx: &egui::Context) {
+    file_dialog::pick_folder(ctx, ADD_FOLDER, file_dialog::FileDialog::new().set_title("Folder with images"));
+}
+
 fn kind_label(k: Kind) -> &'static str {
     k.label()
 }
@@ -956,6 +960,10 @@ impl Workspace for VolumeWorkspace {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if let Some(dir) = file_dialog::take(&ctx, ADD_FOLDER) {
+            self.add_roots(vec![dir], &ctx);
+        }
         egui::Panel::top("volume.toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::left("volume.sources").resizable(true).default_size(230.0).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("volume.sources_scroll").show(ui, |ui| self.sources(ui));

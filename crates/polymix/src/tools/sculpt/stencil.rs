@@ -3,6 +3,7 @@
 //! directory, next to the Stamp tool's outlines.
 
 use mm_edit::brush_alpha::{AlphaImage, Pattern, ScreenStencil};
+use polymix_workspace::file_dialog;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -228,14 +229,17 @@ pub fn picker(ui: &mut egui::Ui, id: &str, current: &mut Option<Alpha>, invert: 
             }
         }
     });
+    // Open image…: the file comes back in a later frame (see [`file_dialog`]).
+    let dialog = ("stencil.open_image", id);
     if open {
-        let mut dlg = rfd::FileDialog::new().add_filter("Image", &EXTENSIONS);
+        let mut dlg = file_dialog::FileDialog::new().add_filter("Image", &EXTENSIONS);
         if let Some(d) = stencils_dir().filter(|d| d.is_dir()) {
             dlg = dlg.set_directory(d);
         }
-        if let Some(path) = dlg.pick_file() {
-            choice = Some(Some(Source::File(path)));
-        }
+        file_dialog::pick_file(ui.ctx(), dialog, dlg);
+    }
+    if let Some(path) = file_dialog::take(ui.ctx(), dialog) {
+        choice = Some(Some(Source::File(path)));
     }
     let Some(choice) = choice else { return false };
     match choice {

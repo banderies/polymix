@@ -20,6 +20,7 @@ use egui::{Color32, Key, PointerButton, RichText};
 use glam::{DVec3, Vec4};
 use mm_core::hash::{FastMap, FastSet};
 use mm_core::Mesh;
+use polymix_workspace::file_dialog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -538,6 +539,14 @@ const DEFAULT_CREASE_DEG: f32 = 40.0;
 /// How often a view showing work in progress (a tool computing, files loading) is redrawn:
 /// about 15 times a second, like the throttled spinner.
 const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_millis(66);
+/// Keys of the Mesh workspace's file panels (see [`file_dialog`]); their answers are taken in
+/// [`MeshWorkspace::file_dialog_answers`].
+const OPEN_PROJECT: &str = "mesh.open_project";
+const SAVE_PROJECT: &str = "mesh.save_project";
+const IMPORT: &str = "mesh.import";
+const IMPORT_REFERENCE: &str = "mesh.import_reference";
+const EXPORT: &str = "mesh.export";
+const TEXTURE: &str = "mesh.texture";
 /// The object browser's width range (drag its left edge).
 const OBJECTS_WIDTH: (f32, f32) = (170.0, 520.0);
 /// The Preferences window's 3D mouse tab (also `prefs:4` in scripts).
@@ -848,6 +857,10 @@ pub struct MeshWorkspace {
     show_prefs: bool,
     prefs_tab: usize,
     last_export_dir: Option<PathBuf>,
+    /// What the Export panel that is up writes.
+    export_scope: ExportScope,
+    /// The object the Texture… panel that is up is for.
+    texture_for: Option<ObjectId>,
     export_ascii: bool,
     /// Where the floating tool panel was last drawn (keeps viewport decorations clear of it).
     tool_panel_rect: Option<egui::Rect>,
@@ -946,6 +959,8 @@ impl MeshWorkspace {
             show_prefs: false,
             prefs_tab: 0,
             last_export_dir: None,
+            export_scope: ExportScope::Active,
+            texture_for: None,
             export_ascii: false,
             tool_panel_rect: None,
             tool_panel_width: 300.0,
@@ -1557,12 +1572,46 @@ impl MeshWorkspace {
     }
 
     fn open_project_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("Polymix project", &[crate::project::EXTENSION]).pick_file() {
+        file_dialog::pick_file(ctx, OPEN_PROJECT, file_dialog::FileDialog::new().add_filter("Polymix project", &[crate::project::EXTENSION]));
+    }
+
+    /// What the file panels (Open project, Save project as, Import, Import reference, Import
+    /// parts folder, Export, Texture) chose, once they close.
+    fn file_dialog_answers(&mut self, ctx: &egui::Context) {
+        if let Some(path) = file_dialog::take(ctx, OPEN_PROJECT) {
             self.open_project(path, ctx);
+        }
+        if let Some(path) = file_dialog::take(ctx, SAVE_PROJECT) {
+            if let Err(e) = self.save_project_to(path, ctx) {
+                self.status = e;
+            }
+        }
+        if let Some(files) = file_dialog::take_all(ctx, IMPORT) {
+            self.start_import(files, ctx);
+        }
+        if let Some(files) = file_dialog::take_all(ctx, IMPORT_REFERENCE) {
+            self.start_import_as(files, true, ctx);
+        }
+        // The library is loaded again when next shown (the folder list changed).
+        if let Some(msg) = crate::parts::take_parts_folder(ctx) {
+            self.status = msg;
+        }
+        if let Some(path) = file_dialog::take(ctx, EXPORT) {
+            self.last_export_dir = path.parent().map(|p| p.to_path_buf());
+            if let Err(e) = self.export_to(path, self.export_scope, ctx) {
+                self.status = e;
+            }
+        }
+        if let Some(path) = file_dialog::take(ctx, TEXTURE) {
+            if let Some(id) = self.texture_for.take() {
+                let vp = self.vp_prev(ctx);
+                self.run(MeshCommand::SetTexture(id, Some(path)), ctx, vp);
+            }
         }
     }
 
-    /// Save the scene as a project (asking for a file when there is none yet or `save_as`).
+    /// Save the scene as a project (asking for a file when there is none yet or `save_as`; the
+    /// file comes back in [`Self::file_dialog_answers`]).
     fn save_project(&mut self, ctx: &egui::Context, save_as: bool) {
         if self.scene.is_empty() {
             self.status = "Nothing to save.".into();
@@ -1572,12 +1621,12 @@ impl MeshWorkspace {
             (Some(p), false) => p.clone(),
             _ => {
                 let name = self.scene.active().map(|o| o.name.clone()).unwrap_or_else(|| "scene".into());
-                let mut dlg = rfd::FileDialog::new().add_filter("Polymix project", &[crate::project::EXTENSION]).set_file_name(format!("{name}.{}", crate::project::EXTENSION));
+                let mut dlg = file_dialog::FileDialog::new().add_filter("Polymix project", &[crate::project::EXTENSION]).set_file_name(format!("{name}.{}", crate::project::EXTENSION));
                 if let Some(d) = self.project_path.as_ref().and_then(|p| p.parent()).or(self.last_export_dir.as_deref()) {
                     dlg = dlg.set_directory(d);
                 }
-                let Some(p) = dlg.save_file() else { return };
-                p
+                file_dialog::save_file(ctx, SAVE_PROJECT, dlg);
+                return;
             }
         };
         if let Err(e) = self.save_project_to(path, ctx) {
@@ -1618,13 +1667,10 @@ impl MeshWorkspace {
     }
 
     fn import_dialog(&mut self, ctx: &egui::Context) {
-        let files = rfd::FileDialog::new()
+        let dlg = file_dialog::FileDialog::new()
             .add_filter("Meshes", &["stl", "obj", "ply", "off", "3mf", "amf", crate::project::EXTENSION])
-            .add_filter("All files", &["*"])
-            .pick_files();
-        if let Some(files) = files {
-            self.start_import(files, ctx);
-        }
+            .add_filter("All files", &["*"]);
+        file_dialog::pick_files(ctx, IMPORT, dlg);
     }
 
     fn export_dialog(&mut self, ctx: &egui::Context, scope: ExportScope) {
@@ -1636,7 +1682,7 @@ impl MeshWorkspace {
             self.status = "Select the triangles to export first.".into();
             return;
         }
-        let mut dlg = rfd::FileDialog::new()
+        let mut dlg = file_dialog::FileDialog::new()
             .add_filter("STL (binary)", &["stl"])
             .add_filter("OBJ", &["obj"])
             .add_filter("PLY", &["ply"])
@@ -1650,11 +1696,8 @@ impl MeshWorkspace {
         if let Some(d) = &self.last_export_dir {
             dlg = dlg.set_directory(d);
         }
-        let Some(path) = dlg.save_file() else { return };
-        self.last_export_dir = path.parent().map(|p| p.to_path_buf());
-        if let Err(e) = self.export_to(path, scope, ctx) {
-            self.status = e;
-        }
+        self.export_scope = scope;
+        file_dialog::save_file(ctx, EXPORT, dlg);
     }
 
     /// Export to `path` (format from the extension) in the background.
@@ -1960,16 +2003,11 @@ impl MeshWorkspace {
                 }
                 if ui.button("Import reference…").on_hover_text("A mesh shown see-through as a guide (e.g. the original segmentation behind an edited model): not picked in the view nor exported with the visible objects, until made editable").clicked() {
                     ui.close();
-                    if let Some(files) = rfd::FileDialog::new().add_filter("Meshes", &["stl", "obj", "ply", "off", "3mf", "amf"]).pick_files() {
-                        self.start_import_as(files, true, &ctx);
-                    }
+                    file_dialog::pick_files(&ctx, IMPORT_REFERENCE, file_dialog::FileDialog::new().add_filter("Meshes", &["stl", "obj", "ply", "off", "3mf", "amf"]));
                 }
                 if ui.button("Import parts folder…").on_hover_text("Add a folder of mesh files to Meshmix as parts").clicked() {
                     ui.close();
-                    // The library is loaded again when next shown (the folder list changed).
-                    if let Some(msg) = crate::parts::import_parts_folder_dialog() {
-                        self.status = msg;
-                    }
+                    crate::parts::import_parts_folder_dialog(&ctx);
                 }
                 if ui.button("Export active…").clicked() {
                     ui.close();
@@ -2688,10 +2726,8 @@ impl MeshWorkspace {
             self.run(MeshCommand::SendToSegmentation(id), &ctx, vp);
         }
         if let Some(id) = texture {
-            if let Some(path) = rfd::FileDialog::new().set_title("Texture image").add_filter("Image", &["png", "jpg", "jpeg", "bmp", "tga"]).pick_file() {
-                let vp = self.vp_prev(&ctx);
-                self.run(MeshCommand::SetTexture(id, Some(path)), &ctx, vp);
-            }
+            self.texture_for = Some(id);
+            file_dialog::pick_file(&ctx, TEXTURE, file_dialog::FileDialog::new().set_title("Texture image").add_filter("Image", &["png", "jpg", "jpeg", "bmp", "tga"]));
         }
         if let Some(id) = toggle_reference {
             let vp = self.vp_prev(&ctx);
@@ -4410,6 +4446,7 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.share_brush();
+        self.file_dialog_answers(&ctx);
 
         // The viewport rect is only known after the side panels are laid out; tools that need it
         // during panel drawing use the previous frame's value.

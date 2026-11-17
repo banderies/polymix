@@ -341,9 +341,21 @@ pub fn remove_parts_folder(dir: &Path) -> Result<()> {
     remove_folder_from(&folders_file().context("no data directory")?, dir)
 }
 
-/// File > Import Parts Folder: pick a folder and add it. None if cancelled.
-pub fn import_parts_folder_dialog() -> Option<String> {
-    let dir = rfd::FileDialog::new().set_title("Add a folder of parts (STL, OBJ, PLY, OFF, 3MF, AMF)").pick_folder()?;
+/// The key of the Import parts folder panel (see [`polymix_workspace::file_dialog`]).
+const PARTS_FOLDER_DIALOG: &str = "mesh.parts_folder";
+
+/// File > Import Parts Folder, and Add parts folder… in the Meshmix panel: ask for a folder;
+/// [`take_parts_folder`] adds it once the panel closes.
+pub fn import_parts_folder_dialog(ctx: &egui::Context) {
+    use polymix_workspace::file_dialog;
+    file_dialog::pick_folder(ctx, PARTS_FOLDER_DIALOG, file_dialog::FileDialog::new().set_title("Add a folder of parts (STL, OBJ, PLY, OFF, 3MF, AMF)"));
+}
+
+/// The folder chosen in [`import_parts_folder_dialog`], added to the library (which loads again
+/// as its files changed); a status message. None while the panel is up, after Cancel, or when
+/// none was asked for.
+pub fn take_parts_folder(ctx: &egui::Context) -> Option<String> {
+    let dir = polymix_workspace::file_dialog::take(ctx, PARTS_FOLDER_DIALOG)?;
     Some(add_parts_folder(&dir).unwrap_or_else(|e| format!("Import parts folder: {e:#}")))
 }
 
@@ -458,10 +470,7 @@ pub fn library_panel(ui: &mut egui::Ui, lib: Option<&mut Library>, has_obj: bool
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.button("Add parts folder…").on_hover_text("Add a folder of mesh files (STL, OBJ, PLY, OFF, 3MF, AMF) to the library: closed meshes become solid parts, meshes with one open border open parts").clicked() {
-            if let Some(msg) = import_parts_folder_dialog() {
-                *status = msg;
-                reload = true;
-            }
+            import_parts_folder_dialog(ui.ctx());
         }
         if ui.button("Reload").on_hover_text("Look again for new and changed parts").clicked() {
             reload = true;

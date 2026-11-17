@@ -12,12 +12,15 @@ use mm_volume::deid::DeidOptions;
 use mm_volume::load::{volume_count, LoadedVolume};
 use mm_volume::model::{Catalog, Kind, Volume, Voxels};
 use mm_volume::slice::Plane;
+use polymix_workspace::file_dialog;
 use polymix_workspace::jobs::{Job, ProgressFn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Largest image processed (voxels; several float copies live in memory while running).
 const MAX_VOXELS: usize = 400_000_000;
+/// The key of the panel choosing where the de-identified copy goes (see [`file_dialog`]).
+const EXPORT_DIR: &str = "volume.deid_export_dir";
 const WARN: egui::Color32 = egui::Color32::from_rgb(240, 170, 90);
 
 /// Where derived images are saved.
@@ -866,6 +869,9 @@ impl Prepare {
 
     /// The panel for volume `k` of `c`: a collapsible "Prepare image" section.
     pub fn ui(&mut self, ui: &mut egui::Ui, c: &Arc<Catalog>, k: usize, privacy: &Privacy) {
+        if let Some(d) = file_dialog::take(ui.ctx(), EXPORT_DIR) {
+            self.export_dir = Some(d);
+        }
         if !applies_to(&c.volumes[k]) {
             return;
         }
@@ -1221,9 +1227,7 @@ impl Prepare {
                 ui.label("Into");
                 ui.horizontal(|ui| {
                     if ui.button("Choose folder…").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().set_title("Folder for the de-identified copy").pick_folder() {
-                            self.export_dir = Some(d);
-                        }
+                        file_dialog::pick_folder(ui.ctx(), EXPORT_DIR, file_dialog::FileDialog::new().set_title("Folder for the de-identified copy"));
                     }
                     if let Some(d) = &self.export_dir {
                         ui.weak(d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());

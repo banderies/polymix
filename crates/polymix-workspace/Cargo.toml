@@ -1,6 +1,6 @@
 [package]
 name = "polymix-workspace"
-description = "Polymix workspaces: the shared trait, crash guard, background jobs, agent tools and data folder"
+description = "Polymix workspaces: the shared trait, crash guard, background jobs, agent tools, file dialogs and data folder"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -12,3 +12,4 @@ anyhow.workspace = true
 log.workspace = true
 rayon.workspace = true
 serde_json = "1"
+rfd = "0.17"
