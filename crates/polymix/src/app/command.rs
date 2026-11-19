@@ -60,6 +60,7 @@ pub const TOOLS: &[ToolInfo] = &[
     t("convex", "Convex Decomposition", "Approximate the object by convex pieces"),
     t("filtercomplex", "Filter Complex", "Keep cells of a complex (Generate Complex) by which inputs they are inside, joined into one object"),
     t("hair", "Grow Hair", "Strands on the selected triangles"),
+    t("assemble", "Assemble: Joints & Pose", "Join kit parts at balls, pins and pegs (clicks two surfaces), then pose them by dragging; grounded parts stay put"),
     t("pivot", "Create Pivot", "Drop a point with a coordinate frame on the object (clicks)"),
     t("planecut", "Plane Cut", "Cut the object with a plane (drag a line; Shift+click a vessel for a square cut)"),
     t("trim", "Trim branch", "Click a vessel to cut it square to its axis and cap it (clicks)"),
@@ -155,6 +156,8 @@ pub enum MeshCommand {
     AddShape(Shape),
     Activate(ObjectId),
     SetVisible(ObjectId, bool),
+    /// Shown see-through and passed by every pick, or solid again.
+    SetSeeThrough(ObjectId, bool),
     Rename(ObjectId, String),
     SetTarget(Option<ObjectId>),
     Undo,
@@ -215,6 +218,10 @@ impl MeshWorkspace {
         let before = self.history.generation();
         // Commands that change the scene: nothing happened if they left no undo step.
         let changed = |ws: &Self| -> Result<String, String> { if ws.history.generation() != before { Ok(ws.status.clone()) } else { Err(ws.status.clone()) } };
+        // The Assembly tab only moves parts: the commands that edit a mesh are the Mesh tab's.
+        if self.assembly_mode && matches!(cmd, C::Discard | C::Separate { .. } | C::FlipNormals | C::CreateFaceGroup | C::GenerateComplex | C::SplitComplex) {
+            return Err("That edits the mesh: use it in the Mesh tab (⌘3; agents: app_show mesh). The Assembly tab only moves parts.".into());
+        }
         match cmd {
             C::Select(c) => {
                 self.active_id()?;
@@ -389,6 +396,11 @@ impl MeshWorkspace {
                 self.scene.active = Some(id);
                 Ok(format!("{name} is active"))
             }
+            C::SetSeeThrough(id, on) => {
+                self.object(id)?;
+                self.scene.get_mut(id).unwrap().see_through = on;
+                Ok(format!("{} is {}", self.scene.get(id).unwrap().name, if on { "see-through (picks go through it)" } else { "solid" }))
+            }
             C::SetVisible(id, visible) => {
                 self.object(id)?;
                 self.scene.get_mut(id).unwrap().visible = visible;
@@ -486,7 +498,11 @@ impl MeshWorkspace {
                 Ok(if axis == UpAxis::Z { "Z up".into() } else { "Y up".into() })
             }
             C::OpenTool(name) => {
+                let status = self.status.clone();
                 self.switch_to(SwitchTo::Tool(name.clone()), ctx, vp);
+                if self.assembly_mode && self.status != status && self.status.contains("edits the mesh") {
+                    return Err(self.status.clone());
+                }
                 if self.pending_switch.is_some() {
                     return Ok(format!("{name} opens when the open tool has finished computing"));
                 }
@@ -773,6 +789,43 @@ pub(super) mod tests {
         assert!(!ws.space_capture && ws.tools.is_empty());
         assert_eq!(ws.space_buttons, vec![(5, A::Tool(TOOLS.last().unwrap().name.into())), (14, A::Nothing)]);
         assert_eq!(ws.space_last_button, Some(14));
+    }
+
+    #[test]
+    fn the_assembly_tab_never_edits_meshes_nor_connects_by_itself() {
+        use crate::spacemouse::ButtonAction as A;
+        let (mut ws, ctx, vp) = workspace();
+        ws.execute(MeshCommand::AddShape(Shape::Sphere), &ctx, vp).unwrap();
+        ws.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();
+        let names = |ws: &MeshWorkspace| ws.tools.iter().map(|t| t.name()).collect::<Vec<_>>();
+        ws.set_assembly_mode(true, &ctx);
+        assert_eq!(names(&ws), ["Assemble"], "Assemble opens with the tab");
+        // Mesh tools and edits are refused, whatever asks for them.
+        assert!(ws.execute(MeshCommand::OpenTool("erasefill".into()), &ctx, vp).is_err());
+        ws.space_buttons = vec![(3, A::Tool("remesh".into()))];
+        ws.space_button(3, &ctx, vp);
+        assert_eq!(names(&ws), ["Assemble"], "{}", ws.status);
+        assert!(ws.execute(MeshCommand::FlipNormals, &ctx, vp).is_err());
+        // Two surfaces picked: the sphere's and a face of the cube.
+        let (b0, b1) = (ws.scene.objects[0].bounds(), ws.scene.objects[1].bounds());
+        ws.execute(MeshCommand::ToolAction("pick_surface".into(), json!({"at": b0.max.to_array(), "part": ws.scene.objects[0].id})), &ctx, vp).unwrap();
+        let face = b1.center() + DVec3::new(0.0, 0.0, b1.extents().z * 0.5);
+        ws.execute(MeshCommand::ToolAction("pick_surface".into(), json!({"at": face.to_array(), "part": ws.scene.objects[1].id})), &ctx, vp).unwrap();
+        // Select is the joint-surface Select, over Assemble.
+        ws.execute(MeshCommand::OpenTool("select".into()), &ctx, vp).unwrap();
+        assert_eq!(names(&ws), ["Assemble", "Select"]);
+        // Back to Assemble (toolbar Connect / Pose, an agent, a button): nothing is connected and
+        // the picks stay.
+        ws.execute(MeshCommand::OpenTool("assemble".into()), &ctx, vp).unwrap();
+        assert_eq!(names(&ws), ["Assemble"]);
+        assert!(ws.scene.assembly.connections.is_empty() && ws.scene.assembly.joints.is_empty(), "nothing made by switching");
+        assert_eq!(ws.tools[0].state(&ws.scene)["picked"].as_array().map(|a| a.len()), Some(2));
+        // Leaving the tab closes Assemble without connecting either.
+        ws.set_assembly_mode(false, &ctx);
+        assert!(ws.tools.is_empty() && ws.scene.assembly.connections.is_empty());
+        // The Mesh tab opens Mesh tools again.
+        ws.space_button(3, &ctx, vp);
+        assert_eq!(names(&ws), ["Remesh"], "{}", ws.status);
     }
 
     #[test]

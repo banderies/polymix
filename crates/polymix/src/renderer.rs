@@ -983,7 +983,6 @@ impl SceneRenderer {
     /// when this copy cannot show the preview (not a similarity transform, never synced,
     /// or holding a per-triangle field where group colours are asked for): upload the moved
     /// mesh instead.
-    #[allow(dead_code)] // For the Transform tool's rigid previews, which are wired up next.
     pub fn sync_rigid_preview(&self, queue: &wgpu::Queue, gpu: &mut GpuMesh, style: &ObjectStyle, model: Mat4) -> bool {
         let m = Mat3::from_mat4(model);
         let scale = m.x_axis.length();

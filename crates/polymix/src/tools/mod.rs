@@ -40,6 +40,7 @@ pub mod cfd_check;
 pub mod centerline_tool;
 pub mod stent;
 pub mod complex;
+pub mod assemble;
 
 /// Screen-space description of the 3D viewport.
 #[derive(Clone, Copy, Debug)]
@@ -216,8 +217,9 @@ pub fn step_brush_size(size: &BrushSize, grow: bool) {
 pub fn pick_ray(scene: &mut Scene, ray: &Ray, only: Option<ObjectId>) -> Option<(ObjectId, RayHit)> {
     let mut best: Option<(ObjectId, RayHit)> = None;
     for o in scene.objects.iter_mut() {
-        // References are guides, not picked (unless asked for by id).
-        if !o.visible || only.is_some_and(|id| id != o.id) || (o.reference && only.is_none()) {
+        // References are guides, not picked (unless asked for by id); see-through objects are
+        // never picked (the pick goes through them).
+        if !o.visible || o.see_through || only.is_some_and(|id| id != o.id) || (o.reference && only.is_none()) {
             continue;
         }
         let bvh = o.bvh();
@@ -289,6 +291,11 @@ pub trait Tool {
     #[allow(dead_code)] // For the renderer's preview drawing, which does not use it yet.
     fn preview_transform(&self) -> Option<glam::DMat4> {
         None
+    }
+    /// Objects the tool shows moved rigidly this frame without changing their meshes (a drag
+    /// in progress): each is drawn moved by its matrix, a rotation and translation.
+    fn rigid_previews(&self) -> Vec<(ObjectId, glam::DMat4)> {
+        Vec::new()
     }
     /// Keyboard shortcuts while the tool is active. Return true if a key was used (the app
     /// then skips its own shortcuts for it).
@@ -496,4 +503,29 @@ pub fn schema_of<T: schemars::JsonSchema>() -> serde_json::Value {
         o.remove("$schema");
     }
     v
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    #[test]
+    fn picks_go_through_see_through_objects() {
+        let mut scene = Scene::default();
+        let back = scene.add("back", mm_core::primitives::cube(1.0, 1));
+        let mut m = mm_core::primitives::cube(1.0, 1);
+        m.transform(|p| p + DVec3::new(0.0, 0.0, 3.0));
+        let front = scene.add("front", m);
+        let ray = Ray::new(DVec3::new(0.0, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        assert_eq!(pick_ray(&mut scene, &ray, None).map(|h| h.0), Some(front));
+        scene.get_mut(front).unwrap().see_through = true;
+        assert_eq!(pick_ray(&mut scene, &ray, None).map(|h| h.0), Some(back), "through the see-through one");
+        assert!(pick_ray(&mut scene, &ray, Some(front)).is_none(), "not even when asked for by id");
+        // Undo keeps it see-through (it is not part of the history).
+        let mut h = crate::scene::History::default();
+        h.push("edit", &scene);
+        scene.get_mut(back).unwrap().mesh_mut().set_vertex(0, DVec3::splat(2.0));
+        h.undo(&mut scene);
+        assert!(scene.get(front).unwrap().see_through);
+    }
 }

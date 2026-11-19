@@ -11,6 +11,9 @@ pub enum Icon {
     Sculpt,
     Edit,
     Vessel,
+    Connect,
+    Pose,
+    Joint,
     Analysis,
     Shaders,
     Export,
@@ -70,6 +73,34 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Shaders => {
             painter.circle(p(0.5, 0.5), s * 0.4, color.gamma_multiply(0.3), stroke);
             painter.circle_filled(p(0.36, 0.36), s * 0.1, color);
+        }
+        Icon::Connect => {
+            // A ball on a stick going into an open socket.
+            let thick = Stroke::new(stroke.width * 1.6, color);
+            painter.add(Shape::line((0..=12).map(|i| {
+                let a = std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 12.0;
+                p(0.42 + 0.3 * a.cos(), 0.5 - 0.3 * a.sin())
+            }).collect(), stroke));
+            painter.circle_filled(p(0.5, 0.5), s * 0.16, color);
+            painter.add(Shape::line(vec![p(0.62, 0.5), p(0.95, 0.5)], thick));
+        }
+        Icon::Joint => {
+            // A ball standing on a surface, with a plus.
+            line(vec![p(0.06, 0.82), p(0.94, 0.82)]);
+            painter.circle_stroke(p(0.42, 0.56), s * 0.24, stroke);
+            line(vec![p(0.78, 0.1), p(0.78, 0.4)]);
+            line(vec![p(0.63, 0.25), p(0.93, 0.25)]);
+        }
+        Icon::Pose => {
+            // A limb turning about its joint.
+            let thick = Stroke::new(stroke.width * 1.6, color);
+            painter.circle_filled(p(0.22, 0.78), s * 0.1, color);
+            painter.add(Shape::line(vec![p(0.22, 0.78), p(0.62, 0.3)], thick));
+            painter.add(Shape::line((0..=10).map(|i| {
+                let a = 0.15 + 1.1 * i as f32 / 10.0;
+                p(0.22 + 0.68 * a.cos(), 0.78 - 0.68 * a.sin())
+            }).collect(), stroke));
+            line(vec![p(0.86, 0.28), p(0.9, 0.46), p(0.74, 0.42)]);
         }
         Icon::Meshmix => {
             // A ball with a part dropped on top.

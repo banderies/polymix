@@ -161,8 +161,9 @@ fn place(mut m: Mesh, c: DVec3, u: DVec3, v: DVec3, n: DVec3) -> Mesh {
     m
 }
 
-/// Least-squares circle through 2D points: algebraic fit, then geometric refinement.
-fn fit_circle(pts: &[DVec2]) -> (DVec2, f64) {
+/// Least-squares circle through 2D points (centre, radius): algebraic fit, then geometric
+/// refinement.
+pub fn fit_circle(pts: &[DVec2]) -> (DVec2, f64) {
     // x² + y² + D x + E y + F = 0.
     let mut ata = [[0.0; 3]; 3];
     let mut atb = DVec3::ZERO;
@@ -201,8 +202,9 @@ fn fit_circle(pts: &[DVec2]) -> (DVec2, f64) {
     (c, r.abs())
 }
 
-/// Least-squares sphere: algebraic fit, then geometric refinement.
-fn fit_sphere(pts: &[DVec3]) -> (DVec3, f64) {
+/// Least-squares sphere through points (centre, radius): algebraic fit, then geometric
+/// refinement.
+pub fn fit_sphere(pts: &[DVec3]) -> (DVec3, f64) {
     // x² + y² + z² + D x + E y + F z + G = 0, solved by normal equations (4×4).
     let mut ata = [[0.0f64; 4]; 4];
     let mut atb = [0.0f64; 4];

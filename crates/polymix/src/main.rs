@@ -2,6 +2,7 @@
 
 mod agents;
 mod app;
+mod assembly;
 mod camera;
 mod centerline;
 mod commands;

@@ -62,6 +62,22 @@ pub struct SelectTool {
     expand: Option<ExpandSession>,
     /// Sub-tool requested from the panel (opened by the app).
     pub request: Option<Box<dyn Tool>>,
+    /// Selecting a joint's surface for Assemble (the Assembly tab): only the selection tools,
+    /// none of the edits, and a button that hands the selection over.
+    pub joint_surface: Option<JointSurface>,
+}
+
+/// What a joint-surface selection is for, and the flag its Use button sets.
+pub struct JointSurface {
+    pub title: String,
+    pub used: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SelectTool {
+    /// Select for a joint's surface (see [`SelectTool::joint_surface`]).
+    pub fn for_joint_surface(title: String, used: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { joint_surface: Some(JointSurface { title, used }), ..Self::default() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +268,7 @@ impl Default for SelectTool {
             before_click: None,
             expand: None,
             request: None,
+            joint_surface: None,
         }
     }
 }
@@ -704,6 +721,26 @@ impl Tool for SelectTool {
     }
 
     fn panel(&mut self, ui: &mut egui::Ui, cx: &mut ToolCx) -> ToolOutcome {
+        if let Some(js) = &self.joint_surface {
+            ui_util::section(ui, "Joint surface");
+            ui.label(&js.title);
+            let n = cx.scene.active().map_or(0, |o| o.selection.len());
+            let mut close = false;
+            ui.horizontal(|ui| {
+                let use_it = egui::Button::new(egui::RichText::new("Use this surface").strong()).fill(egui::Color32::from_rgb(70, 110, 60));
+                if ui.add_enabled(n > 0, use_it).on_hover_text("Fit the joint to the selected triangles and go back to Assemble").clicked() {
+                    js.used.store(true, std::sync::atomic::Ordering::Relaxed);
+                    close = true;
+                }
+                if ui.button("Cancel").on_hover_text("Back to Assemble without using the selection").clicked() {
+                    close = true;
+                }
+            });
+            if close {
+                return ToolOutcome::Close;
+            }
+            ui.small("Paint the joint's surface: only the ball or socket (pin, hole, peg face), not what joins it. Selecting here never changes the parts.");
+        }
         ui_util::section(ui, "Select");
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.mode, SelectMode::Brush, "Brush");
@@ -797,6 +834,10 @@ impl Tool for SelectTool {
             }
         });
 
+        if self.joint_surface.is_some() {
+            // Only selecting here: the edits stay in the Mesh tab.
+            return ToolOutcome::Continue;
+        }
         let has_sel = n_sel > 0;
         ui_util::section(ui, "Edit");
         ui.add_enabled_ui(has_sel, |ui| {
@@ -1089,6 +1130,14 @@ impl Tool for SelectTool {
         use egui::Key;
         let cmd = i.modifiers.command;
         let shift = i.modifiers.shift;
+        // Selecting a joint's surface: the keys that edit the mesh do nothing (used, so the
+        // app does nothing with them either).
+        if self.joint_surface.is_some() {
+            let edits = [Key::X, Key::Delete, Key::Backspace, Key::F, Key::D, Key::R, Key::B, Key::P, Key::J, Key::Y, Key::T];
+            if edits.iter().any(|&k| i.key_pressed(k)) || (i.key_pressed(Key::G) && cmd) {
+                return true;
+            }
+        }
         let mut run = |f: &mut dyn FnMut(&mut CmdCx)| {
             let mut c = CmdCx { scene: cx.scene, history: cx.history, status: cx.status };
             f(&mut c);

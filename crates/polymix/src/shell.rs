@@ -1,8 +1,9 @@
-//! The application shell: the workspace tabs (Volume | Segmentation | Mesh) above
-//! independent workspaces.
+//! The application shell: the workspace tabs (Volume | Segmentation | Mesh | Assembly) above
+//! independent workspaces. Assembly is the Mesh workspace's scene with only the assembly
+//! tools in its toolbar (posing kit parts by their joints): the same parts, camera and undo.
 //!
 //! The shell owns the window-level things every workspace shares: the tab bar and its
-//! hotkeys (⌘1 / ⌘2 / ⌘3), routing of dropped files and command-line paths, the window title,
+//! hotkeys (⌘1 / ⌘2 / ⌘3 / ⌘4), routing of dropped files and command-line paths, the window title,
 //! persistence of the chosen tab, and the test-script runner (`POLYMIX_SCRIPT`). Each
 //! workspace is called through its [`Slot`], so a panic inside one stops only that one: its
 //! tab shows a crash card with a Restart button while the others keep working.
@@ -39,17 +40,25 @@ pub enum Tab {
     Volume,
     Segmentation,
     Mesh,
+    /// The Mesh workspace with the assembly tools.
+    Assembly,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Volume, Tab::Segmentation, Tab::Mesh];
+    const ALL: [Tab; 4] = [Tab::Volume, Tab::Segmentation, Tab::Mesh, Tab::Assembly];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Volume => "Volume",
             Tab::Segmentation => "Segmentation",
             Tab::Mesh => "Mesh",
+            Tab::Assembly => "Assembly",
         }
+    }
+
+    /// It shows the Mesh workspace (with its own tools or the assembly tools).
+    fn is_mesh(self) -> bool {
+        matches!(self, Tab::Mesh | Tab::Assembly)
     }
 
     fn key(self) -> &'static str {
@@ -57,6 +66,7 @@ impl Tab {
             Tab::Volume => "volume",
             Tab::Segmentation => "segmentation",
             Tab::Mesh => "mesh",
+            Tab::Assembly => "assembly",
         }
     }
 
@@ -69,6 +79,7 @@ impl Tab {
             Tab::Volume => egui::Key::Num1,
             Tab::Segmentation => egui::Key::Num2,
             Tab::Mesh => egui::Key::Num3,
+            Tab::Assembly => egui::Key::Num4,
         }
     }
 }
@@ -208,7 +219,9 @@ impl PolymixApp {
         }
         if !mesh.is_empty() {
             self.mesh.call(|w| w.open(mesh, ctx));
-            self.active = Tab::Mesh;
+            if !self.active.is_mesh() {
+                self.active = Tab::Mesh;
+            }
         }
         if !volume.is_empty() {
             self.volume.call(|w| w.open(volume, ctx));
@@ -216,11 +229,19 @@ impl PolymixApp {
         }
     }
 
+    /// Tell the Mesh workspace whether it is shown as the Assembly tab (its tools follow).
+    fn sync_mesh_mode(&mut self, ctx: &egui::Context) {
+        if self.active.is_mesh() {
+            let on = self.active == Tab::Assembly;
+            self.mesh.call(|w| w.set_assembly_mode(on, ctx));
+        }
+    }
+
     fn crashed(&self, tab: Tab) -> bool {
         match tab {
             Tab::Volume => matches!(self.volume, Slot::Crashed(_)),
             Tab::Segmentation => matches!(self.segmentation, Slot::Crashed(_)),
-            Tab::Mesh => matches!(self.mesh, Slot::Crashed(_)),
+            Tab::Mesh | Tab::Assembly => matches!(self.mesh, Slot::Crashed(_)),
         }
     }
 
@@ -268,12 +289,14 @@ impl PolymixApp {
                     }
                 }
             },
-            Tab::Mesh => match &self.mesh {
+            Tab::Mesh | Tab::Assembly => match &self.mesh {
                 Slot::Live(_) => {
+                    let assembly = self.active == Tab::Assembly;
                     self.mesh.call(|w| {
                         if crash {
                             panic!("crash test requested by the script");
                         }
+                        w.set_assembly_mode(assembly, &ctx);
                         w.ui(ui, frame)
                     });
                 }
@@ -305,7 +328,7 @@ impl PolymixApp {
         let title = match self.active {
             Tab::Volume => self.volume.live().map(|w| w.title()),
             Tab::Segmentation => self.segmentation.live().map(|w| w.title()),
-            Tab::Mesh => self.mesh.live().map(|w| w.title()),
+            Tab::Mesh | Tab::Assembly => self.mesh.live().map(|w| w.title()),
         }
         .unwrap_or_else(|| format!("Polymix — {} (stopped)", self.active.label()));
         if title != self.title {
@@ -334,7 +357,11 @@ impl PolymixApp {
         // Changes happen in front of the user: show the workspace being changed.
         if self.agents.kind(&call.tool) != ToolKind::Read {
             if let Some(tab) = call.tool.split('_').next().and_then(Tab::from_key) {
-                self.active = tab;
+                // Mesh changes show in the Assembly tab too: stay there.
+                if !(tab == Tab::Mesh && self.active == Tab::Assembly) {
+                    self.active = tab;
+                    self.sync_mesh_mode(ctx);
+                }
             }
             self.agent_work_until = Some(Instant::now() + AGENT_WORK);
         }
@@ -362,7 +389,7 @@ impl PolymixApp {
                     match self.active {
                         Tab::Volume => self.volume.call(|w| w.agent_acting()),
                         Tab::Segmentation => self.segmentation.call(|w| w.agent_acting()),
-                        Tab::Mesh => self.mesh.call(|w| w.agent_acting()),
+                        Tab::Mesh | Tab::Assembly => self.mesh.call(|w| w.agent_acting()),
                     };
                     self.ui_access.act(call, ctx);
                 }
@@ -371,9 +398,10 @@ impl PolymixApp {
             "app_show" => match polymix_workspace::agent::arg_str(&call.args, "workspace").and_then(Tab::from_key) {
                 Some(tab) => {
                     self.active = tab;
+                    self.sync_mesh_mode(ctx);
                     Reply::Json(json!({"shown": tab.key()}))
                 }
-                None => Reply::Error("workspace must be volume, segmentation or mesh".into()),
+                None => Reply::Error("workspace must be volume, segmentation, mesh or assembly".into()),
             },
             tool => {
                 let (name, r) = match tool.split('_').next().unwrap_or("") {
@@ -403,7 +431,7 @@ impl PolymixApp {
             "app": "Polymix",
             "version": env!("CARGO_PKG_VERSION"),
             "workspace_shown": self.active.key(),
-            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh)},
+            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh), "assembly": "the Mesh workspace's scene with the assembly tools (the Assemble tool); mesh_* tools work on it"},
             "window": {"width": r.width().round(), "height": r.height().round(), "pixels_per_point": ctx.pixels_per_point()},
             "identifiers_hidden_in_volume": self.volume.live().is_some_and(|w| w.hides_identifiers()),
         })
@@ -510,7 +538,7 @@ impl PolymixApp {
         match self.active {
             Tab::Volume => self.volume.live().is_none_or(|w| w.script_idle()),
             Tab::Segmentation => self.segmentation.live().is_none_or(|w| w.script_idle()),
-            Tab::Mesh => self.mesh.live().is_none_or(|w| w.script_idle()),
+            Tab::Mesh | Tab::Assembly => self.mesh.live().is_none_or(|w| w.script_idle()),
         }
     }
 
@@ -614,7 +642,7 @@ impl PolymixApp {
                 let taken = match self.active {
                     Tab::Volume => self.volume.call(|w| w.script_push(step.clone())),
                     Tab::Segmentation => self.segmentation.call(|w| w.script_push(step.clone())),
-                    Tab::Mesh => self.mesh.call(|w| w.script_push(step.clone())),
+                    Tab::Mesh | Tab::Assembly => self.mesh.call(|w| w.script_push(step.clone())),
                 };
                 if taken.is_none() {
                     log::warn!("script step {step} dropped: the {} workspace is not running", self.active.label());
@@ -662,7 +690,7 @@ impl eframe::App for PolymixApp {
             }
         }
         // The Segmentation tab's image, for the image slices in Mesh.
-        if active == Tab::Mesh {
+        if active.is_mesh() {
             let source = self.segmentation.call(|w| w.view_for_mesh()).flatten().map(|i| crate::app::slices::SliceSource { volume: i.volume, name: i.name, cursor: i.cursor, window: i.window });
             self.mesh.call(|w| w.set_image_source(source));
         }
@@ -686,7 +714,9 @@ impl eframe::App for PolymixApp {
         }
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
         self.segmentation.call(|w| w.tick(ctx, active == Tab::Segmentation));
-        self.mesh.call(|w| w.tick(ctx, active == Tab::Mesh));
+        self.mesh.call(|w| w.tick(ctx, active.is_mesh()));
+        // Agents' calls see the tab as it is now, even when no frame is drawn.
+        self.sync_mesh_mode(ctx);
         self.serve_agents(ctx);
         self.finish_waits(ctx);
         self.ui_access.tick(ctx);
@@ -755,8 +785,9 @@ impl eframe::App for PolymixApp {
         if !self.keys_down.is_empty() {
             ctx.request_repaint();
         }
-        // Only the Mesh tab acts on button presses: elsewhere they are not kept for later.
-        if self.active != Tab::Mesh {
+        // Only the Mesh and Assembly tabs act on button presses: elsewhere they are not kept
+        // for later.
+        if !self.active.is_mesh() {
             crate::spacemouse::drop_presses();
         }
         if let Some(script) = &mut self.script {

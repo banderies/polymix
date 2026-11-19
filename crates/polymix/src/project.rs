@@ -3,7 +3,9 @@
 //! the active object, the target surface and the view. No undo history.
 //!
 //! The file is a zip archive holding `manifest.txt` (one `key value` per line) and one
-//! lossless binary mesh per object (`objects/N.bin`).
+//! lossless binary mesh per object (`objects/N.bin`), and `assembly.txt` when the scene has
+//! grounded parts or joints (Assemble; see [`crate::assembly::to_text`]). Readers that do not
+//! know an entry pass it by.
 
 use crate::camera::ViewState;
 use anyhow::{anyhow, bail, Context, Result};
@@ -100,6 +102,8 @@ pub struct Project {
     pub active: Option<usize>,
     pub target: Option<usize>,
     pub view: Option<ViewState>,
+    /// The grounded parts and joints (`assembly.txt`), parts by index.
+    pub assembly: Option<String>,
 }
 
 /// Lossless binary mesh: positions (f64), triangles, face groups, optional vertex colours.
@@ -194,6 +198,7 @@ pub struct SaveProject {
     pub active: Option<usize>,
     pub target: Option<usize>,
     pub view: Option<ViewState>,
+    pub assembly: Option<String>,
 }
 
 /// How hard the archive's entries are compressed.
@@ -315,17 +320,17 @@ fn manifest(view: Option<&ViewState>, active: Option<usize>, target: Option<usiz
 #[allow(dead_code)] // For code holding a `Project` (tests); the app saves with `save_shared`.
 pub fn save(path: &Path, project: &Project) -> Result<()> {
     let objects: Vec<ObjectOut> = project.objects.iter().map(ObjectOut::from).collect();
-    write_project(path, project.view.as_ref(), project.active, project.target, &objects, Compression::Default)
+    write_project(path, project.view.as_ref(), project.active, project.target, &objects, project.assembly.as_deref(), Compression::Default)
 }
 
 /// [`save`] for a snapshot of the scene that shares its meshes: the same file, compressed as
 /// asked.
 pub fn save_shared(path: &Path, project: &SaveProject, compression: Compression) -> Result<()> {
     let objects: Vec<ObjectOut> = project.objects.iter().map(ObjectOut::from).collect();
-    write_project(path, project.view.as_ref(), project.active, project.target, &objects, compression)
+    write_project(path, project.view.as_ref(), project.active, project.target, &objects, project.assembly.as_deref(), compression)
 }
 
-fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, target: Option<usize>, objects: &[ObjectOut], compression: Compression) -> Result<()> {
+fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, target: Option<usize>, objects: &[ObjectOut], assembly: Option<&str>, compression: Compression) -> Result<()> {
     let mut buf = Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
@@ -346,6 +351,10 @@ fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, t
                     UvsOut::ById(corners) => uv_corners_to_bytes(o.mesh.triangle_count(), o.mesh.triangle_ids().map(|t| &corners[t as usize])),
                 })?;
             }
+        }
+        if let Some(a) = assembly {
+            zip.start_file("assembly.txt", opts)?;
+            zip.write_all(a.as_bytes())?;
         }
         zip.finish()?;
     }
@@ -441,6 +450,11 @@ pub fn load(path: &Path) -> Result<Project> {
             (k, _) => return Err(anyhow!("unexpected '{k}' in the project manifest")),
         }
     }
+    if let Ok(mut f) = zip.by_name("assembly.txt") {
+        let mut a = String::new();
+        f.read_to_string(&mut a)?;
+        project.assembly = Some(a);
+    }
     Ok(project)
 }
 
@@ -489,6 +503,7 @@ mod tests {
             active: Some(0),
             target: Some(1),
             view: Some(ViewState { target: DVec3::new(1.0, 2.0, 3.0), distance: 42.0, orient: DQuat::from_rotation_y(0.5) }),
+            assembly: Some("polymix-assembly 1\nground 1\n".into()),
         };
         let dir = std::env::temp_dir().join(format!("polymix-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -498,6 +513,7 @@ mod tests {
         assert_eq!(q.objects.len(), 2);
         assert_eq!((q.active, q.target), (Some(0), Some(1)));
         assert!((q.view.unwrap().distance - 42.0).abs() < 1e-12);
+        assert_eq!(q.assembly.as_deref(), Some("polymix-assembly 1\nground 1\n"));
         let o = &q.objects[0];
         assert_eq!(o.name, "vessel with spaces");
         assert_eq!(o.material, 5);
@@ -807,8 +823,9 @@ mod tests {
             active: Some(1),
             target: Some(0),
             view: Some(ViewState { target: DVec3::new(1.0, -2.0, 3.0), distance: 12.5, orient: DQuat::from_rotation_z(0.2) }),
+            assembly: None,
         };
-        let snapshot = SaveProject { objects: shared, active: copied.active, target: copied.target, view: copied.view };
+        let snapshot = SaveProject { objects: shared, active: copied.active, target: copied.target, view: copied.view, assembly: None };
         let dir = std::env::temp_dir().join(format!("polymix-shared-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Written as before, byte for byte; compressed otherwise, the same entries.

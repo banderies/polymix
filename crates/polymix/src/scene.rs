@@ -24,6 +24,10 @@ pub struct SceneObject {
     pub mesh: Arc<Mesh>,
     pub selection: TriSelection,
     pub visible: bool,
+    /// Shown see-through and passed by every pick (selection, brushes, clicks), to reach a
+    /// surface behind it (the object browser's eye). Not part of the undo history; exported as
+    /// usual.
+    pub see_through: bool,
     pub color: Vec4,
     /// Bumped whenever the selection or face groups change (drives GPU flag uploads).
     pub selection_stamp: u64,
@@ -140,6 +144,7 @@ impl SceneObject {
             mesh: Arc::new(mesh),
             selection,
             visible: true,
+            see_through: false,
             color: default_color(id),
             selection_stamp: next_stamp(),
             group_names: Default::default(),
@@ -259,6 +264,9 @@ pub struct Scene {
     pub target: Option<ObjectId>,
     /// The frame the last tool that records one worked in (not saved in projects).
     pub last_tool_frame: Option<ToolFrame>,
+    /// Grounded parts and the joints between parts (Assemble). Part of the history: undo
+    /// puts joints back with the meshes they belong to.
+    pub assembly: crate::assembly::Assembly,
     /// History::undo / redo made this restored scene coherent already, knowing the scene it
     /// replaced: the [`Scene::after_restore`] their callers make next has nothing to do.
     restored: bool,
@@ -311,6 +319,7 @@ impl Scene {
         if self.target == Some(id) {
             self.target = None;
         }
+        self.assembly.forget(id);
         self.objects.retain(|o| o.id != id);
         if self.active == Some(id) {
             self.active = self.objects.last().map(|o| o.id);
@@ -492,12 +501,21 @@ impl Scene {
     fn carry_metadata(&mut self, from: &Scene) {
         self.target = from.target.filter(|&t| self.get(t).is_some());
         self.last_tool_frame = from.last_tool_frame.clone();
+        self.assembly.selected = from.assembly.selected.filter(|&sel| match sel {
+            crate::assembly::Selected::Joint(j) => self.assembly.joint(j).is_some(),
+            crate::assembly::Selected::Connection(c) => self.assembly.connection(c).is_some(),
+        });
+        // Grounding is a setting, like visibility: undo keeps it for the parts in both scenes;
+        // a part it brings back is grounded as it was.
+        let restored = std::mem::take(&mut self.assembly.grounded);
+        self.assembly.grounded = self.objects.iter().map(|o| o.id).filter(|&id| if from.get(id).is_some() { from.assembly.is_grounded(id) } else { restored.contains(&id) }).collect();
         for o in &mut self.objects {
             if let Some(src) = from.get(o.id) {
                 o.name = src.name.clone();
                 o.color = src.color;
                 o.material = src.material;
                 o.visible = src.visible;
+                o.see_through = src.see_through;
                 for (g, n) in &src.group_names {
                     o.group_names.insert(*g, n.clone());
                 }

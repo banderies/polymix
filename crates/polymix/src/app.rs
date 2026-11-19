@@ -24,6 +24,31 @@ use polymix_workspace::file_dialog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// The tools the Assembly tab opens, by `make_tool` name and by title (`Tool::name`): it only
+/// moves parts (and finishes the print), never edits their meshes by accident.
+const ASSEMBLY_TOOLS: [(&str, &str); 7] = [("assemble", "Assemble"), ("select", "Select"), ("transform", "Transform"), ("align", "Align"), ("clearance", "Clearance"), ("boolean", "Boolean"), ("makesolid", "Make Solid")];
+
+/// A row of the object browser: a part (by index in the scene, indented by its depth in the
+/// tree, with the connection it hangs by) or one of a part's joints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeRow {
+    Part { idx: usize, depth: usize, connection: Option<u64> },
+    Joint { id: u64, depth: usize },
+}
+
+/// Indent an object-browser row `depth` steps, with a branch line to the row above.
+fn branch(ui: &mut egui::Ui, depth: usize) {
+    if depth == 0 {
+        return;
+    }
+    ui.add_space((depth - 1) as f32 * 12.0);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(11.0, ui.spacing().interact_size.y), egui::Sense::hover());
+    let (x, y) = (r.left() + 3.0, r.center().y);
+    let stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color());
+    ui.painter().line_segment([egui::pos2(x, r.top()), egui::pos2(x, y)], stroke);
+    ui.painter().line_segment([egui::pos2(x, y), egui::pos2(r.right(), y)], stroke);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Category {
     Meshmix,
@@ -700,6 +725,7 @@ pub(crate) fn make_tool(name: &str, cx: &mut ToolCx) -> Option<Box<dyn Tool>> {
         "cfdcheck" => Box::new(tools::cfd_check::CfdCheckTool::new(cx)),
         "centerline" => Box::new(tools::centerline_tool::CenterlineTool::new(cx)),
         "stent" => Box::new(tools::stent::StentTool::new(cx)),
+        "assemble" => Box::new(tools::assemble::AssembleTool::new(cx)),
         "filtercomplex" => Box::new(tools::complex::FilterComplexTool::new(cx)),
         "setuv" => Box::new(tools::unwrap::UnwrapTool::new_projection(cx)),
         _ => return None,
@@ -770,6 +796,8 @@ pub struct MeshWorkspace {
     /// Tool stack: the top tool is active; closing a sub-tool returns to the one below.
     tools: Vec<Box<dyn Tool>>,
     category: Option<Category>,
+    /// Shown as the Assembly tab: the toolbar holds the assembly tools only.
+    assembly_mode: bool,
     /// Meshmix parts (loaded again in the background when the category opens; shown as they
     /// were meanwhile).
     library: Option<crate::parts::Library>,
@@ -914,6 +942,7 @@ impl MeshWorkspace {
             view: ViewOptions::default(),
             tools: Vec::new(),
             category: None,
+            assembly_mode: false,
             library: None,
             library_job: None,
             library_changes: crate::parts::library_changes(),
@@ -1224,7 +1253,8 @@ impl MeshWorkspace {
     /// copied here, on the UI thread.
     fn autosave_project(&self) -> crate::project::SaveProject {
         let objects = self.scene.objects.iter().map(|o| save_object(o, o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect())).collect();
-        crate::project::SaveProject { objects, active: None, target: None, view: Some(self.camera.view_state()) }
+        let order: Vec<ObjectId> = self.scene.objects.iter().map(|o| o.id).collect();
+        crate::project::SaveProject { objects, active: None, target: None, view: Some(self.camera.view_state()), assembly: crate::assembly::to_text(&self.scene.assembly, &order) }
     }
 
     /// Offer to restore the autosave of a session that crashed.
@@ -1567,6 +1597,8 @@ impl MeshWorkspace {
         }
         self.scene.active = p.active.and_then(|i| ids.get(i).copied()).or(ids.last().copied());
         self.scene.target = p.target.and_then(|i| ids.get(i).copied());
+        self.scene.assembly = p.assembly.as_deref().map(|t| crate::assembly::from_text(t, &ids)).unwrap_or_default();
+        crate::assembly::follow(&mut self.scene);
         match p.view {
             Some(v) => self.camera.set_view_state(v),
             None => self.focus_scene(),
@@ -1660,6 +1692,7 @@ impl MeshWorkspace {
             active: index(self.scene.active),
             target: index(self.scene.target),
             view: Some(self.camera.view_state()),
+            assembly: crate::assembly::to_text(&self.scene.assembly, &self.scene.objects.iter().map(|o| o.id).collect::<Vec<_>>()),
         };
         self.project_path = Some(path.clone());
         let msg = format!("Saving the project to {}", path.display());
@@ -1818,6 +1851,28 @@ impl MeshWorkspace {
     /// *accepts* it; only Cancel / Esc discards. A tool that is still computing finishes
     /// first and the switch happens when its result has been accepted.
     fn switch_to(&mut self, to: SwitchTo, ctx: &egui::Context, vp: Viewport) {
+        // Assemble already open: go back to it, closing what is over it (the joint-surface
+        // Select) without accepting anything. Reopening it would accept it, which connects
+        // what is picked.
+        if matches!(&to, SwitchTo::Tool(n) if n == "assemble") && self.close_tools_over_assemble(ctx, vp) {
+            self.pending_switch = None;
+            return;
+        }
+        // The Assembly tab, by whatever route a tool is asked for (toolbar, keys, 3D mouse,
+        // agents): Select is the joint-surface Select, the Mesh tools are refused.
+        if self.assembly_mode {
+            match &to {
+                SwitchTo::ClearSelect => return self.assembly_select(ctx, vp),
+                SwitchTo::Tool(n) if n == "select" => return self.assembly_select(ctx, vp),
+                SwitchTo::Tool(n) if !ASSEMBLY_TOOLS.iter().any(|(k, _)| k == n) => {
+                    let title = command::TOOLS.iter().find(|t| t.name == n).map_or(n.as_str(), |t| t.title);
+                    self.status = format!("{title} edits the mesh: use it in the Mesh tab (⌘3). The Assembly tab only moves parts.");
+                    return;
+                }
+                SwitchTo::Category(Some(_)) => return,
+                _ => {}
+            }
+        }
         // Switching to Select returns to an open Select tool underneath the current sub-tool.
         let to_select = matches!(&to, SwitchTo::ClearSelect) || matches!(&to, SwitchTo::Tool(n) if n == "select");
         let keep = if to_select { self.tools.iter().position(|t| t.name() == "Select").map(|i| i + 1).unwrap_or(0) } else { 0 };
@@ -2232,7 +2287,188 @@ impl MeshWorkspace {
         });
     }
 
+    /// Show the workspace as the Assembly tab (only the assembly tools) or as Mesh. The shell
+    /// calls this whenever the shown tab changes (before agents' calls too), and the tools
+    /// follow at once: Assemble opens with the Assembly tab and closes when leaving it.
+    pub fn set_assembly_mode(&mut self, on: bool, ctx: &egui::Context) {
+        if on != self.assembly_mode {
+            self.assembly_mode = on;
+            let vp = self.vp_prev(ctx);
+            self.assembly_mode_tools(ctx, vp);
+        }
+    }
+
+    /// Close the tools open over Assemble (the joint-surface Select), without accepting them,
+    /// so that Assemble is on top again. False if Assemble is not open.
+    fn close_tools_over_assemble(&mut self, ctx: &egui::Context, vp: Viewport) -> bool {
+        if !self.tools.iter().any(|t| t.name() == "Assemble") {
+            return false;
+        }
+        while self.tools.last().is_some_and(|t| t.name() != "Assemble") {
+            let mut t = self.tools.pop().unwrap();
+            let mut cx = self.tool_cx(ctx, vp);
+            t.on_close(&mut cx);
+        }
+        true
+    }
+
+    /// The Assembly tab's Select: a Select for a joint's surface over Assemble (never the Mesh
+    /// tab's Select, whose edits change the parts).
+    fn assembly_select(&mut self, ctx: &egui::Context, vp: Viewport) {
+        if self.tools.last().is_some_and(|t| t.name() == "Select") {
+            return;
+        }
+        if self.tools.last().is_none_or(|t| t.name() != "Assemble") {
+            self.switch_to(SwitchTo::Tool("assemble".into()), ctx, vp);
+        }
+        let Some(mut t) = self.tools.pop() else { return };
+        if t.name() != "Assemble" {
+            // Still waiting for the tool before it to finish.
+            self.tools.push(t);
+            return;
+        }
+        let mut cx = self.tool_cx(ctx, vp);
+        t.script("select", &mut cx);
+        let req = t.take_request();
+        self.tools.push(t);
+        if let Some(r) = req {
+            self.push_sub_tool(r);
+        }
+    }
+
+    /// Open a tool another asked for over it, unless the Assembly tab does not open it.
+    fn push_sub_tool(&mut self, r: Box<dyn Tool>) {
+        if self.assembly_mode && !ASSEMBLY_TOOLS.iter().any(|(_, t)| *t == r.name()) {
+            self.status = format!("{} edits the mesh: use it in the Mesh tab (⌘3). The Assembly tab only moves parts.", r.name());
+            return;
+        }
+        self.tools.push(r);
+    }
+
+    /// Open the tools of the tab just shown: Assemble in Assembly; leaving it closes Assemble.
+    fn assembly_mode_tools(&mut self, ctx: &egui::Context, vp: Viewport) {
+        // Assemble waiting for a busy tool to finish was asked for by the tab, not the user:
+        // forget it on leaving (it would accept that tool and open in the Mesh tab).
+        if !self.assembly_mode && matches!(&self.pending_switch, Some(SwitchTo::Tool(n)) if n == "assemble") {
+            self.pending_switch = None;
+        }
+        let assemble_open = self.tools.iter().any(|t| t.name() == "Assemble");
+        if self.assembly_mode {
+            self.category = None;
+            if !assemble_open {
+                self.switch_to(SwitchTo::Tool("assemble".into()), ctx, vp);
+            }
+        } else if assemble_open {
+            // Close Assemble (and the Select over it) without connecting what is picked: its
+            // work is in the history already.
+            while let Some(mut t) = self.tools.pop() {
+                let mut cx = self.tool_cx(ctx, vp);
+                t.on_close(&mut cx);
+            }
+            self.category = None;
+        }
+    }
+
+    /// The Assembly tab's toolbar.
+    fn assembly_palette(&mut self, ui: &mut egui::Ui, vp: Viewport) {
+        let ctx = ui.ctx().clone();
+        ui.add_space(6.0);
+        use crate::icons::{self, Icon};
+        let big = |ui: &mut egui::Ui, icon: Icon, label: &str, active: bool| {
+            let b = egui::Button::new(RichText::new(format!("       {label}")).size(13.0))
+                .wrap_mode(egui::TextWrapMode::Extend)
+                .min_size(egui::vec2(108.0, 30.0))
+                .selected(active);
+            let r = ui.add(b);
+            let col = if active { ui.visuals().selection.stroke.color } else { ui.visuals().widgets.inactive.fg_stroke.color };
+            icons::paint(ui.painter(), egui::Rect::from_center_size(r.rect.left_center() + egui::vec2(16.0, 0.0), egui::vec2(16.0, 16.0)), icon, col);
+            r
+        };
+        let small = |ui: &mut egui::Ui, label: &str| ui.add(egui::Button::new(RichText::new(label).size(12.0)).min_size(egui::vec2(108.0, 22.0)));
+        let heading = |ui: &mut egui::Ui, text: &str| {
+            ui.add_space(6.0);
+            ui.label(RichText::new(text).small().weak());
+        };
+        // The Assemble tool's mode, when it is the open tool.
+        let mode = self.tools.last().filter(|t| t.name() == "Assemble").map(|t| t.state(&self.scene)["mode"].as_str().unwrap_or("").to_string());
+        let has_parts = self.scene.objects.iter().any(|o| !o.reference);
+        let mut open: Option<&str> = None;
+        let mut assemble: Option<&str> = None;
+        let mut command: Option<MeshCommand> = None;
+        if big(ui, Icon::Import, "Import", false).on_hover_text("⌘O: the kit's parts, one file each (several at once)").clicked() {
+            self.import_dialog(&ctx);
+        }
+        ui.add_enabled_ui(has_parts, |ui| {
+            if big(ui, Icon::Connect, "Connect", mode.as_deref() == Some("connect")).on_hover_text("Connect two parts: click a joint (or a ball, pin or peg) on one, then where it fits on the other").clicked() {
+                assemble = Some("connect");
+            }
+            if big(ui, Icon::Pose, "Pose", mode.as_deref() == Some("pose")).on_hover_text("Drag parts to turn them about their connections; grounded parts stay put").clicked() {
+                assemble = Some("pose");
+            }
+            if big(ui, Icon::Joint, "Add Joint", mode.as_deref() == Some("add_joint")).on_hover_text("Give a part a joint (ball, socket, pin, hole, flat face) that stays with it, to connect later").clicked() {
+                assemble = Some("addjoint");
+            }
+            let sel_active = self.tools.last().is_some_and(|t| t.name() == "Select");
+            if big(ui, Icon::Select, "Select", sel_active).on_hover_text("S: select a joint's surface by hand (brush, lasso, wand), then Use it; selecting never changes the parts").clicked() {
+                assemble = Some("select");
+            }
+            heading(ui, "Move parts");
+            if small(ui, "Transform  (T)").on_hover_text("Move or turn the active part freely").clicked() {
+                open = Some("transform");
+            }
+            if small(ui, "Align").on_hover_text("Put a picked face on the ground or against another part").clicked() {
+                open = Some("align");
+            }
+            if small(ui, "Separate Shells").on_hover_text("Shift+Y: one part per piece, for a kit that came as one file").clicked() {
+                command = Some(MeshCommand::SeparateShells);
+            }
+            heading(ui, "Check");
+            if small(ui, "Collisions").on_hover_text("Find parts that cross each other in this pose").clicked() {
+                assemble = Some("collisions");
+            }
+            if small(ui, "Clearance").on_hover_text("How close the active part comes to another, coloured by distance").clicked() {
+                open = Some("clearance");
+            }
+            heading(ui, "Finish");
+            if small(ui, "Combine visible").on_hover_text("One object of every visible part, as posed (to print in one piece)").clicked() {
+                command = Some(MeshCommand::CombineVisible);
+            }
+            if small(ui, "Boolean").on_hover_text("Unite two parts into one closed surface").clicked() {
+                open = Some("boolean");
+            }
+            if small(ui, "Make Solid").on_hover_text("Rebuild a closed surface (after combining overlapping parts)").clicked() {
+                open = Some("makesolid");
+            }
+        });
+        ui.add_space(6.0);
+        if big(ui, Icon::Export, "Export", false).on_hover_text("⌘E").clicked() {
+            self.export_dialog(&ctx, if self.prefs.export_whole_scene { ExportScope::AllVisible } else { ExportScope::Active });
+        }
+        if let Some(name) = open {
+            self.switch_to(SwitchTo::Tool(name.into()), &ctx, vp);
+        }
+        if let Some(c) = command {
+            self.run(c, &ctx, vp);
+        }
+        match assemble {
+            Some("select") => self.assembly_select(&ctx, vp),
+            Some(what) => {
+                self.switch_to(SwitchTo::Tool("assemble".into()), &ctx, vp);
+                if self.tools.last().is_some_and(|t| t.name() == "Assemble") {
+                    let mut t = self.tools.pop().unwrap();
+                    let mut cx = self.tool_cx(&ctx, vp);
+                    t.script(what, &mut cx);
+                    self.tools.push(t);
+                }
+            }
+            None => {}
+        }
+    }
+
     fn palette(&mut self, ui: &mut egui::Ui, vp: Viewport) {
+        if self.assembly_mode {
+            return self.assembly_palette(ui, vp);
+        }
         let ctx = ui.ctx().clone();
         ui.add_space(6.0);
         use crate::icons::{self, Icon};
@@ -2545,12 +2781,105 @@ impl MeshWorkspace {
             }
         }
         if let Some(sub) = request {
-            self.tools.push(sub);
+            self.push_sub_tool(sub);
         }
     }
 
     /// The object browser's rows and the Statistics, in a scroll area showing `viewport` of
     /// them (content coordinates; `None`: all).
+    /// The object browser's rows in tree order: each group of connected parts from the part it
+    /// hangs from (a grounded part, else its top), the grounded groups first; under each part
+    /// its joints, and under each joint the part connected there, with the connection it hangs
+    /// by.
+    fn object_tree(&self) -> Vec<TreeRow> {
+        let asm = &self.scene.assembly;
+        if asm.joints.is_empty() && asm.connections.is_empty() {
+            let n = self.scene.objects.len();
+            let (mut first, mut rest) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            for (idx, o) in self.scene.objects.iter().enumerate() {
+                let row = TreeRow::Part { idx, depth: 0, connection: None };
+                if asm.is_grounded(o.id) { first.push(row) } else { rest.push(row) }
+            }
+            first.extend(rest);
+            return first;
+        }
+        fn walk(objects: &[crate::scene::SceneObject], asm: &crate::assembly::Assembly, p: ObjectId, depth: usize, connection: Option<u64>, shown: &mut FastSet<ObjectId>, out: &mut Vec<TreeRow>) {
+            if !shown.insert(p) {
+                return;
+            }
+            if let Some(idx) = objects.iter().position(|o| o.id == p) {
+                out.push(TreeRow::Part { idx, depth, connection });
+            }
+            for j in asm.joints_of(p) {
+                out.push(TreeRow::Joint { id: j.id, depth: depth + 1 });
+                if let Some(c) = asm.connection_at(j.id) {
+                    if let Some(q) = c.other(p).filter(|q| !shown.contains(q)) {
+                        walk(objects, asm, q, depth + 2, Some(c.id), shown, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(self.scene.objects.len() + asm.joints.len());
+        let mut shown: FastSet<ObjectId> = FastSet::default();
+        let roots: Vec<ObjectId> = self.scene.objects.iter().map(|o| asm.root_of(o.id)).collect();
+        for grounded in [true, false] {
+            for &r in &roots {
+                if asm.is_grounded(r) == grounded && !shown.contains(&r) {
+                    walk(&self.scene.objects, asm, r, 0, None, &mut shown, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// A joint's row in the object browser: its shape and name under its part; click to select
+    /// it, × to delete it. Returns the row's height.
+    fn joint_row(&self, ui: &mut egui::Ui, id: u64, depth: usize, select: &mut Option<(ObjectId, Option<crate::assembly::Selected>)>, delete: &mut Option<u64>) -> f32 {
+        use crate::assembly::Selected;
+        let asm = &self.scene.assembly;
+        let Some(j) = asm.joint(id) else { return 0.0 };
+        ui.push_id(("joint", id), |ui| {
+            ui.horizontal(|ui| {
+                // As tall as a part's row (the list's rows out of view are counted at that).
+                ui.set_min_height(self.objects_row_h.unwrap_or(ui.spacing().interact_size.y));
+                // Under the part's name, past its row's boxes.
+                ui.add_space(if self.assembly_mode || !asm.is_empty() { 58.0 } else { 40.0 });
+                branch(ui, depth);
+                let on = asm.selected == Some(Selected::Joint(id));
+                let held = asm.connection_at(id);
+                let col = if on { ui_util::ACCENT } else if held.is_some() { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+                tools::assemble::joint_glyph(ui, j.shape, col);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("Delete the joint (and its connection; the parts stay where they are)").clicked() {
+                        *delete = Some(id);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let text = RichText::new(format!("{} · {}", j.name, j.describe())).small().color(col);
+                        let click = if self.assembly_mode { "Click: edit it (shape, radius, depth, place) in the Assemble panel" } else { "Click: select it (edit it in the Assembly tab, ⌘4)" };
+                        let tip = match held {
+                            Some(c) => format!("{}\nConnected ({} · {})\n\n{click}", j.title(), c.interaction.label().to_lowercase(), c.kind.label().to_lowercase()),
+                            None => format!("{}\nNot connected\n\n{click}", j.title()),
+                        };
+                        let r = ui.add(egui::Button::selectable(on, text).truncate()).on_hover_text(tip);
+                        if r.clicked() {
+                            *select = Some((j.part, if on { None } else { Some(Selected::Joint(id)) }));
+                        }
+                        r.context_menu(|ui| {
+                            if ui.button("Delete joint").clicked() {
+                                *delete = Some(id);
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+            })
+            .response
+            .rect
+            .height()
+        })
+        .inner
+    }
+
     fn objects_panel(&mut self, ui: &mut egui::Ui, viewport: Option<egui::Rect>) {
         let mut delete = None;
         let mut make_active = None;
@@ -2570,7 +2899,8 @@ impl MeshWorkspace {
         // object is renamed, as its field may make its row taller; nor while AccessKit is on
         // (agents and screen readers find and use rows out of view through it) or a popup is
         // open (a row's context menu or colour picker stays open only while the row is drawn).
-        let n = self.scene.objects.len();
+        let order = self.object_tree();
+        let n = order.len();
         let gap = ui.spacing().item_spacing.y;
         let step = self.objects_row_h.map(|h| h + gap);
         let draw_all = renaming.is_some() || ui.ctx().has_accesskit_node(egui::accesskit_root_id()) || egui::Popup::is_any_open(ui.ctx());
@@ -2590,10 +2920,42 @@ impl MeshWorkspace {
             ui.skip_ahead_auto_ids(rows.start - 1);
         }
         let mut row_h: Option<f32> = None;
-        for o in self.scene.objects[rows.clone()].iter_mut() {
+        // Grounding and joints show once there are any, and always in the Assembly tab.
+        let assembling = self.assembly_mode || !self.scene.assembly.is_empty();
+        let mut ground: Option<(ObjectId, bool)> = None;
+        let mut select: Option<(ObjectId, Option<crate::assembly::Selected>)> = None;
+        let mut delete_joint: Option<u64> = None;
+        let mut disconnect: Option<u64> = None;
+        for &row in &order[rows.clone()] {
+            let (idx, depth, joint) = match row {
+                TreeRow::Part { idx, depth, connection } => (idx, depth, connection),
+                TreeRow::Joint { id, depth } => {
+                    let r = self.joint_row(ui, id, depth, &mut select, &mut delete_joint);
+                    row_h = Some(row_h.map_or(r, |h| h.max(r)));
+                    continue;
+                }
+            };
+            let asm = &self.scene.assembly;
+            let o = &mut self.scene.objects[idx];
             let mut renamed_row = false;
             let r = ui.push_id(o.id, |ui| ui.horizontal(|ui| {
                 ui.checkbox(&mut o.visible, "").on_hover_text("Visible");
+                if ui_util::eye_toggle(ui, !o.see_through)
+                    .on_hover_text(if o.see_through { "See-through: clicks, brushes and lassos go through it to what is behind. Click to make it solid again." } else { "Make it see-through: still shown, but clicks, brushes and lassos go through it (to select a surface behind it)" })
+                    .clicked()
+                {
+                    o.see_through = !o.see_through;
+                }
+                if assembling {
+                    let grounded = asm.is_grounded(o.id);
+                    if tools::assemble::ground_toggle(ui, grounded)
+                        .on_hover_text(if grounded { "Grounded: it stays put while the parts joined to it are posed. Click to free it." } else { "Ground it: hold it still while the parts joined to it are posed." })
+                        .clicked()
+                    {
+                        ground = Some((o.id, !grounded));
+                    }
+                }
+                branch(ui, depth);
                 let active = Some(o.id) == self.scene.active;
                 if let Some((_, before, focused)) = renaming.as_mut().filter(|r| r.0 == o.id) {
                     let r = ui.add(egui::TextEdit::singleline(&mut o.name).desired_width(ui.available_width()));
@@ -2627,12 +2989,36 @@ impl MeshWorkspace {
                     if target == Some(o.id) {
                         ui.label(RichText::new("◎").color(ui_util::ACCENT)).on_hover_text("Target surface (Attract / Align To Target, Project to Target)");
                     }
+                    // The connection it hangs by.
+                    if let Some(c) = joint.and_then(|c| asm.connection(c)) {
+                        use crate::assembly::Selected;
+                        let on = asm.selected == Some(Selected::Connection(c.id));
+                        let apart = c.is_apart();
+                        let mut text = RichText::new(format!("{} · {}", c.interaction.label().to_lowercase(), c.kind.label().to_lowercase())).small();
+                        if apart {
+                            text = text.color(Color32::from_rgb(255, 90, 80));
+                        }
+                        let tip = format!("Connected by {} ({} · {}){}\n\n{}", c.about, c.interaction.label(), c.kind.label(), if apart { "\nIt has come apart (a part was moved by another tool): Snap together in Assemble puts it back." } else { "" }, if self.assembly_mode { "Click: edit it (interaction, motion, pose) in the Assemble panel" } else { "Click: select it (edit it in the Assembly tab, ⌘4)" });
+                        let r = ui.add(egui::Button::selectable(on, text)).on_hover_text(tip);
+                        if r.clicked() {
+                            select = Some((o.id, if on { None } else { Some(Selected::Connection(c.id)) }));
+                        }
+                        r.context_menu(|ui| {
+                            if ui.button("Disconnect").on_hover_text("The joints stay on their parts, and the parts where they are").clicked() {
+                                disconnect = Some(c.id);
+                                ui.close();
+                            }
+                        });
+                    }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         let label = RichText::new(&o.name).color(if active { ui_util::ACCENT } else { ui.visuals().text_color() });
                         let r = ui.add(egui::Button::selectable(active, label).truncate());
                         let r = hover_text_with(r, || format!("{}\n\nClick: make active · Double-click: rename · Right-click: more", o.name));
                         if r.clicked() {
                             make_active = Some(o.id);
+                            if assembling {
+                                select = Some((o.id, joint.map(crate::assembly::Selected::Connection)));
+                            }
                         }
                         if r.double_clicked() {
                             renaming = Some((o.id, o.name.clone(), false));
@@ -2701,6 +3087,26 @@ impl MeshWorkspace {
         }
         if row_h.is_some() {
             self.objects_row_h = row_h;
+        }
+        if let Some((id, on)) = ground {
+            self.scene.assembly.set_grounded(id, on);
+        }
+        if let Some((id, sel)) = select {
+            self.scene.active = Some(id);
+            // A joint or connection is edited in Assemble's panel: back to it (closing the
+            // Select or other tool over it).
+            if sel.is_some() && self.assembly_mode && self.tools.last().is_none_or(|t| t.name() != "Assemble") {
+                self.pending_switch = Some(SwitchTo::Tool("assemble".into()));
+            }
+            self.scene.assembly.selected = sel;
+        }
+        if let Some(j) = delete_joint {
+            self.history.push("Delete joint", &self.scene);
+            self.scene.assembly.remove_joint(j);
+        }
+        if let Some(c) = disconnect {
+            self.history.push("Disconnect", &self.scene);
+            self.scene.assembly.remove_connection(c);
         }
         if let Some(id) = make_active {
             self.scene.active = Some(id);
@@ -3666,7 +4072,7 @@ impl MeshWorkspace {
             tool.overlay(&mut overlay, &mut cx);
             if let Some(r) = tool.take_request() {
                 self.tools.push(tool);
-                self.tools.push(r);
+                self.push_sub_tool(r);
             } else {
                 self.tools.push(tool);
             }
@@ -3735,7 +4141,7 @@ impl MeshWorkspace {
                         objs.push((&p.gpu, false));
                     }
                 } else if let Some(g) = self.gpu.get(&o.id) {
-                    let see_through = self.view.transparent_target && self.scene.target == Some(o.id);
+                    let see_through = (self.view.transparent_target && self.scene.target == Some(o.id)) || o.see_through;
                     objs.push((g, o.color.w < 0.999 || see_through || self.view.xray));
                 }
             }
@@ -3772,6 +4178,19 @@ impl MeshWorkspace {
                 ctx.request_repaint();
             } else {
                 self.space_marker = None;
+            }
+        }
+        // The joint selected in the object browser, while Assemble (which draws them all) is
+        // not open.
+        if !self.tools.iter().any(|t| t.name() == "Assemble") {
+            let asm = &self.scene.assembly;
+            let (joint, conn) = (asm.selected_joint().cloned(), asm.selected_connection().cloned());
+            let cx = self.tool_cx(&ctx, vp);
+            if let Some(j) = joint {
+                tools::assemble::paint_joint(&painter, &cx, &j, j.frame(), ui_util::ACCENT, true);
+            }
+            if let Some(c) = conn {
+                tools::assemble::paint_connection(&painter, &cx, &c, true, c.on_parent(), c.on_child());
             }
         }
         if self.view.show_pivots {
@@ -3886,6 +4305,8 @@ impl MeshWorkspace {
         let active = self.scene.active;
         let multiple = self.scene.objects.iter().filter(|o| o.visible).count() > 1;
         let preview = self.tools.last().and_then(|t| t.preview());
+        // Objects a tool shows moved without changing them (Assemble's drags).
+        let rigid = self.tools.last().map(|t| t.rigid_previews()).unwrap_or_default();
         if preview.is_none() {
             // The preview has ended. When the object now holds the very mesh it showed (the
             // tool's result was accepted), its GPU copy takes over the object's: accepting
@@ -3905,8 +4326,8 @@ impl MeshWorkspace {
         let see_through = self.scene.target.filter(|_| self.view.transparent_target);
         for o in self.scene.objects.iter_mut().filter(|o| o.visible) {
             let mut color = o.color;
-            if see_through == Some(o.id) {
-                color.w = color.w.min(0.35);
+            if see_through == Some(o.id) || o.see_through {
+                color.w = color.w.min(0.3);
             }
             let style = ObjectStyle {
                 color,
@@ -3945,6 +4366,10 @@ impl MeshWorkspace {
             let uvs = o.uvs.as_deref().filter(|u| u.topo == o.mesh.topology_version()).map(|u| (u.stamp, u.corners.as_slice()));
             let texture = o.texture.as_deref().map(|t| (t.stamp, t.width, t.height, t.rgba.as_slice()));
             renderer.sync_mesh(&rs.device, &rs.queue, g, &o.mesh, Some(&o.selection), o.selection_stamp, &style, (&mut o.moved_vertices, o.moved_from), scalars, uvs, texture);
+            if let Some((_, m)) = rigid.iter().find(|(id, _)| *id == o.id) {
+                // Drawn moved; the next sync_mesh shows it where it is again.
+                renderer.sync_rigid_preview(&rs.queue, g, &style, m.as_mat4());
+            }
         }
     }
 
@@ -4257,7 +4682,7 @@ impl MeshWorkspace {
             let is_select = t.name() == "Select";
             self.tools.push(t);
             if let Some(r) = req {
-                self.tools.push(r);
+                self.push_sub_tool(r);
                 return;
             }
             if used {
@@ -4280,6 +4705,18 @@ impl MeshWorkspace {
         }
         if i.key_pressed(Key::F) && !cmd {
             self.run(MeshCommand::Focus, ctx, vp);
+        }
+        if self.assembly_mode && self.scene.active().is_some() && !cmd {
+            // The Assembly tab: S selects a joint's surface (through Assemble), T moves a part;
+            // the mesh-editing tools' keys stay in the Mesh tab.
+            if i.key_pressed(Key::S) {
+                self.assembly_select(ctx, vp);
+            } else if i.key_pressed(Key::T) && !i.modifiers.shift {
+                self.switch_to(SwitchTo::Tool("transform".into()), ctx, vp);
+            } else if i.key_pressed(Key::Y) && i.modifiers.shift {
+                self.run(MeshCommand::SeparateShells, ctx, vp);
+            }
+            return;
         }
         if self.scene.active().is_some() && !cmd {
             // Tool hotkeys work from inside other tools too: the open tool is accepted first.
@@ -4323,6 +4760,8 @@ impl polymix_workspace::Workspace for MeshWorkspace {
             // covered).
             self.finish_import(ctx);
         }
+        // Joint frames follow parts that tools moved.
+        crate::assembly::follow(&mut self.scene);
         self.autosave_tick(ctx);
         self.bvh_tick(ctx);
         if self.history.by_agent {
@@ -5587,12 +6026,78 @@ mod browser_tests {
     }
 
     #[test]
+    fn the_browser_lists_every_object_once_as_a_tree() {
+        use crate::assembly::{Interaction, JFrame, Joint, Motion, Rigid};
+        let (mut ws, ctx) = many();
+        let ids: Vec<ObjectId> = ws.scene.objects.iter().map(|o| o.id).collect();
+        // Shell 10 grounded with two joints: shell 20 connected at the first, which holds 30 at
+        // a joint of its own; 40 connected to 30 the other way round (40's joint as `a`).
+        let f = JFrame::new(DVec3::ZERO, DVec3::Z, None);
+        let a = &mut ws.scene.assembly;
+        a.set_grounded(ids[10], true);
+        let j10 = a.add_joint(Joint::point(ids[10], f));
+        let j10b = a.add_joint(Joint::point(ids[10], f));
+        let j20 = a.add_joint(Joint::point(ids[20], f));
+        let j20b = a.add_joint(Joint::point(ids[20], f));
+        let j30 = a.add_joint(Joint::point(ids[30], f));
+        let j30b = a.add_joint(Joint::point(ids[30], f));
+        let j40 = a.add_joint(Joint::point(ids[40], f));
+        a.connect(j10, j20, Interaction::Coincident, Motion::Ball, Rigid::IDENTITY, String::new()).unwrap();
+        a.connect(j20b, j30, Interaction::Coincident, Motion::Hinge, Rigid::IDENTITY, String::new()).unwrap();
+        a.connect(j40, j30b, Interaction::Coincident, Motion::Fixed, Rigid::IDENTITY, String::new()).unwrap();
+        let order = ws.object_tree();
+        let parts: Vec<usize> = order.iter().filter_map(|r| match r {
+            TreeRow::Part { idx, .. } => Some(*idx),
+            _ => None,
+        }).collect();
+        let mut seen = parts.clone();
+        seen.sort();
+        assert_eq!(seen, (0..ids.len()).collect::<Vec<_>>(), "each object once");
+        assert_eq!(order.iter().filter(|r| matches!(r, TreeRow::Joint { .. })).count(), 7, "each joint once");
+        let at = |i: usize| order.iter().position(|r| matches!(r, TreeRow::Part { idx, .. } if *idx == i)).unwrap();
+        let k = at(10);
+        let expect = [
+            TreeRow::Part { idx: 10, depth: 0, connection: None },
+            TreeRow::Joint { id: j10, depth: 1 },
+            TreeRow::Part { idx: 20, depth: 2, connection: Some(ws.scene.assembly.connection_at(j10).unwrap().id) },
+            TreeRow::Joint { id: j20, depth: 3 },
+            TreeRow::Joint { id: j20b, depth: 3 },
+            TreeRow::Part { idx: 30, depth: 4, connection: Some(ws.scene.assembly.connection_at(j30).unwrap().id) },
+            TreeRow::Joint { id: j30, depth: 5 },
+            TreeRow::Joint { id: j30b, depth: 5 },
+            TreeRow::Part { idx: 40, depth: 6, connection: Some(ws.scene.assembly.connection_at(j40).unwrap().id) },
+            TreeRow::Joint { id: j40, depth: 7 },
+            TreeRow::Joint { id: j10b, depth: 1 },
+        ];
+        assert_eq!(&order[k..k + expect.len()], &expect[..], "under the joint it hangs from, whichever way it was connected");
+        assert_eq!(k, 0, "the grounded group first");
+        assert_eq!(order[expect.len()], TreeRow::Part { idx: 0, depth: 0, connection: None }, "then the others in order");
+        // Drawn: every row reachable, the same room whether scrolled or not.
+        let (size, _, _) = draw(&mut ws, &ctx, 0.0, true, Vec::new());
+        assert_eq!(draw(&mut ws, &ctx, 2000.0, false, Vec::new()).0, size);
+    }
+
+    #[test]
+    fn grounded_parts_are_listed_first() {
+        let (mut ws, _) = many();
+        let ids: Vec<ObjectId> = ws.scene.objects.iter().map(|o| o.id).collect();
+        ws.scene.assembly.set_grounded(ids[42], true);
+        ws.scene.assembly.set_grounded(ids[7], true);
+        let parts: Vec<usize> = ws.object_tree().iter().filter_map(|r| match r {
+            TreeRow::Part { idx, .. } => Some(*idx),
+            _ => None,
+        }).collect();
+        assert_eq!(&parts[..4], &[7, 42, 0, 1]);
+        assert_eq!(parts.len(), ids.len());
+    }
+
+    #[test]
     fn a_context_menu_stays_open_while_its_row_is_scrolled_away() {
         let (mut ws, ctx) = many();
         let (full, full_widgets, _) = draw(&mut ws, &ctx, 0.0, true, Vec::new());
-        // Right-click the third row's name (just right of its checkbox).
+        // Right-click the third row's name (right of its checkbox and eye).
         let step = ws.objects_row_h.expect("rows measured") + ctx.global_style().spacing.item_spacing.y;
-        let at = egui::pos2(40.0, 2.5 * step);
+        let at = egui::pos2(90.0, 2.5 * step);
         let button = |pressed| egui::Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: Default::default() };
         for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
             draw(&mut ws, &ctx, 0.0, false, events);

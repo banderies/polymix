@@ -15,6 +15,8 @@
 //!   [`transform`] (affine transforms, drop to ground, principal-axis alignment).
 //! * [`pad`] — a flat-topped pad standing off a surface (for a contact microphone).
 //! * [`stand`] — a base under an object and legs holding it up (to display a printed model).
+//! * [`mate`] — mating features for posing kit parts (balls, sockets, pins, holes, flat faces
+//!   recognized from a click) and the move that seats one part's feature on another's.
 //! * [`stent`] — virtual stenting: place a bare or covered stent between two vessel
 //!   cross-sections and reshape the vessel around it.
 //!
@@ -36,6 +38,7 @@ pub mod fit;
 pub mod flow;
 pub mod hair;
 pub mod loft;
+pub mod mate;
 pub mod mirror;
 pub mod part;
 pub mod region;
