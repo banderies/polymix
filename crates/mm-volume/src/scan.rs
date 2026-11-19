@@ -177,7 +177,13 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
             }
             !skip
         });
-        for entry in walker {
+        for (walked, entry) in walker.enumerate() {
+            // Counted over everything walked, not only the files listed: a cloud folder can
+            // hold hundreds of thousands of files not downloaded, skipped below, and walking
+            // past them takes long enough to need cancelling.
+            if walked % 500 == 499 && !progress(Progress::Listing { files: listed.len() }) {
+                bail!("cancelled");
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -202,9 +208,6 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions, cache: Option<&mut FileCache>
                 continue;
             }
             listed.push(Listed { path: entry.into_path(), size: meta.len(), modified: modified(&meta) });
-            if listed.len() % 500 == 0 && !progress(Progress::Listing { files: listed.len() }) {
-                bail!("cancelled");
-            }
         }
         catalog.skipped.folders.append(&mut skipped);
     }
@@ -608,6 +611,25 @@ mod tests {
         // Cancelling stops the scan.
         assert!(scan(std::slice::from_ref(&root), &ScanOptions::default(), None, &|p| !matches!(p, Progress::Reading { .. })).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Cancelling works while the walk passes entries it does not list (here folders; in a
+    /// cloud folder, files not downloaded), not only once it has listed many files.
+    #[test]
+    fn cancelling_stops_a_walk_that_lists_nothing() {
+        let root = std::env::temp_dir().join(format!("mmv-cancel-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for k in 0..2000 {
+            std::fs::create_dir_all(root.join(format!("{}/{k}", k % 10))).unwrap();
+        }
+        let seen = std::sync::Mutex::new(Vec::new());
+        let r = scan(std::slice::from_ref(&root), &ScanOptions::default(), None, &|p| {
+            seen.lock().unwrap().push(p);
+            false
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(r.unwrap_err().to_string(), "cancelled");
+        assert_eq!(*seen.lock().unwrap(), [Progress::Listing { files: 0 }], "stopped during the walk, at the first check");
     }
 
     /// The folders the second walk found before (it stopped at the first error).
