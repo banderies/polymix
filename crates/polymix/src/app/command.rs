@@ -148,6 +148,10 @@ pub enum MeshCommand {
     /// Send a closed object to the Segmentation workspace, where its inside becomes a segment
     /// of the volume shown there.
     SendToSegmentation(ObjectId),
+    /// Copy Mesh objects into the Assembly tab as parts, where they are (see [`crate::link`]).
+    SendToAssembly(Vec<ObjectId>),
+    /// Copy the visible Assembly parts, as posed, into the Mesh tab as objects of their own.
+    SendPosedToMesh,
     /// Show an image on the object through its UVs (`None`: remove its texture).
     SetTexture(ObjectId, Option<std::path::PathBuf>),
     /// Make the object a reference (a see-through guide) or editable again.
@@ -219,8 +223,12 @@ impl MeshWorkspace {
         // Commands that change the scene: nothing happened if they left no undo step.
         let changed = |ws: &Self| -> Result<String, String> { if ws.history.generation() != before { Ok(ws.status.clone()) } else { Err(ws.status.clone()) } };
         // The Assembly tab only moves parts: the commands that edit a mesh are the Mesh tab's.
-        if self.assembly_mode && matches!(cmd, C::Discard | C::Separate { .. } | C::FlipNormals | C::CreateFaceGroup | C::GenerateComplex | C::SplitComplex) {
-            return Err("That edits the mesh: use it in the Mesh tab (⌘3; agents: app_show mesh). The Assembly tab only moves parts.".into());
+        if self.assembly_mode && matches!(cmd, C::Discard | C::Separate { .. } | C::FlipNormals | C::CreateFaceGroup | C::GenerateComplex | C::SplitComplex | C::SeparateShells | C::CombineVisible | C::AddShape(_)) {
+            return Err("That edits the mesh: use it in the Mesh tab (⌘3; agents: app_show mesh). The Assembly tab only moves parts; Send posed to Mesh takes them there as posed.".into());
+        }
+        // See-through parts are the Assembly tab's.
+        if !self.assembly_mode && matches!(cmd, C::SetSeeThrough(..)) {
+            return Err("See-through is for the Assembly tab's parts (⌘4; agents: app_show assembly).".into());
         }
         match cmd {
             C::Select(c) => {
@@ -332,6 +340,8 @@ impl MeshWorkspace {
                 };
                 Ok(self.status.clone())
             }
+            C::SendToAssembly(ids) => self.send_to_assembly(&ids),
+            C::SendPosedToMesh => self.send_posed_to_mesh(),
             C::SendToSegmentation(id) => {
                 let o = self.object(id)?;
                 let (name, mesh) = (o.name.clone(), o.mesh.clone());
@@ -498,6 +508,9 @@ impl MeshWorkspace {
                 Ok(if axis == UpAxis::Z { "Z up".into() } else { "Y up".into() })
             }
             C::OpenTool(name) => {
+                if !self.assembly_mode && name == "assemble" {
+                    return Err("Assemble is in the Assembly tab (agents: app_show assembly), on the parts sent there (mesh_edit send_to_assembly).".into());
+                }
                 let status = self.status.clone();
                 self.switch_to(SwitchTo::Tool(name.clone()), ctx, vp);
                 if self.assembly_mode && self.status != status && self.status.contains("edits the mesh") {
@@ -774,8 +787,8 @@ pub(super) mod tests {
         assert_eq!(ws.tools.iter().map(|t| t.name()).collect::<Vec<_>>(), ["Select"], "still one Select");
         assert!(ws.scene.get(id).unwrap().selection.is_empty(), "pressed again: cleared");
         assert_eq!(ws.status, "3D mouse button 4: Select, nothing selected");
-        // Every tool in the list opens from a button.
-        for t in TOOLS {
+        // Every tool in the list opens from a button (Assemble in the Assembly tab only).
+        for t in TOOLS.iter().filter(|t| t.name != "assemble") {
             ws.execute(MeshCommand::CancelTool, &ctx, vp).ok();
             ws.space_buttons = vec![(5, A::Tool(t.name.into()))];
             ws.space_button(5, &ctx, vp);
@@ -797,15 +810,21 @@ pub(super) mod tests {
         let (mut ws, ctx, vp) = workspace();
         ws.execute(MeshCommand::AddShape(Shape::Sphere), &ctx, vp).unwrap();
         ws.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();
+        let ids: Vec<ObjectId> = ws.scene.objects.iter().map(|o| o.id).collect();
+        ws.execute(MeshCommand::SendToAssembly(ids), &ctx, vp).unwrap();
+        assert_eq!(ws.take_show_tab(), Some(true), "the Assembly tab is shown");
         let names = |ws: &MeshWorkspace| ws.tools.iter().map(|t| t.name()).collect::<Vec<_>>();
         ws.set_assembly_mode(true, &ctx);
         assert_eq!(names(&ws), ["Assemble"], "Assemble opens with the tab");
         // Mesh tools and edits are refused, whatever asks for them.
         assert!(ws.execute(MeshCommand::OpenTool("erasefill".into()), &ctx, vp).is_err());
+        assert!(ws.execute(MeshCommand::OpenTool("boolean".into()), &ctx, vp).is_err());
         ws.space_buttons = vec![(3, A::Tool("remesh".into()))];
         ws.space_button(3, &ctx, vp);
         assert_eq!(names(&ws), ["Assemble"], "{}", ws.status);
-        assert!(ws.execute(MeshCommand::FlipNormals, &ctx, vp).is_err());
+        for c in [MeshCommand::FlipNormals, MeshCommand::SeparateShells, MeshCommand::CombineVisible, MeshCommand::AddShape(Shape::Cube)] {
+            assert!(ws.execute(c.clone(), &ctx, vp).is_err(), "{c:?}");
+        }
         // Two surfaces picked: the sphere's and a face of the cube.
         let (b0, b1) = (ws.scene.objects[0].bounds(), ws.scene.objects[1].bounds());
         ws.execute(MeshCommand::ToolAction("pick_surface".into(), json!({"at": b0.max.to_array(), "part": ws.scene.objects[0].id})), &ctx, vp).unwrap();
@@ -820,12 +839,149 @@ pub(super) mod tests {
         assert_eq!(names(&ws), ["Assemble"]);
         assert!(ws.scene.assembly.connections.is_empty() && ws.scene.assembly.joints.is_empty(), "nothing made by switching");
         assert_eq!(ws.tools[0].state(&ws.scene)["picked"].as_array().map(|a| a.len()), Some(2));
-        // Leaving the tab closes Assemble without connecting either.
+        // The Mesh tab has its own tools: none open, Mesh tools open, Assemble does not.
         ws.set_assembly_mode(false, &ctx);
-        assert!(ws.tools.is_empty() && ws.scene.assembly.connections.is_empty());
-        // The Mesh tab opens Mesh tools again.
+        assert!(ws.tools.is_empty() && ws.other.scene.assembly.connections.is_empty());
         ws.space_button(3, &ctx, vp);
         assert_eq!(names(&ws), ["Remesh"], "{}", ws.status);
+        ws.execute(MeshCommand::CancelTool, &ctx, vp).unwrap();
+        assert!(ws.execute(MeshCommand::OpenTool("assemble".into()), &ctx, vp).is_err());
+        assert!(ws.execute(MeshCommand::SetSeeThrough(ws.scene.objects[0].id, true), &ctx, vp).is_err(), "see-through is the Assembly tab's");
+        // Back in Assembly: Assemble as it was left, with its picks.
+        ws.set_assembly_mode(true, &ctx);
+        assert_eq!(names(&ws), ["Assemble"]);
+        assert_eq!(ws.tools[0].state(&ws.scene)["picked"].as_array().map(|a| a.len()), Some(2));
+    }
+
+    #[test]
+    fn mesh_and_assembly_keep_their_own_places_views_and_undo_but_share_edits() {
+        let (mut ws, ctx, vp) = workspace();
+        ws.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();
+        let cube = ws.scene.active.unwrap();
+        let tris = ws.scene.get(cube).unwrap().mesh.triangle_count();
+        // Nothing reaches the Assembly tab by itself.
+        assert!(ws.other.scene.is_empty());
+        ws.execute(MeshCommand::SendToAssembly(vec![cube]), &ctx, vp).unwrap();
+        assert!(ws.history.labels().0.iter().all(|l| !l.contains("Send")), "sending is the Assembly tab's undo step");
+        ws.set_assembly_mode(true, &ctx);
+        let part = ws.scene.active.unwrap();
+        assert_ne!(part, cube);
+        assert!(std::sync::Arc::ptr_eq(&ws.scene.get(part).unwrap().mesh, &ws.other.scene.get(cube).unwrap().mesh), "the same mesh until either changes");
+        // Posed in Assembly: moved 30 mm along x.
+        ws.history.push("Pose", &ws.scene);
+        ws.scene.get_mut(part).unwrap().mesh_mut().transform(|p| p + DVec3::X * 30.0);
+        let centre = |ws: &MeshWorkspace, id| ws.scene.get(id).unwrap().bounds().center();
+        let posed_at = centre(&ws, part);
+        ws.camera.distance *= 3.0;
+        let asm_distance = ws.camera.distance;
+        ws.set_assembly_mode(false, &ctx);
+        assert!(centre(&ws, cube).length() < 1e-9, "the Mesh object stays where it was");
+        assert!((ws.camera.distance - asm_distance).abs() > 1e-6, "each tab has its own view");
+        // Moved and scaled in Mesh: the part stays where it was posed.
+        ws.history.push("Transform", &ws.scene);
+        ws.scene.get_mut(cube).unwrap().mesh_mut().transform(|p| p * 2.0 + DVec3::Y * 50.0);
+        ws.sync_links(false, None);
+        // Edited in Mesh (half the triangles discarded): the part takes it, where it is posed.
+        ws.execute(MeshCommand::SelectNear { at: DVec3::new(25.0, 50.0, 0.0), radius: 30.0, add: false }, &ctx, vp).unwrap();
+        ws.execute(MeshCommand::Discard, &ctx, vp).unwrap();
+        let left = ws.scene.get(cube).unwrap().mesh.triangle_count();
+        assert!(left < tris && left > 0);
+        ws.sync_links(false, None);
+        ws.set_assembly_mode(true, &ctx);
+        let p = ws.scene.get(part).unwrap();
+        assert_eq!(p.mesh.triangle_count(), left, "the edit reached the part");
+        assert!((ws.camera.distance - asm_distance).abs() < 1e-9, "the Assembly view as it was left");
+        let b = p.mesh.bounds();
+        assert!(b.max.x <= posed_at.x + 12.5 + 1e-6 && b.min.x >= posed_at.x - 12.5 - 1e-6 && b.extents().y <= 25.0 + 1e-6, "posed and sized as before: {b:?}");
+        // Undoing the pose keeps the edit.
+        ws.execute(MeshCommand::Undo, &ctx, vp).unwrap();
+        ws.sync_links(false, None);
+        let p = ws.scene.get(part).unwrap();
+        assert_eq!(p.mesh.triangle_count(), left);
+        assert!(p.bounds().center().x < 12.5, "back where it was sent: {}", p.bounds().center());
+        // The posed parts go back to Mesh as objects of their own, and Mesh is shown.
+        ws.history.push("Pose", &ws.scene);
+        ws.scene.get_mut(part).unwrap().mesh_mut().transform(|p| p + DVec3::Z * 40.0);
+        ws.execute(MeshCommand::SendPosedToMesh, &ctx, vp).unwrap();
+        assert_eq!(ws.take_show_tab(), Some(false));
+        ws.set_assembly_mode(false, &ctx);
+        assert_eq!(ws.scene.objects.len(), 2);
+        let posed = ws.scene.objects.last().unwrap();
+        assert!(posed.name.ends_with("(posed)") && posed.link.is_none());
+        assert!(posed.bounds().min.z > 20.0, "as posed: {:?}", posed.bounds());
+        // Sending from the wrong tab is refused.
+        assert!(ws.execute(MeshCommand::SendPosedToMesh, &ctx, vp).is_err());
+        ws.set_assembly_mode(true, &ctx);
+        assert!(ws.execute(MeshCommand::SendToAssembly(vec![part]), &ctx, vp).is_err());
+    }
+
+    /// Wait for the background save (or export) to finish.
+    fn saved(ws: &mut MeshWorkspace) {
+        let start = std::time::Instant::now();
+        while ws.export_job.is_some() {
+            assert!(start.elapsed().as_secs() < 30, "the save never finished");
+            ws.poll_jobs();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ws.status.starts_with("Saved"), "{}", ws.status);
+    }
+
+    #[test]
+    fn projects_keep_both_tabs_and_open_old_projects_with_their_joints_in_assembly() {
+        use crate::assembly::{JFrame, Joint};
+        let dir = std::env::temp_dir().join(format!("polymix-tabs-project-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A Polymix 0.6 project: two objects, the second grounded with a joint.
+        let (mut old, ctx, vp) = workspace();
+        old.execute(MeshCommand::AddShape(Shape::Sphere), &ctx, vp).unwrap();
+        old.execute(MeshCommand::AddShape(Shape::Cube), &ctx, vp).unwrap();
+        let ids: Vec<ObjectId> = old.scene.objects.iter().map(|o| o.id).collect();
+        let mut asm = crate::assembly::Assembly::default();
+        asm.set_grounded(ids[1], true);
+        asm.add_joint(Joint::point(ids[1], JFrame::new(DVec3::new(0.0, 0.0, 12.5), DVec3::Z, None)));
+        let objects = old.scene.objects.iter().map(|o| crate::project::ProjectObject { name: o.name.clone(), mesh: (*o.mesh).clone(), visible: true, color: o.color, material: 0, frame: o.frame, group_names: Vec::new(), uvs: None, pivots: Vec::new(), texture: None, reference: false }).collect();
+        let legacy = dir.join("legacy.polymix");
+        crate::project::save(&legacy, &crate::project::Project { objects, assembly: crate::assembly::to_text(&asm, &ids), ..Default::default() }).unwrap();
+        let (mut ws, ctx, vp) = workspace();
+        ws.apply_project((crate::project::load(&legacy).unwrap(), Vec::new()), legacy.clone());
+        assert_eq!(ws.scene.objects.len(), 2);
+        assert!(ws.scene.assembly.is_empty(), "the Mesh tab has no joints");
+        assert!(ws.scene.objects.iter().all(|o| o.link.is_none()));
+        ws.set_assembly_mode(true, &ctx);
+        assert_eq!(ws.scene.objects.len(), 2, "the parts it showed in Assembly");
+        let (sphere, cube) = (ws.scene.objects[0].id, ws.scene.objects[1].id);
+        assert!(ws.scene.assembly.is_grounded(cube) && !ws.scene.assembly.is_grounded(sphere));
+        assert_eq!(ws.scene.assembly.joints_of(cube).count(), 1);
+        assert!(ws.scene.objects.iter().zip(&ws.other.scene.objects).all(|(p, o)| p.link.as_ref().is_some_and(|l| l.source == o.id) && std::sync::Arc::ptr_eq(&p.mesh, &o.mesh)));
+        // Posed: the sphere moved; saved and opened again, both tabs come back.
+        ws.history.push("Pose", &ws.scene);
+        ws.scene.get_mut(sphere).unwrap().mesh_mut().transform(|p| p + DVec3::new(40.0, 0.0, 5.0));
+        let posed_at = ws.scene.get(sphere).unwrap().bounds().center();
+        let path = dir.join("both.polymix");
+        ws.save_project_to(path.clone(), &ctx).unwrap();
+        saved(&mut ws);
+        let (mut back, ctx, vp2) = workspace();
+        back.apply_project((crate::project::load(&path).unwrap(), Vec::new()), path.clone());
+        assert_eq!(back.scene.objects.len(), 2);
+        assert!(back.scene.objects[0].bounds().center().length() < 1e-9, "the Mesh sphere where it was");
+        back.set_assembly_mode(true, &ctx);
+        let parts: Vec<ObjectId> = back.scene.objects.iter().map(|o| o.id).collect();
+        assert!((back.scene.get(parts[0]).unwrap().bounds().center() - posed_at).length() < 1e-9, "the posed part where it was posed");
+        assert!(back.scene.assembly.is_grounded(parts[1]) && back.scene.assembly.joints_of(parts[1]).count() == 1);
+        assert!(std::sync::Arc::ptr_eq(&back.scene.objects[1].mesh, &back.other.scene.objects[1].mesh), "the unposed part shares its object's mesh");
+        // Still linked: an edit in Mesh reaches the posed part.
+        back.set_assembly_mode(false, &ctx);
+        let src = back.scene.objects[0].id;
+        back.history.push("Edit", &back.scene);
+        let finer = mm_core::primitives::icosphere(12.5, 2);
+        back.scene.get_mut(src).unwrap().set_mesh(finer);
+        back.sync_links(false, None);
+        back.set_assembly_mode(true, &ctx);
+        let p = back.scene.get(parts[0]).unwrap();
+        assert_eq!(p.mesh.triangle_count(), back.other.scene.get(src).unwrap().mesh.triangle_count());
+        assert!((p.bounds().center() - posed_at).length() < 1e-6);
+        let _ = (vp, vp2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

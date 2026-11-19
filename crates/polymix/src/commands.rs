@@ -347,9 +347,12 @@ pub fn duplicate_object(cx: &mut CmdCx) {
     cx.history.push("Duplicate object", cx.scene);
     let o = cx.scene.active().unwrap();
     let (name, mesh, frame) = (format!("{} copy", o.name), (*o.mesh).clone(), o.frame);
+    // A copy of an Assembly part is sent from the same Mesh object: its edits reach both.
+    let link = o.link.clone();
     let id = cx.scene.add(name, mesh);
     if let Some(o) = cx.scene.get_mut(id) {
         o.frame = frame;
+        o.link = link;
     }
 }
 

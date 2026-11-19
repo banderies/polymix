@@ -25,8 +25,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// The tools the Assembly tab opens, by `make_tool` name and by title (`Tool::name`): it only
-/// moves parts (and finishes the print), never edits their meshes by accident.
-const ASSEMBLY_TOOLS: [(&str, &str); 7] = [("assemble", "Assemble"), ("select", "Select"), ("transform", "Transform"), ("align", "Align"), ("clearance", "Clearance"), ("boolean", "Boolean"), ("makesolid", "Make Solid")];
+/// moves parts, never edits their meshes (the Mesh tab's objects they were sent from are where
+/// meshes are edited; Send posed to Mesh takes the posed parts there to finish them).
+const ASSEMBLY_TOOLS: [(&str, &str); 5] = [("assemble", "Assemble"), ("select", "Select"), ("transform", "Transform"), ("align", "Align"), ("clearance", "Clearance")];
 
 /// A row of the object browser: a part (by index in the scene, indented by its depth in the
 /// tree, with the connection it hangs by) or one of a part's joints.
@@ -459,6 +460,29 @@ impl ExportSource {
 
 /// An object as a project file stores it, sharing its mesh and UVs (UVs only if they still
 /// belong to the mesh's triangles), with `group_names` in the order they are written.
+/// Add a project's objects to `scene`, with their textures (read with the project), in order.
+fn add_project_objects(scene: &mut Scene, objects: Vec<crate::project::ProjectObject>, textures: Vec<Option<std::sync::Arc<crate::scene::TextureImage>>>) -> Vec<ObjectId> {
+    let mut ids = Vec::new();
+    let mut textures = textures.into_iter();
+    for o in objects {
+        let texture = textures.next().flatten();
+        let id = scene.add(o.name, o.mesh);
+        if let Some(so) = scene.get_mut(id) {
+            so.visible = o.visible;
+            so.color = o.color;
+            so.material = o.material;
+            so.frame = o.frame;
+            so.group_names = o.group_names.into_iter().collect();
+            so.uvs = o.uvs.map(|c| std::sync::Arc::new(crate::scene::UvSet::new(&so.mesh, c)));
+            so.pivots = o.pivots;
+            so.reference = o.reference;
+            so.texture = texture;
+        }
+        ids.push(id);
+    }
+    ids
+}
+
 fn save_object(o: &crate::scene::SceneObject, group_names: Vec<(i32, String)>) -> crate::project::SaveObject {
     crate::project::SaveObject {
         name: o.name.clone(),
@@ -778,6 +802,31 @@ struct BoundaryLines {
     lines: Option<((u64, usize), Vec<ColorVertex>)>,
 }
 
+/// What the Mesh and Assembly tabs each have of their own: the scene, its undo history, the
+/// camera and the open tools, with what is drawn, built and cached for them. The shown tab's are
+/// the workspace's own fields; the other tab's wait in [`MeshWorkspace::other`] (see
+/// [`MeshWorkspace::swap_desks`]).
+#[derive(Default)]
+struct Desk {
+    scene: Scene,
+    history: History,
+    camera: Camera,
+    gpu: HashMap<ObjectId, GpuMesh>,
+    preview_gpu: Option<PreviewGpu>,
+    bvh_job: Option<BvhJob>,
+    bvh_generation: u64,
+    bvh_topo: FastMap<ObjectId, u64>,
+    tools: Vec<Box<dyn Tool>>,
+    category: Option<Category>,
+    pending_switch: Option<SwitchTo>,
+    view_history: ViewHistory,
+    com_cache: Option<(ObjectId, u64, DVec3)>,
+    stats_cache: StatsCache,
+    boundary_cache: FastMap<ObjectId, BoundaryLines>,
+    boundary_pruned: u64,
+    status: String,
+}
+
 pub struct MeshWorkspace {
     scene: Scene,
     history: History,
@@ -796,8 +845,17 @@ pub struct MeshWorkspace {
     /// Tool stack: the top tool is active; closing a sub-tool returns to the one below.
     tools: Vec<Box<dyn Tool>>,
     category: Option<Category>,
-    /// Shown as the Assembly tab: the toolbar holds the assembly tools only.
+    /// Shown as the Assembly tab: its own scene, history, camera and tools are the ones above
+    /// (see [`Desk`]), and the toolbar holds the assembly tools only.
     assembly_mode: bool,
+    /// The other tab's scene, history, camera and tools.
+    other: Desk,
+    /// The (Mesh, Assembly) history generations the Assembly parts were last brought up to date
+    /// at (see [`Self::sync_links`]).
+    links_synced: (u64, u64),
+    /// The tab to show (true: Assembly), taken by the shell: after Send to Assembly, Send posed
+    /// to Mesh, or files opened while the Assembly tab is shown.
+    pub(crate) show_tab: Option<bool>,
     /// Meshmix parts (loaded again in the background when the category opens; shown as they
     /// were meanwhile).
     library: Option<crate::parts::Library>,
@@ -943,6 +1001,9 @@ impl MeshWorkspace {
             tools: Vec::new(),
             category: None,
             assembly_mode: false,
+            other: Desk::default(),
+            links_synced: (0, 0),
+            show_tab: None,
             library: None,
             library_job: None,
             library_changes: crate::parts::library_changes(),
@@ -1154,7 +1215,7 @@ impl MeshWorkspace {
         if ctx.input(|i| i.pointer.any_down()) {
             return;
         }
-        let generation = self.history.generation();
+        let generation = self.edits();
         let project = self.autosave_project();
         let Some(auto) = &mut self.autosave else { return };
         auto.saved_generation = generation;
@@ -1168,7 +1229,8 @@ impl MeshWorkspace {
     fn autosave_wait(&self, now: f64) -> Option<f64> {
         let auto = self.autosave.as_ref()?;
         let minutes = self.prefs.autosave_minutes;
-        if auto.job.is_some() || self.recovery.is_some() || minutes == 0 || self.history.generation() == auto.saved_generation || self.scene.is_empty() {
+        let ((mesh, _), (asm, _)) = self.desks();
+        if auto.job.is_some() || self.recovery.is_some() || minutes == 0 || self.edits() == auto.saved_generation || (mesh.is_empty() && asm.is_empty()) {
             return None;
         }
         let (elapsed, period) = (now - auto.last_time, minutes as f64 * 60.0);
@@ -1252,9 +1314,48 @@ impl MeshWorkspace {
     /// The scene as an autosave project. It shares the scene's meshes and UVs: nothing is
     /// copied here, on the UI thread.
     fn autosave_project(&self) -> crate::project::SaveProject {
-        let objects = self.scene.objects.iter().map(|o| save_object(o, o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect())).collect();
-        let order: Vec<ObjectId> = self.scene.objects.iter().map(|o| o.id).collect();
-        crate::project::SaveProject { objects, active: None, target: None, view: Some(self.camera.view_state()), assembly: crate::assembly::to_text(&self.scene.assembly, &order) }
+        let ((mesh, _), _) = self.desks();
+        let objects = mesh.objects.iter().map(|o| save_object(o, o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect())).collect();
+        let view = if self.assembly_mode { &self.other.camera } else { &self.camera }.view_state();
+        crate::project::SaveProject { objects, active: None, target: None, view: Some(view), assembly_tab: self.save_assembly(false) }
+    }
+
+    /// The Assembly tab's scene for a project (`None` without parts), sharing its meshes.
+    /// `sorted`: face group names in order (Save), or as they come (autosave).
+    fn save_assembly(&self, sorted: bool) -> Option<crate::project::SaveAssembly> {
+        let ((mesh, _), (asm, _)) = self.desks();
+        if asm.is_empty() {
+            return None;
+        }
+        let camera = if self.assembly_mode { &self.camera } else { &self.other.camera };
+        let objects = asm
+            .objects
+            .iter()
+            .map(|o| {
+                let mut groups: Vec<(i32, String)> = o.group_names.iter().map(|(g, n)| (*g, n.clone())).collect();
+                if sorted {
+                    groups.sort();
+                }
+                save_object(o, groups)
+            })
+            .collect();
+        let links = asm
+            .objects
+            .iter()
+            .map(|o| {
+                let l = o.link.as_ref()?;
+                let i = mesh.objects.iter().position(|m| m.id == l.source)?;
+                Some((i, std::sync::Arc::ptr_eq(&l.seen, &mesh.objects[i].mesh)))
+            })
+            .collect();
+        let order: Vec<ObjectId> = asm.objects.iter().map(|o| o.id).collect();
+        Some(crate::project::SaveAssembly {
+            objects,
+            links,
+            active: asm.active.and_then(|id| order.iter().position(|&o| o == id)),
+            view: Some(camera.view_state()),
+            joints: crate::assembly::to_text(&asm.assembly, &order),
+        })
     }
 
     /// Offer to restore the autosave of a session that crashed.
@@ -1363,7 +1464,7 @@ impl MeshWorkspace {
             return;
         }
         let placement = match self.prefs.import_mode {
-            _ if self.scene.is_empty() => Some(false),
+            _ if self.desks().0 .0.is_empty() => Some(false),
             ImportMode::Ask => None,
             ImportMode::Append => Some(false),
             ImportMode::Replace => Some(true),
@@ -1379,7 +1480,7 @@ impl MeshWorkspace {
                 match res {
                     Ok(imported) => {
                         let placement = match self.prefs.import_mode {
-                            _ if self.scene.is_empty() => Some(false),
+                            _ if self.desks().0 .0.is_empty() => Some(false),
                             ImportMode::Ask => None,
                             ImportMode::Append => Some(false),
                             ImportMode::Replace => Some(true),
@@ -1427,8 +1528,20 @@ impl MeshWorkspace {
         }
     }
 
-    /// Import prompts (Append / Replace, odd sizes), then add the meshes to the scene.
+    /// Import prompts (Append / Replace, odd sizes), then add the meshes to the Mesh tab's scene
+    /// (shown, if the Assembly tab was).
     fn finish_import(&mut self, ctx: &egui::Context) {
+        if self.pending_import.is_none() {
+            return;
+        }
+        if self.assembly_mode {
+            self.show_tab = Some(false);
+        }
+        self.with_desk(false, |ws| ws.finish_import_here(ctx));
+    }
+
+    /// [`Self::finish_import`] with the Mesh tab's scene in place.
+    fn finish_import_here(&mut self, ctx: &egui::Context) {
         // Test scripts and agents never wait on prompts: they append and keep sizes.
         let scripted = (polymix_workspace::scripted() && !self.script_prompts) || self.agent_import;
         let Some(pending) = &mut self.pending_import else { return };
@@ -1566,43 +1679,76 @@ impl MeshWorkspace {
                 use rayon::prelude::*;
                 let project = crate::project::load(&p)?;
                 // Textures are read again from their files (missing: the object shows without).
-                let textures = project.objects.par_iter().map(|o| o.texture.as_ref().and_then(|t| crate::scene::TextureImage::load(t).ok()).map(std::sync::Arc::new)).collect();
+                let parts = project.assembly_tab.iter().flat_map(|a| a.objects.iter());
+                let all: Vec<&crate::project::ProjectObject> = project.objects.iter().chain(parts).collect();
+                let textures = all.par_iter().map(|o| o.texture.as_ref().and_then(|t| crate::scene::TextureImage::load(t).ok()).map(std::sync::Arc::new)).collect();
                 Ok((project, textures))
             }),
         ));
     }
 
     fn apply_project(&mut self, (p, textures): OpenedProject, path: PathBuf) {
-        self.history.push("Open project", &self.scene);
-        self.scene.objects.clear();
-        self.scene.active = None;
-        self.scene.target = None;
-        let mut ids = Vec::new();
-        let mut textures = textures.into_iter();
-        for o in p.objects {
-            let texture = textures.next().flatten();
-            let id = self.scene.add(o.name, o.mesh);
-            if let Some(so) = self.scene.get_mut(id) {
-                so.visible = o.visible;
-                so.color = o.color;
-                so.material = o.material;
-                so.frame = o.frame;
-                so.group_names = o.group_names.into_iter().collect();
-                so.uvs = o.uvs.map(|c| std::sync::Arc::new(crate::scene::UvSet::new(&so.mesh, c)));
-                so.pivots = o.pivots;
-                so.reference = o.reference;
-                so.texture = texture;
+        let crate::project::Project { objects, active, target, view, assembly, assembly_tab } = p;
+        let (n, mut textures) = (objects.len(), textures.into_iter());
+        let mesh_textures: Vec<_> = textures.by_ref().take(n).collect();
+        // The Mesh tab's objects.
+        let ids = self.with_desk(false, |ws| {
+            ws.history.push("Open project", &ws.scene);
+            ws.scene = Scene::default();
+            let ids = add_project_objects(&mut ws.scene, objects, mesh_textures);
+            ws.scene.active = active.and_then(|i| ids.get(i).copied()).or(ids.last().copied());
+            ws.scene.target = target.and_then(|i| ids.get(i).copied());
+            match view {
+                Some(v) => ws.camera.set_view_state(v),
+                None => ws.focus_scene(),
             }
-            ids.push(id);
-        }
-        self.scene.active = p.active.and_then(|i| ids.get(i).copied()).or(ids.last().copied());
-        self.scene.target = p.target.and_then(|i| ids.get(i).copied());
-        self.scene.assembly = p.assembly.as_deref().map(|t| crate::assembly::from_text(t, &ids)).unwrap_or_default();
-        crate::assembly::follow(&mut self.scene);
-        match p.view {
-            Some(v) => self.camera.set_view_state(v),
-            None => self.focus_scene(),
-        }
+            ids
+        });
+        // The Assembly tab's parts.
+        let mesh_view = view;
+        self.with_desk(true, |ws| {
+            ws.history.push("Open project", &ws.scene);
+            ws.scene = Scene::default();
+            debug_assert!(ws.assembly_mode);
+            let (mesh, asm) = (&mut ws.other.scene, &mut ws.scene);
+            match (assembly_tab, assembly) {
+                (Some(tab), _) => {
+                    let crate::project::ProjectAssembly { objects, links, poses, active, view, joints } = tab;
+                    let parts = add_project_objects(asm, objects, textures.collect());
+                    for (k, &pid) in parts.iter().enumerate() {
+                        let Some(src) = links[k].and_then(|i| ids.get(i)).and_then(|&id| mesh.get_mut(id)) else { continue };
+                        // The object's place is counted from here on.
+                        src.placed = Some(crate::link::Placed { map: crate::link::Affine::IDENTITY, mesh: src.mesh.clone() });
+                        let part = asm.get_mut(pid).unwrap();
+                        // A part stored as its object unmoved shares that object's mesh.
+                        if poses[k].is_some_and(|a| crate::link::moves_nothing(&src.mesh, &a)) {
+                            part.mesh = src.mesh.clone();
+                        }
+                        part.link = Some(crate::link::Link { source: src.id, seen: src.mesh.clone(), seen_place: crate::link::Affine::IDENTITY });
+                    }
+                    asm.active = active.and_then(|i| parts.get(i).copied()).or(parts.last().copied());
+                    asm.assembly = joints.as_deref().map(|t| crate::assembly::from_text(t, &parts)).unwrap_or_default();
+                    match view.or(mesh_view) {
+                        Some(v) => ws.camera.set_view_state(v),
+                        None => ws.focus_scene(),
+                    }
+                }
+                (None, Some(text)) => {
+                    // Polymix 0.6 showed the Mesh tab's objects in the Assembly tab: they are
+                    // sent to it, with their joints.
+                    let parts = crate::link::send(mesh, &ids, asm);
+                    asm.assembly = crate::assembly::from_text(&text, &parts);
+                    asm.active = mesh.active.and_then(|a| ids.iter().position(|&i| i == a)).map(|k| parts[k]);
+                    if let Some(v) = mesh_view {
+                        ws.camera.set_view_state(v);
+                    }
+                }
+                (None, None) => {}
+            }
+            crate::assembly::follow(&mut ws.scene);
+        });
+        let ((_, mh), (_, ah)) = self.desks();
+        self.links_synced = (mh.generation(), ah.generation());
         self.status = format!("Opened {}", path.display());
         self.project_path = Some(path);
     }
@@ -1649,7 +1795,8 @@ impl MeshWorkspace {
     /// Save the scene as a project (asking for a file when there is none yet or `save_as`; the
     /// file comes back in [`Self::file_dialog_answers`]).
     fn save_project(&mut self, ctx: &egui::Context, save_as: bool) {
-        if self.scene.is_empty() {
+        let ((mesh, _), (asm, _)) = self.desks();
+        if mesh.is_empty() && asm.is_empty() {
             self.status = "Nothing to save.".into();
             return;
         }
@@ -1672,13 +1819,16 @@ impl MeshWorkspace {
 
     /// Save the scene as a project at `path` (in the background).
     fn save_project_to(&mut self, path: PathBuf, ctx: &egui::Context) -> Result<String, String> {
-        if self.scene.is_empty() {
+        let ((mesh, _), (asm, _)) = self.desks();
+        if mesh.is_empty() && asm.is_empty() {
             return Err("Nothing to save.".into());
         }
-        let index = |id: Option<ObjectId>| id.and_then(|id| self.scene.objects.iter().position(|o| o.id == id));
+        // The parts as they are after every edit made in Mesh.
+        self.sync_links(true, None);
+        let ((mesh, _), _) = self.desks();
+        let index = |id: Option<ObjectId>| id.and_then(|id| mesh.objects.iter().position(|o| o.id == id));
         // The scene's meshes and UVs are shared with the job, not copied here.
-        let objects: Vec<crate::project::SaveObject> = self
-            .scene
+        let objects: Vec<crate::project::SaveObject> = mesh
             .objects
             .iter()
             .map(|o| {
@@ -1687,13 +1837,8 @@ impl MeshWorkspace {
                 save_object(o, groups)
             })
             .collect();
-        let project = crate::project::SaveProject {
-            objects,
-            active: index(self.scene.active),
-            target: index(self.scene.target),
-            view: Some(self.camera.view_state()),
-            assembly: crate::assembly::to_text(&self.scene.assembly, &self.scene.objects.iter().map(|o| o.id).collect::<Vec<_>>()),
-        };
+        let view = if self.assembly_mode { &self.other.camera } else { &self.camera }.view_state();
+        let project = crate::project::SaveProject { objects, active: index(mesh.active), target: index(mesh.target), view: Some(view), assembly_tab: self.save_assembly(true) };
         self.project_path = Some(path.clone());
         let msg = format!("Saving the project to {}", path.display());
         self.export_job = Some(Job::spawn("Saving", ctx.clone(), move |_| {
@@ -1856,6 +2001,11 @@ impl MeshWorkspace {
         // what is picked.
         if matches!(&to, SwitchTo::Tool(n) if n == "assemble") && self.close_tools_over_assemble(ctx, vp) {
             self.pending_switch = None;
+            return;
+        }
+        // Assemble is the Assembly tab's (its own scene, posed apart from the Mesh tab's).
+        if !self.assembly_mode && matches!(&to, SwitchTo::Tool(n) if n == "assemble") {
+            self.status = "Assemble is in the Assembly tab (⌘4): right-click an object, Send to Assembly, to pose it there.".into();
             return;
         }
         // The Assembly tab, by whatever route a tool is asked for (toolbar, keys, 3D mouse,
@@ -2287,15 +2437,155 @@ impl MeshWorkspace {
         });
     }
 
-    /// Show the workspace as the Assembly tab (only the assembly tools) or as Mesh. The shell
-    /// calls this whenever the shown tab changes (before agents' calls too), and the tools
-    /// follow at once: Assemble opens with the Assembly tab and closes when leaving it.
+    /// Show the workspace as the Assembly tab (its own scene, with only the assembly tools) or
+    /// as Mesh. The shell calls this whenever the shown tab changes (before agents' calls too):
+    /// each tab finds its scene, view and open tools as it left them, and Assemble opens with
+    /// an Assembly tab that has no tool open.
     pub fn set_assembly_mode(&mut self, on: bool, ctx: &egui::Context) {
         if on != self.assembly_mode {
-            self.assembly_mode = on;
+            self.swap_desks();
+            // A drag, glide or 3D-mouse move of the view going on was the other tab's.
+            self.nav_drag = None;
+            self.nav_anchor = None;
+            self.view_anim = None;
+            self.tool_rmb = None;
+            self.brush_drag = false;
+            self.hotbox = None;
+            self.space_centre = None;
+            self.space_full_view = None;
+            self.space_marker = None;
+            // The parts are up to date with what was done in Mesh, whatever it was.
+            self.sync_links(true, None);
             let vp = self.vp_prev(ctx);
             self.assembly_mode_tools(ctx, vp);
         }
+    }
+
+    /// Swap the shown tab's scene, history, camera and tools with the other tab's (see
+    /// [`Desk`]). The display settings of the camera (orthographic, up axis) stay as they are.
+    fn swap_desks(&mut self) {
+        let d = &mut self.other;
+        std::mem::swap(&mut self.scene, &mut d.scene);
+        std::mem::swap(&mut self.history, &mut d.history);
+        let (ortho, up) = (self.camera.orthographic, self.camera.up_axis);
+        std::mem::swap(&mut self.camera, &mut d.camera);
+        (self.camera.orthographic, self.camera.up_axis) = (ortho, up);
+        std::mem::swap(&mut self.gpu, &mut d.gpu);
+        std::mem::swap(&mut self.preview_gpu, &mut d.preview_gpu);
+        std::mem::swap(&mut self.bvh_job, &mut d.bvh_job);
+        std::mem::swap(&mut self.bvh_generation, &mut d.bvh_generation);
+        std::mem::swap(&mut self.bvh_topo, &mut d.bvh_topo);
+        std::mem::swap(&mut self.tools, &mut d.tools);
+        std::mem::swap(&mut self.category, &mut d.category);
+        std::mem::swap(&mut self.pending_switch, &mut d.pending_switch);
+        std::mem::swap(&mut self.view_history, &mut d.view_history);
+        std::mem::swap(&mut self.com_cache, &mut d.com_cache);
+        std::mem::swap(&mut self.stats_cache, &mut d.stats_cache);
+        std::mem::swap(&mut self.boundary_cache, &mut d.boundary_cache);
+        std::mem::swap(&mut self.boundary_pruned, &mut d.boundary_pruned);
+        std::mem::swap(&mut self.status, &mut d.status);
+        self.assembly_mode = !self.assembly_mode;
+    }
+
+    /// Run `f` with the Mesh tab's scene, history, camera and tools in place (`assembly`:
+    /// the Assembly tab's), whichever tab is shown.
+    fn with_desk<R>(&mut self, assembly: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        let swap = assembly != self.assembly_mode;
+        if swap {
+            self.swap_desks();
+        }
+        let r = f(self);
+        if swap {
+            self.swap_desks();
+        }
+        r
+    }
+
+    /// The Mesh tab's scene and the Assembly tab's, whichever is shown.
+    fn scenes_mut(&mut self) -> (&mut Scene, &mut Scene) {
+        if self.assembly_mode {
+            (&mut self.other.scene, &mut self.scene)
+        } else {
+            (&mut self.scene, &mut self.other.scene)
+        }
+    }
+
+    /// The Mesh tab's scene and history, and the Assembly tab's, whichever is shown.
+    fn desks(&self) -> ((&Scene, &History), (&Scene, &History)) {
+        let (shown, other) = ((&self.scene, &self.history), (&self.other.scene, &self.other.history));
+        if self.assembly_mode { (other, shown) } else { (shown, other) }
+    }
+
+    /// Changes made in either tab so far (both histories' generations): autosave saves when
+    /// they change.
+    fn edits(&self) -> u64 {
+        self.history.generation() + self.other.history.generation()
+    }
+
+    /// Bring the Assembly tab's parts up to date with the Mesh objects they were sent from
+    /// (see [`crate::link`]), after a change in either tab (`force`: in any case). Not while a
+    /// button is held (`ctx`): a stroke or drag going on is a change in progress, and its end
+    /// comes with a frame of its own.
+    fn sync_links(&mut self, force: bool, ctx: Option<&egui::Context>) {
+        let ((_, mh), (_, ah)) = self.desks();
+        let generations = (mh.generation(), ah.generation());
+        if !force && (generations == self.links_synced || ctx.is_some_and(|c| c.input(|i| i.pointer.any_down()))) {
+            return;
+        }
+        self.links_synced = generations;
+        let (mesh, asm) = self.scenes_mut();
+        let edited = crate::link::sync(mesh, asm);
+        if !edited.is_empty() {
+            log::info!("{} Assembly part(s) took edits made in the Mesh tab", edited.len());
+        }
+    }
+
+    /// Copy Mesh objects into the Assembly tab as parts (Send to Assembly), where they are; the
+    /// shell then shows that tab.
+    fn send_to_assembly(&mut self, ids: &[ObjectId]) -> Result<String, String> {
+        if self.assembly_mode {
+            return Err("Send to Assembly is for the Mesh tab's objects (⌘3; agents: app_show mesh).".into());
+        }
+        let ids: Vec<ObjectId> = ids.iter().copied().filter(|&id| self.scene.get(id).is_some()).collect();
+        if ids.is_empty() {
+            return Err("Nothing to send.".into());
+        }
+        let first = self.other.scene.is_empty();
+        self.other.history.push(if ids.len() == 1 { "Send to Assembly" } else { "Send visible to Assembly" }, &self.other.scene);
+        let made = crate::link::send(&mut self.scene, &ids, &mut self.other.scene);
+        if first {
+            // The parts are where the objects are: seen as they are seen here.
+            self.other.camera.set_view_state(self.camera.view_state());
+        }
+        let names: Vec<String> = made.iter().filter_map(|&id| self.other.scene.get(id)).map(|o| o.name.clone()).collect();
+        self.show_tab = Some(true);
+        self.status = format!("Sent to the Assembly tab: {}. Shape edits made in the Mesh tab reach them; where they are posed is their own.", names.join(", "));
+        // Said again in the tab they went to, which is shown next.
+        self.other.status = self.status.clone();
+        Ok(self.status.clone())
+    }
+
+    /// Copy the visible Assembly parts, as posed, into the Mesh tab as objects of their own
+    /// (Send posed to Mesh), to finish them there (Boolean, Make Solid, Stand); the shell then
+    /// shows that tab.
+    fn send_posed_to_mesh(&mut self) -> Result<String, String> {
+        if !self.assembly_mode {
+            return Err("Send posed to Mesh is for the Assembly tab's parts (⌘4; agents: app_show assembly).".into());
+        }
+        if !self.scene.objects.iter().any(|o| o.visible && !o.reference) {
+            return Err("No visible parts to send.".into());
+        }
+        self.other.history.push("Send posed to Mesh", &self.other.scene);
+        let made = crate::link::send_posed(&self.scene, &mut self.other.scene);
+        self.show_tab = Some(false);
+        self.status = format!("{} posed part(s) sent to the Mesh tab as new objects: Boolean (union) or Make Solid joins them into one to print.", made.len());
+        self.other.status = self.status.clone();
+        Ok(self.status.clone())
+    }
+
+    /// The shell takes the tab to show (true: Assembly), if one was asked for.
+    pub fn take_show_tab(&mut self) -> Option<bool> {
+        self.show_tab.take()
     }
 
     /// Close the tools open over Assemble (the joint-surface Select), without accepting them,
@@ -2345,27 +2635,11 @@ impl MeshWorkspace {
         self.tools.push(r);
     }
 
-    /// Open the tools of the tab just shown: Assemble in Assembly; leaving it closes Assemble.
+    /// Open the tools of the Assembly tab just shown, when it has none open: Assemble.
     fn assembly_mode_tools(&mut self, ctx: &egui::Context, vp: Viewport) {
-        // Assemble waiting for a busy tool to finish was asked for by the tab, not the user:
-        // forget it on leaving (it would accept that tool and open in the Mesh tab).
-        if !self.assembly_mode && matches!(&self.pending_switch, Some(SwitchTo::Tool(n)) if n == "assemble") {
-            self.pending_switch = None;
-        }
-        let assemble_open = self.tools.iter().any(|t| t.name() == "Assemble");
-        if self.assembly_mode {
+        if self.assembly_mode && self.tools.is_empty() && self.pending_switch.is_none() {
             self.category = None;
-            if !assemble_open {
-                self.switch_to(SwitchTo::Tool("assemble".into()), ctx, vp);
-            }
-        } else if assemble_open {
-            // Close Assemble (and the Select over it) without connecting what is picked: its
-            // work is in the history already.
-            while let Some(mut t) = self.tools.pop() {
-                let mut cx = self.tool_cx(ctx, vp);
-                t.on_close(&mut cx);
-            }
-            self.category = None;
+            self.switch_to(SwitchTo::Tool("assemble".into()), ctx, vp);
         }
     }
 
@@ -2395,8 +2669,9 @@ impl MeshWorkspace {
         let mut open: Option<&str> = None;
         let mut assemble: Option<&str> = None;
         let mut command: Option<MeshCommand> = None;
-        if big(ui, Icon::Import, "Import", false).on_hover_text("⌘O: the kit's parts, one file each (several at once)").clicked() {
-            self.import_dialog(&ctx);
+        if !has_parts {
+            ui.add(egui::Label::new(RichText::new("No parts yet. In the Mesh tab (⌘3), right-click an object: Send to Assembly.").small().weak()).wrap());
+            ui.add_space(4.0);
         }
         ui.add_enabled_ui(has_parts, |ui| {
             if big(ui, Icon::Connect, "Connect", mode.as_deref() == Some("connect")).on_hover_text("Connect two parts: click a joint (or a ball, pin or peg) on one, then where it fits on the other").clicked() {
@@ -2419,9 +2694,6 @@ impl MeshWorkspace {
             if small(ui, "Align").on_hover_text("Put a picked face on the ground or against another part").clicked() {
                 open = Some("align");
             }
-            if small(ui, "Separate Shells").on_hover_text("Shift+Y: one part per piece, for a kit that came as one file").clicked() {
-                command = Some(MeshCommand::SeparateShells);
-            }
             heading(ui, "Check");
             if small(ui, "Collisions").on_hover_text("Find parts that cross each other in this pose").clicked() {
                 assemble = Some("collisions");
@@ -2430,14 +2702,8 @@ impl MeshWorkspace {
                 open = Some("clearance");
             }
             heading(ui, "Finish");
-            if small(ui, "Combine visible").on_hover_text("One object of every visible part, as posed (to print in one piece)").clicked() {
-                command = Some(MeshCommand::CombineVisible);
-            }
-            if small(ui, "Boolean").on_hover_text("Unite two parts into one closed surface").clicked() {
-                open = Some("boolean");
-            }
-            if small(ui, "Make Solid").on_hover_text("Rebuild a closed surface (after combining overlapping parts)").clicked() {
-                open = Some("makesolid");
+            if small(ui, "Send posed to Mesh").on_hover_text("Copies of the visible parts, as posed, as new objects in the Mesh tab: join them there (Boolean union, Make Solid) to print in one piece").clicked() {
+                command = Some(MeshCommand::SendPosedToMesh);
             }
         });
         ui.add_space(6.0);
@@ -2887,6 +3153,7 @@ impl MeshWorkspace {
         let mut show_all = false;
         let mut duplicate = None;
         let mut send = None;
+        let mut to_assembly: Option<Vec<ObjectId>> = None;
         let (mut texture, mut untexture, mut toggle_reference) = (None, None, None);
         let mut new_target: Option<Option<ObjectId>> = None;
         let target = self.scene.target;
@@ -2920,8 +3187,8 @@ impl MeshWorkspace {
             ui.skip_ahead_auto_ids(rows.start - 1);
         }
         let mut row_h: Option<f32> = None;
-        // Grounding and joints show once there are any, and always in the Assembly tab.
-        let assembling = self.assembly_mode || !self.scene.assembly.is_empty();
+        // Grounding, joints and see-through parts are the Assembly tab's.
+        let assembling = self.assembly_mode;
         let mut ground: Option<(ObjectId, bool)> = None;
         let mut select: Option<(ObjectId, Option<crate::assembly::Selected>)> = None;
         let mut delete_joint: Option<u64> = None;
@@ -2940,9 +3207,10 @@ impl MeshWorkspace {
             let mut renamed_row = false;
             let r = ui.push_id(o.id, |ui| ui.horizontal(|ui| {
                 ui.checkbox(&mut o.visible, "").on_hover_text("Visible");
-                if ui_util::eye_toggle(ui, !o.see_through)
-                    .on_hover_text(if o.see_through { "See-through: clicks, brushes and lassos go through it to what is behind. Click to make it solid again." } else { "Make it see-through: still shown, but clicks, brushes and lassos go through it (to select a surface behind it)" })
-                    .clicked()
+                if assembling
+                    && ui_util::eye_toggle(ui, !o.see_through)
+                        .on_hover_text(if o.see_through { "See-through: clicks, brushes and lassos go through it to what is behind. Click to make it solid again." } else { "Make it see-through: still shown, but clicks, brushes and lassos go through it (to select a surface behind it)" })
+                        .clicked()
                 {
                     o.see_through = !o.see_through;
                 }
@@ -3013,7 +3281,15 @@ impl MeshWorkspace {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         let label = RichText::new(&o.name).color(if active { ui_util::ACCENT } else { ui.visuals().text_color() });
                         let r = ui.add(egui::Button::selectable(active, label).truncate());
-                        let r = hover_text_with(r, || format!("{}\n\nClick: make active · Double-click: rename · Right-click: more", o.name));
+                        let mesh_scene = &self.other.scene;
+                        let r = hover_text_with(r, || {
+                            let from = match o.link.as_ref().map(|l| mesh_scene.get(l.source)) {
+                                Some(Some(src)) => format!("\nSent from {} in the Mesh tab: its shape edits there reach this part; where it is here is its own.", src.name),
+                                Some(None) => "\nIts object in the Mesh tab was deleted: it keeps its last shape.".to_string(),
+                                None => String::new(),
+                            };
+                            format!("{}{from}\n\nClick: make active · Double-click: rename · Right-click: more", o.name)
+                        });
                         if r.clicked() {
                             make_active = Some(o.id);
                             if assembling {
@@ -3052,9 +3328,19 @@ impl MeshWorkspace {
                                 untexture = Some(o.id);
                                 ui.close();
                             }
-                            if ui.button("Send to Segmentation").on_hover_text("Its inside becomes a segment of the volume shown in the Segmentation tab (a closed mesh, in the volume's space: LPS as from Make mesh or 3D Slicer, or RAS)").clicked() {
-                                send = Some(o.id);
-                                ui.close();
+                            if !assembling {
+                                if ui.button("Send to Segmentation").on_hover_text("Its inside becomes a segment of the volume shown in the Segmentation tab (a closed mesh, in the volume's space: LPS as from Make mesh or 3D Slicer, or RAS)").clicked() {
+                                    send = Some(o.id);
+                                    ui.close();
+                                }
+                                if ui.button("Send to Assembly").on_hover_text("A copy of it becomes a part in the Assembly tab, to pose. Edits of its shape here reach the part; moving, turning or scaling either one leaves the other where it is.").clicked() {
+                                    to_assembly = Some(vec![o.id]);
+                                    ui.close();
+                                }
+                                if ui.button("Send visible to Assembly").on_hover_text("Every visible object, as Send to Assembly (a kit's parts at once)").clicked() {
+                                    to_assembly = Some(Vec::new());
+                                    ui.close();
+                                }
                             }
                             if target == Some(o.id) {
                                 if ui.button("Clear target").clicked() {
@@ -3134,6 +3420,13 @@ impl MeshWorkspace {
         if let Some(id) = send {
             let vp = self.vp_prev(&ctx);
             self.run(MeshCommand::SendToSegmentation(id), &ctx, vp);
+        }
+        if let Some(mut ids) = to_assembly {
+            if ids.is_empty() {
+                ids = self.scene.objects.iter().filter(|o| o.visible && !o.reference).map(|o| o.id).collect();
+            }
+            let vp = self.vp_prev(&ctx);
+            self.run(MeshCommand::SendToAssembly(ids), &ctx, vp);
         }
         if let Some(id) = texture {
             self.texture_for = Some(id);
@@ -4472,6 +4765,12 @@ impl MeshWorkspace {
                 script.wait = 2;
             }
             "open" => self.run(MeshCommand::Open(vec![PathBuf::from(arg)]), ctx, vp),
+            // send:assembly — the visible objects to the Assembly tab; send:posed — the visible
+            // parts back to Mesh, as posed.
+            "send" => {
+                let cmd = if arg == "posed" { MeshCommand::SendPosedToMesh } else { MeshCommand::SendToAssembly(self.scene.objects.iter().filter(|o| o.visible && !o.reference).map(|o| o.id).collect()) };
+                self.run(cmd, ctx, vp);
+            }
             "wire" => self.run(MeshCommand::Wireframe(!self.view.wireframe), ctx, vp),
             "flat" => self.run(MeshCommand::Normals(if self.view.normals == NormalMode::Face { NormalMode::Group } else { NormalMode::Face }), ctx, vp),
             "normals" => self.run(MeshCommand::Normals(NormalMode::from_key(arg.as_str()).unwrap_or(self.view.normals)), ctx, vp),
@@ -4713,8 +5012,6 @@ impl MeshWorkspace {
                 self.assembly_select(ctx, vp);
             } else if i.key_pressed(Key::T) && !i.modifiers.shift {
                 self.switch_to(SwitchTo::Tool("transform".into()), ctx, vp);
-            } else if i.key_pressed(Key::Y) && i.modifiers.shift {
-                self.run(MeshCommand::SeparateShells, ctx, vp);
             }
             return;
         }
@@ -4760,6 +5057,8 @@ impl polymix_workspace::Workspace for MeshWorkspace {
             // covered).
             self.finish_import(ctx);
         }
+        // Edits made in the Mesh tab reach the Assembly parts sent from there.
+        self.sync_links(false, Some(ctx));
         // Joint frames follow parts that tools moved.
         crate::assembly::follow(&mut self.scene);
         self.autosave_tick(ctx);
@@ -4826,7 +5125,8 @@ impl polymix_workspace::Workspace for MeshWorkspace {
     fn emergency_save(&mut self) {
         // After a crash: keep unsaved work where the restarted workspace offers to recover it.
         let Some(auto) = &self.autosave else { return };
-        if self.scene.is_empty() || self.history.generation() == auto.saved_generation || self.recovery.is_some() {
+        let ((mesh, _), (asm, _)) = self.desks();
+        if (mesh.is_empty() && asm.is_empty()) || self.edits() == auto.saved_generation || self.recovery.is_some() {
             return;
         }
         let file = auto.file.clone();
@@ -6095,9 +6395,9 @@ mod browser_tests {
     fn a_context_menu_stays_open_while_its_row_is_scrolled_away() {
         let (mut ws, ctx) = many();
         let (full, full_widgets, _) = draw(&mut ws, &ctx, 0.0, true, Vec::new());
-        // Right-click the third row's name (right of its checkbox and eye).
+        // Right-click the third row's name (just right of its checkbox).
         let step = ws.objects_row_h.expect("rows measured") + ctx.global_style().spacing.item_spacing.y;
-        let at = egui::pos2(90.0, 2.5 * step);
+        let at = egui::pos2(40.0, 2.5 * step);
         let button = |pressed| egui::Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: Default::default() };
         for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
             draw(&mut ws, &ctx, 0.0, false, events);

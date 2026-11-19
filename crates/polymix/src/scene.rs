@@ -58,6 +58,12 @@ pub struct SceneObject {
     /// A reference (File → Import reference…): drawn see-through as a guide, not picked in the
     /// view nor exported with the visible objects, until made editable.
     pub reference: bool,
+    /// An Assembly tab part: the Mesh object it was sent from (see [`crate::link`]). Part of
+    /// the history, with the mesh it goes with.
+    pub link: Option<crate::link::Link>,
+    /// A Mesh tab object sent to the Assembly tab: the moves made to it since (see
+    /// [`crate::link`]). Part of the history, with the mesh it goes with.
+    pub placed: Option<crate::link::Placed>,
     bvh: Option<Arc<Bvh>>,
 }
 
@@ -158,6 +164,8 @@ impl SceneObject {
             pivots: Vec::new(),
             reference: false,
             texture: None,
+            link: None,
+            placed: None,
             bvh: None,
         }
     }
@@ -292,6 +300,16 @@ impl Scene {
         let id = NEXT_OBJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.objects.push(SceneObject::new(id, name, mesh));
         self.active = Some(id);
+        id
+    }
+
+    /// [`Scene::add`] for a mesh shared with another object (in the other tab) or the history.
+    pub fn add_shared(&mut self, name: impl Into<String>, mesh: Arc<Mesh>) -> ObjectId {
+        let id = self.add(name, Mesh::new());
+        let o = self.get_mut(id).unwrap();
+        o.selection = TriSelection::new(&mesh);
+        o.mesh = mesh;
+        o.touch_selection();
         id
     }
 

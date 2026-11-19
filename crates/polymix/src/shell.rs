@@ -1,6 +1,7 @@
 //! The application shell: the workspace tabs (Volume | Segmentation | Mesh | Assembly) above
-//! independent workspaces. Assembly is the Mesh workspace's scene with only the assembly
-//! tools in its toolbar (posing kit parts by their joints): the same parts, camera and undo.
+//! independent workspaces. Assembly is shown by the Mesh workspace with a scene, camera and undo
+//! of its own and only the assembly tools (posing kit parts by their joints): its parts are
+//! copies of Mesh objects sent to it, which take the edits made to those objects' shapes.
 //!
 //! The shell owns the window-level things every workspace shares: the tab bar and its
 //! hotkeys (⌘1 / ⌘2 / ⌘3 / ⌘4), routing of dropped files and command-line paths, the window title,
@@ -218,10 +219,11 @@ impl PolymixApp {
             }
         }
         if !mesh.is_empty() {
+            // Meshes and projects open in the Mesh tab (projects bring the Assembly tab's parts
+            // too).
+            self.active = Tab::Mesh;
+            self.sync_mesh_mode(ctx);
             self.mesh.call(|w| w.open(mesh, ctx));
-            if !self.active.is_mesh() {
-                self.active = Tab::Mesh;
-            }
         }
         if !volume.is_empty() {
             self.volume.call(|w| w.open(volume, ctx));
@@ -357,7 +359,7 @@ impl PolymixApp {
         // Changes happen in front of the user: show the workspace being changed.
         if self.agents.kind(&call.tool) != ToolKind::Read {
             if let Some(tab) = call.tool.split('_').next().and_then(Tab::from_key) {
-                // Mesh changes show in the Assembly tab too: stay there.
+                // mesh_* tools work on the scene of the tab shown, Mesh or Assembly: stay there.
                 if !(tab == Tab::Mesh && self.active == Tab::Assembly) {
                     self.active = tab;
                     self.sync_mesh_mode(ctx);
@@ -431,7 +433,7 @@ impl PolymixApp {
             "app": "Polymix",
             "version": env!("CARGO_PKG_VERSION"),
             "workspace_shown": self.active.key(),
-            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh), "assembly": "the Mesh workspace's scene with the assembly tools (the Assemble tool); mesh_* tools work on it"},
+            "workspaces": {"volume": state(&self.volume), "segmentation": state(&self.segmentation), "mesh": state(&self.mesh), "assembly": "the Assembly tab: a scene of its own (parts sent from Mesh objects with mesh_edit send_to_assembly; they take the edits made to those objects' shapes, but are posed on their own) with the assembly tools (the Assemble tool); while it is shown, mesh_* tools work on its scene"},
             "window": {"width": r.width().round(), "height": r.height().round(), "pixels_per_point": ctx.pixels_per_point()},
             "identifiers_hidden_in_volume": self.volume.live().is_some_and(|w| w.hides_identifiers()),
         })
@@ -711,6 +713,12 @@ impl eframe::App for PolymixApp {
         if let Some((meshes, by_agent)) = self.segmentation.call(|w| w.take_meshes()).filter(|(m, _)| !m.is_empty()) {
             self.mesh.call(|w| w.add_meshes(meshes, by_agent));
             self.active = Tab::Mesh;
+        }
+        // Sent between Mesh and Assembly (or files opened while Assembly was shown): the tab
+        // they went to is shown.
+        if let Some(assembly) = self.mesh.call(|w| w.take_show_tab()).flatten() {
+            self.active = if assembly { Tab::Assembly } else { Tab::Mesh };
+            self.sync_mesh_mode(ctx);
         }
         self.volume.call(|w| w.tick(ctx, active == Tab::Volume));
         self.segmentation.call(|w| w.tick(ctx, active == Tab::Segmentation));

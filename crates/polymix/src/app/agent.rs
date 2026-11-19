@@ -55,7 +55,7 @@ pub fn tools() -> Vec<AgentTool> {
     vec![
         AgentTool::new(
             "mesh_scene",
-            "The Mesh workspace: every object (id, name, visibility, triangle and vertex counts, open edges, bounds in mm, selected triangles, face groups), which is active and which is the target, the open tool and whether it is computing, the status line, recent undo / redo steps, background jobs, camera and display options.",
+            "The Mesh workspace (`tab`: the Mesh tab, or the Assembly tab when that is shown: each has a scene of its own): every object (id, name, visibility, triangle and vertex counts, open edges, bounds in mm, selected triangles, face groups; in Assembly, `sent_from`: the Mesh object it is a copy of), which is active and which is the target, the open tool and whether it is computing, the status line, recent undo / redo steps, background jobs, camera and display options.",
             json!({}),
         ),
         AgentTool::new(
@@ -106,9 +106,9 @@ pub fn tools() -> Vec<AgentTool> {
         .kind(ToolKind::Change),
         AgentTool::new(
             "mesh_edit",
-            "Edit the scene: discard_selection (delete the selected triangles), separate_selection (the selection becomes a new object; `keep_original` keeps it in the old one too), flip_normals (of the selection), new_face_group (the selection becomes a face group), duplicate, delete_object, separate_shells (one object per shell), combine_visible, add_shape (`shape`), clear_scene. Acts on the active object or `object`. Undoable (mesh_history).",
+            "Edit the scene: discard_selection (delete the selected triangles), separate_selection (the selection becomes a new object; `keep_original` keeps it in the old one too), flip_normals (of the selection), new_face_group (the selection becomes a face group), duplicate, delete_object, separate_shells (one object per shell), combine_visible, add_shape (`shape`), clear_scene. send_to_assembly / send_visible_to_assembly (Mesh tab): a copy of the object (every visible object) becomes a part in the Assembly tab, posed there on its own while shape edits made here reach it; send_posed_to_mesh (Assembly tab): copies of the visible parts, as posed, become new Mesh objects (to join with Boolean / Make Solid). Acts on the active object or `object`. Undoable (mesh_history).",
             json!({
-                "action": choice(&["discard_selection", "separate_selection", "flip_normals", "new_face_group", "duplicate", "delete_object", "separate_shells", "combine_visible", "add_shape", "clear_scene", "send_to_segmentation", "set_texture", "remove_texture", "make_reference", "make_editable"], "What to do (send_to_segmentation: the object's inside becomes a segment of the volume in the Segmentation workspace; set_texture: show the image at `path` on the object through its UVs)"),
+                "action": choice(&["discard_selection", "separate_selection", "flip_normals", "new_face_group", "duplicate", "delete_object", "separate_shells", "combine_visible", "add_shape", "clear_scene", "send_to_segmentation", "send_to_assembly", "send_visible_to_assembly", "send_posed_to_mesh", "set_texture", "remove_texture", "make_reference", "make_editable"], "What to do (send_to_segmentation: the object's inside becomes a segment of the volume in the Segmentation workspace; set_texture: show the image at `path` on the object through its UVs)"),
                 "path": {"type": "string", "description": "set_texture: absolute path of a PNG, JPEG, BMP or TGA image"},
                 "object": object["object"],
                 "keep_original": {"type": "boolean", "description": "separate_selection: keep the triangles in the original object too"},
@@ -186,6 +186,8 @@ struct Snap {
     name: String,
     visible: bool,
     see_through: bool,
+    /// An Assembly part: the Mesh object it is a copy of.
+    sent_from: Option<ObjectId>,
     mesh: Arc<Mesh>,
     selection: TriSelection,
     group_names: HashMap<i32, String>,
@@ -205,6 +207,7 @@ impl Snap {
             name: o.name.clone(),
             visible: o.visible,
             see_through: o.see_through,
+            sent_from: o.link.as_ref().map(|l| l.source),
             mesh: o.mesh.clone(),
             selection: o.selection.clone(),
             group_names: o.group_names.clone(),
@@ -378,6 +381,9 @@ fn parse(ws: &MeshWorkspace, tool: &str, args: &Value) -> Result<Vec<MeshCommand
                 Some("new_face_group") => on_active(C::CreateFaceGroup)?,
                 Some("duplicate") => on_active(C::Duplicate)?,
                 Some("send_to_segmentation") => vec![C::SendToSegmentation(object()?)],
+                Some("send_to_assembly") => vec![C::SendToAssembly(vec![object()?])],
+                Some("send_visible_to_assembly") => vec![C::SendToAssembly(ws.scene.objects.iter().filter(|o| o.visible && !o.reference).map(|o| o.id).collect())],
+                Some("send_posed_to_mesh") => vec![C::SendPosedToMesh],
                 Some("set_texture") => {
                     let path = std::path::PathBuf::from(arg_str(args, "path").ok_or("set_texture needs `path`")?);
                     if !path.is_absolute() {
@@ -553,7 +559,10 @@ fn scene(ws: &MeshWorkspace) -> AgentReply {
     };
     let c = &ws.camera;
     let v = &ws.view;
+    let other_parts = ws.other.scene.objects.len();
     let fixed = json!({
+        "tab": if ws.assembly_mode { "assembly" } else { "mesh" },
+        "objects_in_the_other_tab": other_parts,
         "units": "mm",
         "active_object": active,
         "target_object": target,
@@ -586,6 +595,7 @@ fn scene(ws: &MeshWorkspace) -> AgentReply {
                 "name": o.name,
                 "visible": o.visible,
                 "see_through": o.see_through,
+                "sent_from": o.sent_from,
                 "active": Some(o.id) == active,
                 "target": Some(o.id) == target,
                 "triangles": m.triangle_count(),

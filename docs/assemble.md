@@ -7,18 +7,26 @@ one way. The **Assembly** tab (⌘4) joins such parts and poses them before prin
 grounded, the others hang from it by joints, and dragging a limb turns it about its joint while
 what hangs from it follows.
 
-The Assembly tab shows the Mesh workspace's scene (the same parts, camera, undo and project)
-with only the assembly tools in its toolbar: Connect, Pose, Select (for joint surfaces),
-Transform, Align, Separate Shells, Collisions, Clearance, Combine visible, Boolean, Make Solid.
-Nothing there edits the meshes by accident: its Select only selects (no Discard, Erase & Fill,
-Extrude…, and their keys do nothing), and the sculpt and Inspector keys stay in the Mesh tab.
+The Assembly tab has a scene of its own (its own parts, camera and undo; saved in the same
+project) with only the assembly tools in its toolbar: Connect, Pose, Add Joint, Select (for joint
+surfaces), Transform, Align, Collisions, Clearance and Send posed to Mesh. Parts get there from the
+Mesh tab: right-click an object, **Send to Assembly** (or **Send visible to Assembly**). A part is
+a copy of its Mesh object linked by its mesh only: edits of the object's shape in the Mesh tab
+(brushes, remeshing, booleans, cuts) reach the part, which keeps its pose; moving, turning or
+scaling either one leaves the other where it is. Nothing there edits the meshes: its Select only
+selects (no Discard, Erase & Fill, Extrude…, and their keys do nothing), and the sculpt and
+Inspector keys stay in the Mesh tab. The Mesh tab is as it was before the Assembly tab: a flat
+object list, no joints, no Assemble.
 
 **Status:** ✅ done · 🟡 partial (see notes) · ❌ not yet · ⚪ low priority.
 
 **Code:** recognition, seating and the touching fit are GUI-free in `crates/mm-edit/src/mate.rs`;
 the joint model (grounding, joints, kinematics, following parts other tools move, project text)
-is `crates/polymix/src/assembly.rs`; the tool is `crates/polymix/src/tools/assemble.rs`; the tab
-is `Tab::Assembly` in `crates/polymix/src/shell.rs` with `MeshWorkspace::assembly_palette`.
+is `crates/polymix/src/assembly.rs`; the tool is `crates/polymix/src/tools/assemble.rs`; parts and
+the Mesh objects they came from (telling a move from an edit, sending both ways) are
+`crates/polymix/src/link.rs`; the tab is `Tab::Assembly` in `crates/polymix/src/shell.rs`, shown
+by the Mesh workspace with its other `Desk` (scene, history, camera, tools) and
+`MeshWorkspace::assembly_palette`.
 
 **Prior art:** [assemble_prior_art.md](assemble_prior_art.md) maps two MIT-licensed kitbash
 tools (Kitbash Bench, kitbasher) onto the ❌ rows below, with the algorithms worth porting
@@ -36,6 +44,11 @@ the tab's mode follows agents, offsets keep their meaning when a group is turned
 seat edits keep the rest pose, reshaped parts keep their joint frames, grounding stays out of
 undo, a flat face rests on a ball, a cylinder's axis points out of its part, area-weighted plane
 fit (PA #9)).
+
+**Separate scenes (2026-11-19).** The Mesh tab back to how it was before Assembly; the Assembly
+tab a scene of its own, parts sent to it from Mesh objects and linked by their meshes only (see
+above); Send posed to Mesh in place of Combine visible / Boolean / Make Solid / Separate Shells
+there.
 
 **Phase 1: joints owned by parts, connections between them** (approved 2026-11-18; ✅ built
 the same day).
@@ -105,8 +118,12 @@ MCP actions (constrained flag and clip report, inspect interference, raycast).
 
 ## Using it
 
-1. Import the parts (one file each, or one file split with **Separate Shells**).
-2. **Assembly tab** (⌘4). The largest part is grounded; the ground symbol on each row of the
+1. Import the parts into the **Mesh tab** (one file each, or one file split with **Separate
+   Shells**), and fix them there as needed.
+2. Right-click a part in the object browser: **Send to Assembly** (or **Send visible to
+   Assembly** for the whole kit). The **Assembly tab** (⌘4) shows them, where they were. Edits
+   of their shapes made later in the Mesh tab reach them there, where they are posed; moving
+   them in either tab leaves the other tab's copy where it is. The largest part is grounded; the ground symbol on each row of the
    object browser changes that. The browser shows the parts as a tree: under each part its
    joints, and under each joint the part connected there (click a joint or a connection to edit
    it). The eye beside a part makes it see-through, so clicks and brushes reach a surface behind
@@ -141,11 +158,16 @@ MCP actions (constrained flag and clip report, inspect interference, raycast).
    touching, put it back to rest or disconnect it. **Editing a joint re-seats what is connected
    to it, keeping its pose** (a bigger ball pushes a resting face out; moving a socket's joint
    moves the pivot, and the limb with it).
-6. **Check collisions**, then export the parts as posed, or **Combine visible** / **Boolean**
-   to print in one piece.
+6. **Check collisions**, then export the parts as posed, or **Send posed to Mesh**: copies of the
+   visible parts, as posed, become new objects in the Mesh tab, to join there (**Boolean**
+   union, **Make Solid**) and print in one piece.
 
-Joints and connections are saved in `.polymix` projects (`assembly.txt`, version 2; version 1
-files from before joints belonged to parts load as point joints) and are part of undo.
+The Assembly tab's parts, joints and connections are saved in `.polymix` projects (`assembly/`:
+its manifest, a mesh per part unless the part is its Mesh object moved, turned or scaled, which is
+stored as that map, and `joints.txt`, version 2) and are part of its undo. Projects of Polymix 0.6
+(`assembly.txt` on the Mesh objects) open with every object sent to the Assembly tab, joints and
+grounding on the parts; version 1 files from before joints belonged to parts load as point
+joints.
 
 ## Features
 
@@ -153,12 +175,14 @@ files from before joints belonged to parts load as point joints) and are part of
 
 | Feature | Status | Notes |
 |---|---|---|
-| Assembly tab (⌘4): the Mesh scene with only assembly tools | ✅ | Same parts, camera, undo and project as Mesh; Assemble opens with the tab and closes when leaving it (without connecting what is picked) |
+| Assembly tab (⌘4): a scene of its own with only assembly tools | ✅ | Its own parts, camera, undo and open tools (each tab finds them as it left them); saved in the same project; Assemble opens with the tab when nothing is open there |
+| Parts sent from the Mesh tab, linked by their meshes | ✅ | Send to Assembly / Send visible to Assembly (object browser's right-click); shape edits in Mesh reach the part where it is posed; moves, turns and scales in either tab stay there (a mirror counts as an edit); a part whose object is deleted keeps its last shape; undo in either tab keeps the other's work |
+| Send posed to Mesh | ✅ | Copies of the visible parts, as posed, as new (unlinked) Mesh objects, to join with Boolean / Make Solid |
 | No accidental mesh edits in the Assembly tab | ✅ | Select there only selects; edit keys (X, Delete, F, D, R, B, P, J, Y, T, ⌘G) do nothing; sculpt / Inspector keys only in Mesh |
-| Object browser as a tree (both tabs) | ✅ | Grounded parts as roots, listed first; under each part its joints (shape, name; click: select; ×: delete), under each joint the part connected there with a connection chip (click: select; right-click: disconnect; red when it came apart) |
+| Object browser as a tree (Assembly tab) | ✅ | Grounded parts as roots, listed first; under each part its joints (shape, name; click: select; ×: delete), under each joint the part connected there with a connection chip (click: select; right-click: disconnect; red when it came apart) |
 | Joints owned by parts | ✅ | Ball, socket, pin, hole, flat face, point; made from a click (recognized) or a selection; edit shape, radius, length, depth, nudge, name; fit again from a selection; drawn on the part |
 | Connections between joints | ✅ | Concentric, tangent (flat on ball), coaxial, flush, coincident × ball, hinge, fixed, slider, cylindrical, planar; one per joint (connecting again replaces); editing a joint re-seats keeping the pose |
-| See-through parts (the browser's eye) | ✅ | Both tabs: shown translucent, every pick (clicks, brushes, lassos, posing) goes through it to what is behind; not in undo, exported as usual |
+| See-through parts (the browser's eye) | ✅ | Assembly tab: shown translucent, every pick (clicks, brushes, lassos, posing) goes through it to what is behind; not in undo, exported as usual |
 | Ground / free a part | ✅ | The ground symbol on each row of the object browser; several grounded parts allowed (a joint between two of them cannot move) |
 | Ground the largest part when nothing is grounded | ✅ | By bounding-box volume, when the tool opens |
 | Parts as separate files in one go (folder import) | 🟡 | Existing multi-file import |
@@ -229,7 +253,7 @@ files from before joints belonged to parts load as point joints) and are part of
 | Check collisions between parts in the pose | ✅ | Crossing triangles drawn red; pairs listed, joined pairs greyed |
 | Gap check (parts that should touch but don't) | ❌ | Phase 5 (PA #6). The Clearance tool covers one pair |
 | Fill the gap a turned ball leaves in its socket | ❌ | Phase 5 (PA #7): seam fill or Warp targets; a large empty socket wants a union with the sphere |
-| Combine posed parts into one print | 🟡 | Combine visible / Boolean / Make Solid exist |
+| Combine posed parts into one print | 🟡 | Send posed to Mesh, then Boolean / Make Solid there |
 | Export each posed part separately | 🟡 | Export already writes visible objects; no per-part batch yet |
 | Magnet holes / pins at a joint | ❌ | Phase 5 (PA #5): held by the connection (Phase 1) |
 | Round bases (25 / 32 / 40 / 50 mm) and drop the model on one | ❌ | Phase 5 |

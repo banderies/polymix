@@ -3,9 +3,14 @@
 //! the active object, the target surface and the view. No undo history.
 //!
 //! The file is a zip archive holding `manifest.txt` (one `key value` per line) and one
-//! lossless binary mesh per object (`objects/N.bin`), and `assembly.txt` when the scene has
-//! grounded parts or joints (Assemble; see [`crate::assembly::to_text`]). Readers that do not
-//! know an entry pass it by.
+//! lossless binary mesh per object (`objects/N.bin`). The Assembly tab's scene, when it has
+//! parts, is in `assembly/`: its own `manifest.txt`, a mesh per part (`objects/N.bin`) unless
+//! the part is its Mesh object placed by a map (`link` and `pose`: it is made again from that
+//! object), and `joints.txt` (see [`crate::assembly::to_text`]). Readers that do not know an
+//! entry pass it by.
+//!
+//! Projects of Polymix 0.6 kept grounded parts and joints in `assembly.txt` (parts by Mesh
+//! object), the Assembly tab then showing the Mesh tab's objects: [`Project::assembly`].
 
 use crate::camera::ViewState;
 use anyhow::{anyhow, bail, Context, Result};
@@ -102,8 +107,26 @@ pub struct Project {
     pub active: Option<usize>,
     pub target: Option<usize>,
     pub view: Option<ViewState>,
-    /// The grounded parts and joints (`assembly.txt`), parts by index.
+    /// Grounded parts and joints as Polymix 0.6 kept them (`assembly.txt`), on the objects
+    /// above, by index.
     pub assembly: Option<String>,
+    /// The Assembly tab's scene.
+    pub assembly_tab: Option<ProjectAssembly>,
+}
+
+/// The Assembly tab's scene as stored in a project.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectAssembly {
+    pub objects: Vec<ProjectObject>,
+    /// Per part: the Mesh object it was sent from (by index in [`Project::objects`]).
+    pub links: Vec<Option<usize>>,
+    /// Per part: the map placing that object's mesh where the part is, when the part was stored
+    /// as that (its mesh, above, was made from the object's on loading).
+    pub poses: Vec<Option<crate::link::Affine>>,
+    pub active: Option<usize>,
+    pub view: Option<ViewState>,
+    /// Grounded parts, joints and connections, parts by index (see [`crate::assembly::to_text`]).
+    pub joints: Option<String>,
 }
 
 /// Lossless binary mesh: positions (f64), triangles, face groups, optional vertex colours.
@@ -198,7 +221,39 @@ pub struct SaveProject {
     pub active: Option<usize>,
     pub target: Option<usize>,
     pub view: Option<ViewState>,
-    pub assembly: Option<String>,
+    pub assembly_tab: Option<SaveAssembly>,
+}
+
+/// The Assembly tab's scene to save with [`save_shared`].
+pub struct SaveAssembly {
+    pub objects: Vec<SaveObject>,
+    /// Per part: the Mesh object it was sent from (by index in [`SaveProject::objects`]), and
+    /// whether the part is up to date with it (it may then be stored as that object, placed).
+    pub links: Vec<Option<(usize, bool)>>,
+    pub active: Option<usize>,
+    pub view: Option<ViewState>,
+    pub joints: Option<String>,
+}
+
+/// The Assembly tab as the writer gets it.
+struct AssemblyOut<'a> {
+    objects: Vec<ObjectOut<'a>>,
+    links: Vec<Option<(usize, bool)>>,
+    active: Option<usize>,
+    view: Option<&'a ViewState>,
+    joints: Option<&'a str>,
+}
+
+impl<'a> From<&'a ProjectAssembly> for AssemblyOut<'a> {
+    fn from(a: &'a ProjectAssembly) -> Self {
+        Self { objects: a.objects.iter().map(ObjectOut::from).collect(), links: a.links.iter().map(|l| l.map(|i| (i, true))).collect(), active: a.active, view: a.view.as_ref(), joints: a.joints.as_deref() }
+    }
+}
+
+impl<'a> From<&'a SaveAssembly> for AssemblyOut<'a> {
+    fn from(a: &'a SaveAssembly) -> Self {
+        Self { objects: a.objects.iter().map(ObjectOut::from).collect(), links: a.links.clone(), active: a.active, view: a.view.as_ref(), joints: a.joints.as_deref() }
+    }
 }
 
 /// How hard the archive's entries are compressed.
@@ -274,7 +329,18 @@ impl<'a> From<&'a SaveObject> for ObjectOut<'a> {
 
 /// Text of the manifest.
 fn manifest(view: Option<&ViewState>, active: Option<usize>, target: Option<usize>, objects: &[ObjectOut]) -> String {
-    let mut s = String::from("polymix-project 1\n");
+    manifest_of(MESH_HEAD, "objects", view, active, target, objects, None)
+}
+
+/// The first line of the Mesh tab's manifest and of the Assembly tab's.
+const MESH_HEAD: &str = "polymix-project 1";
+const ASSEMBLY_HEAD: &str = "polymix-assembly-tab 1";
+
+/// Text of a manifest (`head` its first line), its objects' files in `dir`; for the Assembly
+/// tab, `parts` gives each part's Mesh object and the map placing that object's mesh where the
+/// part is (no mesh file of its own then).
+fn manifest_of(head: &str, dir: &str, view: Option<&ViewState>, active: Option<usize>, target: Option<usize>, objects: &[ObjectOut], parts: Option<(&[Option<(usize, bool)>], &[Option<crate::link::Affine>])>) -> String {
+    let mut s = format!("{head}\n");
     let one_line = |x: &str| x.replace(['\n', '\r'], " ");
     if let Some(v) = view {
         let q = v.orient;
@@ -289,7 +355,16 @@ fn manifest(view: Option<&ViewState>, active: Option<usize>, target: Option<usiz
     for (i, o) in objects.iter().enumerate() {
         s += "object\n";
         s += &format!("name {}\n", one_line(o.name));
-        s += &format!("file objects/{i}.bin\n");
+        let pose = parts.and_then(|(_, poses)| poses[i]);
+        if pose.is_none() {
+            s += &format!("file {dir}/{i}.bin\n");
+        }
+        if let Some((src, _)) = parts.and_then(|(links, _)| links[i]) {
+            s += &format!("link {src}\n");
+        }
+        if let Some(a) = pose {
+            s += &format!("pose {}\n", a.to_array().map(|x| x.to_string()).join(" "));
+        }
         s += &format!("visible {}\n", o.visible as u8);
         s += &format!("color {} {} {} {}\n", o.color.x, o.color.y, o.color.z, o.color.w);
         s += &format!("material {}\n", o.material);
@@ -298,7 +373,7 @@ fn manifest(view: Option<&ViewState>, active: Option<usize>, target: Option<usiz
             s += &format!("group {g} {}\n", one_line(n));
         }
         if o.uvs.is_some() {
-            s += &format!("uvs objects/{i}.uv\n");
+            s += &format!("uvs {dir}/{i}.uv\n");
         }
         for p in o.pivots {
             let (x, q) = (p.position, p.frame);
@@ -320,17 +395,36 @@ fn manifest(view: Option<&ViewState>, active: Option<usize>, target: Option<usiz
 #[allow(dead_code)] // For code holding a `Project` (tests); the app saves with `save_shared`.
 pub fn save(path: &Path, project: &Project) -> Result<()> {
     let objects: Vec<ObjectOut> = project.objects.iter().map(ObjectOut::from).collect();
-    write_project(path, project.view.as_ref(), project.active, project.target, &objects, project.assembly.as_deref(), Compression::Default)
+    let tab = project.assembly_tab.as_ref().map(AssemblyOut::from);
+    write_project(path, project.view.as_ref(), project.active, project.target, &objects, project.assembly.as_deref(), tab.as_ref(), Compression::Default)
 }
 
 /// [`save`] for a snapshot of the scene that shares its meshes: the same file, compressed as
 /// asked.
 pub fn save_shared(path: &Path, project: &SaveProject, compression: Compression) -> Result<()> {
     let objects: Vec<ObjectOut> = project.objects.iter().map(ObjectOut::from).collect();
-    write_project(path, project.view.as_ref(), project.active, project.target, &objects, project.assembly.as_deref(), compression)
+    let tab = project.assembly_tab.as_ref().map(AssemblyOut::from);
+    write_project(path, project.view.as_ref(), project.active, project.target, &objects, None, tab.as_ref(), compression)
 }
 
-fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, target: Option<usize>, objects: &[ObjectOut], assembly: Option<&str>, compression: Compression) -> Result<()> {
+/// Write an object's mesh and UVs as `dir/i.bin` and `dir/i.uv` (the mesh only with `mesh`).
+fn write_object<W: Write + std::io::Seek>(zip: &mut zip::ZipWriter<W>, opts: zip::write::SimpleFileOptions, dir: &str, i: usize, o: &ObjectOut, mesh: bool) -> Result<()> {
+    if mesh {
+        zip.start_file(format!("{dir}/{i}.bin"), opts)?;
+        zip.write_all(&mesh_to_bytes(o.mesh))?;
+    }
+    if let Some(uvs) = o.uvs {
+        zip.start_file(format!("{dir}/{i}.uv"), opts)?;
+        zip.write_all(&match uvs {
+            UvsOut::Compact(uvs) => uvs_to_bytes(uvs),
+            UvsOut::ById(corners) => uv_corners_to_bytes(o.mesh.triangle_count(), o.mesh.triangle_ids().map(|t| &corners[t as usize])),
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, target: Option<usize>, objects: &[ObjectOut], assembly: Option<&str>, tab: Option<&AssemblyOut>, compression: Compression) -> Result<()> {
     let mut buf = Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
@@ -342,19 +436,30 @@ fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, t
         zip.start_file("manifest.txt", opts)?;
         zip.write_all(manifest(view, active, target, objects).as_bytes())?;
         for (i, o) in objects.iter().enumerate() {
-            zip.start_file(format!("objects/{i}.bin"), opts)?;
-            zip.write_all(&mesh_to_bytes(o.mesh))?;
-            if let Some(uvs) = o.uvs {
-                zip.start_file(format!("objects/{i}.uv"), opts)?;
-                zip.write_all(&match uvs {
-                    UvsOut::Compact(uvs) => uvs_to_bytes(uvs),
-                    UvsOut::ById(corners) => uv_corners_to_bytes(o.mesh.triangle_count(), o.mesh.triangle_ids().map(|t| &corners[t as usize])),
-                })?;
-            }
+            write_object(&mut zip, opts, "objects", i, o, true)?;
         }
         if let Some(a) = assembly {
             zip.start_file("assembly.txt", opts)?;
             zip.write_all(a.as_bytes())?;
+        }
+        if let Some(tab) = tab.filter(|t| !t.objects.is_empty()) {
+            // A part up to date with its Mesh object, and that object placed exactly, is stored
+            // as the map alone.
+            let poses: Vec<Option<crate::link::Affine>> = tab
+                .objects
+                .iter()
+                .zip(&tab.links)
+                .map(|(o, l)| l.filter(|l| l.1).and_then(|(src, _)| objects.get(src)).and_then(|src| crate::link::exact_pose(src.mesh, o.mesh)))
+                .collect();
+            zip.start_file("assembly/manifest.txt", opts)?;
+            zip.write_all(manifest_of(ASSEMBLY_HEAD, "assembly/objects", tab.view, tab.active, None, &tab.objects, Some((&tab.links, &poses))).as_bytes())?;
+            for (i, o) in tab.objects.iter().enumerate() {
+                write_object(&mut zip, opts, "assembly/objects", i, o, poses[i].is_none())?;
+            }
+            if let Some(j) = tab.joints {
+                zip.start_file("assembly/joints.txt", opts)?;
+                zip.write_all(j.as_bytes())?;
+            }
         }
         zip.finish()?;
     }
@@ -364,29 +469,44 @@ fn write_project(path: &Path, view: Option<&ViewState>, active: Option<usize>, t
     Ok(())
 }
 
-pub fn load(path: &Path) -> Result<Project> {
-    let data = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut zip = zip::ZipArchive::new(Cursor::new(data)).context("not a Polymix project")?;
-    let mut text = String::new();
-    zip.by_name("manifest.txt").context("project has no manifest")?.read_to_string(&mut text)?;
+/// What a manifest lists besides its objects.
+#[derive(Default)]
+struct Head {
+    view: Option<ViewState>,
+    active: Option<usize>,
+    target: Option<usize>,
+}
+
+/// An object read from a manifest, with (for an Assembly part) its Mesh object and the map
+/// placing that object's mesh where the part is, when it has no mesh file of its own.
+struct Listed {
+    object: ProjectObject,
+    link: Option<usize>,
+    pose: Option<crate::link::Affine>,
+}
+
+/// Read the manifest `text` (first line `head`), and each object's mesh and UVs from `zip`, in
+/// manifest order. `parts`: an Assembly tab manifest, whose objects may give `link` and `pose`.
+fn read_manifest(zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>, text: &str, head: &str, parts: bool) -> Result<(Head, Vec<Listed>)> {
     let mut lines = text.lines();
-    if lines.next().map(str::trim) != Some("polymix-project 1") {
+    if lines.next().map(str::trim) != Some(head) {
         bail!("unsupported project version");
     }
     let nums = |rest: &str| -> Vec<f64> { rest.split_whitespace().filter_map(|x| x.parse().ok()).collect() };
-    let mut project = Project::default();
-    let mut cur: Option<(ProjectObject, String)> = None;
+    let mut h = Head::default();
+    let mut out = Vec::new();
+    let mut cur: Option<(Listed, String)> = None;
     let mut uv_file: Option<String> = None;
     for line in lines {
         let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
         match (key, cur.as_mut()) {
             ("view", None) => {
                 if let [x, y, z, d, qx, qy, qz, qw] = nums(rest)[..] {
-                    project.view = Some(ViewState { target: DVec3::new(x, y, z), distance: d, orient: DQuat::from_xyzw(qx, qy, qz, qw).normalize() });
+                    h.view = Some(ViewState { target: DVec3::new(x, y, z), distance: d, orient: DQuat::from_xyzw(qx, qy, qz, qw).normalize() });
                 }
             }
-            ("active", None) => project.active = rest.trim().parse().ok(),
-            ("target", None) => project.target = rest.trim().parse().ok(),
+            ("active", None) => h.active = rest.trim().parse().ok(),
+            ("target", None) => h.target = rest.trim().parse().ok(),
             ("object", None) => {
                 let o = ProjectObject {
                     name: String::new(),
@@ -401,59 +521,104 @@ pub fn load(path: &Path) -> Result<Project> {
                     texture: None,
                     reference: false,
                 };
-                cur = Some((o, String::new()));
+                cur = Some((Listed { object: o, link: None, pose: None }, String::new()));
                 uv_file = None;
             }
-            ("name", Some((o, _))) => o.name = rest.to_string(),
+            ("name", Some((l, _))) => l.object.name = rest.to_string(),
             ("file", Some((_, f))) => *f = rest.trim().to_string(),
-            ("visible", Some((o, _))) => o.visible = rest.trim() != "0",
-            ("color", Some((o, _))) => {
+            ("link", Some((l, _))) if parts => l.link = rest.trim().parse().ok(),
+            ("pose", Some((l, _))) if parts => {
+                let v = nums(rest);
+                let a: [f64; 12] = v.try_into().map_err(|_| anyhow!("a part's pose needs 12 numbers"))?;
+                l.pose = Some(crate::link::Affine::from_array(&a));
+            }
+            ("visible", Some((l, _))) => l.object.visible = rest.trim() != "0",
+            ("color", Some((l, _))) => {
                 if let [r, g, b, a] = nums(rest)[..] {
-                    o.color = Vec4::new(r as f32, g as f32, b as f32, a as f32);
+                    l.object.color = Vec4::new(r as f32, g as f32, b as f32, a as f32);
                 }
             }
-            ("material", Some((o, _))) => o.material = rest.trim().parse().unwrap_or(0),
-            ("frame", Some((o, _))) => {
+            ("material", Some((l, _))) => l.object.material = rest.trim().parse().unwrap_or(0),
+            ("frame", Some((l, _))) => {
                 if let [x, y, z, w] = nums(rest)[..] {
-                    o.frame = DQuat::from_xyzw(x, y, z, w).normalize();
+                    l.object.frame = DQuat::from_xyzw(x, y, z, w).normalize();
                 }
             }
-            ("group", Some((o, _))) => {
+            ("group", Some((l, _))) => {
                 let (g, n) = rest.split_once(' ').unwrap_or((rest, ""));
                 if let Ok(g) = g.parse() {
-                    o.group_names.push((g, n.to_string()));
+                    l.object.group_names.push((g, n.to_string()));
                 }
             }
             ("uvs", Some(_)) => uv_file = Some(rest.trim().to_string()),
-            ("texture", Some((o, _))) => o.texture = Some(std::path::PathBuf::from(rest)),
-            ("reference", Some((o, _))) => o.reference = rest.trim() != "0",
-            ("pivot", Some((o, _))) => {
+            ("texture", Some((l, _))) => l.object.texture = Some(std::path::PathBuf::from(rest)),
+            ("reference", Some((l, _))) => l.object.reference = rest.trim() != "0",
+            ("pivot", Some((l, _))) => {
                 if let [x, y, z, qx, qy, qz, qw] = nums(rest)[..] {
-                    o.pivots.push(crate::scene::Pivot { position: DVec3::new(x, y, z), frame: DQuat::from_xyzw(qx, qy, qz, qw).normalize() });
+                    l.object.pivots.push(crate::scene::Pivot { position: DVec3::new(x, y, z), frame: DQuat::from_xyzw(qx, qy, qz, qw).normalize() });
                 }
             }
             ("end", Some(_)) => {
-                let (mut o, file) = cur.take().unwrap();
-                let mut bytes = Vec::new();
-                zip.by_name(&file).with_context(|| format!("project is missing {file}"))?.read_to_end(&mut bytes)?;
-                o.mesh = mesh_from_bytes(&bytes).with_context(|| format!("in {file}"))?;
+                let (mut l, file) = cur.take().unwrap();
+                // A part stored as its Mesh object placed has no file: its mesh is made later.
+                if !(file.is_empty() && l.pose.is_some() && l.link.is_some()) {
+                    let mut bytes = Vec::new();
+                    zip.by_name(&file).with_context(|| format!("project is missing {file}"))?.read_to_end(&mut bytes)?;
+                    l.object.mesh = mesh_from_bytes(&bytes).with_context(|| format!("in {file}"))?;
+                    l.pose = None;
+                }
                 if let Some(f) = uv_file.take() {
                     let mut b = Vec::new();
                     zip.by_name(&f).with_context(|| format!("project is missing {f}"))?.read_to_end(&mut b)?;
                     let uvs = uvs_from_bytes(&b).with_context(|| format!("in {f}"))?;
-                    // UVs that don't match the triangles are dropped rather than misapplied.
-                    o.uvs = (uvs.len() == o.mesh.triangle_count()).then_some(uvs);
+                    // UVs that don't match the triangles are dropped rather than misapplied
+                    // (a part's, once its mesh is made).
+                    l.object.uvs = (l.pose.is_some() || uvs.len() == l.object.mesh.triangle_count()).then_some(uvs);
                 }
-                project.objects.push(o);
+                out.push(l);
             }
             ("", _) => {}
             (k, _) => return Err(anyhow!("unexpected '{k}' in the project manifest")),
         }
     }
-    if let Ok(mut f) = zip.by_name("assembly.txt") {
-        let mut a = String::new();
-        f.read_to_string(&mut a)?;
-        project.assembly = Some(a);
+    Ok((h, out))
+}
+
+/// A zip entry's text, if the archive has it.
+fn entry_text(zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Result<Option<String>> {
+    match zip.by_name(name) {
+        Ok(mut f) => {
+            let mut t = String::new();
+            f.read_to_string(&mut t)?;
+            Ok(Some(t))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+pub fn load(path: &Path) -> Result<Project> {
+    let data = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(Cursor::new(data)).context("not a Polymix project")?;
+    let text = entry_text(&mut zip, "manifest.txt")?.context("project has no manifest")?;
+    let (head, objects) = read_manifest(&mut zip, &text, MESH_HEAD, false)?;
+    let mut project = Project { objects: objects.into_iter().map(|l| l.object).collect(), active: head.active, target: head.target, view: head.view, ..Default::default() };
+    project.assembly = entry_text(&mut zip, "assembly.txt")?;
+    if let Some(text) = entry_text(&mut zip, "assembly/manifest.txt")? {
+        let (head, parts) = read_manifest(&mut zip, &text, ASSEMBLY_HEAD, true)?;
+        let mut tab = ProjectAssembly { active: head.active, view: head.view, joints: entry_text(&mut zip, "assembly/joints.txt")?, ..Default::default() };
+        for (k, mut l) in parts.into_iter().enumerate() {
+            if let Some(pose) = l.pose {
+                let src = l.link.and_then(|i| project.objects.get(i)).with_context(|| format!("the Assembly tab's part {k} is placed from a missing object"))?;
+                l.object.mesh = crate::link::place(src.mesh.clone(), &pose);
+                if l.object.uvs.as_ref().is_some_and(|u| u.len() != l.object.mesh.triangle_count()) {
+                    l.object.uvs = None;
+                }
+            }
+            tab.objects.push(l.object);
+            tab.links.push(l.link.filter(|&i| i < project.objects.len()));
+            tab.poses.push(l.pose);
+        }
+        project.assembly_tab = Some(tab);
     }
     Ok(project)
 }
@@ -504,6 +669,7 @@ mod tests {
             target: Some(1),
             view: Some(ViewState { target: DVec3::new(1.0, 2.0, 3.0), distance: 42.0, orient: DQuat::from_rotation_y(0.5) }),
             assembly: Some("polymix-assembly 1\nground 1\n".into()),
+            assembly_tab: None,
         };
         let dir = std::env::temp_dir().join(format!("polymix-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -824,8 +990,9 @@ mod tests {
             target: Some(0),
             view: Some(ViewState { target: DVec3::new(1.0, -2.0, 3.0), distance: 12.5, orient: DQuat::from_rotation_z(0.2) }),
             assembly: None,
+            assembly_tab: None,
         };
-        let snapshot = SaveProject { objects: shared, active: copied.active, target: copied.target, view: copied.view, assembly: None };
+        let snapshot = SaveProject { objects: shared, active: copied.active, target: copied.target, view: copied.view, assembly_tab: None };
         let dir = std::env::temp_dir().join(format!("polymix-shared-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Written as before, byte for byte; compressed otherwise, the same entries.
@@ -849,6 +1016,61 @@ mod tests {
         }
         let size = |c: Compression| std::fs::metadata(dir.join(format!("{c:?}.polymix"))).unwrap().len();
         assert!(size(Compression::Fast) < size(Compression::Stored));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_assembly_tab_round_trips_with_placed_parts_stored_as_their_map() {
+        use crate::link::Affine;
+        let obj = |name: &str, mesh: Mesh| ProjectObject { name: name.into(), mesh, visible: true, color: Vec4::ONE, material: 0, frame: DQuat::IDENTITY, group_names: Vec::new(), uvs: None, pivots: Vec::new(), texture: None, reference: false };
+        let arm = mm_core::primitives::cube(3.0, 4);
+        let torso = mm_core::primitives::icosphere(5.0, 3);
+        let pose = Affine { m: glam::DMat3::from_quat(DQuat::from_rotation_z(0.8)), t: DVec3::new(10.0, 0.0, 2.0) };
+        let posed_arm = crate::link::place(arm.clone(), &pose);
+        let mut dented = torso.clone();
+        dented.set_vertex(0, dented.vertex(0) * 1.2);
+        let mut uv_arm = obj("arm", posed_arm.clone());
+        uv_arm.uvs = Some((0..posed_arm.triangle_count()).map(|t| [[t as f32, 0.0], [0.5, 1.0], [0.0, 0.25]]).collect());
+        let view = ViewState { target: DVec3::new(0.0, 1.0, 2.0), distance: 80.0, orient: DQuat::from_rotation_x(0.3) };
+        let p = Project {
+            objects: vec![obj("arm", arm.clone()), obj("torso", torso.clone())],
+            assembly_tab: Some(ProjectAssembly {
+                objects: vec![uv_arm, obj("torso", dented.clone()), obj("loose", mm_core::primitives::cube(1.0, 1))],
+                links: vec![Some(0), Some(1), None],
+                poses: vec![None; 3],
+                active: Some(1),
+                view: Some(view),
+                joints: Some("polymix-assembly 2\nground 1\n".into()),
+            }),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("polymix-assembly-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kit.polymix");
+        save(&path, &p).unwrap();
+        let names: Vec<String> = entries(&path).into_iter().map(|(n, _)| n).collect();
+        for n in ["assembly/manifest.txt", "assembly/joints.txt", "assembly/objects/0.uv", "assembly/objects/1.bin", "assembly/objects/2.bin"] {
+            assert!(names.iter().any(|x| x == n), "{n} in {names:?}");
+        }
+        assert!(!names.iter().any(|x| x == "assembly/objects/0.bin" || x == "assembly.txt"), "the placed arm is its map alone: {names:?}");
+        let q = load(&path).unwrap();
+        assert!(q.assembly.is_none());
+        let tab = q.assembly_tab.unwrap();
+        assert_eq!(tab.links, vec![Some(0), Some(1), None]);
+        assert!(tab.poses[0].is_some_and(|a| (a.m - pose.m).to_cols_array().iter().all(|x| x.abs() < 1e-12)) && tab.poses[1].is_none() && tab.poses[2].is_none());
+        assert_eq!((tab.active, tab.joints.as_deref()), (Some(1), Some("polymix-assembly 2\nground 1\n")));
+        assert!((tab.view.unwrap().distance - 80.0).abs() < 1e-12);
+        assert_eq!(tab.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["arm", "torso", "loose"]);
+        for (v, w) in posed_arm.vertex_ids().zip(tab.objects[0].mesh.vertex_ids()) {
+            assert!((posed_arm.vertex(v) - tab.objects[0].mesh.vertex(w)).length() < 1e-9);
+        }
+        assert_eq!(tab.objects[0].uvs, p.assembly_tab.as_ref().unwrap().objects[0].uvs, "UVs of a part made from its object");
+        assert_eq!(tab.objects[1].mesh.vertex(0), dented.vertex(0), "an edited part keeps its own mesh");
+        // A Polymix 0.6 reader passes the tab by: the Mesh objects are as they were.
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut m = String::new();
+        zip.by_name("manifest.txt").unwrap().read_to_string(&mut m).unwrap();
+        assert!(!m.contains("link") && !m.contains("pose"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

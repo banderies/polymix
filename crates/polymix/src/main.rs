@@ -9,6 +9,7 @@ mod commands;
 mod icons;
 mod image_planes;
 mod jobs;
+mod link;
 #[cfg(target_os = "macos")]
 mod macos_open;
 mod materials;
