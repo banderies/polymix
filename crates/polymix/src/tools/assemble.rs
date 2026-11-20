@@ -17,9 +17,14 @@
 //! **Pose:** drag a part to turn it about its connection; what hangs from it follows and
 //! grounded parts stay put. Ball: the grabbed point follows the cursor (Shift: twist about the
 //! limb). Hinge: turn about the axis. Slider: slide along it. ⌘ turns in steps of 15°. The
-//! selected connection's angles can also be typed in the panel.
+//! selected connection has handles for the motions it allows, one turn or slide at a time: a
+//! ball's three rings (its x, y and twist, turning with the part), a hinge's ring, a slider's
+//! arrow, a cylindrical joint's ring and arrow, a planar joint's ring and two arrows (⌘: steps of
+//! 15° or 1 mm, Shift: 1° or 0.1 mm, of the connection's own angle or slide). Its angles can
+//! also be typed in the panel.
 
 use super::*;
+use super::transform::{dist_to_segment, AXIS_COLORS};
 use crate::assembly::{self, anchors, initial_seat, Assembly, Connection, Drive, Interaction, JFrame, Joint, JointShape, Motion, Rigid, Selected};
 use crate::ui_util;
 use egui::{Color32, RichText};
@@ -125,9 +130,186 @@ enum RefineFor {
     Joint(u64),
 }
 
+/// A pose handle on the selected connection: only the turns and slides its motion allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handle {
+    /// A ring turning about axis `i` of the gizmo (a ball's x, y and twist; the axis of a
+    /// hinge, cylindrical or planar connection is 2).
+    Turn(usize),
+    /// An arrow sliding along axis `i` (a slider's or cylindrical connection's axis is 2; a
+    /// planar connection slides along 0 and 1).
+    Slide(usize),
+}
+
+/// The selected connection's handles (Pose).
+#[derive(Clone, Debug)]
+struct Gizmo {
+    connection: u64,
+    kind: Motion,
+    /// The parts the handles move, and whether that is the connection's child's side.
+    parts: Vec<ObjectId>,
+    moving_child: bool,
+    /// On the moving side's frame; axes the moving frame's for a ball (they turn with the part),
+    /// else the parent's (in which the connection's angle and slides are measured).
+    centre: DVec3,
+    axes: [DVec3; 3],
+}
+
+impl Gizmo {
+    fn handles(&self) -> &'static [Handle] {
+        match self.kind {
+            Motion::Ball => &[Handle::Turn(0), Handle::Turn(1), Handle::Turn(2)],
+            Motion::Hinge => &[Handle::Turn(2)],
+            Motion::Cylindrical => &[Handle::Turn(2), Handle::Slide(2)],
+            Motion::Slider => &[Handle::Slide(2)],
+            Motion::Planar => &[Handle::Turn(2), Handle::Slide(0), Handle::Slide(1)],
+            Motion::Fixed => &[],
+        }
+    }
+
+    /// Moved by a drag's motion, as drawn while it goes on.
+    fn moved(&self, m: &Rigid) -> Gizmo {
+        let mut g = self.clone();
+        g.centre = m.apply(self.centre);
+        if self.kind == Motion::Ball {
+            g.axes = self.axes.map(|a| m.rot * a);
+        }
+        g
+    }
+
+    /// The rings' radius and the arrows' half length, in world units (constant on screen).
+    fn sizes(&self, cx: &ToolCx) -> (f64, f64) {
+        let per = cx.world_per_point(self.centre);
+        (per * 70.0, per * 100.0)
+    }
+
+    fn name(&self, h: Handle) -> &'static str {
+        match (self.kind, h) {
+            (Motion::Ball, Handle::Turn(0)) => "X",
+            (Motion::Ball, Handle::Turn(1)) => "Y",
+            (Motion::Ball, Handle::Turn(_)) => "Twist",
+            (_, Handle::Turn(_)) => "Angle",
+            (Motion::Planar, Handle::Slide(0)) => "Slide X",
+            (Motion::Planar, Handle::Slide(_)) => "Slide Y",
+            (_, Handle::Slide(_)) => "Slide",
+        }
+    }
+
+    /// Points round ring `i`.
+    fn ring(&self, i: usize, r: f64, n: usize) -> Vec<DVec3> {
+        let (u, v) = mm_core::geom::orthonormal_basis(self.axes[i]);
+        (0..=n).map(|k| {
+            let t = k as f64 / n as f64 * std::f64::consts::TAU;
+            self.centre + (u * t.cos() + v * t.sin()) * r
+        }).collect()
+    }
+
+    /// The handle under `pos` (the nearest within a few points), and where on it.
+    fn handle_at(&self, pos: egui::Pos2, cx: &ToolCx) -> Option<(Handle, DVec3)> {
+        let (r, len) = self.sizes(cx);
+        let mut best: Option<(f32, Handle, DVec3)> = None;
+        for &h in self.handles() {
+            let (d, at) = match h {
+                Handle::Turn(i) => {
+                    let pts = self.ring(i, r, 64);
+                    let mut near = (f32::MAX, self.centre);
+                    for w in pts.windows(2) {
+                        if let (Some(a), Some(b)) = (cx.project(w[0]), cx.project(w[1])) {
+                            let d = dist_to_segment(pos, a, b);
+                            if d < near.0 {
+                                near = (d, if pos.distance(a) < pos.distance(b) { w[0] } else { w[1] });
+                            }
+                        }
+                    }
+                    near
+                }
+                Handle::Slide(i) => match (cx.project(self.centre - self.axes[i] * len), cx.project(self.centre + self.axes[i] * len)) {
+                    (Some(a), Some(b)) => (dist_to_segment(pos, a, b), self.centre),
+                    _ => (f32::MAX, self.centre),
+                },
+            };
+            if d < 7.0 && best.is_none_or(|b| d < b.0) {
+                best = Some((d, h, at));
+            }
+        }
+        best.map(|b| (b.1, b.2))
+    }
+
+    fn paint(&self, painter: &egui::Painter, cx: &ToolCx, active: Option<Handle>) {
+        let Some(c) = cx.project(self.centre) else { return };
+        let (r, len) = self.sizes(cx);
+        for &h in self.handles() {
+            let hot = active == Some(h);
+            let (i, width) = match h {
+                Handle::Turn(i) | Handle::Slide(i) => (i, if hot { 3.5 } else { 2.0 }),
+            };
+            let col = if hot { Color32::YELLOW } else { AXIS_COLORS[i] };
+            match h {
+                Handle::Turn(_) => {
+                    let pts: Vec<egui::Pos2> = self.ring(i, r, 64).into_iter().filter_map(|p| cx.project(p)).collect();
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(width, col)));
+                }
+                Handle::Slide(_) => {
+                    for s in [1.0, -1.0] {
+                        if let Some(tip) = cx.project(self.centre + self.axes[i] * (len * s)) {
+                            painter.arrow(c, tip - c, egui::Stroke::new(width + 0.5, col));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A drag on a pose handle.
+#[derive(Clone, Debug)]
+struct HandleDrag {
+    gizmo: Gizmo,
+    handle: Handle,
+    /// Where on the ring it was grabbed.
+    grab: DVec3,
+    /// The cursor's ray met the ring's plane (else the turn follows the cursor's move along the
+    /// way the grabbed point goes on screen); for a slide, the ray was not along the axis.
+    exact: bool,
+    /// For a slide, where along the axis the cursor's ray passed at the press.
+    along0: f64,
+    /// The connection's angle (one-axis turns) or slide along the handle's axis at the press,
+    /// as the panel shows it, and +1 or −1 as the moving side's motion adds to it or takes from it.
+    base: f64,
+    sign: f64,
+    /// This drag's turn (radians) or slide (mm) so far, and the cursor.
+    amount: f64,
+    at: egui::Pos2,
+}
+
+impl HandleDrag {
+    /// What the drag has done so far: a ball's turn, else the connection's angle or slide.
+    fn readout(&self) -> String {
+        let name = self.gizmo.name(self.handle);
+        match self.handle {
+            Handle::Turn(_) if self.gizmo.kind == Motion::Ball => format!("{name} {:+.1}°", self.amount.to_degrees()),
+            Handle::Turn(_) => {
+                let d = (self.base + self.sign * self.amount).to_degrees();
+                format!("{name} {:.1}° ({:+.1}°)", (d + 180.0).rem_euclid(360.0) - 180.0, (self.sign * self.amount).to_degrees())
+            }
+            Handle::Slide(_) => format!("{name} {:.3} mm ({:+.3})", self.base + self.sign * self.amount, self.sign * self.amount),
+        }
+    }
+}
+
+/// Text on a dark plate, for readouts over the model.
+fn plate_text(painter: &egui::Painter, at: egui::Pos2, text: String, col: Color32) {
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), col);
+    let rect = egui::Rect::from_min_size(at, galley.size()).expand(3.0);
+    painter.rect_filled(rect, 3.0, Color32::from_black_alpha(170));
+    painter.galley(at, galley, col);
+}
+
 struct Drag {
     part: ObjectId,
     drive: Drive,
+    /// Dragging one of the selected connection's handles (else the part itself).
+    handle: Option<HandleDrag>,
     /// Where the part was grabbed (world), and the cursor then.
     grab: DVec3,
     start: egui::Pos2,
@@ -167,6 +349,8 @@ pub struct AssembleTool {
     request: Option<Box<dyn Tool>>,
     plan: Result<Option<Plan>, String>,
     hover: Option<(ObjectId, egui::Pos2)>,
+    /// The selected connection's handle under the cursor (Pose), and the cursor.
+    hover_handle: Option<(Handle, egui::Pos2)>,
     drag: Option<Drag>,
     pressed_at: Option<egui::Pos2>,
     /// The grounded parts, joints and connections when last planned (the object browser,
@@ -231,6 +415,7 @@ impl AssembleTool {
             request: None,
             plan: Ok(None),
             hover: None,
+            hover_handle: None,
             drag: None,
             pressed_at: None,
             seen: seen_of(&cx.scene.assembly),
@@ -723,7 +908,7 @@ impl AssembleTool {
                 let kind = cx.scene.assembly.connection(*connection)?.kind;
                 let (c, axis) = (frame.origin, frame.axis());
                 let turn = || {
-                    let a = turn_angle(&ray, d.grab, c, axis).map(snap_angle).unwrap_or_else(|| screen_turn(axis, c));
+                    let a = turn_angle(&ray, d.grab, c, axis, 0.3).map(snap_angle).unwrap_or_else(|| screen_turn(axis, c));
                     Rigid::about(DQuat::from_axis_angle(axis, a), c)
                 };
                 let slide = || {
@@ -769,6 +954,122 @@ impl AssembleTool {
                         Rigid::translation(v - axis * v.dot(axis))
                     }
                 })
+            }
+        }
+    }
+
+    /// A press on a part (Pose): drag it about the connection that moves it.
+    fn press_part(&mut self, pos: egui::Pos2, shift: bool, cx: &mut ToolCx) {
+        let Some((id, hit)) = cx.pick(pos, None) else { return };
+        let drive = cx.scene.assembly.drive(id);
+        cx.scene.active = Some(id);
+        let name = cx.scene.get(id).map_or_else(String::new, |o| o.name.clone());
+        match &drive {
+            Drive::Grounded(g) => {
+                let gname = cx.scene.get(*g).map_or_else(String::new, |o| o.name.clone());
+                *cx.status = if *g == id { format!("{name} is grounded: it stays put (click its ground symbol in the object browser to free it).") } else { format!("{name} is held by {gname}, which is grounded.") };
+                let asm = &mut cx.scene.assembly;
+                if let Some(c) = asm.parent_connection(id).map(|c| c.id) {
+                    asm.selected = Some(Selected::Connection(c));
+                }
+                return;
+            }
+            Drive::Connection { connection, .. } => cx.scene.assembly.selected = Some(Selected::Connection(*connection)),
+            Drive::Free(_) => {}
+        }
+        let parts = drive.parts();
+        let mut b = Aabb::EMPTY;
+        for o in parts.iter().filter_map(|&p| cx.scene.get(p)) {
+            b = b.union(&o.bounds());
+        }
+        let centre = b.center();
+        let limb = match &drive {
+            Drive::Connection { frame, .. } => (centre - frame.origin).normalize_or(frame.axis()),
+            _ => DVec3::Z,
+        };
+        self.drag = Some(Drag { part: id, drive, handle: None, grab: hit.point, start: pos, alt: shift, centre, limb, motion: Rigid::IDENTITY, generation: cx.history.generation() });
+    }
+
+    /// The selected connection's handles, in Pose: none for a fixed connection, one that came
+    /// apart (Snap together puts it back first), or one held by grounded parts on both sides.
+    fn gizmo(&self, scene: &Scene) -> Option<Gizmo> {
+        if self.mode != Mode::Pose {
+            return None;
+        }
+        let asm = &scene.assembly;
+        let Some(Selected::Connection(cid)) = asm.selected else { return None };
+        let c = asm.connection(cid)?;
+        if c.kind == Motion::Fixed || c.is_apart() {
+            return None;
+        }
+        let Some(Drive::Connection { parts, moving_child, .. }) = asm.connection_drive(cid) else { return None };
+        if !parts.iter().any(|&p| scene.get(p).is_some_and(|o| o.visible)) {
+            return None;
+        }
+        let moving = if moving_child { c.on_child() } else { c.on_parent() };
+        let rot = if c.kind == Motion::Ball { moving.rot } else { c.on_parent().rot };
+        Some(Gizmo { connection: cid, kind: c.kind, parts, moving_child, centre: moving.origin, axes: [rot * DVec3::X, rot * DVec3::Y, rot * DVec3::Z] })
+    }
+
+    /// Start dragging handle `h` of `g`, grabbed at `at` (on a ring), the cursor at `pos`.
+    fn start_handle(&mut self, g: Gizmo, h: Handle, at: DVec3, pos: egui::Pos2, cx: &ToolCx) {
+        let Some(c) = cx.scene.assembly.connection(g.connection) else { return };
+        let (_, off) = c.pose();
+        let ray = cx.ray_at(pos);
+        let mut at = at;
+        let (exact, along0, base) = match h {
+            Handle::Turn(i) => {
+                let exact = ray.dir.normalize().dot(g.axes[i]).abs() > 0.2;
+                // Turn from under the cursor, not from the ring's nearest drawn point.
+                if let Some(hit) = ray_plane(&ray, g.centre, g.axes[i]).filter(|_| exact) {
+                    at = hit;
+                }
+                (exact, 0.0, c.angle())
+            }
+            Handle::Slide(i) => {
+                let along = slide_along(&ray, g.centre, g.axes[i]);
+                (along.is_some(), along.unwrap_or(0.0), off[i])
+            }
+        };
+        let part = if g.moving_child { c.child } else { c.parent };
+        let frame = if g.moving_child { c.on_parent() } else { c.on_child() };
+        let drive = Drive::Connection { connection: g.connection, parts: g.parts.clone(), frame, moving_child: g.moving_child };
+        // Turning or sliding the parent's side takes from the connection's angle and slides.
+        let sign = if g.moving_child { 1.0 } else { -1.0 };
+        let (centre, limb) = (g.centre, g.axes[2]);
+        let hd = HandleDrag { gizmo: g, handle: h, grab: at, exact, along0, base, sign, amount: 0.0, at: pos };
+        self.drag = Some(Drag { part, drive, handle: Some(hd), grab: at, start: pos, alt: false, centre, limb, motion: Rigid::IDENTITY, generation: cx.history.generation() });
+    }
+
+    /// The motion a handle drag gives the moving parts with the cursor at `pos`. ⌘: steps of
+    /// 15° (1 mm), Shift: 1° (0.1 mm); a one-axis turn or a slide steps the connection's own
+    /// angle or slide (what the panel shows), a ball's ring this drag's turn.
+    fn handle_motion(&self, h: &mut HandleDrag, start: egui::Pos2, pos: egui::Pos2, coarse: bool, fine: bool, cx: &ToolCx) -> Rigid {
+        let ray = cx.ray_at(pos);
+        h.at = pos;
+        let (centre, axes, kind, sign, base) = (h.gizmo.centre, h.gizmo.axes, h.gizmo.kind, h.sign, h.base);
+        let stepped = |raw: f64, step: f64, absolute: bool| {
+            if step <= 0.0 {
+                raw
+            } else if absolute {
+                sign * (((base + sign * raw) / step).round() * step - base)
+            } else {
+                (raw / step).round() * step
+            }
+        };
+        match h.handle {
+            Handle::Turn(i) => {
+                let axis = axes[i];
+                let raw = if h.exact { turn_angle(&ray, h.grab, centre, axis, 0.0).unwrap_or(h.amount) } else { screen_angle(cx, h.grab, start, pos, axis, centre) };
+                let step = if coarse { self.snap_deg.to_radians() } else if fine { 1f64.to_radians() } else { 0.0 };
+                h.amount = stepped(raw, step, kind != Motion::Ball);
+                Rigid::about(DQuat::from_axis_angle(axis, h.amount), centre)
+            }
+            Handle::Slide(i) => {
+                let axis = axes[i];
+                let raw = if h.exact { slide_along(&ray, centre, axis).map_or(h.amount, |s| s - h.along0) } else { screen_slide(cx, centre, start, pos, axis) };
+                h.amount = stepped(raw, if coarse { 1.0 } else if fine { 0.1 } else { 0.0 }, true);
+                Rigid::translation(axis * h.amount)
             }
         }
     }
@@ -1538,9 +1839,9 @@ fn ray_plane(ray: &mm_core::Ray, p0: DVec3, n: DVec3) -> Option<DVec3> {
 }
 
 /// The turn about `axis` (through `c`) that brings the grabbed point under the ray, when the axis
-/// is not too side-on to the view.
-fn turn_angle(ray: &mm_core::Ray, grab: DVec3, c: DVec3, axis: DVec3) -> Option<f64> {
-    if ray.dir.normalize().dot(axis).abs() < 0.3 {
+/// is not too side-on to the view (the cosine between them at least `min_cos`).
+fn turn_angle(ray: &mm_core::Ray, grab: DVec3, c: DVec3, axis: DVec3, min_cos: f64) -> Option<f64> {
+    if ray.dir.normalize().dot(axis).abs() < min_cos {
         return None;
     }
     let cp = c + axis * (grab - c).dot(axis);
@@ -1693,11 +1994,13 @@ impl Tool for AssembleTool {
             if mode != self.mode {
                 self.mode = mode;
                 self.drag = None;
+                self.hover_handle = None;
             }
         });
         match self.mode {
             Mode::Pose => {
                 ui.small("Drag a part to turn it about its connection; what hangs from it follows. Shift+drag: twist a ball, slide, turn on a face. ⌘: steps of 15°. A part with no connection moves freely (Shift: turns).");
+                ui.small("The selected connection has handles for what its motion allows (a ball: rings for X, Y and twist; a hinge: one ring; a slider: an arrow). Drag one for that turn or slide alone; ⌘: 15° (1 mm) steps, Shift: 1° (0.1 mm).");
             }
             Mode::Connect => self.connect_ui(ui, cx),
             Mode::AddJoint => self.add_joint_ui(ui, cx),
@@ -1763,42 +2066,24 @@ impl Tool for AssembleTool {
                 }
             }
             Mode::Pose => {
+                if self.drag.is_none() && !input.down {
+                    self.hover_handle = self.gizmo(cx.scene).and_then(|g| g.handle_at(pos, cx)).map(|(h, _)| (h, pos));
+                }
                 if input.pressed {
                     assembly::follow(cx.scene);
-                    let Some((id, hit)) = cx.pick(pos, None) else { return };
-                    let drive = cx.scene.assembly.drive(id);
-                    cx.scene.active = Some(id);
-                    let name = cx.scene.get(id).map_or_else(String::new, |o| o.name.clone());
-                    match &drive {
-                        Drive::Grounded(g) => {
-                            let gname = cx.scene.get(*g).map_or_else(String::new, |o| o.name.clone());
-                            *cx.status = if *g == id { format!("{name} is grounded: it stays put (click its ground symbol in the object browser to free it).") } else { format!("{name} is held by {gname}, which is grounded.") };
-                            let asm = &mut cx.scene.assembly;
-                            if let Some(c) = asm.parent_connection(id).map(|c| c.id) {
-                                asm.selected = Some(Selected::Connection(c));
-                            }
-                            return;
-                        }
-                        Drive::Connection { connection, .. } => cx.scene.assembly.selected = Some(Selected::Connection(*connection)),
-                        Drive::Free(_) => {}
+                    match self.gizmo(cx.scene).and_then(|g| g.handle_at(pos, cx).map(|(h, at)| (g, h, at))) {
+                        Some((g, h, at)) => self.start_handle(g, h, at, pos, cx),
+                        None => self.press_part(pos, input.shift, cx),
                     }
-                    let parts = drive.parts();
-                    let mut b = Aabb::EMPTY;
-                    for o in parts.iter().filter_map(|&p| cx.scene.get(p)) {
-                        b = b.union(&o.bounds());
-                    }
-                    let centre = b.center();
-                    let limb = match &drive {
-                        Drive::Connection { frame, .. } => (centre - frame.origin).normalize_or(frame.axis()),
-                        _ => DVec3::Z,
-                    };
-                    self.drag = Some(Drag { part: id, drive, grab: hit.point, start: pos, alt: input.shift, centre, limb, motion: Rigid::IDENTITY, generation: cx.history.generation() });
                 }
                 if input.down {
-                    if let Some(d) = &self.drag {
-                        if let Some(m) = self.drag_motion(d, pos, input.command, cx) {
-                            self.drag.as_mut().unwrap().motion = m;
+                    if let Some(mut d) = self.drag.take() {
+                        if let Some(h) = d.handle.as_mut() {
+                            d.motion = self.handle_motion(h, d.start, pos, input.command, input.shift, cx);
+                        } else if let Some(m) = self.drag_motion(&d, pos, input.command, cx) {
+                            d.motion = m;
                         }
+                        self.drag = Some(d);
                     }
                 }
                 if input.released {
@@ -1886,8 +2171,41 @@ impl Tool for AssembleTool {
                 painter.text(c + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "pivot", egui::FontId::proportional(12.0), SEL);
             }
         }
-        // What a drag on the part under the cursor would do.
-        if self.mode == Mode::Pose && self.drag.is_none() {
+        // The selected connection's handles, moved with a drag of its parts.
+        let gizmo = match &self.drag {
+            Some(Drag { handle: Some(h), motion, .. }) => Some((h.gizmo.moved(motion), Some(h.handle))),
+            Some(d) => self.gizmo(cx.scene).filter(|g| d.drive.parts() == g.parts.as_slice()).map(|g| (g.moved(&d.motion), None)),
+            None => self.gizmo(cx.scene).map(|g| (g, self.hover_handle.map(|h| h.0))),
+        };
+        if let Some((g, active)) = &gizmo {
+            g.paint(painter, cx, *active);
+        }
+        if let Some(Drag { handle: Some(h), .. }) = &self.drag {
+            if let (Handle::Turn(i), Some(c)) = (h.handle, cx.project(h.gizmo.centre)) {
+                // The wedge turned through, from where the ring was grabbed.
+                let axis = h.gizmo.axes[i];
+                let (r, _) = h.gizmo.sizes(cx);
+                let v = h.grab - h.gizmo.centre;
+                let r0 = (v - axis * v.dot(axis)).normalize_or_zero() * r;
+                let n = ((h.amount.abs().to_degrees() / 3.0).ceil() as usize).clamp(2, 120);
+                let pts: Vec<egui::Pos2> = (0..=n).filter_map(|k| cx.project(h.gizmo.centre + DQuat::from_axis_angle(axis, h.amount * k as f64 / n as f64) * r0)).collect();
+                if r0 != DVec3::ZERO && pts.len() > 1 {
+                    let s = egui::Stroke::new(1.5, Color32::YELLOW);
+                    painter.line_segment([c, pts[0]], s);
+                    painter.line_segment([c, pts[pts.len() - 1]], s);
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(5.0, Color32::YELLOW.gamma_multiply(0.6))));
+                }
+            }
+            plate_text(painter, h.at + egui::vec2(18.0, -26.0), h.readout(), Color32::YELLOW);
+        }
+        // What a drag on a handle, or on the part under the cursor, would do.
+        if let (Mode::Pose, None, Some((h, pos)), Some((g, _))) = (self.mode, &self.drag, self.hover_handle, &gizmo) {
+            let how = match h {
+                Handle::Turn(_) => "drag to turn · ⌘ 15° steps · Shift 1°",
+                Handle::Slide(_) => "drag to slide · ⌘ 1 mm steps · Shift 0.1 mm",
+            };
+            plate_text(painter, pos + egui::vec2(16.0, -24.0), format!("{}: {how}", g.name(h)), Color32::from_gray(235));
+        } else if self.mode == Mode::Pose && self.drag.is_none() {
             if let Some((id, pos)) = self.hover {
                 let what = match asm.drive(id) {
                     Drive::Grounded(g) if g == id => "grounded".to_string(),
@@ -2391,6 +2709,115 @@ mod tests {
         let state = t.state(cx.scene);
         assert_eq!(state["connections"][0]["motion"], "Ball");
         assert_eq!(state["grounded"][0], "torso");
+    }
+
+    /// Press at `from`, drag to `to`, release (⌘ and Shift as given).
+    fn drag_pointer(t: &mut AssembleTool, cx: &mut ToolCx, from: egui::Pos2, to: egui::Pos2, command: bool, shift: bool) {
+        let ev = |pos: egui::Pos2, pressed: bool, down: bool, released: bool| PointerInput { pos: Some(pos), pressed, down, released, clicked: false, double_clicked: false, shift, command };
+        t.pointer(&ev(from, false, false, false), cx);
+        t.pointer(&ev(from, true, true, false), cx);
+        t.pointer(&ev(from + (to - from) * 0.5, false, true, false), cx);
+        t.pointer(&ev(to, false, true, false), cx);
+        t.pointer(&ev(to, false, false, true), cx);
+    }
+
+    /// Drag ring `i` of the selected connection's handles by `deg` degrees (seen along its axis).
+    fn turn_ring(t: &mut AssembleTool, cx: &mut ToolCx, i: usize, deg: f64, command: bool) {
+        let g = t.gizmo(cx.scene).expect("handles");
+        assert!(g.handles().contains(&Handle::Turn(i)));
+        let axis = g.axes[i];
+        cx.camera.look_along(-axis);
+        let (r, _) = g.sizes(cx);
+        let (u, v) = mm_core::geom::orthonormal_basis(axis);
+        let p0 = g.centre + (u * 0.3f64.cos() + v * 0.3f64.sin()) * r;
+        let p1 = g.centre + DQuat::from_axis_angle(axis, deg.to_radians()) * (p0 - g.centre);
+        let (a, b) = (cx.project(p0).unwrap(), cx.project(p1).unwrap());
+        drag_pointer(t, cx, a, b, command, false);
+    }
+
+    #[test]
+    fn pose_handles_turn_and_slide_only_as_the_connection_allows() {
+        let (mut scene, torso, arm) = kit();
+        let ball_top = arm_motion().apply(DVec3::new(0.0, 0.0, 5.6));
+        let (mut history, mut camera, mut status) = (crate::scene::History::default(), crate::camera::Camera::default(), String::new());
+        let ctx = egui::Context::default();
+        let mut cx = cx_for(&mut scene, &mut history, &mut camera, &mut status, &ctx);
+        let mut t = AssembleTool::new(&mut cx);
+        t.act("pick_surface", &json!({"at": ball_top.to_array()}), &mut cx).unwrap();
+        t.act("pick_surface", &json!({"at": [3.3, 0.0, 0.0]}), &mut cx).unwrap();
+        t.act("seat", &json!({"mode": "joints"}), &mut cx).unwrap();
+        t.act("connect", &json!({}), &mut cx).unwrap();
+        let cid = cx.scene.assembly.connections[0].id;
+        cx.scene.assembly.selected = Some(Selected::Connection(cid));
+        t.mode = Mode::Pose;
+        let mut b = Aabb::EMPTY;
+        for o in &cx.scene.objects {
+            b = b.union(&o.bounds());
+        }
+        cx.camera.focus(&b);
+        let arm_at = |cx: &ToolCx| cx.scene.get(arm).unwrap().mesh.vertex(0);
+        let torso_at = |cx: &ToolCx| cx.scene.get(torso).unwrap().mesh.vertex(0);
+
+        // A ball: three rings, turning with the part. The twist ring turns the arm about its own
+        // axis by just what the cursor went round.
+        let g = t.gizmo(cx.scene).unwrap();
+        assert_eq!(g.handles(), &[Handle::Turn(0), Handle::Turn(1), Handle::Turn(2)]);
+        turn_ring(&mut t, &mut cx, 2, 40.0, false);
+        let c = cx.scene.assembly.connection(cid).unwrap().clone();
+        let (rel, off) = c.pose();
+        assert!((rel.angle_between(DQuat::IDENTITY).to_degrees() - 40.0).abs() < 0.05, "{rel:?}");
+        assert!((assembly::twist_z(rel).angle_between(DQuat::IDENTITY).to_degrees() - 40.0).abs() < 0.05, "all of it a twist");
+        assert!(off.length() < 1e-9 && c.error() < 1e-9, "still in its socket");
+        assert_eq!(cx.history.undo_label(), Some("Pose arm"));
+
+        // A hinge: one ring, about its axis; ⌘ steps the connection's angle by 15°.
+        t.act("set_connection", &json!({"connection": cid, "motion": "Hinge"}), &mut cx).unwrap();
+        t.act("rest_pose", &json!({}), &mut cx).unwrap();
+        assert_eq!(t.gizmo(cx.scene).unwrap().handles(), &[Handle::Turn(2)]);
+        turn_ring(&mut t, &mut cx, 2, 37.0, true);
+        let c = cx.scene.assembly.connection(cid).unwrap().clone();
+        assert!((c.angle().to_degrees() - 30.0).abs() < 1e-6, "{}", c.angle().to_degrees());
+        assert!(c.error() < 1e-9);
+
+        // The arm grounded instead: the torso turns, the other way round its angle.
+        t.act("rest_pose", &json!({}), &mut cx).unwrap();
+        cx.scene.assembly.set_grounded(torso, false);
+        cx.scene.assembly.set_grounded(arm, true);
+        let (arm0, torso0) = (arm_at(&cx), torso_at(&cx));
+        turn_ring(&mut t, &mut cx, 2, 37.0, true);
+        let c = cx.scene.assembly.connection(cid).unwrap().clone();
+        assert!((c.angle().to_degrees() + 30.0).abs() < 1e-6, "{}", c.angle().to_degrees());
+        assert_eq!(arm_at(&cx), arm0, "the grounded arm stays");
+        assert!((torso_at(&cx) - torso0).length() > 0.1, "the torso turned");
+        assert_eq!(cx.history.undo_label(), Some("Pose torso"));
+        cx.scene.assembly.set_grounded(arm, false);
+        cx.scene.assembly.set_grounded(torso, true);
+        t.act("rest_pose", &json!({}), &mut cx).unwrap();
+
+        // A slider: one arrow, no ring; Shift steps the slide by 0.1 mm.
+        t.act("set_connection", &json!({"connection": cid, "motion": "Slider"}), &mut cx).unwrap();
+        let g = t.gizmo(cx.scene).unwrap();
+        assert_eq!(g.handles(), &[Handle::Slide(2)]);
+        let axis = g.axes[2];
+        cx.camera.look_along(mm_core::geom::orthonormal_basis(axis).0);
+        let (_, len) = g.sizes(&cx);
+        let p0 = g.centre + axis * (0.5 * len);
+        let (a, b) = (cx.project(p0).unwrap(), cx.project(p0 + axis * 0.73).unwrap());
+        drag_pointer(&mut t, &mut cx, a, b, false, true);
+        let c = cx.scene.assembly.connection(cid).unwrap().clone();
+        let (rel, off) = c.pose();
+        assert!((off.z - 0.7).abs() < 1e-9 && off.x.abs() < 1e-9 && off.y.abs() < 1e-9, "{off}");
+        assert!(rel.angle_between(DQuat::IDENTITY) < 1e-9, "a slider does not turn");
+
+        // Planar: a ring and two arrows. Fixed: none.
+        t.act("set_connection", &json!({"connection": cid, "motion": "Planar"}), &mut cx).unwrap();
+        assert_eq!(t.gizmo(cx.scene).unwrap().handles(), &[Handle::Turn(2), Handle::Slide(0), Handle::Slide(1)]);
+        t.act("set_connection", &json!({"connection": cid, "motion": "Fixed"}), &mut cx).unwrap();
+        assert!(t.gizmo(cx.scene).is_none());
+        // Nor any outside Pose.
+        t.act("set_connection", &json!({"connection": cid, "motion": "Ball"}), &mut cx).unwrap();
+        t.mode = Mode::Connect;
+        assert!(t.gizmo(cx.scene).is_none());
     }
 
     #[test]

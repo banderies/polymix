@@ -864,6 +864,22 @@ impl Assembly {
         }
     }
 
+    /// What turning connection `cid` itself moves (its pose handles), as [`move_connection`]
+    /// does: the child's side, or the parent's side when a grounded part holds the child's.
+    pub fn connection_drive(&self, cid: u64) -> Option<Drive> {
+        let c = self.connection(cid)?;
+        let held = |side: &[ObjectId]| side.iter().find(|&&p| self.is_grounded(p)).copied();
+        let child_side = self.side(cid, c.child);
+        if held(&child_side).is_none() {
+            return Some(Drive::Connection { connection: cid, parts: child_side, frame: c.on_parent(), moving_child: true });
+        }
+        let parent_side = self.side(cid, c.parent);
+        Some(match held(&parent_side) {
+            None => Drive::Connection { connection: cid, parts: parent_side, frame: c.on_child(), moving_child: false },
+            Some(g) => Drive::Grounded(g),
+        })
+    }
+
     /// Make `id` the top of its group (no connection's child), turning round the connections
     /// above it (their joints and seats stay; only which side is the parent changes).
     pub fn reroot(&mut self, id: ObjectId) {

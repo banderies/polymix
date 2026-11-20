@@ -89,7 +89,7 @@ the same day).
 - Joint limits (PA #4): clamp in `constrain()`; a ball's cone by swing–twist.
 - IK and aim (PA #4): damped least squares over the joints to the grounded part, stiffer joints
   carrying more parts; aim = a ball turned to point a part's forward axis at a click.
-- Pose library, mirror a pose, rotation gizmo on the selected joint.
+- Pose library, mirror a pose.
 
 **Phase 4: kits that assemble themselves.**
 - Auto-detect the joints of a kit modelled assembled (PA #3): contact points between each pair →
@@ -153,7 +153,10 @@ MCP actions (constrained flag and clip report, inspect interference, raycast).
      round. **Seat offset** moves the part from its seat (in the axes of the joint it is
      connected to).
 5. **Pose:** drag a part. Ball: the grabbed point follows the cursor; Shift+drag twists the
-   limb. Hinge: turns about its axis. Slider: slides. ⌘ snaps to 15° steps. Select a connection
+   limb. Hinge: turns about its axis. Slider: slides. ⌘ snaps to 15° steps. The selected
+   connection has **handles** for what its motion allows, one turn or slide at a time (a ball's
+   rings for x, y and twist; a hinge's ring; a slider's arrow); ⌘ steps them by 15° or 1 mm,
+   Shift by 1° or 0.1 mm, with the angle shown as it turns. Select a connection
    to type its angles, change its interaction or motion, move its seat, fit its surfaces
    touching, put it back to rest or disconnect it. **Editing a joint re-seats what is connected
    to it, keeping its pose** (a bigger ball pushes a resting face out; moving a socket's joint
@@ -232,6 +235,7 @@ joints.
 | Fixed joints weld parts (dragging a sword turns the wrist) | ✅ | |
 | Drag from either side (grounding decides which side moves) | ✅ | |
 | ⌘ snaps angles to 15° | ✅ | |
+| Handles on the selected connection | ✅ | Only what its motion allows: ball three rings (x, y, twist; they turn with the part), hinge one ring, slider an arrow, cylindrical a ring and an arrow, planar a ring and two arrows, fixed none. ⌘ steps of 15° / 1 mm, Shift 1° / 0.1 mm (a one-axis turn or slide steps the connection's own value); the angle or slide is shown while dragging |
 | Type a joint's angles / slide in the panel | ✅ | Ball: X, Y, twist; hinge: angle; slider: slide |
 | Rest pose (one joint or all) | ✅ | |
 | Change a joint's type (pose kept as far as it allows) | ✅ | |

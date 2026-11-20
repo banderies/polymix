@@ -134,13 +134,13 @@ struct GizmoDrag {
 }
 
 const AXES: [DVec3; 3] = [DVec3::X, DVec3::Y, DVec3::Z];
-const AXIS_COLORS: [egui::Color32; 3] = [
+pub(super) const AXIS_COLORS: [egui::Color32; 3] = [
     egui::Color32::from_rgb(230, 80, 80),
     egui::Color32::from_rgb(90, 200, 90),
     egui::Color32::from_rgb(90, 140, 240),
 ];
 
-fn dist_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+pub(super) fn dist_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let ab = b - a;
     let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
     p.distance(a + ab * t)
